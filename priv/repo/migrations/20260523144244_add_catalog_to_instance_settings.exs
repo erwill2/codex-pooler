@@ -7,7 +7,7 @@ defmodule CodexPooler.Repo.Migrations.AddCatalogToInstanceSettings do
         null: false,
         default:
           fragment(
-            ~s('{"openai_pricing_url": "https://s3.icorete.ch/openai-json-pricing/pricing.json"}'::jsonb)
+            ~s('{"openai_pricing_url": "https://icoretech.github.io/openai-json-pricing/pricing.json"}'::jsonb)
           )
     end
   end

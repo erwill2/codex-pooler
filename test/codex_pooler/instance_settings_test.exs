@@ -49,7 +49,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert settings.transcription.max_upload_bytes == 26_214_400
 
     assert settings.catalog.openai_pricing_url ==
-             "https://s3.icorete.ch/openai-json-pricing/pricing.json"
+             "https://icoretech.github.io/openai-json-pricing/pricing.json"
 
     assert settings.development.impeccable_live_enabled == false
     assert settings.mcp.enabled == false
@@ -210,7 +210,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     InstanceSettings.reset_cache_for_test()
 
     assert InstanceSettings.current().catalog.openai_pricing_url ==
-             "https://s3.icorete.ch/openai-json-pricing/pricing.json"
+             "https://icoretech.github.io/openai-json-pricing/pricing.json"
 
     assert {:ok, updated} =
              InstanceSettings.update(Repo.reload!(legacy), %{
@@ -220,7 +220,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert updated.files.upload_ttl_seconds == 600
 
     assert updated.catalog.openai_pricing_url ==
-             "https://s3.icorete.ch/openai-json-pricing/pricing.json"
+             "https://icoretech.github.io/openai-json-pricing/pricing.json"
   end
 
   test "legacy singleton settings rows backfill the mcp service setting without losing updates" do

@@ -6,7 +6,7 @@ defmodule CodexPooler.InstanceSettings.Defaults do
 
   @transcription_max_upload_bytes 26_214_400
   @operator_login_base_url "http://localhost"
-  @openai_pricing_url "https://s3.icorete.ch/openai-json-pricing/pricing.json"
+  @openai_pricing_url "https://icoretech.github.io/openai-json-pricing/pricing.json"
   @smtp_from "codex-pooler@example.com"
 
   @spec gateway() :: map()

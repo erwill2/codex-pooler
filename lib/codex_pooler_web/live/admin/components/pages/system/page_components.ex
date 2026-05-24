@@ -309,7 +309,7 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents do
               field={catalog_form[:openai_pricing_url]}
               type="url"
               label="OpenAI pricing URL"
-              placeholder="https://s3.icorete.ch/openai-json-pricing/pricing.json"
+              placeholder="https://icoretech.github.io/openai-json-pricing/pricing.json"
             />
           </div>
         </.settings_group>

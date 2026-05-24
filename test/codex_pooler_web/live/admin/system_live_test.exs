@@ -455,7 +455,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
 
     assert has_element?(
              view,
-             "#instance-settings-openai-pricing-url[value='https://s3.icorete.ch/openai-json-pricing/pricing.json']"
+             "#instance-settings-openai-pricing-url[value='https://icoretech.github.io/openai-json-pricing/pricing.json']"
            )
 
     assert html =~ "the scheduler resolves this URL when each pricing import job runs"
