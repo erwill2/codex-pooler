@@ -27,7 +27,7 @@ defmodule CodexPooler.Files.RequestLog do
         transport: request_metadata.transport,
         status: status,
         response_status_code: response_status,
-        correlation_id: request_metadata.request_id,
+        correlation_id: Ecto.UUID.generate(),
         idempotency_key: request_idempotency_key(request_metadata),
         client_ip: request_metadata.client_ip,
         user_agent: request_metadata.user_agent,
@@ -96,8 +96,22 @@ defmodule CodexPooler.Files.RequestLog do
         }),
       "routing" => drop_nil_values(%{"route_class" => request_metadata.route_class})
     })
+    |> maybe_put_client_request_id(request_metadata)
     |> drop_empty_maps()
   end
+
+  defp maybe_put_client_request_id(metadata, %RequestMetadata{client_request_id: value})
+       when is_binary(value) do
+    value = value |> String.trim() |> String.slice(0, 160)
+
+    if value == "" do
+      metadata
+    else
+      Map.put(metadata, "client_request_id", value)
+    end
+  end
+
+  defp maybe_put_client_request_id(metadata, %RequestMetadata{}), do: metadata
 
   defp drop_empty_maps(metadata) do
     metadata

@@ -17,6 +17,7 @@ defmodule CodexPooler.Gateway.Payloads.FileRequestMetadata do
         transport: transport.transport,
         route_class: transport.route_class,
         request_id: request_metadata.request_id,
+        client_request_id: request_metadata.client_request_id,
         idempotency_key: request_metadata.idempotency_key,
         client_ip: request_metadata.client_ip,
         user_agent: request_metadata.user_agent,
