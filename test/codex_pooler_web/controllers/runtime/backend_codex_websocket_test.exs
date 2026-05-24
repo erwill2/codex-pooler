@@ -526,7 +526,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
              )
 
     assert message =~
-             "backend-api/files uploads are not valid Responses input_image.file_id references"
+             "Responses input_image values must use https image URLs or supported image data URLs"
 
     refute_received {:websocket_frame, _frame}
     assert FakeUpstream.requests(upstream) == []
@@ -1252,6 +1252,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     {:ok, session} =
       Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-tool-continuation"})
 
+    tool_output = "sample output"
+    tool_call_id = "call_sample"
+    previous_response_id = "resp_ws_tool_origin"
+
     assert :ok =
              execute_websocket_response(
                auth,
@@ -1261,25 +1265,68 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                  "input" => [
                    %{
                      "type" => "function_call_output",
-                     "call_id" => "call_sample",
-                     "output" => "sample output"
+                     "call_id" => tool_call_id,
+                     "output" => tool_output
                    }
                  ],
                  "stream" => true,
                  "generate" => true,
-                 "previous_response_id" => "resp_ws_tool_origin"
+                 "previous_response_id" => previous_response_id
                }),
                %{request_id: "ws-tool-continuation", codex_session: session},
                fn frame -> send(self(), {:websocket_frame, frame}) end
              )
 
-    assert_received {:websocket_frame, frame}
+    assert_receive {:websocket_frame, frame}, @websocket_frame_timeout
     assert %{"id" => "resp_ws_tool_continuation"} = Jason.decode!(frame)
 
     assert [captured] = FakeUpstream.requests(upstream)
-    assert captured.json["previous_response_id"] == "resp_ws_tool_origin"
+    assert captured.method == "WEBSOCKET"
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["previous_response_id"] == previous_response_id
     assert captured.json["type"] == "response.create"
     assert captured.json["generate"] == true
+
+    assert captured.json["input"] == [
+             %{
+               "type" => "function_call_output",
+               "call_id" => tool_call_id,
+               "output" => tool_output
+             }
+           ]
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "websocket"
+    assert request.status == "succeeded"
+    assert request.response_status_code == 200
+    assert request.usage_status == "usage_known"
+    assert request.request_metadata["codex_session_id"] == session.id
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.transport == "websocket"
+    assert attempt.status == "succeeded"
+    assert attempt.upstream_status_code == 200
+
+    assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+    assert turn.request_id == request.id
+    assert turn.status == "succeeded"
+    assert turn.transport_kind == "websocket"
+    assert turn.completed_at
+    assert turn.final_attempt_id == attempt.id
+
+    session = Repo.get!(CodexSession, session.id)
+    assert session.status == "active"
+    assert session.pool_upstream_assignment_id == setup.assignment.id
+
+    persistence_text =
+      inspect({request.request_metadata, attempt.response_metadata, session, turn})
+
+    refute persistence_text =~ setup.authorization
+    refute persistence_text =~ previous_response_id
+    refute persistence_text =~ tool_call_id
+    refute persistence_text =~ tool_output
+    refute persistence_text =~ "upstream-token"
   end
 
   test "websocket custom tool output continuations keep previous_response_id for upstream context" do

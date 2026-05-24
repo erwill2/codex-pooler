@@ -2755,7 +2755,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
            } = json_response(conn, 400)
 
     assert message =~
-             "backend-api/files uploads are not valid Responses input_image.file_id references"
+             "Responses input_image values must use https image URLs or supported image data URLs"
 
     refute conn.resp_body =~ sentinel_file_id
     assert FakeUpstream.requests(upstream) == []
@@ -2802,7 +2802,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
            } = json_response(conn, 400)
 
     assert message =~
-             "Codex sediment:// file URIs are unsupported as Responses input_image.image_url values"
+             "Responses input_image values must use https image URLs or supported image data URLs"
 
     refute conn.resp_body =~ sentinel_url
     assert FakeUpstream.requests(upstream) == []
@@ -2834,7 +2834,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         }
       )
 
-    inline_image_url = "data:image/png;base64,INLINE_IMAGE_SENTINEL_DO_NOT_LOG"
+    inline_image_bytes = "inline image fixture"
+    inline_image_url = "data:image/png;base64," <> Base.encode64(inline_image_bytes)
 
     input = [
       %{
@@ -2865,7 +2866,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert captured.json["input"] == input
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
-    refute inspect(request.request_metadata) =~ inline_image_url
+    metadata = inspect(request.request_metadata)
+    refute metadata =~ inline_image_url
+    refute metadata =~ inline_image_bytes
+    refute metadata =~ Base.encode64(inline_image_bytes)
   end
 
   test "POST /backend-api/codex/responses rejects input_image for text-only models before dispatch",

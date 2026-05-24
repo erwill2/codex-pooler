@@ -136,6 +136,44 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
              ]
     end
 
+    test "documents unsupported v1 public surface with exact OpenAI-shaped error contract" do
+      feature = CompatibilityMatrix.by_slug!(:v1_unsupported_public_surface)
+      fixture = CompatibilityMatrix.fixture!(:v1_unsupported_public_surface)
+
+      expected_routes = [
+        %{method: :post, path: "/v1/images/variations"},
+        %{method: :post, path: "/v1/embeddings"},
+        %{method: :post, path: "/v1/batches"},
+        %{method: :post, path: "/v1/moderations"},
+        %{method: :post, path: "/v1/fine_tuning/jobs"},
+        %{method: :get, path: "/v1/responses/:response_id"},
+        %{method: :post, path: "/v1/responses/:response_id/cancel"},
+        %{method: :delete, path: "/v1/responses/:response_id"}
+      ]
+
+      assert feature.status == :supported
+      assert feature.current == :openai_shaped_unsupported_route_contract
+      assert :route in feature.categories
+      assert :auth in feature.categories
+      assert :error in feature.categories
+      assert feature.routes == expected_routes
+      assert feature.contract =~ "deterministic OpenAI-shaped 404 errors"
+
+      assert fixture.status == 404
+      assert fixture.error_code == "unsupported_endpoint"
+
+      assert fixture.routes == [
+               %{method: :post, path: "/v1/images/variations"},
+               %{method: :post, path: "/v1/embeddings"},
+               %{method: :post, path: "/v1/batches"},
+               %{method: :post, path: "/v1/moderations"},
+               %{method: :post, path: "/v1/fine_tuning/jobs"},
+               %{method: :get, path: "/v1/responses/resp_fixture"},
+               %{method: :post, path: "/v1/responses/resp_fixture/cancel"},
+               %{method: :delete, path: "/v1/responses/resp_fixture"}
+             ]
+    end
+
     test "documents backend v1 alias surface as explicit authenticated backend aliases" do
       feature = CompatibilityMatrix.by_slug!(:backend_v1_alias_surface)
       fixture = CompatibilityMatrix.fixture!(:backend_v1_alias_surface)
