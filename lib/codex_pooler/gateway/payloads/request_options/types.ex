@@ -2,6 +2,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.RequestMetadata do
   @moduledoc false
   defstruct [
     :request_id,
+    :client_request_id,
     :idempotency_key,
     :client_ip,
     :user_agent,
@@ -12,6 +13,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.RequestMetadata do
 
   @type t :: %__MODULE__{
           request_id: Ecto.UUID.t() | nil,
+          client_request_id: String.t() | nil,
           idempotency_key: String.t() | nil,
           client_ip: term(),
           user_agent: String.t() | nil,

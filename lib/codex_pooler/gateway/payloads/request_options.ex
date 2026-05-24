@@ -101,6 +101,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :reconnect_window_seconds,
     :reason,
     :request_bytes,
+    :client_request_id,
     :request_content_type,
     :request_id,
     :requested_model,
@@ -210,6 +211,36 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     %{options | request_metadata: struct!(options.request_metadata, updates)}
   end
 
+  @spec server_correlation_id(t()) :: Ecto.UUID.t()
+  def server_correlation_id(%__MODULE__{
+        transport: %{transport: "websocket"},
+        continuity: %{codex_turn_id: turn_id}
+      }) do
+    turn_id || Ecto.UUID.generate()
+  end
+
+  def server_correlation_id(%__MODULE__{}), do: Ecto.UUID.generate()
+
+  @spec websocket_request_correlation_id(t()) :: Ecto.UUID.t() | String.t()
+  def websocket_request_correlation_id(%__MODULE__{
+        request_metadata: %{request_id: request_id},
+        transport: %{transport: "websocket"},
+        continuity: %{codex_turn_id: turn_id}
+      }) do
+    turn_id || request_id || Ecto.UUID.generate()
+  end
+
+  def websocket_request_correlation_id(%__MODULE__{} = options),
+    do: server_correlation_id(options)
+
+  @spec client_request_metadata(t()) :: map()
+  def client_request_metadata(%__MODULE__{} = options) do
+    case safe_client_request_id(options.request_metadata.client_request_id) do
+      nil -> %{}
+      client_request_id -> %{"client_request_id" => client_request_id}
+    end
+  end
+
   @spec put_routing(t(), keyword()) :: t()
   def put_routing(%__MODULE__{} = options, updates) when is_list(updates) do
     %{options | routing: struct!(options.routing, updates)}
@@ -316,6 +347,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   defp request_metadata(opts, _endpoint, payload) do
     %RequestMetadata{
       request_id: Map.get(opts, :request_id),
+      client_request_id: Map.get(opts, :client_request_id),
       idempotency_key: Map.get(opts, :idempotency_key),
       client_ip: Map.get(opts, :client_ip),
       user_agent: Map.get(opts, :user_agent),
@@ -491,6 +523,18 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   end
 
   defp forwarded_headers(_headers), do: []
+
+  defp safe_client_request_id(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.slice(0, 160)
+    |> case do
+      "" -> nil
+      value -> value
+    end
+  end
+
+  defp safe_client_request_id(_value), do: nil
 
   defp websocket_owner_forwarder_opts(opts) do
     case Map.get(opts, :websocket_owner_forwarder_opts) do

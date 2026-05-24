@@ -99,6 +99,7 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpers do
   def request_opts(conn) do
     %{
       request_id: request_id(conn),
+      client_request_id: client_request_id(conn),
       idempotency_key: get_req_header(conn, "idempotency-key") |> List.first(),
       accepted_turn_state: accepted_turn_state(conn),
       previous_response_id: previous_response_id(conn),
@@ -206,6 +207,8 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpers do
     List.first(get_req_header(conn, "x-request-id")) ||
       List.first(get_resp_header(conn, "x-request-id"))
   end
+
+  defp client_request_id(conn), do: List.first(get_req_header(conn, "x-request-id"))
 
   defp request_metadata(conn) do
     %{
