@@ -138,6 +138,19 @@ defmodule CodexPoolerWeb.V1.RouteAuthTest do
   end
 
   describe "unsupported /v1 public OpenAI surfaces" do
+    test "unsupported route registry lists the SDK-probed endpoint shapes exactly" do
+      assert @unsupported_routes == [
+               {:post, "/v1/images/variations"},
+               {:post, "/v1/embeddings"},
+               {:post, "/v1/batches"},
+               {:post, "/v1/moderations"},
+               {:post, "/v1/fine_tuning/jobs"},
+               {:get, "/v1/responses/resp_fixture"},
+               {:post, "/v1/responses/resp_fixture/cancel"},
+               {:delete, "/v1/responses/resp_fixture"}
+             ]
+    end
+
     test "legacy public OpenAI endpoints return deterministic OpenAI-shaped 404", %{conn: conn} do
       setup = active_api_key_fixture()
 
@@ -148,6 +161,9 @@ defmodule CodexPoolerWeb.V1.RouteAuthTest do
           code: "unsupported_endpoint",
           message: "Unsupported OpenAI /v1 endpoint"
         )
+
+        assert [content_type] = get_resp_header(conn, "content-type")
+        assert content_type =~ "application/json"
       end
 
       assert_no_gateway_side_effects()
