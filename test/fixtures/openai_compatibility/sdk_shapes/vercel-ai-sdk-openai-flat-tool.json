@@ -1,0 +1,40 @@
+{
+  "schema_version": "2026-05-24.sdk-shape-corpus.v1",
+  "scenario_id": "vercel-ai-sdk-openai.responses.flat_function_tool.v1",
+  "sdk_name": "Vercel OpenAI provider",
+  "sdk_package": "@ai-sdk/openai",
+  "sdk_version": "3.0.65",
+  "version_provenance": "Sanitized local smoke and registry version queried with npm view @ai-sdk/openai version on 2026-05-24; fixture records provider-specific structural keys only.",
+  "endpoint": "/v1/responses",
+  "http_method": "POST",
+  "scenario": "Provider-specific Responses tool definition using the flat function tool shape.",
+  "top_level_keys": ["model", "input", "tools", "tool_choice"],
+  "input_item_types": ["message:user"],
+  "content_part_types": ["input_text"],
+  "tool_shape_keys": ["type", "name", "description", "parameters"],
+  "expected_decision": {
+    "status": "pending_task_2_matrix",
+    "allowed_values": ["accept", "translate", "reject", "passthrough"]
+  },
+  "owner_placeholder": "matrix_owner_pending",
+  "synthetic_data_policy": {
+    "model_placeholder": "sample-model",
+    "message_placeholder": "sample-user-message",
+    "tool_call_placeholder": "sample-tool-call"
+  },
+  "structural_summary": {
+    "payload_kind": "responses_flat_function_tool",
+    "flat_function_tool_shape": true,
+    "parameters_shape": "json_schema_object",
+    "raw_payload_stored": false,
+    "placeholder_values_only": true,
+    "notes": ["Responses flat function tools use top-level name, description, and parameters keys on each tool object."]
+  },
+  "redaction_status": {
+    "metadata_only": true,
+    "contains_real_prompt": false,
+    "contains_credentials": false,
+    "contains_headers": false,
+    "contains_media_or_file_bytes": false
+  }
+}

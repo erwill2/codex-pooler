@@ -1,0 +1,43 @@
+{
+  "schema_version": "2026-05-24.sdk-shape-corpus.v1",
+  "scenario_id": "vercel-ai.responses.tool_output_continuation.v1",
+  "sdk_name": "Vercel ai",
+  "sdk_package": "ai",
+  "sdk_version": "6.0.191",
+  "version_provenance": "Sanitized local smoke and registry version queried with npm view ai version on 2026-05-24; captured evidence recorded structural item types only.",
+  "endpoint": "/v1/responses",
+  "http_method": "POST",
+  "scenario": "Responses tool-output continuation emitted through Vercel AI SDK integration with a previous response reference and stored response state flag.",
+  "top_level_keys": ["model", "previous_response_id", "store", "input", "tools"],
+  "input_item_types": ["item_reference", "function_call_output", "message:user"],
+  "content_part_types": ["input_text"],
+  "tool_shape_keys": ["type", "name", "description", "parameters"],
+  "expected_decision": {
+    "status": "pending_task_2_matrix",
+    "allowed_values": ["accept", "translate", "reject", "passthrough"]
+  },
+  "owner_placeholder": "matrix_owner_pending",
+  "synthetic_data_policy": {
+    "model_placeholder": "sample-model",
+    "previous_response_placeholder": "sample-response-id",
+    "item_reference_placeholder": "sample-item-reference",
+    "tool_call_placeholder": "sample-tool-call",
+    "user_message_placeholder": "sample-user-message"
+  },
+  "structural_summary": {
+    "payload_kind": "responses_tool_output_continuation",
+    "previous_response_id_present": true,
+    "store_value": true,
+    "flat_function_tool_shape": true,
+    "raw_payload_stored": false,
+    "placeholder_values_only": true,
+    "notes": ["Known observed continuation shape includes item_reference, function_call_output, and user input together."]
+  },
+  "redaction_status": {
+    "metadata_only": true,
+    "contains_real_prompt": false,
+    "contains_credentials": false,
+    "contains_headers": false,
+    "contains_media_or_file_bytes": false
+  }
+}

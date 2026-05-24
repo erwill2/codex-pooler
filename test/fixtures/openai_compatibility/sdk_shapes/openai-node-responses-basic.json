@@ -1,0 +1,37 @@
+{
+  "schema_version": "2026-05-24.sdk-shape-corpus.v1",
+  "scenario_id": "openai-node.responses.basic_text.v1",
+  "sdk_name": "OpenAI Node",
+  "sdk_package": "openai",
+  "sdk_version": "6.39.0",
+  "version_provenance": "Registry version queried with npm view openai version on 2026-05-24; local smoke setup is tracked separately and no raw transport body is stored here.",
+  "endpoint": "/v1/responses",
+  "http_method": "POST",
+  "scenario": "Basic Responses text creation with a synthetic user message.",
+  "top_level_keys": ["model", "input", "stream"],
+  "input_item_types": ["message:user"],
+  "content_part_types": ["input_text"],
+  "tool_shape_keys": [],
+  "expected_decision": {
+    "status": "pending_task_2_matrix",
+    "allowed_values": ["accept", "translate", "reject", "passthrough"]
+  },
+  "owner_placeholder": "matrix_owner_pending",
+  "synthetic_data_policy": {
+    "model_placeholder": "sample-model",
+    "input_placeholder": "sample-user-message"
+  },
+  "structural_summary": {
+    "payload_kind": "responses_basic_text",
+    "raw_payload_stored": false,
+    "placeholder_values_only": true,
+    "notes": ["String input may be represented by codex-pooler as one user message with one input_text part."]
+  },
+  "redaction_status": {
+    "metadata_only": true,
+    "contains_real_prompt": false,
+    "contains_credentials": false,
+    "contains_headers": false,
+    "contains_media_or_file_bytes": false
+  }
+}

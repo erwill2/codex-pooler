@@ -1,0 +1,82 @@
+{
+  "schema_version": "2026-05-24.sdk-shape-corpus.v1",
+  "purpose": "Metadata-only structural corpus for OpenAI-compatible SDK request shapes.",
+  "required_fields": [
+    "schema_version",
+    "scenario_id",
+    "sdk_name",
+    "sdk_package",
+    "sdk_version",
+    "version_provenance",
+    "endpoint",
+    "http_method",
+    "scenario",
+    "top_level_keys",
+    "input_item_types",
+    "content_part_types",
+    "tool_shape_keys",
+    "expected_decision",
+    "owner_placeholder",
+    "synthetic_data_policy",
+    "structural_summary",
+    "redaction_status"
+  ],
+  "redaction_rules": {
+    "allowed": [
+      "field names",
+      "item type names",
+      "content part type names",
+      "endpoint paths",
+      "package names",
+      "package versions",
+      "status classes",
+      "counts",
+      "neutral placeholder ids"
+    ],
+    "forbidden": [
+      "credential header values",
+      "session header values",
+      "full real request payloads",
+      "real prompt text",
+      "customer or operator data",
+      "transport traces",
+      "upload locations from live systems",
+      "file bytes",
+      "audio bytes",
+      "image bytes",
+      "websocket frames",
+      "raw external service responses"
+    ]
+  },
+  "sdk_version_policy": {
+    "rule": "Every fixture pins sdk_package and sdk_version and explains provenance without raw transport bodies.",
+    "registry_checked_at": "2026-05-24",
+    "registry_versions": {
+      "openai:npm": "6.39.0",
+      "openai:pypi": "2.38.0",
+      "ai:npm": "6.0.191",
+      "@ai-sdk/openai:npm": "3.0.65"
+    }
+  },
+  "neutral_synthetic_data_policy": {
+    "rule": "Use generic placeholders only.",
+    "examples": [
+      "sample-user-message",
+      "sample-tool-call",
+      "sample-file-id",
+      "sample-response-id",
+      "https://example.com/sample.png"
+    ]
+  },
+  "expected_decision_placeholder_policy": {
+    "task_1_value": "pending_task_2_matrix",
+    "task_2_allowed_values": ["accept", "translate", "reject", "passthrough"],
+    "matrix_file_owner": "Task 2"
+  },
+  "fixture_files": [
+    "openai-node-responses-basic.json",
+    "openai-python-chat-basic.json",
+    "vercel-ai-responses-tool-continuation.json",
+    "vercel-ai-sdk-openai-flat-tool.json"
+  ]
+}
