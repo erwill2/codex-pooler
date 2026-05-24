@@ -412,13 +412,14 @@ defmodule CodexPooler.CompatibilityMatrix do
     },
     v1_unsupported_public_surface: %{
       routes: [
-        "/v1/images/variations",
-        "/v1/embeddings",
-        "/v1/batches",
-        "/v1/moderations",
-        "/v1/fine_tuning/jobs",
-        "/v1/responses/resp_fixture",
-        "/v1/responses/resp_fixture/cancel"
+        %{method: :post, path: "/v1/images/variations"},
+        %{method: :post, path: "/v1/embeddings"},
+        %{method: :post, path: "/v1/batches"},
+        %{method: :post, path: "/v1/moderations"},
+        %{method: :post, path: "/v1/fine_tuning/jobs"},
+        %{method: :get, path: "/v1/responses/resp_fixture"},
+        %{method: :post, path: "/v1/responses/resp_fixture/cancel"},
+        %{method: :delete, path: "/v1/responses/resp_fixture"}
       ],
       status: 404,
       error_code: "unsupported_endpoint"
