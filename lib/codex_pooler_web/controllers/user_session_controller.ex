@@ -137,11 +137,19 @@ defmodule CodexPoolerWeb.UserSessionController do
   end
 
   def change_password(conn, %{"user" => user_params}) do
+    current_token = get_session(conn, :user_token)
+
     with %{user: user} <- conn.assigns.current_scope,
-         {:ok, %{user: user, token: token}} <-
-           Accounts.change_user_password(user, user_params, UserAuth.request_metadata(conn)) do
+         {:ok, user} <-
+           Accounts.change_current_user_password(
+             user,
+             user_params,
+             UserAuth.request_metadata(conn),
+             current_token
+           ) do
+      disconnect_parallel_sessions(user, current_token)
+
       conn
-      |> UserAuth.replace_user_session(user, token)
       |> json(%{status: "ok", authenticated: true})
     else
       nil ->
@@ -154,6 +162,13 @@ defmodule CodexPoolerWeb.UserSessionController do
 
       {:error, :invalid_session} ->
         invalid_session(conn)
+
+      {:error, :invalid_current_password} ->
+        conn
+        |> put_status(:unprocessable_entity)
+        |> json(%{
+          error: %{code: "invalid_current_password", message: "Current password is invalid"}
+        })
 
       {:error, _reason} ->
         conn
@@ -205,4 +220,12 @@ defmodule CodexPoolerWeb.UserSessionController do
       error: %{code: "invalid_session", message: "operator session is invalid or expired"}
     })
   end
+
+  defp disconnect_parallel_sessions(user, current_token) when is_binary(current_token) do
+    UserAuth.disconnect_user_sessions(user.id,
+      except_live_socket_id: UserAuth.live_socket_id_for_token(current_token)
+    )
+  end
+
+  defp disconnect_parallel_sessions(_user, _current_token), do: :ok
 end

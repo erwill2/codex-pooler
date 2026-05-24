@@ -222,29 +222,49 @@ defmodule CodexPoolerWeb.AuthControllerTest do
     assert redirected_to(reused) == ~p"/login?mfa=1"
   end
 
-  test "password change API rotates the current session and accepts the new password", %{
-    conn: conn
-  } do
-    bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+  test "password change API requires current password, preserves the current session, revokes parallel sessions, and accepts the new password",
+       %{
+         conn: conn
+       } do
+    %{user: user} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+
+    assert {:ok, %{token: parallel_token}} =
+             Accounts.login_user(%{"email" => user.email, "password" => valid_user_password()})
 
     conn =
       post(conn, ~p"/login", %{
-        "user" => %{"email" => "owner@example.com", "password" => valid_user_password()}
+        "user" => %{"email" => user.email, "password" => valid_user_password()}
       })
 
-    old_token = get_session(conn, :user_token)
-    assert Accounts.get_user_by_session_token(old_token)
+    current_token = get_session(conn, :user_token)
+    assert Accounts.get_user_by_session_token(current_token)
+    assert Accounts.get_user_by_session_token(parallel_token)
+
+    Phoenix.PubSub.subscribe(
+      CodexPooler.PubSub,
+      CodexPoolerWeb.UserAuth.user_sessions_topic(user.id)
+    )
 
     conn =
       post(conn, ~p"/settings/password", %{
-        "user" => %{"new_password" => "new-bootstrap-pass-456"}
+        "user" => %{
+          "current_password" => valid_user_password(),
+          "new_password" => "new-bootstrap-pass-456"
+        }
       })
 
     assert json_response(conn, 200) == %{"authenticated" => true, "status" => "ok"}
-    new_token = get_session(conn, :user_token)
-    refute new_token == old_token
-    refute Accounts.get_user_by_session_token(old_token)
-    assert Accounts.get_user_by_session_token(new_token)
+    assert get_session(conn, :user_token) == current_token
+    assert Accounts.get_user_by_session_token(current_token)
+    refute Accounts.get_user_by_session_token(parallel_token)
+
+    assert_receive {:disconnect_user_sessions,
+                    %{user_id: user_id, except_live_socket_id: except_live_socket_id}}
+
+    assert user_id == user.id
+
+    assert except_live_socket_id ==
+             CodexPoolerWeb.UserAuth.live_socket_id_for_token(current_token)
 
     conn = delete(conn, ~p"/logout")
     assert redirected_to(conn) == ~p"/login"
@@ -294,7 +314,7 @@ defmodule CodexPoolerWeb.AuthControllerTest do
   end
 
   test "password change API rejects anonymous and invalid password requests", %{conn: conn} do
-    bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+    %{user: user} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
 
     anonymous =
       post(conn, ~p"/settings/password", %{
@@ -305,16 +325,45 @@ defmodule CodexPoolerWeb.AuthControllerTest do
 
     conn =
       post(build_conn(), ~p"/login", %{
-        "user" => %{"email" => "owner@example.com", "password" => valid_user_password()}
+        "user" => %{"email" => user.email, "password" => valid_user_password()}
       })
+
+    current_token = get_session(conn, :user_token)
+
+    missing_current_password =
+      post(conn, ~p"/settings/password", %{
+        "user" => %{"new_password" => "new-bootstrap-pass-456"}
+      })
+
+    assert %{"error" => %{"code" => "invalid_current_password"}} =
+             json_response(missing_current_password, 422)
+
+    assert Accounts.get_user_by_email_and_password(user.email, valid_user_password())
+    assert Accounts.get_user_by_session_token(current_token)
+    refute Accounts.get_user_by_email_and_password(user.email, "new-bootstrap-pass-456")
+
+    wrong_current_password =
+      post(conn, ~p"/settings/password", %{
+        "user" => %{
+          "current_password" => "wrong-current-password",
+          "new_password" => "new-bootstrap-pass-456"
+        }
+      })
+
+    assert %{"error" => %{"code" => "invalid_current_password"}} =
+             json_response(wrong_current_password, 422)
+
+    assert Accounts.get_user_by_email_and_password(user.email, valid_user_password())
+    assert Accounts.get_user_by_session_token(current_token)
+    refute Accounts.get_user_by_email_and_password(user.email, "new-bootstrap-pass-456")
 
     invalid =
       post(conn, ~p"/settings/password", %{
-        "user" => %{"new_password" => "short"}
+        "user" => %{"current_password" => valid_user_password(), "new_password" => "short"}
       })
 
     assert %{"error" => %{"code" => "invalid_password"}} = json_response(invalid, 422)
-    assert Accounts.get_user_by_email_and_password("owner@example.com", valid_user_password())
+    assert Accounts.get_user_by_email_and_password(user.email, valid_user_password())
   end
 
   describe "forced password change auth flow" do
