@@ -30,10 +30,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       "tools" => [
         %{
           "type" => "function",
-          "function" => %{
-            "name" => "lookup_fixture",
-            "parameters" => %{"type" => "object", "properties" => %{}}
-          }
+          "name" => "lookup_fixture",
+          "parameters" => %{"type" => "object", "properties" => %{}}
         }
       ],
       "tool_choice" => "auto",
@@ -309,67 +307,106 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              })
   end
 
-  test "Responses tool-result input normalization returns explicit results without raising" do
-    assert {:ok, %{payload: payload}} =
-             Responses.coerce(%{
-               "model" => "gpt-fixture-text",
-               "input" => [
-                 %{"call_id" => "call_fixture", "result" => %{"status" => "ok"}}
-               ]
-             })
+  describe "Task 4 Responses continuation and input-reference validation" do
+    test "tool-result input normalization returns explicit results without raising" do
+      assert {:ok, %{payload: payload}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [
+                   %{"call_id" => "call_fixture", "result" => %{"status" => "ok"}}
+                 ]
+               })
 
-    assert [%{"call_id" => "call_fixture", "result" => %{"status" => "ok"}}] =
-             payload["input"]
-  end
+      assert [%{"call_id" => "call_fixture", "result" => %{"status" => "ok"}}] =
+               payload["input"]
+    end
 
-  test "Responses item_reference continuations require previous response tool-result context" do
-    payload = %{
-      "model" => "gpt-fixture-text",
-      "previous_response_id" => "resp_fixture_previous",
-      "input" => [
-        %{"type" => "item_reference", "id" => "msg_existing_fixture"},
+    test "item_reference continuations require previous response tool-result context" do
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "previous_response_id" => "resp_fixture_previous",
+        "input" => [
+          %{"type" => "item_reference", "id" => "msg_existing_fixture"},
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_fixture",
+            "output" => "{\"ok\":true}"
+          }
+        ]
+      }
+
+      assert {:ok, %{payload: coerced}} = Responses.coerce(payload)
+      assert coerced["previous_response_id"] == "resp_fixture_previous"
+
+      assert [
+               %{"type" => "item_reference", "id" => "msg_existing_fixture"},
+               %{"type" => "function_call_output", "call_id" => "call_fixture"}
+             ] = coerced["input"]
+
+      malformed_references = [
+        %{"type" => "item_reference"},
+        %{"type" => "item_reference", "id" => ""},
+        %{"type" => "item_reference", "id" => "msg_existing_fixture", "output" => "bad"}
+      ]
+
+      Enum.each(malformed_references, fn item ->
+        assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+                 Responses.coerce(%{"model" => "gpt-fixture-text", "input" => [item]})
+      end)
+
+      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [%{"type" => "item_reference", "id" => "msg_existing_fixture"}]
+               })
+
+      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "previous_response_id" => "resp_fixture_previous",
+                 "input" => [
+                   %{"type" => "item_reference", "id" => "msg_existing_fixture"},
+                   %{"role" => "user", "content" => "synthetic ordinary continuation"}
+                 ]
+               })
+    end
+
+    test "previous_response_id without semantic tool output is rejected" do
+      invalid_payloads = [
         %{
-          "type" => "function_call_output",
-          "call_id" => "call_fixture",
-          "output" => "{\"ok\":true}"
+          "previous_response_id" => "resp_fixture_ordinary",
+          "input" => "synthetic ordinary continuation"
+        },
+        %{
+          "previous_response_id" => "resp_fixture_message_only",
+          "input" => [%{"role" => "user", "content" => "synthetic ordinary continuation"}]
+        },
+        %{
+          "previous_response_id" => "",
+          "input" => [
+            %{"type" => "function_call_output", "call_id" => "call_fixture", "output" => "ok"}
+          ]
+        },
+        %{
+          "previous_response_id" => 123,
+          "input" => [
+            %{"type" => "function_call_output", "call_id" => "call_fixture", "output" => "ok"}
+          ]
         }
       ]
-    }
 
-    assert {:ok, %{payload: coerced}} = Responses.coerce(payload)
-    assert coerced["previous_response_id"] == "resp_fixture_previous"
-
-    assert [
-             %{"type" => "item_reference", "id" => "msg_existing_fixture"},
-             %{"type" => "function_call_output", "call_id" => "call_fixture"}
-           ] = coerced["input"]
-
-    malformed_references = [
-      %{"type" => "item_reference"},
-      %{"type" => "item_reference", "id" => ""},
-      %{"type" => "item_reference", "id" => "msg_existing_fixture", "output" => "bad"}
-    ]
-
-    Enum.each(malformed_references, fn item ->
-      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
-               Responses.coerce(%{"model" => "gpt-fixture-text", "input" => [item]})
-    end)
-
-    assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
-             Responses.coerce(%{
-               "model" => "gpt-fixture-text",
-               "input" => [%{"type" => "item_reference", "id" => "msg_existing_fixture"}]
-             })
-
-    assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
-             Responses.coerce(%{
-               "model" => "gpt-fixture-text",
-               "previous_response_id" => "resp_fixture_previous",
-               "input" => [
-                 %{"type" => "item_reference", "id" => "msg_existing_fixture"},
-                 %{"role" => "user", "content" => "synthetic ordinary continuation"}
-               ]
-             })
+      Enum.each(invalid_payloads, fn payload ->
+        assert {:error,
+                %{
+                  status: 400,
+                  code: "invalid_request",
+                  param: "previous_response_id"
+                }} =
+                 payload
+                 |> Map.put("model", "gpt-fixture-text")
+                 |> Responses.coerce()
+      end)
+    end
   end
 
   @tag :unsupported_fields
@@ -440,7 +477,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       "model" => "gpt-fixture-text",
       "input" => "synthetic input",
       "tools" => [
-        function_tool("lookup_fixture", %{
+        flat_function_tool("lookup_fixture", %{
           "type" => "object",
           "additionalProperties" => false,
           "properties" => %{"ok" => %{"type" => "boolean"}},
@@ -466,7 +503,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     }
 
     assert {:ok, chat_result} = Chat.coerce(chat_payload)
-    assert chat_result.payload["tools"] == chat_payload["tools"]
+    assert chat_result.payload["tools"] == translated_chat_tools(chat_payload["tools"])
   end
 
   @tag :responses_coercion
@@ -494,6 +531,245 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert result.payload["tools"] == payload["tools"]
   end
 
+  describe "Task 5 Responses and Chat tool shape compatibility" do
+    test "documents the tool shape divergence between Responses and Chat" do
+      divergence = [
+        %{
+          endpoint: :responses,
+          accepted_shape: "flat function tool",
+          translated_upstream_shape: "flat function tool"
+        },
+        %{
+          endpoint: :chat,
+          accepted_shape: "nested function tool",
+          translated_upstream_shape: "flat function tool"
+        }
+      ]
+
+      assert divergence == [
+               %{
+                 endpoint: :responses,
+                 accepted_shape: "flat function tool",
+                 translated_upstream_shape: "flat function tool"
+               },
+               %{
+                 endpoint: :chat,
+                 accepted_shape: "nested function tool",
+                 translated_upstream_shape: "flat function tool"
+               }
+             ]
+    end
+
+    test "Responses accepts flat function tools with nonblank names and map parameters" do
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "input" => "synthetic input",
+        "tools" => [
+          %{
+            "type" => "function",
+            "name" => "lookup_fixture",
+            "description" => "Lookup synthetic fixture",
+            "parameters" => %{"type" => "object", "properties" => %{}}
+          }
+        ]
+      }
+
+      assert {:ok, result} = Responses.coerce(payload)
+      assert result.payload["tools"] == payload["tools"]
+    end
+
+    test "Chat accepts nested function tools and translates them to flat Responses tools" do
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "messages" => [%{"role" => "user", "content" => "synthetic input"}],
+        "tools" => [
+          function_tool("lookup_fixture", %{"type" => "object", "properties" => %{}}, nil)
+        ]
+      }
+
+      assert {:ok, result} = Chat.coerce(payload)
+      assert result.payload["tools"] == translated_chat_tools(payload["tools"])
+    end
+
+    test "Responses rejects malformed and Chat-only tool shapes" do
+      invalid_payloads = [
+        {%{"type" => "function", "parameters" => %{}}, "tools"},
+        {%{"type" => "function", "name" => "", "parameters" => %{}}, "tools"},
+        {%{"type" => "function", "name" => "   ", "parameters" => %{}}, "tools"},
+        {%{"type" => "function", "name" => "lookup_fixture", "parameters" => []}, "tools"},
+        {%{"type" => "unsupported_tool", "name" => "lookup_fixture", "parameters" => %{}},
+         "tools"},
+        {function_tool("chat_only_nested", %{"type" => "object", "properties" => %{}}), "tools"}
+      ]
+
+      Enum.each(invalid_payloads, fn {tool, expected_param} ->
+        assert {:error, %{status: 400, code: "invalid_request", param: ^expected_param}} =
+                 Responses.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "input" => "synthetic input",
+                   "tools" => [tool]
+                 })
+      end)
+    end
+
+    test "Chat rejects malformed nested function tools" do
+      invalid_tools = [
+        %{"type" => "function", "function" => %{"parameters" => %{}}},
+        %{"type" => "function", "function" => %{"name" => "", "parameters" => %{}}},
+        %{"type" => "function", "function" => %{"name" => "lookup_fixture", "parameters" => []}},
+        %{"type" => "unknown", "function" => %{"name" => "lookup_fixture", "parameters" => %{}}}
+      ]
+
+      Enum.each(invalid_tools, fn tool ->
+        assert {:error, %{status: 400, code: "invalid_request", param: "tools"}} =
+                 Chat.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "messages" => [%{"role" => "user", "content" => "synthetic input"}],
+                   "tools" => [tool]
+                 })
+      end)
+    end
+
+    test "tool_choice variants are explicit for strings, named functions, and image generation" do
+      base_payload = %{
+        "model" => "gpt-fixture-text",
+        "input" => "synthetic input",
+        "tools" => [
+          flat_function_tool("lookup_fixture", %{"type" => "object", "properties" => %{}}, nil)
+        ]
+      }
+
+      for choice <- ["auto", "none", "required"] do
+        payload = Map.put(base_payload, "tool_choice", choice)
+        assert {:ok, result} = Responses.coerce(payload)
+        assert result.payload["tool_choice"] == choice
+      end
+
+      named_choice = %{"type" => "function", "name" => "lookup_fixture"}
+      assert {:ok, result} = Responses.coerce(Map.put(base_payload, "tool_choice", named_choice))
+      assert result.payload["tool_choice"] == named_choice
+
+      image_payload = %{
+        "model" => "gpt-fixture-text",
+        "input" => "synthetic input",
+        "tools" => [%{"type" => "image_generation"}],
+        "tool_choice" => %{"type" => "image_generation"}
+      }
+
+      assert {:ok, result} = Responses.coerce(image_payload)
+      assert result.payload["tool_choice"] == %{"type" => "image_generation"}
+    end
+
+    test "tool_choice rejects missing, blank, malformed, and unknown named function choices" do
+      base_payload = %{
+        "model" => "gpt-fixture-text",
+        "input" => "synthetic input",
+        "tools" => [
+          flat_function_tool("lookup_fixture", %{"type" => "object", "properties" => %{}})
+        ]
+      }
+
+      invalid_choices = [
+        %{"type" => "function"},
+        %{"type" => "function", "name" => ""},
+        %{"type" => "function", "name" => "missing_fixture"},
+        %{"type" => "function", "function" => %{"name" => "lookup_fixture"}},
+        %{"type" => "unsupported_tool"}
+      ]
+
+      Enum.each(invalid_choices, fn choice ->
+        assert {:error, %{status: 400, code: "invalid_request", param: "tool_choice"}} =
+                 base_payload
+                 |> Map.put("tool_choice", choice)
+                 |> Responses.coerce()
+      end)
+    end
+
+    test "parallel_tool_calls true and false are preserved for Responses and Chat" do
+      for value <- [true, false] do
+        response_payload = %{
+          "model" => "gpt-fixture-text",
+          "input" => "synthetic input",
+          "parallel_tool_calls" => value
+        }
+
+        assert {:ok, response_result} = Responses.coerce(response_payload)
+        assert response_result.payload["parallel_tool_calls"] == value
+
+        chat_payload = %{
+          "model" => "gpt-fixture-text",
+          "messages" => [%{"role" => "user", "content" => "synthetic input"}],
+          "parallel_tool_calls" => value
+        }
+
+        assert {:ok, chat_result} = Chat.coerce(chat_payload)
+        assert chat_result.payload["parallel_tool_calls"] == value
+      end
+    end
+  end
+
+  describe "Task 9 advanced Responses built-in tool classification" do
+    test "Responses allows only exact safe passthrough built-in tool shapes" do
+      for tool <- [
+            %{"type" => "web_search_preview"},
+            %{"type" => "image_generation"},
+            %{
+              "type" => "image_generation",
+              "model" => "gpt-image-1",
+              "size" => "1024x1024",
+              "quality" => "high",
+              "background" => "transparent",
+              "input_fidelity" => "high"
+            }
+          ] do
+        payload = %{
+          "model" => "gpt-fixture-text",
+          "input" => "synthetic input",
+          "tools" => [tool]
+        }
+
+        assert {:ok, result} = Responses.coerce(payload)
+        assert result.payload["tools"] == [tool]
+      end
+    end
+
+    test "Responses rejects unsupported hosted built-in and namespace/deferred tools" do
+      rejected_tools = [
+        %{"type" => "web_search_preview", "search_context_size" => "low"},
+        %{"type" => "image_generation", "quality" => "high"},
+        %{"type" => "file_search", "vector_store_ids" => ["vs_fixture"]},
+        %{"type" => "code_interpreter", "container" => %{"type" => "auto"}},
+        %{"type" => "computer_use", "environment" => "browser"},
+        %{"type" => "mcp", "server_label" => "fixture-mcp"},
+        %{"type" => "shell", "description" => "synthetic shell"},
+        %{"type" => "local_shell", "description" => "synthetic local shell"},
+        %{"type" => "apply_patch", "description" => "synthetic patch"},
+        %{"type" => "tool_search", "namespace" => "fixture_namespace"},
+        %{
+          "type" => "function",
+          "name" => "lookup_fixture",
+          "parameters" => %{},
+          "namespace" => "fixture_namespace"
+        },
+        %{
+          "type" => "function",
+          "name" => "lookup_fixture",
+          "parameters" => %{},
+          "deferred" => true
+        }
+      ]
+
+      Enum.each(rejected_tools, fn tool ->
+        assert {:error, %{status: 400, code: "invalid_request", param: "tools"}} =
+                 Responses.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "input" => "synthetic input",
+                   "tools" => [tool]
+                 })
+      end)
+    end
+  end
+
   @tag :responses_coercion
   test "strict function parameters reject missing additionalProperties at the top level" do
     assert {:error, reason} =
@@ -501,7 +777,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                "model" => "gpt-fixture-text",
                "input" => "synthetic input",
                "tools" => [
-                 function_tool("lookup_missing_additional_properties", %{
+                 flat_function_tool("lookup_missing_additional_properties", %{
                    "type" => "object",
                    "properties" => %{"ok" => %{"type" => "boolean"}},
                    "required" => ["ok"]
@@ -514,7 +790,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              code: "invalid_function_parameters",
              message:
                "Invalid schema for function 'lookup_missing_additional_properties': strict json_schema object schemas must set additionalProperties to false",
-             param: "tools.0.function.parameters"
+             param: "tools.0.parameters"
            }
   end
 
@@ -525,7 +801,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                "model" => "gpt-fixture-text",
                "input" => "synthetic input",
                "tools" => [
-                 function_tool("lookup_additional_properties_true", %{
+                 flat_function_tool("lookup_additional_properties_true", %{
                    "type" => "object",
                    "additionalProperties" => true,
                    "properties" => %{"ok" => %{"type" => "boolean"}},
@@ -539,7 +815,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              code: "invalid_function_parameters",
              message:
                "Invalid schema for function 'lookup_additional_properties_true': strict json_schema object schemas must set additionalProperties to false",
-             param: "tools.0.function.parameters"
+             param: "tools.0.parameters"
            }
   end
 
@@ -550,7 +826,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                "model" => "gpt-fixture-text",
                "input" => "synthetic input",
                "tools" => [
-                 function_tool("lookup_omitted_required", %{
+                 flat_function_tool("lookup_omitted_required", %{
                    "type" => "object",
                    "additionalProperties" => false,
                    "properties" => %{"ok" => %{"type" => "boolean"}}
@@ -563,7 +839,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              code: "invalid_function_parameters",
              message:
                "Invalid schema for function 'lookup_omitted_required': strict json_schema object schemas must list every property in required (missing ok)",
-             param: "tools.0.function.parameters.required"
+             param: "tools.0.parameters.required"
            }
 
     assert {:error, reason} =
@@ -571,7 +847,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                "model" => "gpt-fixture-text",
                "input" => "synthetic input",
                "tools" => [
-                 function_tool("lookup_missing_required_property", %{
+                 flat_function_tool("lookup_missing_required_property", %{
                    "type" => "object",
                    "additionalProperties" => false,
                    "properties" => %{
@@ -588,7 +864,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              code: "invalid_function_parameters",
              message:
                "Invalid schema for function 'lookup_missing_required_property': strict json_schema object schemas must list every property in required (missing extra)",
-             param: "tools.0.function.parameters.required"
+             param: "tools.0.parameters.required"
            }
   end
 
@@ -600,7 +876,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                "input" => "synthetic input",
                "tools" => [
                  %{"type" => "web_search_preview"},
-                 function_tool("lookup_nested_object", %{
+                 flat_function_tool("lookup_nested_object", %{
                    "type" => "object",
                    "additionalProperties" => false,
                    "properties" => %{
@@ -620,7 +896,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              code: "invalid_function_parameters",
              message:
                "Invalid schema for function 'lookup_nested_object': strict json_schema object schemas must set additionalProperties to false",
-             param: "tools.1.function.parameters.properties.settings"
+             param: "tools.1.parameters.properties.settings"
            }
   end
 
@@ -629,7 +905,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     payload = %{
       "model" => "gpt-fixture-text",
       "input" => "synthetic input",
-      "tools" => [function_tool("lookup_local_refs", local_ref_function_parameters())]
+      "tools" => [flat_function_tool("lookup_local_refs", local_ref_function_parameters())]
     }
 
     assert {:ok, result} = Responses.coerce(payload)
@@ -645,7 +921,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     }
 
     assert {:ok, result} = Chat.coerce(payload)
-    assert result.payload["tools"] == payload["tools"]
+    assert result.payload["tools"] == translated_chat_tools(payload["tools"])
   end
 
   @tag :responses_coercion
@@ -654,17 +930,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       {
         "unresolved",
         invalid_local_ref_function_parameters("#/$defs/missing", "profile", %{}),
-        "tools.0.function.parameters.properties.profile.$ref"
+        "tools.0.parameters.properties.profile.$ref"
       },
       {
         "malformed",
         invalid_local_ref_function_parameters("#/%24defs/%zz", "profile", %{}),
-        "tools.0.function.parameters.properties.profile.$ref"
+        "tools.0.parameters.properties.profile.$ref"
       },
       {
         "double_hash",
         invalid_local_ref_function_parameters("##/$defs/profile", "profile", %{}),
-        "tools.0.function.parameters.properties.profile.$ref"
+        "tools.0.parameters.properties.profile.$ref"
       },
       {
         "remote",
@@ -673,7 +949,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "profile",
           %{}
         ),
-        "tools.0.function.parameters.properties.profile.$ref"
+        "tools.0.parameters.properties.profile.$ref"
       },
       {
         "circular",
@@ -682,7 +958,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "node",
           %{"next" => %{"$ref" => "#/$defs/node"}}
         ),
-        "tools.0.function.parameters.properties.profile.properties.next.$ref"
+        "tools.0.parameters.properties.profile.properties.next.$ref"
       },
       {
         "non_map_target",
@@ -691,7 +967,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "profile",
           "not a schema object"
         ),
-        "tools.0.function.parameters.properties.profile.$ref"
+        "tools.0.parameters.properties.profile.$ref"
       }
     ]
 
@@ -699,7 +975,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       response_payload = %{
         "model" => "gpt-fixture-text",
         "input" => "synthetic input",
-        "tools" => [function_tool("lookup_invalid_local_ref", parameters)]
+        "tools" => [flat_function_tool("lookup_invalid_local_ref", parameters)]
       }
 
       chat_payload = %{
@@ -732,7 +1008,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       "model" => "gpt-fixture-text",
       "input" => "synthetic input",
       "tools" => [
-        function_tool(
+        flat_function_tool(
           "lookup_false",
           %{
             "type" => "object",
@@ -740,7 +1016,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           },
           false
         ),
-        function_tool(
+        flat_function_tool(
           "lookup_omitted",
           %{
             "type" => "object",
@@ -778,7 +1054,300 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     }
 
     assert {:ok, chat_result} = Chat.coerce(chat_payload)
-    assert chat_result.payload["tools"] == chat_payload["tools"]
+    assert chat_result.payload["tools"] == translated_chat_tools(chat_payload["tools"])
+  end
+
+  describe "Task 6 structured outputs, reasoning, and service tier compatibility" do
+    test "Responses accepts strict text.format json_schema refs and rejects remote refs" do
+      accepted_payloads = [
+        %{
+          "model" => "gpt-fixture-text",
+          "input" => "synthetic input",
+          "text" => %{"format" => strict_text_format(local_ref_schema())}
+        },
+        %{
+          "model" => "gpt-fixture-text",
+          "input" => "synthetic input",
+          "text" => %{"format" => strict_text_format(root_ref_defs_schema())}
+        },
+        %{
+          "model" => "gpt-fixture-text",
+          "input" => "synthetic input",
+          "text" => %{"format" => strict_text_format(root_ref_definitions_schema())}
+        }
+      ]
+
+      Enum.each(accepted_payloads, fn payload ->
+        assert {:ok, result} = Responses.coerce(payload)
+        assert get_in(result.payload, ["text", "format", "type"]) == "json_schema"
+        assert get_in(result.payload, ["text", "format", "strict"]) == true
+      end)
+
+      assert {:error,
+              %{
+                status: 400,
+                code: "invalid_json_schema",
+                param: "text.format.schema.$ref"
+              }} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => "synthetic input",
+                 "text" => %{"format" => strict_text_format(remote_ref_schema())}
+               })
+    end
+
+    test "Chat translates structured response_format json_schema and json_object shapes" do
+      json_schema_payload = %{
+        "model" => "gpt-fixture-text",
+        "messages" => [%{"role" => "user", "content" => "synthetic input"}],
+        "response_format" => %{
+          "type" => "json_schema",
+          "json_schema" => %{
+            "name" => "fixture_schema",
+            "strict" => true,
+            "schema" => root_ref_defs_schema()
+          }
+        }
+      }
+
+      assert {:ok, result} = Chat.coerce(json_schema_payload)
+      assert get_in(result.payload, ["text", "format", "type"]) == "json_schema"
+      assert get_in(result.payload, ["text", "format", "name"]) == "fixture_schema"
+      assert get_in(result.payload, ["text", "format", "strict"]) == true
+
+      assert {:ok, result} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [%{"role" => "user", "content" => "synthetic input"}],
+                 "response_format" => %{"type" => "json_object"}
+               })
+
+      assert result.payload["text"] == %{"format" => %{"type" => "json_object"}}
+
+      assert {:error, %{status: 400, code: "invalid_request", param: "response_format"}} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [%{"role" => "user", "content" => "synthetic input"}],
+                 "response_format" => %{"type" => "json_schema", "json_schema" => []}
+               })
+
+      assert {:error,
+              %{
+                status: 400,
+                code: "invalid_json_schema",
+                param: "text.format.schema.$ref"
+              }} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [%{"role" => "user", "content" => "synthetic input"}],
+                 "response_format" => %{
+                   "type" => "json_schema",
+                   "json_schema" => %{
+                     "name" => "remote_fixture",
+                     "strict" => true,
+                     "schema" => remote_ref_schema()
+                   }
+                 }
+               })
+    end
+
+    test "Responses accepts explicit reasoning effort and summary variants" do
+      for effort <- ["minimal", "low", "medium", "high", "xhigh"],
+          summary <- ["auto", "concise", "detailed"] do
+        payload = %{
+          "model" => "gpt-fixture-text",
+          "input" => "synthetic input",
+          "reasoning" => %{"effort" => effort, "summary" => summary}
+        }
+
+        assert {:ok, result} = Responses.coerce(payload)
+        assert result.payload["reasoning"] == payload["reasoning"]
+      end
+    end
+
+    test "Responses rejects unsupported reasoning shapes deterministically" do
+      invalid_reasoning_payloads = [
+        {%{"effort" => "extreme"}, "reasoning.effort"},
+        {%{"summary" => "verbose"}, "reasoning.summary"},
+        {%{"effort" => "low", "unsupported" => true}, "reasoning.unsupported"},
+        {"low", "reasoning"},
+        {%{"effort" => 1}, "reasoning.effort"},
+        {%{"summary" => false}, "reasoning.summary"}
+      ]
+
+      Enum.each(invalid_reasoning_payloads, fn {reasoning, expected_param} ->
+        assert {:error,
+                %{
+                  status: 400,
+                  code: "invalid_request",
+                  param: ^expected_param
+                }} =
+                 Responses.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "input" => "synthetic input",
+                   "reasoning" => reasoning
+                 })
+      end)
+    end
+
+    test "Responses accepts omitted and explicit service_tier variants" do
+      assert {:ok, result} =
+               Responses.coerce(%{"model" => "gpt-fixture-text", "input" => "synthetic input"})
+
+      refute Map.has_key?(result.payload, "service_tier")
+
+      for tier <- ["auto", "default", "flex", "priority", "ultrafast"] do
+        payload = %{
+          "model" => "gpt-fixture-text",
+          "input" => "synthetic input",
+          "service_tier" => tier
+        }
+
+        assert {:ok, result} = Responses.coerce(payload)
+        assert result.payload["service_tier"] == tier
+      end
+    end
+
+    test "Responses rejects unsupported service_tier variants deterministically" do
+      for tier <- ["unsupported", "", 123, true] do
+        assert {:error,
+                %{
+                  status: 400,
+                  code: "invalid_request",
+                  param: "service_tier"
+                }} =
+                 Responses.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "input" => "synthetic input",
+                   "service_tier" => tier
+                 })
+      end
+    end
+  end
+
+  describe "Task 7 multimodal media compatibility" do
+    test "Responses accepts supported image URLs and inline PDF file data" do
+      image_data_url = "data:image/png;base64," <> Base.encode64("png fixture")
+      file_data_url = "data:application/pdf;base64," <> Base.encode64("pdf fixture")
+
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "input" => [
+          %{
+            "role" => "user",
+            "content" => [
+              %{"type" => "input_text", "text" => "synthetic media request"},
+              %{"type" => "input_image", "image_url" => image_data_url},
+              %{"type" => "input_image", "image_url" => "https://example.com/sample.png"},
+              %{
+                "type" => "input_file",
+                "filename" => "sample.pdf",
+                "file_data" => file_data_url
+              }
+            ]
+          }
+        ]
+      }
+
+      assert {:ok, result} = Responses.coerce(payload)
+      assert [message] = result.payload["input"]
+
+      assert Enum.map(message["content"], & &1["type"]) == [
+               "input_text",
+               "input_image",
+               "input_image",
+               "input_file"
+             ]
+    end
+
+    test "Responses rejects unsupported image/file media references deterministically" do
+      invalid_payloads = [
+        {%{"type" => "input_image", "file_id" => "file_fixture"},
+         "unsupported_input_image_format"},
+        {%{"type" => "input_image", "image_url" => "sediment://file_fixture"},
+         "unsupported_input_image_format"},
+        {%{"type" => "input_image", "image_url" => "http://example.com/sample.png"},
+         "unsupported_input_image_format"},
+        {%{
+           "type" => "input_image",
+           "image_url" => "data:text/html;base64," <> Base.encode64("html fixture")
+         }, "unsupported_input_image_format"},
+        {%{
+           "type" => "input_file",
+           "filename" => "sample.html",
+           "file_data" => "data:text/html;base64," <> Base.encode64("html fixture")
+         }, "unsupported_input_file_format"}
+      ]
+
+      Enum.each(invalid_payloads, fn {part, expected_code} ->
+        assert {:error, %{status: 400, code: ^expected_code, param: "input"}} =
+                 Responses.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "input" => [%{"role" => "user", "content" => [part]}]
+                 })
+      end)
+    end
+
+    test "Chat translates SDK image and audio parts through Responses compatibility" do
+      audio_data = Base.encode64("wav fixture")
+
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "messages" => [
+          %{
+            "role" => "user",
+            "content" => [
+              %{"type" => "text", "text" => "synthetic multimodal chat"},
+              %{
+                "type" => "image_url",
+                "image_url" => %{"url" => "https://example.com/sample.png"}
+              },
+              %{
+                "type" => "input_audio",
+                "input_audio" => %{"data" => audio_data, "format" => "wav"}
+              }
+            ]
+          }
+        ]
+      }
+
+      assert {:ok, result} = Chat.coerce(payload)
+      assert [%{"content" => content}] = result.payload["input"]
+      assert Enum.map(content, & &1["type"]) == ["input_text", "input_image", "input_audio"]
+      assert Enum.at(content, 1)["image_url"] == "https://example.com/sample.png"
+      assert get_in(Enum.at(content, 2), ["input_audio", "format"]) == "wav"
+    end
+
+    test "Chat rejects unsupported image schemes and malformed audio before dispatch" do
+      assert {:error, %{status: 400, code: "unsupported_input_image_format", param: "input"}} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [
+                   %{
+                     "role" => "user",
+                     "content" => [
+                       %{"type" => "image_url", "image_url" => "file:///tmp/private.png"}
+                     ]
+                   }
+                 ]
+               })
+
+      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [
+                   %{
+                     "role" => "user",
+                     "content" => [
+                       %{
+                         "type" => "input_audio",
+                         "input_audio" => %{"data" => "not base64", "format" => "wav"}
+                       }
+                     ]
+                   }
+                 ]
+               })
+    end
   end
 
   defp function_tool(name, parameters, strict \\ true) do
@@ -791,6 +1360,70 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       end
 
     %{"type" => "function", "function" => function}
+  end
+
+  defp flat_function_tool(name, parameters, strict \\ true) do
+    tool = %{"type" => "function", "name" => name, "parameters" => parameters}
+
+    case strict do
+      nil -> tool
+      value -> Map.put(tool, "strict", value)
+    end
+  end
+
+  defp translated_chat_tools(tools), do: Enum.map(tools, &translated_chat_tool/1)
+
+  defp translated_chat_tool(%{"type" => "function", "function" => function}) do
+    function
+    |> Map.take(["name", "description", "parameters", "strict"])
+    |> Map.put("type", "function")
+  end
+
+  defp translated_chat_tool(tool), do: tool
+
+  defp strict_text_format(schema) do
+    %{
+      "type" => "json_schema",
+      "name" => "fixture_schema",
+      "strict" => true,
+      "schema" => schema
+    }
+  end
+
+  defp local_ref_schema, do: local_ref_function_parameters()
+
+  defp root_ref_defs_schema do
+    %{
+      "$ref" => "#/$defs/root",
+      "$defs" => %{
+        "root" => %{
+          "type" => "object",
+          "additionalProperties" => false,
+          "properties" => %{"answer" => %{"$ref" => "#/$defs/answer"}},
+          "required" => ["answer"]
+        },
+        "answer" => %{"type" => "string"}
+      }
+    }
+  end
+
+  defp root_ref_definitions_schema do
+    %{
+      "$ref" => "#/definitions/root",
+      "definitions" => %{
+        "root" => %{
+          "type" => "object",
+          "additionalProperties" => false,
+          "properties" => %{"enabled" => %{"$ref" => "#/definitions/enabled"}},
+          "required" => ["enabled"]
+        },
+        "enabled" => %{"type" => "boolean"}
+      }
+    }
+  end
+
+  defp remote_ref_schema do
+    %{"$ref" => "https://example.com/schema.json#/$defs/root"}
   end
 
   defp local_ref_function_parameters do

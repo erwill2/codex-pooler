@@ -5,6 +5,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   alias CodexPooler.Gateway.Payloads.{InputShape, RequestOptions, StrictSchema, ToolResultShape}
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
+  @reasoning_efforts ~w(minimal low medium high xhigh)
+  @reasoning_summaries ~w(auto concise detailed)
+  @service_tiers ~w(auto default flex priority ultrafast)
+  @input_audio_formats ~w(mp3 wav)
+
   @endpoint "/backend-api/codex/responses"
 
   @spec validate(term()) :: {:ok, map()} | {:error, Error.reason()}
@@ -14,8 +19,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
          :ok <- Validation.reject_unsupported_fields(payload, :responses),
          :ok <- Validation.require_model(payload),
          :ok <- validate_input(payload),
+         :ok <- validate_previous_response_continuation(payload),
          :ok <- validate_tools(payload),
          :ok <- validate_tool_choice(payload),
+         :ok <- validate_reasoning(payload),
+         :ok <- validate_service_tier(payload),
          :ok <- StrictSchema.validate(payload),
          :ok <- InputShape.validate(payload) do
       {:ok, payload}
@@ -238,6 +246,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
        when is_binary(file_id) and file_id != "",
        do: :ok
 
+  defp validate_input_item(%{"type" => "input_file", "file_data" => file_data}, _payload)
+       when is_binary(file_data),
+       do: :ok
+
   defp validate_input_item(
          %{"type" => "function_call_output", "call_id" => call_id} = item,
          _payload
@@ -281,6 +293,111 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
 
   defp validate_item_reference(_item, _payload),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_previous_response_continuation(%{"previous_response_id" => response_id} = payload)
+       when is_binary(response_id) do
+    cond do
+      String.trim(response_id) == "" ->
+        {:error,
+         Error.invalid_request(
+           "previous_response_id requires a tool-output continuation",
+           "previous_response_id"
+         )}
+
+      payload |> Map.get("input") |> ToolResultShape.items() |> Enum.empty?() ->
+        {:error,
+         Error.invalid_request(
+           "previous_response_id requires a tool-output continuation",
+           "previous_response_id"
+         )}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_previous_response_continuation(%{"previous_response_id" => _response_id}),
+    do:
+      {:error,
+       Error.invalid_request(
+         "previous_response_id requires a tool-output continuation",
+         "previous_response_id"
+       )}
+
+  defp validate_previous_response_continuation(_payload), do: :ok
+
+  defp validate_reasoning(%{"reasoning" => reasoning}) when is_map(reasoning) do
+    reasoning
+    |> Map.new(fn {key, value} -> {to_string(key), value} end)
+    |> validate_reasoning_map()
+  end
+
+  defp validate_reasoning(%{"reasoning" => _reasoning}),
+    do: {:error, Error.invalid_request("reasoning must be an object", "reasoning")}
+
+  defp validate_reasoning(_payload), do: :ok
+
+  defp validate_reasoning_map(reasoning) do
+    with :ok <- validate_reasoning_keys(reasoning),
+         :ok <- validate_reasoning_effort(Map.get(reasoning, "effort")) do
+      validate_reasoning_summary(Map.get(reasoning, "summary"))
+    end
+  end
+
+  defp validate_reasoning_keys(reasoning) do
+    case reasoning |> Map.keys() |> Enum.reject(&(&1 in ["effort", "summary"])) do
+      [] ->
+        :ok
+
+      [key | _rest] ->
+        {:error, Error.invalid_request("reasoning field is not supported", "reasoning." <> key)}
+    end
+  end
+
+  defp validate_reasoning_effort(nil), do: :ok
+
+  defp validate_reasoning_effort(effort) when is_binary(effort) do
+    normalized = effort |> String.trim() |> String.downcase()
+
+    if normalized in @reasoning_efforts do
+      :ok
+    else
+      {:error, Error.invalid_request("reasoning effort is not supported", "reasoning.effort")}
+    end
+  end
+
+  defp validate_reasoning_effort(_effort),
+    do: {:error, Error.invalid_request("reasoning effort is not supported", "reasoning.effort")}
+
+  defp validate_reasoning_summary(nil), do: :ok
+
+  defp validate_reasoning_summary(summary) when is_binary(summary) do
+    normalized = summary |> String.trim() |> String.downcase()
+
+    if normalized in @reasoning_summaries do
+      :ok
+    else
+      {:error, Error.invalid_request("reasoning summary is not supported", "reasoning.summary")}
+    end
+  end
+
+  defp validate_reasoning_summary(_summary),
+    do: {:error, Error.invalid_request("reasoning summary is not supported", "reasoning.summary")}
+
+  defp validate_service_tier(%{"service_tier" => tier}) when is_binary(tier) do
+    normalized = tier |> String.trim() |> String.downcase()
+
+    if normalized in @service_tiers do
+      :ok
+    else
+      {:error, Error.invalid_request("service_tier is not supported", "service_tier")}
+    end
+  end
+
+  defp validate_service_tier(%{"service_tier" => _tier}),
+    do: {:error, Error.invalid_request("service_tier is not supported", "service_tier")}
+
+  defp validate_service_tier(_payload), do: :ok
 
   defp bare_item_reference?(item),
     do: map_size(item) == 2 and Map.has_key?(item, "id") and Map.has_key?(item, "type")
@@ -333,8 +450,29 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
        when is_binary(file_id) and file_id != "",
        do: :ok
 
+  defp validate_message_content_part(%{"type" => "input_file", "file_data" => file_data})
+       when is_binary(file_data),
+       do: :ok
+
+  defp validate_message_content_part(%{
+         "type" => "input_audio",
+         "input_audio" => %{"data" => data, "format" => format}
+       })
+       when is_binary(data) and format in @input_audio_formats,
+       do: validate_base64_audio(data)
+
   defp validate_message_content_part(_part),
     do: {:error, Error.invalid_request("message content part is not translatable", "input")}
+
+  defp validate_base64_audio(data) do
+    case Base.decode64(data, ignore: :whitespace) do
+      {:ok, bytes} when byte_size(bytes) > 0 ->
+        :ok
+
+      _value ->
+        {:error, Error.invalid_request("input_audio data must be base64", "input")}
+    end
+  end
 
   defp validate_tools(%{"tools" => tools}) when is_list(tools) do
     Enum.reduce_while(tools, :ok, fn tool, _acc ->
@@ -350,37 +488,96 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
 
   defp validate_tools(_payload), do: :ok
 
-  defp validate_tool(%{
-         "type" => "function",
-         "function" => %{"name" => name, "parameters" => parameters}
-       })
-       when is_binary(name) and name != "" and is_map(parameters),
-       do: :ok
+  defp validate_tool(%{"namespace" => _namespace}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_tool(%{"deferred" => _deferred}),
+    do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
 
   defp validate_tool(%{"type" => "function", "name" => name, "parameters" => parameters})
-       when is_binary(name) and name != "" and is_map(parameters),
-       do: :ok
+       when is_binary(name) and is_map(parameters) do
+    if String.trim(name) == "",
+      do: {:error, Error.invalid_request("function tool requires a non-empty name", "tools")},
+      else: :ok
+  end
 
-  defp validate_tool(%{"type" => type}) when type in ["web_search_preview", "image_generation"],
-    do: :ok
+  defp validate_tool(%{"type" => "function"}),
+    do:
+      {:error, Error.invalid_request("function tool requires flat name and parameters", "tools")}
+
+  defp validate_tool(%{"type" => "web_search_preview"} = tool),
+    do: validate_exact_builtin_tool(tool, ["type"])
+
+  defp validate_tool(
+         %{"type" => "image_generation", "model" => model, "size" => size, "quality" => quality} =
+           tool
+       )
+       when is_binary(model) and is_binary(size) and is_binary(quality),
+       do:
+         validate_exact_builtin_tool(tool, [
+           "type",
+           "model",
+           "size",
+           "quality",
+           "background",
+           "input_fidelity"
+         ])
+
+  defp validate_tool(%{"type" => "image_generation"} = tool),
+    do: validate_exact_builtin_tool(tool, ["type"])
 
   defp validate_tool(_tool),
     do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+
+  defp validate_exact_builtin_tool(tool, allowed_keys) do
+    case tool |> Map.keys() |> Enum.reject(&(&1 in allowed_keys)) do
+      [] -> :ok
+      [_key | _rest] -> {:error, Error.invalid_request("tool shape is not translatable", "tools")}
+    end
+  end
 
   defp validate_tool_choice(%{"tool_choice" => choice})
        when choice in ["auto", "none", "required"],
        do: :ok
 
-  defp validate_tool_choice(%{
-         "tool_choice" => %{"type" => "function", "function" => %{"name" => name}}
-       })
-       when is_binary(name) and name != "",
-       do: :ok
+  defp validate_tool_choice(%{"tool_choice" => %{"type" => "function", "name" => name}} = payload)
+       when is_binary(name) do
+    validate_named_tool_choice(payload, name)
+  end
 
   defp validate_tool_choice(%{"tool_choice" => %{"type" => "image_generation"}}), do: :ok
+
+  defp validate_tool_choice(%{"tool_choice" => %{"type" => "function"}}),
+    do:
+      {:error,
+       Error.invalid_request("tool_choice function requires a non-empty name", "tool_choice")}
 
   defp validate_tool_choice(%{"tool_choice" => _choice}),
     do: {:error, Error.invalid_request("tool_choice shape is not translatable", "tool_choice")}
 
   defp validate_tool_choice(_payload), do: :ok
+
+  defp validate_named_tool_choice(payload, name) do
+    cond do
+      String.trim(name) == "" ->
+        {:error,
+         Error.invalid_request("tool_choice function requires a non-empty name", "tool_choice")}
+
+      name in function_tool_names(payload) ->
+        :ok
+
+      true ->
+        {:error,
+         Error.invalid_request("tool_choice references unknown function tool", "tool_choice")}
+    end
+  end
+
+  defp function_tool_names(%{"tools" => tools}) when is_list(tools) do
+    Enum.flat_map(tools, fn
+      %{"type" => "function", "name" => name} when is_binary(name) -> [name]
+      _tool -> []
+    end)
+  end
+
+  defp function_tool_names(_payload), do: []
 end

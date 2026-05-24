@@ -240,6 +240,110 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
+  test "POST /v1/responses forwards supported SDK-shaped image and file parts safely", %{
+    conn: conn
+  } do
+    image_bytes = "inline image fixture"
+    pdf_bytes = "inline pdf fixture"
+    image_data_url = "data:image/png;base64," <> Base.encode64(image_bytes)
+    file_data_url = "data:application/pdf;base64," <> Base.encode64(pdf_bytes)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_media_supported",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "role" => "user",
+            "content" => [
+              %{"type" => "input_text", "text" => "synthetic multimodal response"},
+              %{"type" => "input_image", "image_url" => image_data_url},
+              %{"type" => "input_image", "image_url" => "https://example.com/sample.png"},
+              %{
+                "type" => "input_file",
+                "filename" => "sample.pdf",
+                "file_data" => file_data_url
+              }
+            ]
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_v1_media_supported"} = json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert [%{"content" => content}] = captured.json["input"]
+
+    assert Enum.map(content, & &1["type"]) == [
+             "input_text",
+             "input_image",
+             "input_image",
+             "input_file"
+           ]
+
+    assert Enum.at(content, 1)["image_url"] =~ "data:image/png;base64,"
+    assert Enum.at(content, 2)["image_url"] == "https://example.com/sample.png"
+    assert Enum.at(content, 3)["filename"] == "sample.pdf"
+    assert Enum.at(content, 3)["file_data"] =~ "data:application/pdf;base64,"
+
+    [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    metadata = inspect(request.request_metadata)
+    refute metadata =~ "synthetic multimodal response"
+    refute metadata =~ image_bytes
+    refute metadata =~ pdf_bytes
+    refute metadata =~ Base.encode64(image_bytes)
+    refute metadata =~ Base.encode64(pdf_bytes)
+    refute metadata =~ "https://example.com/sample.png"
+  end
+
+  test "POST /v1/responses rejects unsupported media references before dispatch", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    invalid_parts = [
+      {%{"type" => "input_image", "file_id" => "file_image_fixture"},
+       "unsupported_input_image_format"},
+      {%{"type" => "input_image", "image_url" => "file:///tmp/private.png"},
+       "unsupported_input_image_format"},
+      {%{
+         "type" => "input_file",
+         "filename" => "sample.html",
+         "file_data" => "data:text/html;base64," <> Base.encode64("html fixture")
+       }, "unsupported_input_file_format"}
+    ]
+
+    Enum.each(invalid_parts, fn {part, expected_code} ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"role" => "user", "content" => [part]}]
+        })
+
+      assert %{"error" => %{"code" => ^expected_code, "param" => "input"}} =
+               json_response(response, 400)
+    end)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
   test "POST /v1/responses/compact returns deterministic unsupported error without dispatch", %{
     conn: conn
   } do

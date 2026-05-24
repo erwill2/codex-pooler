@@ -36,148 +36,150 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     :ok
   end
 
-  @tag :tool_result_previous_response
-  test "v1 Responses preserves previous_response_id only for semantic tool-result continuations",
-       %{conn: conn} do
-    upstream =
-      start_upstream(
-        {:sequence,
-         [
-           FakeUpstream.require_json_field(
-             "previous_response_id",
-             %{
-               "id" => "resp_v1_tool_continuation",
-               "object" => "response",
-               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-             },
-             %{"error" => %{"code" => "missing_tool_context"}}
-           ),
-           FakeUpstream.reject_json_field(
-             "previous_response_id",
-             %{
-               "id" => "resp_v1_ordinary_continuation",
-               "object" => "response",
-               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-             },
-             %{"error" => %{"code" => "invalid_previous_response_id"}}
-           )
-         ]}
-      )
+  describe "Task 4 Responses continuation and input-reference behavior" do
+    @tag :tool_result_previous_response
+    test "v1 Responses forwards the observed Vercel tool-output continuation shape", %{conn: conn} do
+      upstream =
+        start_upstream(
+          FakeUpstream.require_json_field(
+            "previous_response_id",
+            %{
+              "id" => "resp_v1_ai_sdk_item_reference",
+              "object" => "response",
+              "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+            },
+            %{"error" => %{"code" => "missing_tool_context"}}
+          )
+        )
 
-    setup = gateway_setup(upstream)
+      setup = gateway_setup(upstream)
 
-    tool_conn =
-      conn
-      |> auth(setup)
-      |> post("/v1/responses", %{
-        "model" => setup.model.exposed_model_id,
-        "previous_response_id" => "resp_v1_tool_origin",
-        "input" => [
-          %{
-            "type" => "custom_tool_call_output",
-            "call_id" => "call_v1_tool",
-            "name" => "sample_tool",
-            "output" => "synthetic tool output"
-          }
-        ]
-      })
+      response_conn =
+        conn
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "previous_response_id" => "resp_v1_ai_sdk_previous",
+          "store" => true,
+          "input" => [
+            %{
+              "type" => "item_reference",
+              "id" => "msg_existing_123"
+            },
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_123",
+              "output" => "{\"ok\":true}"
+            },
+            %{
+              "role" => "user",
+              "content" => [%{"type" => "input_text", "text" => "synthetic follow-up"}]
+            }
+          ],
+          "tools" => [
+            %{
+              "type" => "function",
+              "name" => "lookup",
+              "description" => "Lookup synthetic fixture",
+              "parameters" => %{
+                "$schema" => "http://json-schema.org/draft-07/schema#",
+                "type" => "object",
+                "additionalProperties" => false,
+                "properties" => %{"value" => %{"type" => "string"}},
+                "required" => ["value"]
+              }
+            }
+          ]
+        })
 
-    assert %{"id" => "resp_v1_tool_continuation"} = json_response(tool_conn, 200)
+      assert %{"id" => "resp_v1_ai_sdk_item_reference"} = json_response(response_conn, 200)
 
-    ordinary_conn =
-      build_conn()
-      |> auth(setup)
-      |> post("/v1/responses", %{
-        "model" => setup.model.exposed_model_id,
-        "previous_response_id" => "resp_v1_stale_ordinary",
-        "input" => "synthetic ordinary continuation"
-      })
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.json["previous_response_id"] == "resp_v1_ai_sdk_previous"
+      assert captured.json["store"] == false
 
-    assert %{"id" => "resp_v1_ordinary_continuation"} = json_response(ordinary_conn, 200)
+      assert [
+               %{"type" => "item_reference", "id" => "msg_existing_123"},
+               %{"type" => "function_call_output", "call_id" => "call_123"},
+               %{"type" => "message", "role" => "user"}
+             ] = captured.json["input"]
 
-    assert [tool_request, ordinary_request] = FakeUpstream.requests(upstream)
-    assert tool_request.json["previous_response_id"] == "resp_v1_tool_origin"
+      assert [
+               %{"type" => "function", "name" => "lookup", "parameters" => %{"type" => "object"}}
+             ] = captured.json["tools"]
 
-    assert tool_request.json["input"] |> List.first() |> Map.fetch!("type") ==
-             "custom_tool_call_output"
+      metadata = persisted_gateway_metadata(setup.pool.id)
+      refute metadata =~ "synthetic follow-up"
+      refute metadata =~ "msg_existing_123"
+      refute metadata =~ "resp_v1_ai_sdk_previous"
+      refute metadata =~ "call_123"
+      refute metadata =~ "{\"ok\":true}"
+      refute metadata =~ "raw_request"
+    end
 
-    refute Map.has_key?(ordinary_request.json, "previous_response_id")
-
-    refute persisted_gateway_metadata(setup.pool.id) =~ "synthetic tool output"
-    refute persisted_gateway_metadata(setup.pool.id) =~ "synthetic ordinary continuation"
-    refute persisted_gateway_metadata(setup.pool.id) =~ "resp_v1_tool_origin"
-  end
-
-  @tag :tool_result_previous_response
-  test "v1 Responses accepts ai-sdk item references in previous response tool-result continuations",
-       %{conn: conn} do
-    upstream =
-      start_upstream(
-        FakeUpstream.require_json_field(
-          "previous_response_id",
-          %{
-            "id" => "resp_v1_ai_sdk_item_reference",
+    @tag :tool_result_previous_response
+    test "v1 Responses rejects stale or malformed previous-response references before dispatch",
+         _context do
+      upstream =
+        start_upstream(
+          FakeUpstream.json_response(%{
+            "id" => "resp_v1_should_not_dispatch",
             "object" => "response",
             "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-          },
-          %{"error" => %{"code" => "missing_tool_context"}}
+          })
         )
-      )
 
-    setup = gateway_setup(upstream)
+      setup = gateway_setup(upstream)
 
-    response_conn =
-      conn
-      |> auth(setup)
-      |> post("/v1/responses", %{
-        "model" => setup.model.exposed_model_id,
-        "previous_response_id" => "resp_v1_ai_sdk_previous",
-        "input" => [
-          %{
-            "role" => "user",
-            "content" => [%{"type" => "input_text", "text" => "synthetic follow-up"}]
-          },
-          %{"type" => "item_reference", "id" => "msg_existing_123"},
-          %{
-            "type" => "function_call_output",
-            "call_id" => "call_123",
-            "output" => "{\"ok\":true}"
-          }
-        ],
-        "tools" => [
-          %{
-            "type" => "function",
-            "name" => "lookup",
-            "description" => "Lookup synthetic fixture",
-            "parameters" => %{
-              "$schema" => "http://json-schema.org/draft-07/schema#",
-              "type" => "object",
-              "additionalProperties" => false,
-              "properties" => %{"value" => %{"type" => "string"}},
-              "required" => ["value"]
-            }
-          }
-        ]
-      })
+      invalid_payloads = [
+        {%{
+           "previous_response_id" => "resp_v1_stale_ordinary",
+           "input" => "synthetic ordinary continuation"
+         }, "previous_response_id"},
+        {%{
+           "previous_response_id" => "resp_v1_stale_item_reference",
+           "input" => [
+             %{"type" => "item_reference", "id" => "msg_existing_stale"},
+             %{"role" => "user", "content" => "synthetic ordinary continuation"}
+           ]
+         }, "input"},
+        {%{
+           "previous_response_id" => "resp_v1_broad_reference",
+           "input" => [
+             %{"type" => "item_reference", "id" => "msg_existing_extra", "output" => "bad"},
+             %{"type" => "function_call_output", "call_id" => "call_invalid", "output" => "bad"}
+           ]
+         }, "input"},
+        {%{
+           "previous_response_id" => 123,
+           "input" => [
+             %{"type" => "function_call_output", "call_id" => "call_invalid", "output" => "bad"}
+           ]
+         }, "previous_response_id"}
+      ]
 
-    assert %{"id" => "resp_v1_ai_sdk_item_reference"} = json_response(response_conn, 200)
+      Enum.each(invalid_payloads, fn {payload, expected_param} ->
+        rejected_conn =
+          build_conn()
+          |> auth(setup)
+          |> post("/v1/responses", Map.put(payload, "model", setup.model.exposed_model_id))
 
-    assert [captured] = FakeUpstream.requests(upstream)
-    assert captured.json["previous_response_id"] == "resp_v1_ai_sdk_previous"
+        assert %{"error" => %{"code" => "invalid_request", "param" => ^expected_param}} =
+                 json_response(rejected_conn, 400)
 
-    assert [
-             %{"type" => "message", "role" => "user"},
-             %{"type" => "item_reference", "id" => "msg_existing_123"},
-             %{"type" => "function_call_output", "call_id" => "call_123"}
-           ] = captured.json["input"]
+        assert FakeUpstream.count(upstream) == 0
+      end)
 
-    assert [
-             %{"type" => "function", "name" => "lookup", "parameters" => %{"type" => "object"}}
-           ] = captured.json["tools"]
-
-    refute persisted_gateway_metadata(setup.pool.id) =~ "synthetic follow-up"
-    refute persisted_gateway_metadata(setup.pool.id) =~ "msg_existing_123"
-    refute persisted_gateway_metadata(setup.pool.id) =~ "resp_v1_ai_sdk_previous"
+      metadata = persisted_gateway_metadata(setup.pool.id)
+      refute metadata =~ "synthetic ordinary continuation"
+      refute metadata =~ "resp_v1_stale_ordinary"
+      refute metadata =~ "resp_v1_stale_item_reference"
+      refute metadata =~ "resp_v1_broad_reference"
+      refute metadata =~ "msg_existing_stale"
+      refute metadata =~ "msg_existing_extra"
+      refute metadata =~ "call_invalid"
+      refute metadata =~ "raw_request"
+    end
   end
 
   @tag :input_file_affinity
