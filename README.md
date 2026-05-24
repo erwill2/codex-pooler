@@ -196,7 +196,7 @@ The Helm migration hook runs database migrations and imports the vendored OpenAI
 pricing feed so request-log cost reporting has pricing snapshots after install
 or upgrade. The scheduler also refreshes pricing hourly from the OpenAI pricing
 catalog URL in Instance Settings, which defaults to
-`https://s3.icorete.ch/openai-json-pricing/pricing.json`.
+`https://icoretech.github.io/openai-json-pricing/pricing.json`.
 
 ## Local Development
 
