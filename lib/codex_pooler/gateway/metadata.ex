@@ -60,7 +60,7 @@ defmodule CodexPooler.Gateway.Metadata do
     MetadataAccounting.record_metadata_request(:record_models_metadata_request, auth, %{
       endpoint: endpoint,
       transport: "http_json",
-      correlation_id: request_metadata.request_id,
+      correlation_id: RequestOptions.server_correlation_id(request_options),
       idempotency_key: request_metadata.idempotency_key,
       client_ip: request_metadata.client_ip,
       user_agent: request_metadata.user_agent,
@@ -73,6 +73,7 @@ defmodule CodexPooler.Gateway.Metadata do
           "operation" => "models",
           "model_source" => Catalog.model_source_snapshot(source_identity)
         }
+        |> Map.merge(RequestOptions.client_request_metadata(request_options))
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Map.new()
     })

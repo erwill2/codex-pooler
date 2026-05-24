@@ -19,7 +19,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
     %{
       endpoint: endpoint,
       transport: transport.transport,
-      correlation_id: request_correlation_id(request_options),
+      correlation_id: RequestOptions.server_correlation_id(request_options),
       idempotency_key: request_metadata.idempotency_key,
       client_ip: request_metadata.client_ip,
       user_agent: request_metadata.user_agent,
@@ -48,6 +48,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
       "request_content_type" => request_metadata.request_content_type,
       "quota_decision" => routing.quota_decision
     }
+    |> Map.merge(RequestOptions.client_request_metadata(request_options))
     |> Map.merge(owner_forwarding_metadata(request_options))
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
@@ -73,16 +74,4 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
   end
 
   defp owner_forwarding_metadata(_request_options), do: %{}
-
-  defp request_correlation_id(%RequestOptions{
-         transport: %{transport: "websocket"},
-         continuity: %{codex_turn_id: turn_id}
-       }) do
-    turn_id || Ecto.UUID.generate()
-  end
-
-  defp request_correlation_id(%RequestOptions{} = request_options) do
-    request_options.continuity.codex_turn_id || request_options.request_metadata.request_id ||
-      Ecto.UUID.generate()
-  end
 end

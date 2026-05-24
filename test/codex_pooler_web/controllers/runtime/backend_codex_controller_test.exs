@@ -79,6 +79,93 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert request.request_metadata["model_source"]["upstream_identity_id"] == setup.identity.id
   end
 
+  test "GET /backend-api/codex/models records unique server correlation ids for repeated client request ids",
+       %{conn: conn} do
+    client_request_id = "duplicate-client-models-request-id"
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+
+    first_conn =
+      conn
+      |> put_req_header("x-request-id", client_request_id)
+      |> auth(setup)
+      |> get("/backend-api/codex/models")
+
+    second_conn =
+      build_conn()
+      |> put_req_header("x-request-id", client_request_id)
+      |> auth(setup)
+      |> get("/backend-api/codex/models")
+
+    assert %{"models" => [_model]} = json_response(first_conn, 200)
+    assert %{"models" => [_model]} = json_response(second_conn, 200)
+
+    requests =
+      Repo.all(
+        from request in Request,
+          where:
+            request.pool_id == ^setup.pool.id and
+              request.endpoint == "/backend-api/codex/models",
+          order_by: [asc: request.admitted_at]
+      )
+
+    assert length(requests) == 2
+    assert Enum.map(requests, & &1.correlation_id) |> Enum.uniq() |> length() == 2
+    refute Enum.any?(requests, &(&1.correlation_id == client_request_id))
+    assert Enum.all?(requests, &(&1.request_metadata["client_request_id"] == client_request_id))
+  end
+
+  test "POST /backend-api/codex/responses records unique server correlation ids for repeated client request ids",
+       %{conn: conn} do
+    client_request_id = "duplicate-client-responses-request-id"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_duplicate_request_id",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    first_conn =
+      conn
+      |> put_req_header("x-request-id", client_request_id)
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "first duplicate request id fixture"
+      })
+
+    second_conn =
+      build_conn()
+      |> put_req_header("x-request-id", client_request_id)
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "second duplicate request id fixture"
+      })
+
+    assert %{"id" => "resp_duplicate_request_id"} = json_response(first_conn, 200)
+    assert %{"id" => "resp_duplicate_request_id"} = json_response(second_conn, 200)
+
+    requests =
+      Repo.all(
+        from request in Request,
+          where:
+            request.pool_id == ^setup.pool.id and
+              request.endpoint == "/backend-api/codex/responses",
+          order_by: [asc: request.admitted_at]
+      )
+
+    assert length(requests) == 2
+    assert Enum.map(requests, & &1.correlation_id) |> Enum.uniq() |> length() == 2
+    refute Enum.any?(requests, &(&1.correlation_id == client_request_id))
+    assert Enum.all?(requests, &(&1.request_metadata["client_request_id"] == client_request_id))
+  end
+
   test "GET /backend-api/codex/v1/models routes through the alias path and keeps backend auth semantics",
        %{conn: conn} do
     upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
@@ -3603,9 +3690,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert [%{json: upstream_payload}] = FakeUpstream.requests(upstream)
     refute Map.has_key?(upstream_payload, "service_tier")
 
-    assert [request_id] = get_resp_header(conn, "x-request-id")
-
-    assert %Request{} = request = Repo.get_by!(Request, correlation_id: request_id)
+    assert %Request{} =
+             request =
+             Repo.one!(
+               from request in Request,
+                 where:
+                   request.pool_id == ^setup.pool.id and
+                     request.endpoint == "/backend-api/codex/responses",
+                 order_by: [desc: request.admitted_at],
+                 limit: 1
+             )
 
     assert request.request_metadata["pricing"]["status"] == "priced"
     assert request.request_metadata["pricing"]["requested_service_tier"] == "auto"

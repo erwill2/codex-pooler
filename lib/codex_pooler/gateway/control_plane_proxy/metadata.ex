@@ -17,22 +17,24 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy.Metadata do
     body = request.body
     request_options = metadata_request_options(request, body)
 
-    request_metadata = %{
-      "endpoint" => request.local_endpoint,
-      "routing" => %{"route_class" => request_options.transport.route_class},
-      "request" => %{
-        "body_bytes" => byte_size(body),
-        "content_type" => request_options.request_metadata.request_content_type
-      },
-      "control_plane" => %{"analytics_forwarding" => "disabled"}
-    }
+    request_metadata =
+      %{
+        "endpoint" => request.local_endpoint,
+        "routing" => %{"route_class" => request_options.transport.route_class},
+        "request" => %{
+          "body_bytes" => byte_size(body),
+          "content_type" => request_options.request_metadata.request_content_type
+        },
+        "control_plane" => %{"analytics_forwarding" => "disabled"}
+      }
+      |> Map.merge(RequestOptions.client_request_metadata(request_options))
 
     with :ok <-
            MetadataAccounting.record_metadata_request(:record_disabled_analytics_request, auth, %{
              endpoint: request.local_endpoint,
              transport: "http_json",
              status: "succeeded",
-             correlation_id: request_options.request_metadata.request_id,
+             correlation_id: RequestOptions.server_correlation_id(request_options),
              client_ip: request_options.request_metadata.client_ip,
              user_agent: request_options.request_metadata.user_agent,
              response_status_code: 204,
@@ -142,7 +144,7 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy.Metadata do
       endpoint: request.local_endpoint,
       transport: "http_json",
       status: status,
-      correlation_id: request_options.request_metadata.request_id,
+      correlation_id: RequestOptions.server_correlation_id(request_options),
       client_ip: request_options.request_metadata.client_ip,
       user_agent: request_options.request_metadata.user_agent,
       response_status_code: response_status_code,
@@ -172,6 +174,7 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy.Metadata do
       },
       "auth_refresh" => refresh_metadata
     })
+    |> Map.merge(RequestOptions.client_request_metadata(request_options))
   end
 
   defp control_plane_routing_metadata(model, selection) do

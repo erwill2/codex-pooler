@@ -147,14 +147,16 @@ defmodule CodexPooler.Gateway.Usage do
       %{
         endpoint: endpoint,
         transport: "http_json",
-        correlation_id: request_metadata.request_id,
+        correlation_id: RequestOptions.server_correlation_id(request_options),
         client_ip: request_metadata.client_ip,
         user_agent: request_metadata.user_agent,
         response_status_code: 200,
-        request_metadata: %{
-          "endpoint" => endpoint,
-          "operation" => "usage"
-        }
+        request_metadata:
+          %{
+            "endpoint" => endpoint,
+            "operation" => "usage"
+          }
+          |> Map.merge(RequestOptions.client_request_metadata(request_options))
       }
     )
   end
@@ -170,7 +172,7 @@ defmodule CodexPooler.Gateway.Usage do
     MetadataAccounting.record_metadata_request(:record_usage_metadata_request, auth, %{
       endpoint: endpoint,
       transport: "http_json",
-      correlation_id: request_metadata.request_id,
+      correlation_id: RequestOptions.server_correlation_id(request_options),
       idempotency_key: request_metadata.idempotency_key,
       client_ip: request_metadata.client_ip,
       user_agent: request_metadata.user_agent,
@@ -181,6 +183,7 @@ defmodule CodexPooler.Gateway.Usage do
           "endpoint" => endpoint,
           "operation" => "usage"
         }
+        |> Map.merge(RequestOptions.client_request_metadata(request_options))
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Map.new()
     })

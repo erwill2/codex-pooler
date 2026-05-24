@@ -100,7 +100,7 @@ defmodule CodexPooler.Gateway.Denials do
     %{
       endpoint: endpoint,
       transport: request_options.transport.transport,
-      correlation_id: request_options.request_metadata.request_id || Ecto.UUID.generate(),
+      correlation_id: RequestOptions.websocket_request_correlation_id(request_options),
       idempotency_key: request_options.request_metadata.idempotency_key,
       client_ip: request_options.request_metadata.client_ip,
       user_agent: request_options.request_metadata.user_agent,
@@ -127,6 +127,7 @@ defmodule CodexPooler.Gateway.Denials do
       "upload_bytes" => request_options.request_metadata.upload_bytes,
       "request_content_type" => request_options.request_metadata.request_content_type
     }
+    |> Map.merge(RequestOptions.client_request_metadata(request_options))
   end
 
   defp gateway_metadata(reason_code, message, reason) do
