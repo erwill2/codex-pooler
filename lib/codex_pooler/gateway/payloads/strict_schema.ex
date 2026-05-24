@@ -46,15 +46,27 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
     name = Map.get(function, "name")
     parameters = Map.get(function, "parameters")
 
-    if is_binary(name) and name != "" and
-         (Map.get(function, "strict") == true or Map.get(tool, "strict") == true) do
+    if strict_function_tool?(name, function, tool) do
       {parameters, "tools." <> Integer.to_string(index) <> ".function.parameters", name}
     else
       nil
     end
   end
 
+  defp function_tool_target(%{"type" => "function", "name" => name} = tool, index) do
+    if strict_function_tool?(name, tool, tool) do
+      {Map.get(tool, "parameters"), "tools." <> Integer.to_string(index) <> ".parameters", name}
+    else
+      nil
+    end
+  end
+
   defp function_tool_target(_tool, _index), do: nil
+
+  defp strict_function_tool?(name, function, tool) do
+    is_binary(name) and name != "" and
+      (Map.get(function, "strict") == true or Map.get(tool, "strict") == true)
+  end
 
   defp text_format_target(%{
          "text" => %{"format" => %{"type" => "json_schema", "strict" => true} = format}
@@ -133,11 +145,25 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
   end
 
   defp validate_ref_only_schema(schema, path) do
-    if Map.keys(schema) == ["$ref"] do
-      :ok
-    else
-      {:error, invalid_schema(path, "$ref schema nodes must contain only $ref")}
+    keys = Map.keys(schema)
+
+    cond do
+      keys == ["$ref"] ->
+        :ok
+
+      root_schema_path?(path) and Enum.all?(keys, &(&1 in ["$ref", "$defs", "definitions"])) ->
+        :ok
+
+      true ->
+        {:error, invalid_schema(path, "$ref schema nodes must contain only $ref")}
     end
+  end
+
+  defp root_schema_path?("text.format.schema"), do: true
+  defp root_schema_path?("response_format.json_schema.schema"), do: true
+
+  defp root_schema_path?(path) do
+    String.starts_with?(path, "tools.") and String.ends_with?(path, ".parameters")
   end
 
   defp parse_local_ref(ref, path) when is_binary(ref) do
