@@ -1,0 +1,129 @@
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+imagePullSecrets: []
+
+image:
+  repository: ghcr.io/icoretech/codex-pooler
+  tag: latest
+  pullPolicy: IfNotPresent
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: codex-pooler.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+config:
+  host: codex-pooler.example.com
+  port: 4000
+  poolSize: 10
+  ectoIpv6: "false"
+  obanJobsQueueLimit: "8"
+  lang: "C.UTF-8"
+  lcAll: "C.UTF-8"
+
+clustering:
+  enabled: false
+  query: ""
+  distributionPort: "9000"
+  epmdPort: "4369"
+  headlessService:
+    enabled: true
+    nameOverride: ""
+    publishNotReadyAddresses: true
+  cookie:
+    existingSecret: ""
+    existingSecretKey: release-cookie
+    value: ""
+  participants:
+    app: true
+    worker: true
+    scheduler: true
+
+secrets:
+  create: false
+  existingSecret: codex-pooler-secrets
+  databaseUrl: ""
+  secretKeyBase: ""
+  totpEncryptionKey: ""
+  totpKeyVersion: v1
+  upstreamSecretKey: ""
+  upstreamSecretKeyVersion: v1
+
+app:
+  enabled: true
+  replicaCount: 1
+  websocketContinuity:
+    allowUnsafeMultiReplica: false
+    ownerForwarding:
+      enabled: false
+  strategy:
+    maxUnavailable: 1
+    maxSurge: 1
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  service:
+    type: ClusterIP
+    port: 4000
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+migrations:
+  enabled: true
+  ttlSecondsAfterFinished: 300
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      cpu: 250m
+      memory: 384Mi
+
+oban:
+  worker:
+    enabled: true
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 75m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 768Mi
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+  scheduler:
+    enabled: true
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 192Mi
+      limits:
+        cpu: 250m
+        memory: 384Mi
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}

@@ -1,0 +1,363 @@
+defmodule CodexPooler.Upstreams.Quota.Charts do
+  @moduledoc """
+  Read-only quota chart and capacity summaries for admin surfaces.
+  """
+
+  import Ecto.Query
+
+  alias CodexPooler.Quotas.Evidence
+  alias CodexPooler.Repo
+
+  alias CodexPooler.Upstreams.{
+    Quota,
+    Quota.Charts.Measurements
+  }
+
+  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+
+  alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+
+  @account_quota_key "account"
+  @deleted "deleted"
+  @fresh "fresh"
+
+  @spec quota_capacity_summary_by_pool_ids([term()] | term()) :: %{
+          optional(Ecto.UUID.t()) => map()
+        }
+  def quota_capacity_summary_by_pool_ids(pool_ids) when is_list(pool_ids) do
+    pool_ids = pool_ids |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    rows =
+      case pool_ids do
+        [] ->
+          []
+
+        _ ->
+          Repo.all(
+            from assignment in PoolUpstreamAssignment,
+              join: window in Quota.AccountQuotaWindow,
+              on: window.upstream_identity_id == assignment.upstream_identity_id,
+              where: assignment.pool_id in ^pool_ids and assignment.status != ^@deleted,
+              select: {
+                assignment.pool_id,
+                window.used_percent,
+                window.reset_at,
+                window.freshness_state
+              }
+          )
+      end
+
+    summaries =
+      rows
+      |> Enum.group_by(fn {pool_id, _used_percent, _reset_at, _freshness_state} -> pool_id end)
+      |> Map.new(fn {pool_id, window_rows} -> {pool_id, quota_capacity_summary(window_rows)} end)
+
+    Enum.into(pool_ids, %{}, fn pool_id ->
+      {pool_id, Map.get(summaries, pool_id, quota_capacity_summary([]))}
+    end)
+  end
+
+  def quota_capacity_summary_by_pool_ids(_pool_ids), do: %{}
+
+  @spec quota_remaining_charts_by_pool_ids([term()] | term(), keyword()) ::
+          %{optional(Ecto.UUID.t()) => map()}
+  def quota_remaining_charts_by_pool_ids(pool_ids, opts \\ [])
+
+  def quota_remaining_charts_by_pool_ids(pool_ids, opts) when is_list(pool_ids) do
+    pool_ids = pool_ids |> Enum.filter(&is_binary/1) |> Enum.uniq()
+    timestamp = Keyword.get(opts, :at, now())
+
+    rows = quota_remaining_chart_rows(pool_ids)
+
+    charts_by_pool_id =
+      rows
+      |> Enum.reject(fn {_assignment, _identity, window} -> is_nil(window) end)
+      |> Enum.map(&quota_remaining_chart_row(&1, timestamp))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.group_by(& &1.pool_id)
+      |> Map.new(fn {pool_id, rows} -> {pool_id, quota_remaining_pool_charts(rows)} end)
+
+    Enum.into(pool_ids, %{}, fn pool_id ->
+      {pool_id, Map.get(charts_by_pool_id, pool_id, quota_remaining_empty_pool_charts(pool_id))}
+    end)
+  end
+
+  def quota_remaining_charts_by_pool_ids(_pool_ids, _opts), do: %{}
+
+  defp quota_remaining_chart_rows([]), do: []
+
+  defp quota_remaining_chart_rows(pool_ids) do
+    Repo.all(
+      from assignment in PoolUpstreamAssignment,
+        join: identity in UpstreamIdentity,
+        on: identity.id == assignment.upstream_identity_id,
+        left_join: window in Quota.AccountQuotaWindow,
+        on:
+          window.upstream_identity_id == identity.id and window.quota_scope == "account" and
+            window.quota_key == @account_quota_key and
+            ((window.window_kind == "primary" and window.window_minutes == 300) or
+               window.window_kind == "secondary"),
+        where: assignment.pool_id in ^pool_ids and assignment.status != ^@deleted,
+        order_by: [asc: assignment.pool_id, asc: assignment.created_at, asc: assignment.id],
+        select: {assignment, identity, window}
+    )
+  end
+
+  defp quota_remaining_chart_row(
+         {%PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity,
+          %Quota.AccountQuotaWindow{} = window},
+         timestamp
+       ) do
+    chart_key = quota_remaining_chart_key(window)
+
+    if chart_key do
+      usable? = QuotaWindows.usable_window?(window, timestamp)
+      measurements = Measurements.for_window(window)
+
+      %{
+        chart_key: chart_key,
+        pool_id: assignment.pool_id,
+        assignment_id: assignment.id,
+        upstream_identity_id: identity.id,
+        window_assignment_id: quota_window_assignment_id(window),
+        label: quota_remaining_label(assignment, identity, window),
+        plan_family: identity.plan_family,
+        plan_label: quota_remaining_plan_label(identity),
+        reset_at: window.reset_at,
+        freshness_state: Evidence.current_freshness_state(window, timestamp),
+        routing_usable?: usable?,
+        remaining: measurements.remaining,
+        capacity: measurements.capacity,
+        used: measurements.used,
+        used_percent: measurements.used_percent,
+        remaining_percent: measurements.remaining_percent,
+        merge_precedence: window.merge_precedence || 0,
+        observed_at: window.observed_at,
+        updated_at: window.updated_at,
+        excluded_reasons:
+          if(usable?, do: [], else: Quota.Windows.routing_window_reason_codes(window, timestamp))
+      }
+    end
+  end
+
+  defp quota_remaining_chart_row(_row, _timestamp), do: nil
+
+  defp quota_remaining_chart_key(%Quota.AccountQuotaWindow{
+         quota_scope: "account",
+         quota_key: @account_quota_key,
+         window_kind: "primary",
+         window_minutes: 300
+       }),
+       do: :primary_5h
+
+  defp quota_remaining_chart_key(%Quota.AccountQuotaWindow{
+         quota_scope: "account",
+         quota_key: @account_quota_key,
+         window_kind: "secondary"
+       }),
+       do: :weekly
+
+  defp quota_remaining_chart_key(%Quota.AccountQuotaWindow{}), do: nil
+
+  defp quota_remaining_plan_label(%UpstreamIdentity{plan_label: label})
+       when is_binary(label) and label != "",
+       do: label
+
+  defp quota_remaining_plan_label(%UpstreamIdentity{plan_family: family})
+       when is_binary(family) and family != "",
+       do: family
+
+  defp quota_remaining_plan_label(%UpstreamIdentity{}), do: nil
+
+  defp quota_remaining_pool_charts(rows) do
+    weekly_rows = Enum.filter(rows, &(&1.chart_key == :weekly))
+    weekly_winners = quota_remaining_winners(weekly_rows)
+    weekly = quota_remaining_chart(:weekly, "Weekly Remaining", weekly_rows, weekly_winners)
+
+    primary_rows =
+      rows
+      |> Enum.filter(&(&1.chart_key == :primary_5h))
+      |> quota_remaining_winners()
+      |> Enum.map(
+        &Measurements.apply_weekly_cap(
+          &1,
+          Enum.filter(weekly_winners, fn weekly -> weekly.routing_usable? end)
+        )
+      )
+
+    %{
+      primary_5h:
+        quota_remaining_chart(
+          :primary_5h,
+          "5h Remaining",
+          rows,
+          primary_rows
+        ),
+      weekly: weekly
+    }
+  end
+
+  defp quota_remaining_empty_pool_charts(_pool_id) do
+    %{
+      primary_5h: quota_remaining_chart(:primary_5h, "5h Remaining", [], []),
+      weekly: quota_remaining_chart(:weekly, "Weekly Remaining", [], [])
+    }
+  end
+
+  defp quota_remaining_chart(chart_key, title, _rows, winners) do
+    items =
+      winners
+      |> Enum.filter(& &1.routing_usable?)
+      |> Enum.sort(&quota_remaining_item_before?/2)
+      |> Enum.with_index()
+      |> Enum.map(fn {item, index} ->
+        item
+        |> Map.take([
+          :assignment_id,
+          :upstream_identity_id,
+          :label,
+          :plan_family,
+          :plan_label,
+          :remaining,
+          :capacity,
+          :used,
+          :used_percent,
+          :remaining_percent,
+          :reset_at,
+          :freshness_state,
+          :routing_usable?
+        ])
+        |> Map.put(:color_index, index)
+      end)
+
+    excluded = Enum.reject(winners, & &1.routing_usable?)
+
+    %{
+      key: chart_key,
+      title: title,
+      remaining_total: Measurements.sum(items, :remaining),
+      capacity_total: Measurements.sum_known(items, :capacity),
+      used_total: Measurements.sum_known(items, :used),
+      used_percent: Measurements.items_used_percent(items),
+      items: items,
+      excluded_count: length(excluded),
+      excluded_reasons: quota_excluded_reasons(excluded),
+      state: quota_chart_state(items, excluded)
+    }
+  end
+
+  defp quota_remaining_winners(rows) do
+    rows
+    |> Enum.group_by(&{&1.assignment_id, &1.upstream_identity_id, &1.chart_key})
+    |> Enum.map(fn {_key, bucket} ->
+      Enum.min_by(bucket, &quota_remaining_winner_sort_key/1)
+    end)
+  end
+
+  defp quota_remaining_winner_sort_key(row) do
+    {
+      if(row.routing_usable?, do: 0, else: 1),
+      -(row.merge_precedence || 0),
+      -datetime_sort_value(row.observed_at),
+      -datetime_sort_value(row.updated_at),
+      -datetime_sort_value(row.reset_at)
+    }
+  end
+
+  defp quota_remaining_item_before?(left, right) do
+    case decimal_compare_for_sort(left.remaining, right.remaining) do
+      :gt -> true
+      :lt -> false
+      :eq -> quota_remaining_item_tiebreaker(left) <= quota_remaining_item_tiebreaker(right)
+    end
+  end
+
+  defp quota_remaining_item_tiebreaker(item) do
+    {sanitize_chart_sort_value(item.label), item.assignment_id, item.upstream_identity_id}
+  end
+
+  defp sanitize_chart_sort_value(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp sanitize_chart_sort_value(_value), do: ""
+
+  defp decimal_compare_for_sort(%Decimal{} = left, %Decimal{} = right),
+    do: Decimal.compare(left, right)
+
+  defp decimal_compare_for_sort(%Decimal{}, _right), do: :gt
+  defp decimal_compare_for_sort(_left, %Decimal{}), do: :lt
+  defp decimal_compare_for_sort(_left, _right), do: :eq
+
+  defp quota_excluded_reasons(excluded) do
+    excluded
+    |> Enum.flat_map(& &1.excluded_reasons)
+    |> Enum.frequencies()
+  end
+
+  defp quota_chart_state([_ | _], _excluded), do: "usable"
+  defp quota_chart_state([], [_ | _]), do: "blocked"
+  defp quota_chart_state([], []), do: "empty"
+
+  defp quota_remaining_label(assignment, identity, window) do
+    assignment.assignment_label || identity.account_label || window.display_label ||
+      "Upstream account"
+  end
+
+  defp quota_window_assignment_id(%Quota.AccountQuotaWindow{metadata: metadata})
+       when is_map(metadata) do
+    case metadata["assignment_id"] || metadata["pool_upstream_assignment_id"] do
+      value when is_binary(value) and value != "" -> value
+      _value -> nil
+    end
+  end
+
+  defp quota_window_assignment_id(%Quota.AccountQuotaWindow{}), do: nil
+
+  defp datetime_sort_value(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :microsecond)
+  defp datetime_sort_value(_datetime), do: 0
+
+  defp quota_capacity_summary(window_rows) do
+    used_percents =
+      window_rows
+      |> Enum.map(fn {_pool_id, used_percent, _reset_at, _freshness_state} ->
+        percent_to_float(used_percent)
+      end)
+      |> Enum.reject(&is_nil/1)
+
+    best_remaining_percent =
+      used_percents
+      |> Enum.map(&(100.0 - &1))
+      |> Enum.max(fn -> nil end)
+
+    next_reset_at =
+      window_rows
+      |> Enum.map(fn {_pool_id, _used_percent, reset_at, _freshness_state} -> reset_at end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.min_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
+
+    %{
+      window_count: length(window_rows),
+      fresh_window_count:
+        Enum.count(window_rows, fn {_pool_id, _used_percent, _reset_at, freshness_state} ->
+          freshness_state == @fresh
+        end),
+      known_percent_count: length(used_percents),
+      best_remaining_percent: best_remaining_percent && clamp_percent(best_remaining_percent),
+      next_reset_at: next_reset_at
+    }
+  end
+
+  defp percent_to_float(%Decimal{} = value), do: Decimal.to_float(value)
+  defp percent_to_float(value) when is_integer(value), do: value * 1.0
+  defp percent_to_float(value) when is_float(value), do: value
+  defp percent_to_float(_value), do: nil
+
+  defp clamp_percent(value) when value < 0.0, do: 0.0
+  defp clamp_percent(value) when value > 100.0, do: 100.0
+  defp clamp_percent(value), do: value
+
+  defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+end

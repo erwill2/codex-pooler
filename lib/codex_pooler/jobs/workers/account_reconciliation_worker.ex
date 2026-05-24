@@ -1,0 +1,64 @@
+defmodule CodexPooler.Jobs.AccountReconciliationWorker do
+  @moduledoc """
+  Refreshes one pool assignment's account health, quota windows, and catalog state.
+  """
+
+  use Oban.Worker,
+    queue: :jobs,
+    max_attempts: 1,
+    tags: ["account_reconciliation"],
+    unique: [
+      fields: [:args, :queue, :worker],
+      keys: [:pool_id, :pool_upstream_assignment_id],
+      states: [:scheduled, :available, :executing, :retryable],
+      period: {7, :days}
+    ]
+
+  alias CodexPooler.Jobs.DevelopmentControls
+  alias CodexPooler.Upstreams.Reconciliation.AccountReconciliation
+
+  @impl Oban.Worker
+  def timeout(%Oban.Job{}), do: :timer.minutes(20)
+
+  @impl Oban.Worker
+  def perform(%Oban.Job{
+        args:
+          %{
+            "pool_id" => pool_id,
+            "pool_upstream_assignment_id" => assignment_id
+          } = args
+      }) do
+    if DevelopmentControls.account_reconciliation_paused?() do
+      :ok
+    else
+      trigger_kind = Map.get(args, "trigger_kind", "manual")
+
+      with {:ok, result} <- AccountReconciliation.run(pool_id, assignment_id, trigger_kind) do
+        reconciliation_outcome(result)
+      end
+    end
+  end
+
+  @impl Oban.Worker
+  def backoff(%Oban.Job{attempt: attempt}) do
+    min(trunc(:math.pow(2, attempt) * 15), 3_600)
+  end
+
+  @spec reconciliation_outcome(map()) :: :ok | {:error, String.t()}
+  defp reconciliation_outcome(result) do
+    if AccountReconciliation.successful_status?(result) do
+      :ok
+    else
+      {:error, "account reconciliation #{result.status}: #{first_failure_code(result)}"}
+    end
+  end
+
+  defp first_failure_code(result) do
+    [result.health, result.quota, result.catalog]
+    |> Enum.find(&(&1.status == :failed))
+    |> case do
+      %{code: code} -> code
+      nil -> "failed"
+    end
+  end
+end

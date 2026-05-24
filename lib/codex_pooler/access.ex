@@ -1,0 +1,146 @@
+defmodule CodexPooler.Access do
+  @moduledoc """
+  External API key, policy binding, invite, and gateway authorization APIs.
+  """
+
+  alias CodexPooler.Access.{APIKey, APIKeys, Invite, InviteEmail, Invites}
+  alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Pools.Pool
+
+  @type access_error :: %{required(:code) => atom(), required(:message) => String.t()}
+  @type auth_context :: %{
+          required(:api_key) => APIKey.t(),
+          required(:pool) => Pool.t(),
+          required(:api_key_id) => Ecto.UUID.t(),
+          required(:pool_id) => Ecto.UUID.t(),
+          required(:key_prefix) => String.t()
+        }
+  @type api_key_result :: {:ok, map()} | {:error, Ecto.Changeset.t() | access_error()}
+  @type policy_result :: {:ok, map()} | {:error, atom() | access_error()}
+  @type invite_result :: {:ok, map()} | {:error, Ecto.Changeset.t() | access_error()}
+
+  @spec create_invite(Scope.t(), Pool.t() | Ecto.UUID.t(), map()) ::
+          invite_result()
+  defdelegate create_invite(scope, pool_or_id, attrs \\ %{}), to: Invites
+
+  @spec maybe_deliver_pool_invite_email(map(), boolean(), binary(), Pool.t(), Scope.t()) ::
+          map()
+  def maybe_deliver_pool_invite_email(result, send_email?, invite_url, pool, %Scope{} = scope),
+    do: InviteEmail.maybe_deliver_pool_invite(result, send_email?, invite_url, pool, scope.user)
+
+  @spec get_invite_by_token(binary()) :: Invite.t() | nil
+  defdelegate get_invite_by_token(raw_token), to: Invites
+
+  @spec load_usable_invite(term()) :: {:ok, map()} | {:error, access_error()}
+  defdelegate load_usable_invite(raw_token), to: Invites
+
+  @spec load_usable_invite_contract(term()) :: {:ok, map()} | {:error, access_error()}
+  defdelegate load_usable_invite_contract(raw_token), to: Invites
+
+  @spec lock_usable_invite(term()) :: {:ok, term()} | {:error, access_error()}
+  defdelegate lock_usable_invite(invite), to: Invites
+
+  @spec consume_invite(Invite.t(), map()) :: invite_result()
+  defdelegate consume_invite(invite, attrs), to: Invites
+
+  @spec list_invites(Scope.t(), keyword()) :: map()
+  defdelegate list_invites(scope, opts \\ []), to: Invites
+
+  @spec revoke_invite(Scope.t(), Invite.t() | Ecto.UUID.t()) ::
+          {:ok, Invite.t()} | {:error, Ecto.Changeset.t() | access_error()}
+  defdelegate revoke_invite(scope, invite_or_id), to: Invites
+
+  @spec reissue_invite(Scope.t(), Invite.t() | Ecto.UUID.t()) :: invite_result()
+  defdelegate reissue_invite(scope, invite_or_id), to: Invites
+
+  @spec create_api_key(Scope.t(), Pool.t() | Ecto.UUID.t(), map()) :: api_key_result()
+  defdelegate create_api_key(scope, pool_or_id, attrs \\ %{}), to: APIKeys
+
+  @spec list_api_keys(Scope.t()) :: {:ok, [APIKey.t()]} | {:error, access_error()}
+  defdelegate list_api_keys(scope), to: APIKeys
+
+  @spec count_api_keys_by_pool_ids([Ecto.UUID.t()]) :: %{
+          optional(Ecto.UUID.t()) => non_neg_integer()
+        }
+  defdelegate count_api_keys_by_pool_ids(pool_ids), to: APIKeys
+
+  @spec api_key_ids_for_pool(Pool.t()) :: [Ecto.UUID.t()]
+  defdelegate api_key_ids_for_pool(pool), to: APIKeys
+
+  @spec assign_api_keys_to_pool(Scope.t(), Pool.t() | Ecto.UUID.t(), [Ecto.UUID.t()]) ::
+          :ok | {:error, Ecto.Changeset.t() | access_error()}
+  defdelegate assign_api_keys_to_pool(scope, pool_or_id, api_key_ids), to: APIKeys
+
+  @spec list_api_keys_with_policy(Scope.t()) :: {:ok, [map()]} | {:error, access_error()}
+  defdelegate list_api_keys_with_policy(scope), to: APIKeys
+
+  @spec list_api_keys(Scope.t(), Pool.t() | Ecto.UUID.t()) ::
+          {:ok, [APIKey.t()]} | {:error, access_error()}
+  defdelegate list_api_keys(scope, pool_or_id), to: APIKeys
+
+  @spec get_api_key(Scope.t(), Ecto.UUID.t()) :: {:ok, APIKey.t()} | {:error, access_error()}
+  defdelegate get_api_key(scope, api_key_id), to: APIKeys
+
+  @spec get_api_key_with_policy(Scope.t(), Ecto.UUID.t()) ::
+          {:ok, map()} | {:error, access_error()}
+  defdelegate get_api_key_with_policy(scope, api_key_id), to: APIKeys
+
+  @spec update_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t(), map()) ::
+          {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
+  defdelegate update_api_key(scope, api_key, attrs), to: APIKeys
+
+  @spec update_api_key_with_policy(Scope.t(), APIKey.t() | Ecto.UUID.t(), map()) ::
+          api_key_result()
+  defdelegate update_api_key_with_policy(scope, api_key, attrs), to: APIKeys
+
+  @spec pause_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) ::
+          {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
+  defdelegate pause_api_key(scope, api_key), to: APIKeys
+
+  @spec resume_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) ::
+          {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
+  defdelegate resume_api_key(scope, api_key), to: APIKeys
+
+  @spec rotate_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) :: api_key_result()
+  defdelegate rotate_api_key(scope, api_key), to: APIKeys
+
+  @spec revoke_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) ::
+          {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
+  defdelegate revoke_api_key(scope, api_key), to: APIKeys
+
+  @spec delete_api_key(Scope.t(), APIKey.t() | Ecto.UUID.t()) ::
+          {:ok, APIKey.t()} | {:error, Ecto.Changeset.t() | access_error()}
+  defdelegate delete_api_key(scope, api_key), to: APIKeys
+
+  @spec authenticate_api_key(term()) :: {:ok, auth_context()} | {:error, access_error()}
+  defdelegate authenticate_api_key(raw_key), to: APIKeys
+
+  @spec authenticate_authorization_header(term()) ::
+          {:ok, auth_context()} | {:error, access_error()}
+  defdelegate authenticate_authorization_header(header), to: APIKeys
+
+  @spec authenticate_v1_authorization_header(term()) ::
+          {:ok, auth_context()} | {:error, access_error()}
+  defdelegate authenticate_v1_authorization_header(header), to: APIKeys
+
+  @spec authenticate_v1_api_key(term()) :: {:ok, auth_context()} | {:error, access_error()}
+  defdelegate authenticate_v1_api_key(raw_key), to: APIKeys
+
+  @spec policy_denial_precedence() :: [atom()]
+  defdelegate policy_denial_precedence, to: APIKeys
+
+  @spec normalize_api_key_policy(term()) :: policy_result()
+  defdelegate normalize_api_key_policy(policy), to: APIKeys
+
+  @spec authorize_api_key_policy(term(), map()) :: {:ok, map()} | {:error, atom()}
+  defdelegate authorize_api_key_policy(api_key_or_policy, attrs \\ %{}), to: APIKeys
+
+  @spec hash_api_key_secret(binary()) :: binary()
+  defdelegate hash_api_key_secret(secret), to: APIKeys
+
+  @spec access_error(atom(), String.t()) :: access_error()
+  defdelegate access_error(code, message), to: APIKeys
+
+  @spec hash_invite_token(binary()) :: binary()
+  defdelegate hash_invite_token(token), to: Invites
+end

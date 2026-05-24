@@ -1,0 +1,459 @@
+defmodule CodexPooler.Accounting.RequestLifecycle do
+  @moduledoc """
+  Request admission, attempt settlement, and ledger lifecycle APIs.
+
+  The context stores metadata-only request information. Caller payloads may be
+  used for token estimates, but raw prompt/output bodies are never persisted.
+  """
+
+  import Ecto.Query
+
+  alias CodexPooler.Accounting.{
+    Attempt,
+    LedgerEntry,
+    Metadata,
+    PricingResolution,
+    Request,
+    Rollups
+  }
+
+  alias CodexPooler.Accounting.RequestLifecycle.{
+    IdentitySnapshot,
+    LedgerEntries,
+    Recovery,
+    Reservation
+  }
+
+  alias CodexPooler.Catalog.Model
+  alias CodexPooler.Events
+  alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
+
+  @usage_pending "usage_pending"
+  @usage_known "usage_known"
+  @usage_unknown "usage_unknown"
+  @usage_not_applicable "not_applicable"
+  @type auth :: CodexPooler.Access.auth_context()
+  @type model_ref :: Model.t() | Ecto.UUID.t() | String.t() | nil
+  @type accounting_error :: Metadata.accounting_error()
+  @type request_result_row :: %{required(:request) => Request.t(), optional(atom()) => term()}
+  @type request_result :: {:ok, request_result_row()} | {:error, accounting_error()}
+
+  @spec reserve(auth(), model_ref(), map(), map()) :: request_result()
+  def reserve(auth, model_or_id, payload, opts \\ %{})
+
+  # Reason: public boundary accepts multiple model lookup outcomes.
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  def reserve(%{pool: _pool, api_key: _api_key} = auth, model_or_id, payload, opts)
+      when is_map(payload) do
+    case normalize_model(model_or_id) do
+      %Model{} = model ->
+        auth
+        |> Reservation.reserve_for_model(model, payload, opts)
+        |> tap_request_log_event("request_reserved")
+
+      nil ->
+        {:error, Metadata.accounting_error(:model_not_found, "model was not found")}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def reserve(_auth, _model_or_id, _payload, _opts),
+    do:
+      {:error,
+       Metadata.accounting_error(:invalid_request, "authenticated pool and api key are required")}
+
+  @spec record_denied_request(auth(), model_ref(), map()) :: request_result()
+  def record_denied_request(auth, model_or_id, opts \\ %{})
+
+  # Reason: denied requests still need complete metadata normalization.
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  def record_denied_request(%{pool: _pool, api_key: _api_key} = auth, model_or_id, opts) do
+    Reservation.record_denied_request(auth, model_or_id, opts)
+    |> tap_request_log_event("request_rejected")
+  end
+
+  def record_denied_request(_auth, _model_or_id, _opts),
+    do:
+      {:error,
+       Metadata.accounting_error(:invalid_request, "authenticated pool and api key are required")}
+
+  @spec recover_stale_reservations(DateTime.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def recover_stale_reservations(now \\ DateTime.utc_now(), opts \\ []) do
+    Recovery.recover_stale_reservations(DateTime.truncate(now, :microsecond), opts)
+  end
+
+  @spec create_attempt(Request.t(), PoolUpstreamAssignment.t(), map()) ::
+          {:ok, Attempt.t()} | {:error, Ecto.Changeset.t()}
+  def create_attempt(%Request{} = request, %PoolUpstreamAssignment{} = assignment, attrs \\ %{}) do
+    model = request.model_id && Repo.get(Model, request.model_id)
+    pricing_snapshot = PricingResolution.latest_snapshot_for_request(request, model)
+    timestamp = now(attrs)
+
+    attempt_number =
+      Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count, :id) + 1
+
+    attempt_changes =
+      %Attempt{
+        request_id: request.id,
+        attempt_number: attempt_number,
+        pool_upstream_assignment_id: assignment.id,
+        upstream_identity_id: assignment.upstream_identity_id,
+        pricing_snapshot_id: pricing_snapshot && pricing_snapshot.id,
+        model_id: request.model_id,
+        upstream_model_id: (model && model.upstream_model_id) || request.requested_model,
+        transport: request.transport,
+        status: Map.get(attrs, :status, "in_progress"),
+        started_at: timestamp,
+        retryable: Map.get(attrs, :retryable, false),
+        usage_status: Map.get(attrs, :usage_status, @usage_pending),
+        response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :response_metadata, %{}))
+      }
+
+    case Repo.insert(attempt_changes) do
+      {:ok, attempt} ->
+        IdentitySnapshot.persist_request_identity_snapshot(request, assignment)
+        {:ok, attempt}
+
+      {:error, _changeset} = error ->
+        error
+    end
+  end
+
+  @spec record_retryable_attempt_failure(Attempt.t(), map()) ::
+          {:ok, Attempt.t()} | {:error, Ecto.Changeset.t()}
+  def record_retryable_attempt_failure(%Attempt{} = attempt, attrs \\ %{}) do
+    timestamp = now(attrs)
+
+    attempt
+    |> Ecto.Changeset.change(%{
+      status: Map.get(attrs, :attempt_status, "retryable_failed"),
+      completed_at: timestamp,
+      upstream_status_code: Map.get(attrs, :response_status_code),
+      retryable: true,
+      network_error_code: blank_to_nil(Map.get(attrs, :last_error_code)),
+      error_message: blank_to_nil(Map.get(attrs, :error_message)),
+      latency_ms: Map.get(attrs, :latency_ms),
+      usage_status: Map.get(attrs, :usage_status, @usage_unknown),
+      response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :attempt_metadata, %{}))
+    })
+    |> Repo.update()
+  end
+
+  @spec finalize_reserved_request_failure(Request.t(), map()) :: request_result()
+  def finalize_reserved_request_failure(%Request{} = request, attrs \\ %{}) do
+    timestamp = now(attrs)
+    request_status = Map.get(attrs, :request_status, Map.get(attrs, :status, "failed"))
+    last_error_code = blank_to_nil(Map.get(attrs, :last_error_code))
+    usage_status = Map.get(attrs, :usage_status, @usage_not_applicable)
+
+    Repo.transaction(fn ->
+      request = Repo.get!(Request, request.id, lock: "FOR UPDATE")
+
+      request =
+        request
+        |> Ecto.Changeset.change(%{
+          status: request_status,
+          usage_status: usage_status,
+          completed_at: timestamp,
+          response_status_code: Map.get(attrs, :response_status_code),
+          last_error_code: last_error_code
+        })
+        |> Repo.update!()
+
+      reservation =
+        Repo.get_by!(
+          LedgerEntry,
+          source_event_id: LedgerEntries.reservation_source_event_id(request.id)
+        )
+
+      release =
+        request
+        |> LedgerEntries.reservation_failure_release_attrs(
+          reservation,
+          usage_status,
+          last_error_code,
+          timestamp
+        )
+        |> LedgerEntries.create_or_get!()
+
+      %{request: request, attempt: nil, release: release}
+    end)
+    |> unwrap_transaction()
+    |> tap_request_finalized_events()
+  end
+
+  @spec finalize_request(Request.t(), Attempt.t(), map()) :: request_result()
+  def finalize_request(%Request{} = request, %Attempt{} = attempt, attrs \\ %{}) do
+    timestamp = now(attrs)
+    request_status = Map.get(attrs, :request_status, Map.get(attrs, :status, "succeeded"))
+
+    attempt_status =
+      Map.get(attrs, :attempt_status, request_status_to_attempt_status(request_status))
+
+    usage = normalize_final_usage(Map.get(attrs, :usage, %{}), request_status)
+    response_status_code = Map.get(attrs, :response_status_code)
+    retry_count = Map.get(attrs, :retry_count, request.retry_count || 0)
+    last_error_code = blank_to_nil(Map.get(attrs, :last_error_code))
+    error_message = blank_to_nil(Map.get(attrs, :error_message))
+
+    finalization = %{
+      attempt_status: attempt_status,
+      request_status: request_status,
+      response_status_code: response_status_code,
+      retry_count: retry_count,
+      last_error_code: last_error_code,
+      error_message: error_message,
+      timestamp: timestamp
+    }
+
+    Repo.transaction(fn ->
+      {request, attempt, reservation} = lock_finalization_rows(request, attempt)
+
+      {request, attempt} =
+        persist_final_attempt_and_request(request, attempt, usage, attrs, finalization)
+
+      pricing =
+        PricingResolution.lookup_for_settlement(
+          request,
+          attempt,
+          reservation,
+          usage,
+          attrs,
+          timestamp
+        )
+
+      request = IdentitySnapshot.persist_finalized_request_snapshot!(request, attempt, pricing)
+
+      settlement_state =
+        build_settlement_context(request, attempt, reservation, usage, pricing, finalization)
+
+      %{settlement: settlement, release: release} =
+        persist_settlement_entries(request, attempt, reservation, settlement_state)
+
+      %{request: request, attempt: attempt, settlement: settlement, release: release}
+    end)
+    |> unwrap_transaction()
+    |> tap_request_finalized_events()
+  end
+
+  defp lock_finalization_rows(%Request{} = request, %Attempt{} = attempt) do
+    request = Repo.get!(Request, request.id, lock: "FOR UPDATE")
+    attempt = Repo.get!(Attempt, attempt.id, lock: "FOR UPDATE")
+
+    reservation =
+      Repo.get_by!(LedgerEntry,
+        source_event_id: LedgerEntries.reservation_source_event_id(request.id)
+      )
+
+    {request, attempt, reservation}
+  end
+
+  defp persist_final_attempt_and_request(request, attempt, usage, attrs, finalization) do
+    attempt =
+      attempt
+      |> Ecto.Changeset.change(%{
+        status: finalization.attempt_status,
+        completed_at: finalization.timestamp,
+        upstream_status_code: finalization.response_status_code,
+        retryable: Map.get(attrs, :retryable, false),
+        network_error_code: finalization.last_error_code,
+        error_message: finalization.error_message,
+        latency_ms: Map.get(attrs, :latency_ms),
+        usage_status: usage.status,
+        response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :attempt_metadata, %{}))
+      })
+      |> Repo.update!()
+
+    request =
+      request
+      |> Ecto.Changeset.change(%{
+        status: finalization.request_status,
+        usage_status: usage.status,
+        completed_at: finalization.timestamp,
+        response_status_code: finalization.response_status_code,
+        retry_count: finalization.retry_count,
+        last_error_code: finalization.last_error_code
+      })
+      |> Repo.update!()
+
+    {request, attempt}
+  end
+
+  defp build_settlement_context(request, _attempt, reservation, usage, pricing, finalization) do
+    usage = fill_unknown_usage_from_reservation(usage, reservation, finalization.timestamp)
+    snapshot = pricing.snapshot
+
+    settled_cost =
+      if usage.status == @usage_known,
+        do: PricingResolution.cost_micros(snapshot, usage),
+        else: nil
+
+    %{
+      pricing: pricing,
+      usage: usage,
+      timestamp: finalization.timestamp,
+      settlement_context: %{
+        response_status_code: finalization.response_status_code,
+        retry_count: finalization.retry_count,
+        settled_cost: settled_cost
+      },
+      settlement_existed?:
+        not is_nil(
+          Repo.get_by(LedgerEntry,
+            source_event_id: LedgerEntries.settlement_source_event_id(request.id)
+          )
+        )
+    }
+  end
+
+  defp persist_settlement_entries(request, attempt, reservation, state) do
+    settlement =
+      request
+      |> LedgerEntries.settlement_attrs(attempt, reservation, %{
+        usage: state.usage,
+        pricing: state.pricing,
+        context: state.settlement_context,
+        timestamp: state.timestamp
+      })
+      |> LedgerEntries.create_or_get!()
+
+    release =
+      request
+      |> LedgerEntries.release_attrs(attempt, reservation, %{
+        usage: state.usage,
+        pricing: state.pricing,
+        timestamp: state.timestamp
+      })
+      |> LedgerEntries.create_or_get!()
+
+    unless state.settlement_existed?, do: Rollups.accumulate!(request, settlement)
+
+    %{settlement: settlement, release: release}
+  end
+
+  defp tap_request_log_event({:ok, %{request: request}} = result, reason) do
+    Events.broadcast_request_logs(request.pool_id, reason, %{
+      request_id: request.id,
+      status: request.status
+    })
+
+    result
+  end
+
+  defp tap_request_log_event(result, _reason), do: result
+
+  defp tap_request_finalized_events({:ok, %{request: request}} = result) do
+    Events.broadcast_request_logs(request.pool_id, "request_finalized", %{
+      request_id: request.id,
+      status: request.status
+    })
+
+    Events.broadcast_usage(request.pool_id, "usage_updated", %{
+      request_id: request.id,
+      status: request.status,
+      usage_status: request.usage_status
+    })
+
+    result
+  end
+
+  defp tap_request_finalized_events(result), do: result
+
+  defp attr(map, key) when is_atom(key),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  # Reason: usage finalization accepts atom and string payload shapes.
+  # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
+  defp normalize_final_usage(usage, request_status) do
+    status =
+      attr(usage, :status) ||
+        if(request_status == "succeeded", do: @usage_pending, else: @usage_unknown)
+
+    input_tokens = get_int(usage, [:input_tokens, "input_tokens"])
+    cached_input_tokens = get_int(usage, [:cached_input_tokens, "cached_input_tokens"]) || 0
+    output_tokens = get_int(usage, [:output_tokens, "output_tokens"])
+    reasoning_tokens = get_int(usage, [:reasoning_tokens, "reasoning_tokens"]) || 0
+
+    total_tokens =
+      get_int(usage, [:total_tokens, "total_tokens"]) ||
+        (input_tokens || 0) + (output_tokens || 0)
+
+    %{
+      status:
+        if(status in [@usage_known, @usage_pending, @usage_unknown, @usage_not_applicable],
+          do: status,
+          else: @usage_unknown
+        ),
+      input_tokens: input_tokens || 0,
+      cached_input_tokens: cached_input_tokens,
+      output_tokens: output_tokens || 0,
+      reasoning_tokens: reasoning_tokens,
+      total_tokens: total_tokens,
+      source: attr(usage, :source) || default_usage_source(status),
+      service_tier: attr(usage, :service_tier),
+      recorded_at: attr(usage, :recorded_at) || now()
+    }
+  end
+
+  defp fill_unknown_usage_from_reservation(
+         %{status: @usage_known} = usage,
+         _reservation,
+         _timestamp
+       ),
+       do: usage
+
+  defp fill_unknown_usage_from_reservation(usage, reservation, timestamp) do
+    %{
+      usage
+      | input_tokens: reservation.input_tokens || 0,
+        cached_input_tokens: reservation.cached_input_tokens || 0,
+        output_tokens: reservation.output_tokens || 0,
+        reasoning_tokens: reservation.reasoning_tokens || 0,
+        total_tokens: reservation.total_tokens || 0,
+        recorded_at: timestamp
+    }
+  end
+
+  defp normalize_model(%Model{} = model), do: model
+  defp normalize_model(id) when is_binary(id), do: Repo.get(Model, id)
+  defp normalize_model(_id), do: nil
+
+  defp request_status_to_attempt_status("succeeded"), do: "succeeded"
+  defp request_status_to_attempt_status("cancelled"), do: "cancelled"
+  defp request_status_to_attempt_status(_status), do: "failed"
+  defp default_usage_source(@usage_known), do: "upstream_usage"
+  defp default_usage_source(@usage_pending), do: "usage_pending"
+  defp default_usage_source(_status), do: "usage_unknown"
+  defp blank?(value), do: is_nil(value) or String.trim(to_string(value)) == ""
+  defp blank_to_nil(value), do: if(blank?(value), do: nil, else: value)
+
+  defp now(opts \\ %{}),
+    do:
+      (attr(opts, :now) || DateTime.utc_now())
+      |> DateTime.truncate(:microsecond)
+
+  defp get_int(map, keys),
+    do: keys |> Enum.find_value(fn key -> Map.get(map, key) end) |> int_value()
+
+  defp int_value(nil), do: nil
+  defp int_value(%Decimal{} = value), do: decimal_to_integer(value)
+  defp int_value(value) when is_integer(value), do: value
+
+  defp int_value(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {i, _} -> i
+      :error -> nil
+    end
+  end
+
+  defp int_value(_value), do: nil
+
+  defp decimal_to_integer(%Decimal{} = value),
+    do: value |> Decimal.round(0) |> Decimal.to_integer()
+
+  defp unwrap_transaction({:ok, value}), do: {:ok, value}
+  defp unwrap_transaction({:error, value}), do: {:error, value}
+end

@@ -1,0 +1,474 @@
+defmodule CodexPooler.Accounting.PricingResolution do
+  @moduledoc false
+
+  import Ecto.Query
+
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
+  alias CodexPooler.Accounting.PricingResolution.Costing
+  alias CodexPooler.Catalog.{Model, PricingSnapshot}
+  alias CodexPooler.Repo
+
+  @default_price_bucket "default"
+  @long_context_price_bucket "long_context"
+
+  @spec lookup(Model.t(), String.t(), map(), map(), DateTime.t()) :: map()
+  def lookup(%Model{} = model, requested_model, payload, opts, timestamp) do
+    requested_tier = requested_service_tier(payload, opts)
+    actual_tier = actual_service_tier(%{}, opts)
+    batch_usage? = explicit_batch_usage?(payload, opts)
+    price_bucket = Costing.price_bucket(payload)
+
+    lookup_for_tier(
+      model,
+      requested_model,
+      requested_tier,
+      actual_tier,
+      price_bucket,
+      timestamp,
+      batch_usage?
+    )
+  end
+
+  @spec lookup_for_settlement(
+          Request.t(),
+          Attempt.t(),
+          LedgerEntry.t(),
+          map(),
+          map(),
+          DateTime.t()
+        ) ::
+          map()
+  def lookup_for_settlement(
+        %Request{} = request,
+        %Attempt{} = attempt,
+        %LedgerEntry{} = reservation,
+        usage,
+        attrs,
+        timestamp
+      ) do
+    model = request.model_id && Repo.get(Model, request.model_id)
+
+    if model do
+      requested_tier =
+        reservation
+        |> details_value("requested_service_tier")
+        |> fallback(request |> metadata_pricing_value("requested_service_tier"))
+
+      actual_tier =
+        actual_service_tier(usage, attrs) ||
+          metadata_service_tier(attempt.response_metadata) ||
+          request |> metadata_pricing_value("actual_service_tier")
+
+      lookup_for_tier(
+        model,
+        request.requested_model,
+        requested_tier,
+        actual_tier,
+        Costing.price_bucket_for_input_tokens(usage.input_tokens),
+        timestamp,
+        details_value(reservation, "batch_usage") == true
+      )
+    else
+      unpriced_snapshot("unpriced_missing_model", nil, nil, nil, false)
+    end
+  end
+
+  @spec latest_snapshot_for_request(Request.t(), Model.t() | nil) :: struct() | nil
+  def latest_snapshot_for_request(%Request{} = request, %Model{} = model) do
+    request
+    |> lookup_for_request_metadata(model, now())
+    |> Map.get(:snapshot)
+  end
+
+  def latest_snapshot_for_request(%Request{}, nil), do: nil
+
+  @spec reservation_estimate(map(), struct() | nil, term()) :: {:ok, map()}
+  defdelegate reservation_estimate(payload, snapshot, policy), to: Costing
+
+  @spec cost_micros(struct() | nil, map()) :: Decimal.t() | nil
+  defdelegate cost_micros(snapshot, usage), to: Costing
+
+  @spec metadata(map()) :: map()
+  def metadata(pricing) do
+    snapshot = pricing.snapshot
+
+    %{
+      "status" => pricing.status,
+      "requested_service_tier" => pricing.requested_service_tier,
+      "actual_service_tier" => pricing.actual_service_tier,
+      "service_tier" => pricing.service_tier,
+      "price_bucket" => pricing.price_bucket,
+      "pricing_type" => pricing.pricing_type,
+      "batch_usage" => pricing.batch_usage,
+      "snapshot" =>
+        if(snapshot,
+          do: %{
+            "id" => snapshot.id,
+            "model_identifier" => snapshot.model_identifier,
+            "price_version" => snapshot.price_version
+          },
+          else: nil
+        )
+    }
+  end
+
+  @spec details(map()) :: map()
+  def details(pricing) do
+    snapshot = pricing.snapshot
+
+    %{
+      "pricing_status" => pricing.status,
+      "requested_service_tier" => pricing.requested_service_tier,
+      "actual_service_tier" => pricing.actual_service_tier,
+      "service_tier" => pricing.service_tier,
+      "price_bucket" => pricing.price_bucket,
+      "pricing_type" => pricing.pricing_type,
+      "batch_usage" => pricing.batch_usage,
+      "price_version" => snapshot && snapshot.price_version
+    }
+  end
+
+  @spec update_request_metadata(map() | nil, map()) :: map()
+  def update_request_metadata(metadata, pricing) do
+    Map.put(metadata || %{}, "pricing", metadata(pricing))
+  end
+
+  @spec request_settings_snapshot(map(), map(), map()) :: map()
+  def request_settings_snapshot(payload, request_metadata, pricing) do
+    requested_tier = requested_service_tier_snapshot(payload, request_metadata, pricing)
+    actual_tier = actual_service_tier_snapshot(request_metadata, pricing)
+
+    effective_tier =
+      effective_service_tier_snapshot(requested_tier, actual_tier, request_metadata, pricing)
+
+    %{
+      reasoning_effort: payload_reasoning_effort(payload) |> normalize_snapshot_value(),
+      requested_service_tier: normalize_snapshot_value(requested_tier),
+      actual_service_tier: normalize_snapshot_value(actual_tier),
+      service_tier: normalize_snapshot_value(effective_tier)
+    }
+  end
+
+  defp lookup_for_request_metadata(%Request{} = request, %Model{} = model, timestamp) do
+    requested_tier = metadata_pricing_value(request, "requested_service_tier")
+    actual_tier = metadata_pricing_value(request, "actual_service_tier")
+
+    lookup_for_tier(
+      model,
+      request.requested_model,
+      requested_tier,
+      actual_tier,
+      metadata_pricing_value(request, "price_bucket") || @default_price_bucket,
+      timestamp,
+      metadata_pricing_value(request, "batch_usage") == true
+    )
+  end
+
+  defp lookup_for_tier(
+         %Model{} = model,
+         requested_model,
+         requested_tier,
+         actual_tier,
+         price_bucket,
+         timestamp,
+         batch_usage?
+       ) do
+    identifiers = pricing_identifiers(model, requested_model)
+
+    case priceable_service_tier(requested_tier, actual_tier, batch_usage?) do
+      {:ok, service_tier} ->
+        lookup_for_service_tier(
+          model,
+          identifiers,
+          requested_tier,
+          actual_tier,
+          service_tier,
+          price_bucket,
+          timestamp,
+          batch_usage?
+        )
+
+      {:unpriced, status} ->
+        service_tier = if normalize_service_tier(requested_tier) == "batch", do: "batch"
+        unpriced_snapshot(status, requested_tier, actual_tier, service_tier, batch_usage?)
+    end
+  end
+
+  defp lookup_for_service_tier(
+         model,
+         identifiers,
+         requested_tier,
+         actual_tier,
+         service_tier,
+         price_bucket,
+         timestamp,
+         batch_usage?
+       ) do
+    snapshot = pricing_snapshot(identifiers, service_tier, price_bucket, timestamp)
+
+    case snapshot do
+      %PricingSnapshot{} = snapshot ->
+        priced_snapshot(snapshot, requested_tier, actual_tier, service_tier, batch_usage?)
+
+      nil ->
+        case fallback_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) do
+          %PricingSnapshot{} = fallback ->
+            priced_snapshot(fallback, requested_tier, actual_tier, service_tier, batch_usage?)
+
+          nil ->
+            missing_pricing_snapshot(
+              model,
+              identifiers,
+              requested_tier,
+              actual_tier,
+              service_tier,
+              timestamp,
+              batch_usage?
+            )
+        end
+    end
+  end
+
+  defp pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) do
+    Repo.one(
+      from ps in PricingSnapshot,
+        where:
+          ps.model_identifier in ^identifiers and ps.effective_at <= ^timestamp and
+            fragment("?->>'service_tier'", ps.config) == ^service_tier and
+            fragment("?->>'price_bucket'", ps.config) == ^price_bucket and
+            fragment("?->>'pricing_type'", ps.config) == "per_1m_tokens",
+        order_by: [desc: ps.effective_at, desc: ps.captured_at, desc: ps.id],
+        limit: 1
+    )
+  end
+
+  defp fallback_pricing_snapshot(
+         identifiers,
+         service_tier,
+         @long_context_price_bucket,
+         timestamp
+       ),
+       do: pricing_snapshot(identifiers, service_tier, @default_price_bucket, timestamp)
+
+  defp fallback_pricing_snapshot(_identifiers, _service_tier, _price_bucket, _timestamp), do: nil
+
+  defp pricing_identifiers(model, requested_model) do
+    Enum.uniq(
+      Enum.reject(
+        [model.pricing_ref, model.upstream_model_id, model.exposed_model_id, requested_model],
+        &blank?/1
+      )
+    )
+  end
+
+  defp missing_pricing_snapshot(
+         _model,
+         identifiers,
+         requested_tier,
+         actual_tier,
+         service_tier,
+         timestamp,
+         batch_usage?
+       ) do
+    model_snapshot_exists? =
+      Repo.exists?(
+        from ps in PricingSnapshot,
+          where:
+            ps.model_identifier in ^identifiers and ps.effective_at <= ^timestamp and
+              fragment("?->>'price_bucket'", ps.config) == "default" and
+              fragment("?->>'pricing_type'", ps.config) == "per_1m_tokens"
+      )
+
+    status =
+      if model_snapshot_exists?, do: "unpriced_missing_tier", else: "unpriced_missing_model"
+
+    unpriced_snapshot(status, requested_tier, actual_tier, service_tier, batch_usage?)
+  end
+
+  defp priced_snapshot(snapshot, requested_tier, actual_tier, service_tier, batch_usage?) do
+    %{
+      snapshot: snapshot,
+      status: "priced",
+      requested_service_tier: requested_tier,
+      actual_service_tier: actual_tier,
+      service_tier: service_tier,
+      price_bucket: snapshot.config["price_bucket"],
+      pricing_type: snapshot.config["pricing_type"],
+      batch_usage: batch_usage?
+    }
+  end
+
+  defp unpriced_snapshot(status, requested_tier, actual_tier, service_tier, batch_usage?) do
+    %{
+      snapshot: nil,
+      status: status,
+      requested_service_tier: requested_tier,
+      actual_service_tier: actual_tier,
+      service_tier: service_tier,
+      price_bucket: "default",
+      pricing_type: "per_1m_tokens",
+      batch_usage: batch_usage?
+    }
+  end
+
+  defp requested_service_tier(payload, opts) do
+    enforced_service_tier(opts) || attr(opts, :service_tier) || attr(payload, :service_tier)
+  end
+
+  defp enforced_service_tier(opts) do
+    policy = attr(opts, :api_key_policy) || %{}
+    attr(policy, :enforced_service_tier)
+  end
+
+  defp explicit_batch_usage?(payload, opts) do
+    [
+      dual_key_value(opts, :batch_usage),
+      dual_key_value(opts, :batch),
+      dual_key_value(payload, :batch_usage),
+      dual_key_value(payload, :batch)
+    ]
+    |> Enum.any?(&truthy?/1)
+    |> batch_usage_from_flags?(
+      attr(opts, :endpoint),
+      attr(opts, :request_metadata)
+    )
+  end
+
+  defp batch_usage_from_flags?(true, _endpoint, _metadata), do: true
+
+  defp batch_usage_from_flags?(false, endpoint, metadata) do
+    batch_endpoint?(endpoint) || batch_metadata?(metadata)
+  end
+
+  defp batch_metadata?(%{} = metadata) do
+    pricing = dual_key_value(metadata, :pricing)
+
+    truthy?(dual_key_value(metadata, :batch_usage)) ||
+      truthy?(dual_key_value(metadata, :batch)) ||
+      truthy?(dual_key_value(pricing, :batch_usage))
+  end
+
+  defp batch_metadata?(_metadata), do: false
+
+  defp dual_key_value(%{} = map, atom_key) when is_atom(atom_key) do
+    case Map.fetch(map, atom_key) do
+      {:ok, value} -> value
+      :error -> Map.get(map, Atom.to_string(atom_key))
+    end
+  end
+
+  defp dual_key_value(_map, _atom_key), do: nil
+
+  defp batch_endpoint?(endpoint) when is_binary(endpoint), do: String.contains?(endpoint, "batch")
+  defp batch_endpoint?(_endpoint), do: false
+
+  defp actual_service_tier(usage, opts) do
+    attr(opts, :actual_service_tier) ||
+      metadata_service_tier(attr(opts, :attempt_metadata)) ||
+      attr(usage, :service_tier)
+  end
+
+  defp metadata_service_tier(%{} = metadata) do
+    attr(metadata, :service_tier) ||
+      get_in(metadata, ["response", "service_tier"]) ||
+      get_in(metadata, [:response, :service_tier]) ||
+      get_in(metadata, ["pricing", "actual_service_tier"]) ||
+      get_in(metadata, [:pricing, :actual_service_tier])
+  end
+
+  defp metadata_service_tier(_metadata), do: nil
+
+  defp priceable_service_tier(requested_tier, actual_tier, batch_usage?) do
+    requested = normalize_service_tier(requested_tier)
+    actual = normalize_service_tier(actual_tier)
+
+    cond do
+      requested == "batch" and not batch_usage? -> {:unpriced, "unpriced_batch_tier"}
+      requested == "auto" and actual in [nil, "auto"] -> {:unpriced, "unpriced_auto_tier"}
+      requested == "auto" -> mapped_service_tier(actual, batch_usage?)
+      true -> mapped_service_tier(requested, batch_usage?)
+    end
+  end
+
+  defp mapped_service_tier("batch", false), do: {:unpriced, "unpriced_batch_tier"}
+  defp mapped_service_tier("batch", true), do: {:ok, "batch"}
+  defp mapped_service_tier(tier, _batch_usage?), do: mapped_service_tier(tier)
+
+  defp mapped_service_tier(nil), do: {:ok, "standard"}
+  defp mapped_service_tier("default"), do: {:ok, "standard"}
+  defp mapped_service_tier("standard"), do: {:ok, "standard"}
+  defp mapped_service_tier("flex"), do: {:ok, "flex"}
+  defp mapped_service_tier("priority"), do: {:ok, "priority"}
+  defp mapped_service_tier("batch"), do: {:ok, "batch"}
+  defp mapped_service_tier(_tier), do: {:unpriced, "unpriced_unsupported_tier"}
+
+  defp normalize_service_tier(nil), do: nil
+
+  defp normalize_service_tier(tier) when is_binary(tier) do
+    tier
+    |> String.trim()
+    |> String.downcase()
+    |> blank_to_nil()
+  end
+
+  defp normalize_service_tier(tier), do: tier |> to_string() |> normalize_service_tier()
+
+  defp requested_service_tier_snapshot(payload, request_metadata, pricing) do
+    pricing.requested_service_tier ||
+      pricing_metadata_value(request_metadata, "requested_service_tier") ||
+      attr(payload, :service_tier)
+  end
+
+  defp actual_service_tier_snapshot(request_metadata, pricing) do
+    pricing.actual_service_tier || pricing_metadata_value(request_metadata, "actual_service_tier")
+  end
+
+  defp effective_service_tier_snapshot(requested_tier, actual_tier, request_metadata, pricing) do
+    pricing.service_tier ||
+      pricing_metadata_value(request_metadata, "service_tier") ||
+      actual_tier || requested_tier
+  end
+
+  defp payload_reasoning_effort(payload) do
+    attr(payload, :reasoning_effort) ||
+      get_in(payload, ["reasoning", "effort"]) ||
+      get_in(payload, [:reasoning, :effort])
+  end
+
+  defp pricing_metadata_value(request_metadata, key) do
+    get_in(request_metadata, ["pricing", key])
+  end
+
+  defp normalize_snapshot_value(nil), do: nil
+
+  defp normalize_snapshot_value(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> blank_to_nil()
+  end
+
+  defp normalize_snapshot_value(value), do: value |> to_string() |> normalize_snapshot_value()
+
+  defp metadata_pricing_value(%Request{request_metadata: metadata}, key) do
+    get_in(metadata || %{}, ["pricing", key])
+  end
+
+  defp metadata_pricing_value(_request, _key), do: nil
+
+  defp details_value(%LedgerEntry{details: details}, key),
+    do: Map.get(details || %{}, key)
+
+  defp details_value(_entry, _key), do: nil
+
+  defp fallback(nil, value), do: value
+  defp fallback(value, _fallback), do: value
+
+  defp attr(map, key) when is_atom(key),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp blank?(value), do: is_nil(value) or String.trim(to_string(value)) == ""
+  defp blank_to_nil(value), do: if(blank?(value), do: nil, else: value)
+  defp truthy?(value), do: value in [true, "true", "1", 1, "yes", "batch"]
+
+  defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+end

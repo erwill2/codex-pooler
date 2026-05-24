@@ -1,0 +1,415 @@
+defmodule CodexPooler.Upstreams.Quota.Windows do
+  @moduledoc false
+
+  import Ecto.Query
+
+  alias CodexPooler.Events
+  alias CodexPooler.Quotas.Evidence
+  alias CodexPooler.Repo
+
+  alias CodexPooler.Upstreams.{
+    Quota,
+    Quota.Windows.Attributes,
+    Quota.Windows.EvidenceStore,
+    Quota.Windows.Routing
+  }
+
+  alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+
+  alias Ecto.Multi
+
+  @fresh "fresh"
+  @account_quota_key "account"
+
+  @type lifecycle_error :: %{required(:code) => atom(), required(:message) => String.t()}
+  @type identity_ref :: UpstreamIdentity.t() | Ecto.UUID.t()
+
+  @spec upsert_quota_windows(identity_ref(), [map()]) ::
+          {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  def upsert_quota_windows(identity_or_id, windows, opts \\ [delete_missing?: false])
+
+  def upsert_quota_windows(identity_or_id, windows, opts) when is_list(windows) do
+    case normalize_identity(identity_or_id) do
+      %UpstreamIdentity{} = identity ->
+        do_upsert_quota_windows(identity, windows, opts)
+
+      nil ->
+        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
+    end
+  end
+
+  defp do_upsert_quota_windows(%UpstreamIdentity{} = identity, windows, opts) do
+    delete_missing? = Keyword.fetch!(opts, :delete_missing?)
+    windows = Enum.map(windows, &normalize_upsert_quota_window_attrs/1)
+
+    window_keys =
+      Enum.map(windows, &{Map.fetch!(&1, :quota_key), Map.fetch!(&1, :window_kind)})
+
+    if Enum.uniq(window_keys) != window_keys do
+      {:error, lifecycle_error(:duplicate_quota_window_kind, "quota window keys must be unique")}
+    else
+      Enum.reduce(windows, Multi.new(), fn attrs, multi ->
+        Multi.run(multi, {:quota_window, attrs.quota_key, attrs.window_kind}, fn _repo,
+                                                                                 _changes ->
+          attrs =
+            attrs
+            |> put_default(:metadata, %{})
+            |> put_default(:source, "local_reconciliation")
+            |> put_default(:freshness_state, @fresh)
+
+          # Reason: Multi callback normalizes quota evidence errors at the boundary.
+          # credo:disable-for-next-line Credo.Check.Refactor.Nesting
+          case EvidenceStore.record_evidence(identity, attrs, now()) do
+            {:ok, window} -> {:ok, window}
+            {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
+            {:error, errors} -> {:error, quota_window_error_changeset(identity, attrs, errors)}
+          end
+        end)
+      end)
+      |> maybe_delete_missing_quota_windows(identity, windows, delete_missing?)
+      |> Repo.transaction()
+      |> case do
+        {:ok, changes} ->
+          quota_windows =
+            changes
+            |> Map.values()
+            |> Enum.filter(&match?(%Quota.AccountQuotaWindow{}, &1))
+            |> Enum.sort_by(&{&1.quota_key, &1.window_kind})
+
+          broadcast_upstream_change(%{identity: identity}, "upstream_quota_windows_updated")
+
+          {:ok, quota_windows}
+
+        {:error, _operation, reason, _changes} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp normalize_upsert_quota_window_attrs(attrs) do
+    attrs = Attributes.normalize(attrs)
+
+    attrs
+    |> Map.put(
+      :quota_key,
+      attrs |> Map.get(:quota_key, @account_quota_key) |> normalize_quota_key()
+    )
+    |> Map.update!(:window_kind, &normalize_token/1)
+  end
+
+  @spec evidence_changeset(identity_ref(), map(), DateTime.t()) ::
+          {:ok, Ecto.Changeset.t()} | {:error, Evidence.errors() | map()}
+  def evidence_changeset(identity_or_id, attrs, observed_at \\ now()) do
+    EvidenceStore.evidence_changeset(identity_or_id, attrs, observed_at)
+  end
+
+  @spec record_evidence(identity_ref(), map(), DateTime.t()) ::
+          {:ok, Quota.AccountQuotaWindow.t()}
+          | {:error, Ecto.Changeset.t() | Evidence.errors() | map()}
+  def record_evidence(identity_or_id, attrs, observed_at \\ now()) do
+    EvidenceStore.record_evidence(identity_or_id, attrs, observed_at)
+  end
+
+  @spec list_evidence(identity_ref()) :: [Quota.AccountQuotaWindow.t()]
+  def list_evidence(identity_or_id) do
+    EvidenceStore.list_evidence(identity_or_id)
+  end
+
+  defp maybe_delete_missing_quota_windows(multi, _identity, _windows, false), do: multi
+  defp maybe_delete_missing_quota_windows(multi, _identity, [], true), do: multi
+
+  defp maybe_delete_missing_quota_windows(multi, identity, _windows, true) do
+    Multi.run(multi, :delete_missing_quota_windows, fn repo, changes ->
+      incoming_windows =
+        changes
+        |> Map.values()
+        |> Enum.filter(&match?(%Quota.AccountQuotaWindow{}, &1))
+
+      incoming_quota_keys =
+        incoming_windows
+        |> Enum.map(& &1.quota_key)
+        |> Enum.uniq()
+
+      incoming_identities =
+        incoming_windows
+        |> Enum.map(&quota_window_evidence_identity/1)
+        |> MapSet.new()
+
+      stale_ids =
+        Quota.AccountQuotaWindow
+        |> where([window], window.upstream_identity_id == ^identity.id)
+        |> where([window], window.quota_key in ^incoming_quota_keys)
+        |> repo.all()
+        |> Enum.reject(&(quota_window_evidence_identity(&1) in incoming_identities))
+        |> Enum.map(& &1.id)
+
+      {deleted_count, _rows} =
+        from(window in Quota.AccountQuotaWindow, where: window.id in ^stale_ids)
+        |> repo.delete_all()
+
+      {:ok, deleted_count}
+    end)
+  end
+
+  defp quota_window_evidence_identity(%Quota.AccountQuotaWindow{} = window) do
+    {
+      window.quota_scope,
+      window.quota_family,
+      lower_string(window.model),
+      lower_string(window.upstream_model),
+      window.quota_key,
+      window.window_kind,
+      window.window_minutes,
+      window.source,
+      window.raw_limit_id || "",
+      window.raw_limit_name || "",
+      window.raw_metered_feature || ""
+    }
+  end
+
+  defp lower_string(value) when is_binary(value), do: String.downcase(value)
+  defp lower_string(_value), do: ""
+
+  defp quota_window_error_changeset(identity, attrs, _errors) do
+    timestamp = now()
+
+    %Quota.AccountQuotaWindow{}
+    |> Quota.AccountQuotaWindow.changeset(
+      attrs
+      |> Map.put(:upstream_identity_id, identity.id)
+      |> put_default(:last_sync_at, timestamp)
+      |> put_default(:created_at, timestamp)
+      |> Map.put(:updated_at, timestamp)
+    )
+  end
+
+  @spec list_quota_windows(identity_ref()) :: [Quota.AccountQuotaWindow.t()]
+  def list_quota_windows(identity_or_id) do
+    case identity_id(identity_or_id) do
+      identity_id when is_binary(identity_id) ->
+        Repo.all(
+          from window in Quota.AccountQuotaWindow,
+            where: window.upstream_identity_id == ^identity_id,
+            order_by: [asc: window.quota_key, asc: window.window_kind]
+        )
+
+      nil ->
+        []
+    end
+  end
+
+  @spec quota_window_selection_data(identity_ref(), keyword()) :: map()
+  def quota_window_selection_data(identity_or_id, opts \\ []) do
+    windows = list_quota_windows(identity_or_id)
+
+    quota_window_selection_data_from_windows(windows, opts)
+  end
+
+  @spec quota_window_selection_data_from_windows([Quota.AccountQuotaWindow.t()], keyword()) ::
+          map()
+  def quota_window_selection_data_from_windows(windows, opts \\ []) when is_list(windows) do
+    Routing.selection_data_from_windows(windows, opts)
+  end
+
+  @spec routing_quota_eligibility(identity_ref(), keyword()) :: map()
+  def routing_quota_eligibility(identity_or_id, opts \\ []) do
+    selection = quota_window_selection_data(identity_or_id, opts)
+
+    Routing.eligibility_from_selection(selection, opts)
+  end
+
+  @spec routing_quota_eligibility_from_windows([Quota.AccountQuotaWindow.t()], keyword()) :: map()
+  def routing_quota_eligibility_from_windows(windows, opts \\ []) when is_list(windows) do
+    Routing.eligibility_from_windows(windows, opts)
+  end
+
+  @spec fresh_window?(Quota.AccountQuotaWindow.t(), DateTime.t()) :: boolean()
+  def fresh_window?(%Quota.AccountQuotaWindow{} = window, timestamp \\ now()) do
+    Routing.fresh_window?(window, timestamp)
+  end
+
+  @spec usable_window?(Quota.AccountQuotaWindow.t(), DateTime.t()) :: boolean()
+  def usable_window?(%Quota.AccountQuotaWindow{} = window, timestamp \\ now()) do
+    Routing.usable_window?(window, timestamp)
+  end
+
+  @spec usable_window?(Quota.AccountQuotaWindow.t(), DateTime.t(), keyword()) :: boolean()
+  def usable_window?(%Quota.AccountQuotaWindow{} = window, timestamp, opts) when is_list(opts) do
+    Routing.usable_window?(window, timestamp, opts)
+  end
+
+  @spec routing_window_exclusion(Quota.AccountQuotaWindow.t(), DateTime.t()) :: map()
+  def routing_window_exclusion(%Quota.AccountQuotaWindow{} = window, timestamp \\ now()) do
+    Routing.window_exclusion(window, timestamp)
+  end
+
+  @spec routing_window_reason_codes(Quota.AccountQuotaWindow.t(), DateTime.t()) :: [String.t()]
+  def routing_window_reason_codes(%Quota.AccountQuotaWindow{} = window, timestamp \\ now()) do
+    Routing.window_reason_codes(window, timestamp)
+  end
+
+  @spec codex_usage_quota_windows_from_payload(term(), DateTime.t()) ::
+          {:ok, [map()]} | {:error, lifecycle_error()}
+  def codex_usage_quota_windows_from_payload(payload, synced_at \\ now())
+
+  def codex_usage_quota_windows_from_payload(payload, synced_at) do
+    case Quota.Evidence.codex_usage_windows_from_payload(payload, synced_at) do
+      {:ok, windows} -> {:ok, windows}
+      {:error, %{code: code, message: message}} -> {:error, lifecycle_error(code, message)}
+    end
+  end
+
+  @spec upsert_quota_windows_from_codex_usage_payload(identity_ref(), term(), DateTime.t()) ::
+          {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  def upsert_quota_windows_from_codex_usage_payload(identity_or_id, payload, synced_at \\ now()) do
+    with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
+         {:ok, windows} <- codex_usage_quota_windows_from_payload(payload, synced_at) do
+      do_upsert_quota_windows(identity, windows, delete_missing?: false)
+    else
+      nil ->
+        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  @spec upsert_quota_windows_from_codex_headers(identity_ref(), term(), DateTime.t()) ::
+          {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  def upsert_quota_windows_from_codex_headers(identity_or_id, headers, synced_at \\ now()) do
+    with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
+         [_ | _] = windows <- quota_windows_from_codex_headers(headers, synced_at) do
+      do_upsert_quota_windows(identity, windows, delete_missing?: false)
+    else
+      nil ->
+        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
+
+      [] ->
+        {:ok, []}
+    end
+  end
+
+  @spec upsert_quota_windows_from_codex_rate_limit_event(identity_ref(), term(), DateTime.t()) ::
+          {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  def upsert_quota_windows_from_codex_rate_limit_event(identity_or_id, event, synced_at \\ now()) do
+    with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
+         [_ | _] = windows <- quota_windows_from_codex_rate_limit_event(event, synced_at) do
+      do_upsert_quota_windows(identity, windows, delete_missing?: false)
+    else
+      nil ->
+        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
+
+      [] ->
+        {:ok, []}
+    end
+  end
+
+  @spec upsert_quota_windows_from_codex_rate_limit_error(identity_ref(), term(), DateTime.t()) ::
+          {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  def upsert_quota_windows_from_codex_rate_limit_error(
+        identity_or_id,
+        payload,
+        synced_at \\ now()
+      ) do
+    with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
+         [_ | _] = windows <- quota_windows_from_codex_rate_limit_error(payload, synced_at) do
+      do_upsert_quota_windows(identity, windows, delete_missing?: false)
+    else
+      nil ->
+        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
+
+      [] ->
+        {:ok, []}
+    end
+  end
+
+  defp quota_windows_from_codex_headers(headers, synced_at) do
+    Quota.Evidence.codex_header_windows(headers, synced_at)
+  end
+
+  defp quota_windows_from_codex_rate_limit_event(event, synced_at) do
+    Quota.Evidence.codex_rate_limit_event_windows(event, synced_at)
+  end
+
+  defp quota_windows_from_codex_rate_limit_error(payload, synced_at) do
+    Quota.Evidence.codex_rate_limit_error_windows(payload, synced_at)
+  end
+
+  @spec quota_windows_from_metadata(term()) :: [map()]
+  def quota_windows_from_metadata(metadata), do: Attributes.from_metadata(metadata)
+
+  @spec existing_quota_window_attrs(identity_ref()) :: [map()]
+  def existing_quota_window_attrs(identity) do
+    identity
+    |> list_quota_windows()
+    |> Attributes.from_windows()
+  end
+
+  defp normalize_quota_key(nil), do: nil
+
+  defp normalize_quota_key(value) when is_binary(value) do
+    value
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9]+/u, "_")
+    |> String.trim("_")
+    |> case do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_quota_key(value) when is_atom(value),
+    do: value |> Atom.to_string() |> normalize_quota_key()
+
+  defp normalize_quota_key(value), do: value |> to_string() |> normalize_quota_key()
+
+  defp broadcast_upstream_change(%{identity: %UpstreamIdentity{} = identity}, reason) do
+    identity.id
+    |> assignments_for_identity()
+    |> Enum.each(&broadcast_upstream_assignment(&1, identity, reason))
+  end
+
+  defp broadcast_upstream_assignment(%PoolUpstreamAssignment{} = assignment, identity, reason) do
+    Events.broadcast_upstreams(assignment.pool_id, reason, %{
+      assignment_id: assignment.id,
+      upstream_identity_id: assignment.upstream_identity_id,
+      upstream_status: identity.status,
+      assignment_status: assignment.status
+    })
+  end
+
+  defp assignments_for_identity(identity_id) do
+    Repo.all(
+      from assignment in PoolUpstreamAssignment,
+        where: assignment.upstream_identity_id == ^identity_id,
+        order_by: [asc: assignment.created_at, asc: assignment.id]
+    )
+  end
+
+  defp lifecycle_error(code, message), do: %{code: code, message: message}
+
+  defp normalize_identity(%UpstreamIdentity{id: id}), do: Repo.get(UpstreamIdentity, id)
+  defp normalize_identity(id) when is_binary(id), do: Repo.get(UpstreamIdentity, id)
+  defp normalize_identity(_id), do: nil
+
+  defp identity_id(%UpstreamIdentity{id: id}), do: id
+  defp identity_id(id) when is_binary(id), do: id
+  defp identity_id(_id), do: nil
+
+  defp put_default(map, key, value) do
+    case Map.get(map, key) do
+      nil -> Map.put(map, key, value)
+      _value -> map
+    end
+  end
+
+  defp normalize_token(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_token(value), do: value
+
+  defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+end

@@ -1,0 +1,25 @@
+name: codex-pooler-smoke
+
+services:
+  codex-smoke:
+    image: ${CODEX_SMOKE_IMAGE:-ghcr.io/icoretech/codex-docker:0.133.0}
+    working_dir: /workspace
+    environment:
+      CODEX_HOME: /home/codex/.codex
+      CODEX_POOLER_API_KEY: ${CODEX_POOLER_API_KEY:?set CODEX_POOLER_API_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - type: bind
+        source: ./tmp/codex-smoke/codex-home
+        target: /home/codex/.codex
+      - type: bind
+        source: ./tmp/codex-smoke/workspace
+        target: /workspace
+    command:
+      - exec
+      - --skip-git-repo-check
+      - --ephemeral
+      - -C
+      - /workspace
+      - "${CODEX_SMOKE_PROMPT:-Reply with exactly: codex-pooler-smoke}"

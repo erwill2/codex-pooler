@@ -1,0 +1,411 @@
+defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
+  @moduledoc false
+
+  use CodexPoolerWeb, :html
+
+  alias CodexPoolerWeb.Admin.ApiKeysReadModel
+  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
+  alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+
+  attr :created_secret, :map, required: true
+
+  def created_secret_dialog(assigns) do
+    ~H"""
+    <dialog id="api-key-created-secret-dialog" class="modal" open>
+      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-6 py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-primary">
+            API key secret
+          </p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">Copy this API key now</h2>
+          <p class="mt-2 text-sm leading-6 text-base-content/70">
+            This raw key is shown once. Future views only show fingerprint {@created_secret.key_prefix}.
+          </p>
+        </div>
+
+        <div class="grid gap-5 p-6">
+          <div id="api-key-created-secret" class="alert alert-success items-start">
+            <.icon name="hero-key" class="size-5" />
+            <div class="grid gap-1">
+              <p class="font-semibold">Copy this API key before closing the dialog.</p>
+              <p class="text-sm">It will not be shown again.</p>
+            </div>
+          </div>
+
+          <div class="grid gap-2 rounded-box border border-base-300 bg-base-200 p-4">
+            <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
+              one-time api key
+            </p>
+            <div class="join w-full">
+              <code
+                id="api-key-created-secret-value"
+                class="join-item min-h-10 flex-1 break-all border border-base-300 bg-base-100 px-3 py-2.5 font-mono text-sm text-base-content"
+              >
+                {@created_secret.raw_key}
+              </code>
+              <button
+                id="api-key-copy-created-secret"
+                type="button"
+                class="btn btn-neutral join-item min-h-10"
+                phx-hook="ClipboardCopy"
+                phx-update="ignore"
+                data-copy-text={@created_secret.raw_key}
+                data-copy-label="Copy"
+                data-copied-label="Copied"
+                aria-label="Copy API key"
+              >
+                <.icon name="hero-clipboard-document" class="copy-icon size-4" />
+                <span data-copy-label>Copy</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="modal-action mt-0">
+            <button
+              id="api-key-secret-dialog-close"
+              type="button"
+              class="btn btn-primary btn-sm"
+              phx-click="close_secret"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+      <form method="dialog" class="modal-backdrop">
+        <button type="button" phx-click="close_secret">close</button>
+      </form>
+    </dialog>
+    """
+  end
+
+  attr :api_key, :any, required: true
+  attr :form, :any, required: true
+  attr :form_version, :integer, required: true
+
+  def delete_api_key_dialog(assigns) do
+    ~H"""
+    <dialog id="api-key-delete-dialog" class="modal" open>
+      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-6 py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-error">Hard delete</p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">Delete API key</h2>
+          <p class="mt-2 text-sm leading-6 text-base-content/70">
+            This permanently removes the API key and its related request history from this instance.
+          </p>
+        </div>
+
+        <.form
+          id="api-key-delete-form"
+          for={@form}
+          phx-submit="confirm_delete_api_key"
+          autocomplete="off"
+          class="grid gap-5 p-6"
+        >
+          <.input field={@form[:id]} type="hidden" />
+          <div class="alert alert-warning items-start">
+            <.icon name="hero-exclamation-triangle" class="size-5" />
+            <div class="grid gap-1">
+              <p class="font-semibold">
+                This removes {@api_key.display_name} permanently.
+              </p>
+              <p class="text-sm">
+                Type <span class="break-all font-semibold">{@api_key.key_prefix}</span> to confirm.
+              </p>
+            </div>
+          </div>
+          <.input
+            field={@form[:confirmation_prefix]}
+            id={"api_key_delete_confirmation_prefix_#{@form_version}"}
+            type="text"
+            label="Confirm prefix"
+            placeholder={@api_key.key_prefix}
+            required
+          />
+          <div class="modal-action mt-0">
+            <AdminComponents.action_button
+              id="api-key-delete-cancel"
+              icon="hero-x-mark"
+              label="Cancel"
+              phx-click="cancel_delete_api_key"
+            />
+            <AdminComponents.action_button
+              id="api-key-delete-submit"
+              icon="hero-trash"
+              label="Delete API key"
+              type="submit"
+              variant={:danger}
+            />
+          </div>
+        </.form>
+      </div>
+      <form method="dialog" class="modal-backdrop">
+        <button type="button" phx-click="cancel_delete_api_key">close</button>
+      </form>
+    </dialog>
+    """
+  end
+
+  attr :pools, :list, required: true
+  attr :groups, :list, required: true
+  attr :usage_summaries, :map, required: true
+
+  def api_key_groups(assigns) do
+    ~H"""
+    <div id="admin-api-keys" class="grid min-w-0 gap-4">
+      <AdminComponents.empty_state
+        :if={@groups == []}
+        id="api-key-empty-state"
+        title="No API keys"
+        description={
+          if @pools == [],
+            do: "Create a Pool before adding API keys.",
+            else: "Create the first API key for an active Pool."
+        }
+        icon="hero-key"
+      >
+        <:actions>
+          <AdminComponents.action_button
+            :if={@pools == []}
+            id="api-key-empty-create-action"
+            icon="hero-server-stack"
+            label="Create Pool"
+            navigate={~p"/admin/pools"}
+            variant={:primary}
+          />
+          <AdminComponents.action_button
+            :if={@pools != []}
+            id="api-key-empty-create-action"
+            icon="hero-key"
+            label="Create API key"
+            phx-click="open_create_api_key"
+            variant={:primary}
+          />
+        </:actions>
+      </AdminComponents.empty_state>
+
+      <section
+        :for={group <- @groups}
+        id={"api-key-pool-group-#{group.dom_id}"}
+        class="min-w-0 overflow-visible rounded-box border border-base-300 bg-base-100 shadow-sm"
+      >
+        <header class="flex flex-wrap items-center justify-between gap-3 border-b border-base-300 px-4 py-3">
+          <h2 class="font-semibold leading-6 text-base-content">{group.name}</h2>
+          <span
+            id={"api-key-pool-group-#{group.dom_id}-count"}
+            class={AdminBadges.count_chip_class()}
+          >
+            {group.count_label}
+          </span>
+        </header>
+
+        <div
+          id={"api-key-pool-group-#{group.dom_id}-table-scroll-region"}
+          class="overflow-x-auto md:overflow-visible"
+        >
+          <table class="table min-w-[56rem]">
+            <thead>
+              <tr>
+                <th>Key</th>
+                <th class="text-center">Status</th>
+                <th>Usage</th>
+                <th>Policy</th>
+                <th class="text-center">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                :for={api_key <- group.api_keys}
+                id={"api-key-row-#{api_key.id}"}
+                class="text-sm transition-colors hover:bg-base-200/80"
+              >
+                <td id={"api-key-row-#{api_key.id}-key"} class="min-w-64 align-middle">
+                  <div class="grid gap-1.5">
+                    <span class="flex items-center gap-1.5 font-medium leading-5 text-base-content">
+                      <span>{api_key.display_name}</span>
+                      <.api_key_notes_popover
+                        :if={ApiKeysReadModel.api_key_operator_notes(api_key)}
+                        id={"api-key-row-#{api_key.id}-notes"}
+                        notes={ApiKeysReadModel.api_key_operator_notes(api_key)}
+                      />
+                    </span>
+                    <span class="font-mono text-xs text-base-content/60">
+                      {api_key.key_prefix}
+                    </span>
+                  </div>
+                </td>
+                <td class="align-middle text-center">
+                  <span
+                    id={"api-key-row-#{api_key.id}-status"}
+                    class={AdminBadges.lifecycle_chip_class(api_key.status)}
+                  >
+                    {api_key.status}
+                  </span>
+                </td>
+                <td id={"api-key-row-#{api_key.id}-usage"} class="min-w-56 align-middle">
+                  <.api_key_row_usage usage={Map.get(@usage_summaries, api_key.id)} />
+                </td>
+                <td class="min-w-80 align-middle">
+                  <div class="grid gap-1 text-sm text-base-content/70">
+                    <span id={"api-key-row-#{api_key.id}-models"}>
+                      Models: {ApiKeysReadModel.model_policy_label(api_key.allowed_model_identifiers)}
+                    </span>
+                  </div>
+                </td>
+                <td class="w-16 align-middle text-center">
+                  <.api_key_actions_menu api_key={api_key} />
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+    """
+  end
+
+  attr :api_key, :any, required: true
+
+  defp api_key_actions_menu(assigns) do
+    ~H"""
+    <div class="dropdown dropdown-end inline-block">
+      <button
+        id={"api-key-actions-menu-#{@api_key.id}"}
+        type="button"
+        class="btn btn-ghost btn-sm btn-square"
+        tabindex="0"
+        aria-label={"Actions for #{@api_key.display_name}"}
+      >
+        <.icon name="hero-ellipsis-vertical" class="size-5" />
+      </button>
+      <ul
+        tabindex="0"
+        class="menu dropdown-content z-20 mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-2 shadow-xl"
+      >
+        <li>
+          <AdminComponents.dropdown_action_item
+            id={"edit-api-key-#{@api_key.id}"}
+            icon="hero-pencil-square"
+            label="Edit"
+            phx-click="edit_api_key"
+            phx-value-id={@api_key.id}
+            disabled={@api_key.status == "revoked"}
+          />
+        </li>
+        <li>
+          <AdminComponents.dropdown_action_item
+            id={"disable-api-key-#{@api_key.id}"}
+            icon="hero-pause"
+            label="Pause"
+            variant={:warning}
+            phx-click="disable_api_key"
+            phx-value-id={@api_key.id}
+            disabled={@api_key.status != "active"}
+          />
+        </li>
+        <li>
+          <AdminComponents.dropdown_action_item
+            id={"enable-api-key-#{@api_key.id}"}
+            icon="hero-play"
+            label="Resume"
+            variant={:positive}
+            phx-click="enable_api_key"
+            phx-value-id={@api_key.id}
+            disabled={@api_key.status != "paused"}
+          />
+        </li>
+        <li>
+          <AdminComponents.dropdown_action_item
+            id={"rotate-api-key-#{@api_key.id}"}
+            icon="hero-arrow-path"
+            label="Rotate"
+            phx-click="rotate_api_key"
+            phx-value-id={@api_key.id}
+            disabled={@api_key.status == "revoked"}
+          />
+        </li>
+        <li>
+          <AdminComponents.dropdown_action_item
+            id={"revoke-api-key-#{@api_key.id}"}
+            icon="hero-no-symbol"
+            label="Revoke"
+            variant={:danger}
+            phx-click="revoke_api_key"
+            phx-value-id={@api_key.id}
+            disabled={@api_key.status == "revoked"}
+          />
+        </li>
+        <li>
+          <AdminComponents.dropdown_action_item
+            id={"delete-api-key-#{@api_key.id}"}
+            icon="hero-trash"
+            label="Delete"
+            variant={:danger}
+            phx-click="delete_api_key"
+            phx-value-id={@api_key.id}
+          />
+        </li>
+      </ul>
+    </div>
+    """
+  end
+
+  attr :usage, :map, default: nil
+
+  defp api_key_row_usage(%{usage: usage} = assigns) when is_map(usage) do
+    assigns = assign(assigns, :show_usage?, ApiKeysReadModel.usage_present?(usage))
+
+    ~H"""
+    <div :if={@show_usage?} class="grid gap-0.5 text-sm tabular-nums text-base-content">
+      <span class="font-medium">
+        {ApiKeysReadModel.format_integer(@usage.request_count)} requests
+      </span>
+      <span class="text-xs text-base-content/70">
+        {ApiKeysReadModel.format_integer(@usage.total_tokens)} tokens
+      </span>
+      <span
+        :if={ApiKeysReadModel.usage_present?(%{cached_input_tokens: @usage.cached_input_tokens})}
+        class="text-xs text-base-content/60"
+      >
+        {ApiKeysReadModel.format_integer(@usage.cached_input_tokens)} cached input
+      </span>
+      <span :if={ApiKeysReadModel.row_usage_cost(@usage)} class="text-xs text-base-content/60">
+        {ApiKeysReadModel.row_usage_cost(@usage)}
+      </span>
+    </div>
+    <span :if={!@show_usage?} class="text-sm text-base-content/50">No usage recorded</span>
+    """
+  end
+
+  defp api_key_row_usage(assigns) do
+    ~H"""
+    <span class="text-sm text-base-content/50">No usage recorded</span>
+    """
+  end
+
+  attr :id, :string, required: true
+  attr :notes, :string, required: true
+
+  defp api_key_notes_popover(assigns) do
+    ~H"""
+    <span id={@id} class="dropdown dropdown-hover dropdown-right inline-flex">
+      <button
+        id={"#{@id}-button"}
+        type="button"
+        class="btn btn-ghost btn-xs btn-circle text-base-content/45 transition-colors hover:bg-base-200 hover:text-base-content"
+        tabindex="0"
+        aria-label="Show API key notes"
+      >
+        <.icon name="hero-information-circle" class="size-4" />
+      </button>
+      <span
+        id={"#{@id}-content"}
+        tabindex="0"
+        class="dropdown-content z-20 ml-2 block w-72 rounded-box border border-base-300 bg-base-100 p-3 text-left text-xs font-normal leading-5 text-base-content/70 shadow-xl"
+      >
+        {@notes}
+      </span>
+    </span>
+    """
+  end
+end

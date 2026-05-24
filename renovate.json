@@ -1,0 +1,137 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "dependencyDashboard": true,
+  "enabledManagers": [
+    "custom.regex",
+    "docker-compose",
+    "dockerfile",
+    "github-actions",
+    "helm-values",
+    "helmv3",
+    "mix",
+    "npm"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "platformAutomerge": false,
+  "prConcurrentLimit": 10,
+  "prHourlyLimit": 0,
+  "rangeStrategy": "bump",
+  "rebaseWhen": "conflicted",
+  "timezone": "Europe/Rome",
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "packageRules": [
+    {
+      "description": "Require explicit review for major updates",
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Pin Mix dependency ranges for Elixir application updates",
+      "matchManagers": [
+        "mix"
+      ],
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Keep websock_adapter on Phoenix-compatible releases",
+      "matchPackageNames": [
+        "websock_adapter"
+      ],
+      "allowedVersions": "< 0.6.0"
+    },
+    {
+      "description": "Keep Erlang/Elixir runtime image updates together",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "elixir"
+      ],
+      "groupName": "Elixir runtime image",
+      "groupSlug": "elixir-runtime-image"
+    },
+    {
+      "description": "Keep Node runtime image updates together",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "node"
+      ],
+      "groupName": "Node runtime image",
+      "groupSlug": "node-runtime-image"
+    },
+    {
+      "description": "Keep Helm CLI pins together",
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchPackageNames": [
+        "helm/helm"
+      ],
+      "groupName": "Helm CLI",
+      "groupSlug": "helm-cli"
+    },
+    {
+      "description": "Track Phoenix Tailwind binary version",
+      "matchDatasources": [
+        "github-releases"
+      ],
+      "matchPackageNames": [
+        "tailwindlabs/tailwindcss"
+      ],
+      "groupName": "Tailwind CSS CLI",
+      "groupSlug": "tailwind-css-cli"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update Helm CLI version used by Drone",
+      "managerFilePatterns": [
+        "/(^|/)\\.drone\\.jsonnet$/"
+      ],
+      "matchStrings": [
+        "local helmVersion = 'v(?<currentValue>[^']+)';"
+      ],
+      "depNameTemplate": "helm/helm",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "Update Docker images pinned in Drone Jsonnet",
+      "managerFilePatterns": [
+        "/(^|/)\\.drone\\.jsonnet$/"
+      ],
+      "matchStrings": [
+        "local nodeImage = '(?<depName>[^:']+):(?<currentValue>[^']+)';",
+        "image: '(?<depName>elixir):(?<currentValue>[^']+)'",
+        "image: '(?<depName>postgres):(?<currentValue>[^']+)'"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Update Tailwind CSS binary version used by the Phoenix Mix task",
+      "managerFilePatterns": [
+        "/(^|/)config/config\\.exs$/"
+      ],
+      "matchStrings": [
+        "config :tailwind,[\\s\\S]*?version: \"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "tailwindlabs/tailwindcss",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    }
+  ]
+}

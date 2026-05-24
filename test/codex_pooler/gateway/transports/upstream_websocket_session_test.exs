@@ -1,0 +1,143 @@
+defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest do
+  use ExUnit.Case, async: false
+
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Request
+  alias CodexPooler.Gateway.Transports.Websocket.WebSocketFrameWriter
+
+  @timeouts %{connect_timeout_ms: 1_000, receive_timeout_ms: 1_000}
+
+  test "reused request returns unavailable error when session process is gone" do
+    {:ok, session} = UpstreamWebSocketSession.start_link([])
+    :ok = UpstreamWebSocketSession.close(session)
+
+    request = %Request{
+      url: "https://example.com/backend-api/codex/responses",
+      headers: [],
+      payload: "{}",
+      timeouts: @timeouts,
+      writer: fn _text -> :ok end,
+      message_mapper: nil
+    }
+
+    assert {:error, %{body: "", headers: [], reason: :upstream_websocket_session_unavailable}} =
+             UpstreamWebSocketSession.request(session, request)
+  end
+
+  test "frame writer preserves websocket send failure reason and updated state" do
+    ref = make_ref()
+    updated_conn = {:updated_conn, make_ref()}
+
+    state = %{
+      conn: :original_conn,
+      ref: ref,
+      websocket: %Mint.WebSocket{},
+      retained_field: :kept
+    }
+
+    stream_request_body = fn conn, request_ref, data ->
+      assert conn == :original_conn
+      assert request_ref == ref
+      assert is_binary(data)
+
+      {:error, updated_conn, :synthetic_write_failure}
+    end
+
+    assert {:error, :synthetic_write_failure, updated_state} =
+             WebSocketFrameWriter.send_frame(
+               state,
+               {:pong, "codex-pooler"},
+               stream_request_body
+             )
+
+    assert updated_state.conn == updated_conn
+    assert %Mint.WebSocket{} = updated_state.websocket
+    assert updated_state.retained_field == :kept
+  end
+
+  test "keeps queued GenServer calls while collecting upstream websocket frames" do
+    parent = self()
+    first_release_ref = make_ref()
+    second_release_ref = make_ref()
+
+    events = [
+      %{
+        "type" => "response.created",
+        "response" => %{"id" => "resp_ws_mailbox"}
+      },
+      %{
+        "type" => "response.completed",
+        "response" => %{"id" => "resp_ws_mailbox"}
+      }
+    ]
+
+    upstream =
+      start_upstream(
+        {:sequence,
+         [
+           FakeUpstream.barrier_sse_stream(events,
+             notify: parent,
+             release_ref: first_release_ref,
+             barrier_after: 1
+           ),
+           FakeUpstream.barrier_sse_stream(events,
+             notify: parent,
+             release_ref: second_release_ref,
+             barrier_after: 1
+           )
+         ]}
+      )
+
+    {:ok, session} = UpstreamWebSocketSession.start_link([])
+
+    request =
+      %Request{
+        url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+        headers: [{"authorization", "Bearer synthetic-upstream-token"}],
+        payload:
+          Jason.encode!(%{
+            "model" => "upstream-test-model",
+            "input" => [%{"type" => "message", "role" => "user", "content" => "sample"}],
+            "stream" => true
+          }),
+        timeouts: @timeouts,
+        writer: fn text -> send(parent, {:upstream_websocket_frame, text}) end,
+        message_mapper: nil
+      }
+
+    request_task = Task.async(fn -> UpstreamWebSocketSession.request(session, request) end)
+
+    assert_receive {:fake_upstream_chunk_sent, 1}, 1_000
+    assert_receive {:fake_upstream_chunk_barrier, 1, barrier_pid, ^first_release_ref}, 1_000
+
+    send_task =
+      Task.async(fn ->
+        UpstreamWebSocketSession.send_request_frame(
+          session,
+          Jason.encode!(%{"type" => "response.processed", "response_id" => "resp_ws_mailbox"})
+        )
+      end)
+
+    send(barrier_pid, {:fake_upstream_release_chunk, first_release_ref})
+
+    assert {:ok, %{terminal: "response.completed", status: 200}} = Task.await(request_task, 1_000)
+    assert_receive {:fake_upstream_chunk_sent, 2}, 1_000
+    assert_receive {:fake_upstream_chunk_sent, 3}, 1_000
+
+    assert {:ok, :sent} = Task.await(send_task, 1_000)
+    assert_receive {:fake_upstream_chunk_sent, 1}, 1_000
+    assert_receive {:fake_upstream_chunk_barrier, 1, barrier_pid, ^second_release_ref}, 1_000
+
+    send(barrier_pid, {:fake_upstream_release_chunk, second_release_ref})
+
+    assert_receive {:fake_upstream_chunk_sent, 2}, 1_000
+    assert_receive {:fake_upstream_chunk_sent, 3}, 1_000
+  end
+
+  defp start_upstream(mode) do
+    {:ok, upstream} = FakeUpstream.start_link(mode)
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    upstream
+  end
+end

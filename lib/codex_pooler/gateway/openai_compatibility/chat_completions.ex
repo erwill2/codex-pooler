@@ -1,0 +1,343 @@
+defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
+  @moduledoc false
+
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+
+  @spec normalize_response(map(), map()) :: map()
+  def normalize_response(decoded, chat_payload) when is_map(decoded) do
+    message = %{"role" => "assistant", "content" => output_text(decoded)}
+    message = put_if_present(message, "tool_calls", output_tool_calls(decoded))
+
+    %{
+      "id" => response_id(decoded),
+      "object" => "chat.completion",
+      "created" => created(decoded),
+      "model" => model(decoded, chat_payload),
+      "choices" => [
+        %{
+          "index" => 0,
+          "message" => message,
+          "finish_reason" => finish_reason(decoded)
+        }
+      ]
+    }
+    |> put_if_present("usage", usage(decoded))
+  end
+
+  @type stream_state :: %{
+          required(:buffer) => binary(),
+          required(:id) => String.t(),
+          required(:created) => integer(),
+          required(:model) => String.t() | nil,
+          required(:role_sent?) => boolean()
+        }
+
+  @spec stream_state(map()) :: stream_state()
+  def stream_state(chat_payload), do: initial_state(chat_payload)
+
+  @spec normalize_stream_data(binary(), stream_state()) :: {binary(), stream_state()}
+  def normalize_stream_data(data, state) when is_binary(data) and is_map(state) do
+    {blocks, buffer} = StreamProtocol.complete_sse_blocks(state.buffer <> data, bounded?: false)
+
+    {iodata, state} =
+      Enum.map_reduce(blocks, %{state | buffer: buffer}, fn block, stream_state ->
+        normalize_stream_block(block, stream_state)
+      end)
+
+    state = if terminal_blocks?(blocks), do: %{state | buffer: ""}, else: state
+
+    {IO.iodata_to_binary(iodata), state}
+  end
+
+  def normalize_stream_data(data, state), do: {data, state}
+
+  defp normalize_stream_block("data: [DONE]", state), do: {[], state}
+
+  defp normalize_stream_block(block, state) do
+    event_type = StreamProtocol.sse_field(block, "event")
+    decoded = block |> StreamProtocol.sse_field("data") |> StreamProtocol.decode_sse_data()
+    type = event_type || decoded_string(decoded, "type")
+
+    normalize_stream_event(type, decoded, state)
+  end
+
+  defp normalize_stream_event("response.created", decoded, state) do
+    state
+    |> sync_response_state(decoded)
+    |> maybe_role_chunk()
+  end
+
+  defp normalize_stream_event("response.output_text.delta", decoded, state) do
+    state = sync_response_state(state, decoded)
+    text_delta_chunk(decoded_string(decoded, "delta") || "", state)
+  end
+
+  defp normalize_stream_event(type, decoded, state)
+       when type in ["response.output_item.added", "response.output_item.done"] do
+    state = sync_response_state(state, decoded)
+    tool_call_item_chunk(decoded["item"], state)
+  end
+
+  defp normalize_stream_event("response.function_call_arguments.delta", decoded, state) do
+    state = sync_response_state(state, decoded)
+    tool_call_arguments_chunk(decoded, state)
+  end
+
+  defp normalize_stream_event(type, decoded, state) when is_binary(type) do
+    cond do
+      codex_event?(type) ->
+        {[], state}
+
+      terminal_event?(type) ->
+        terminal_stream_chunk(decoded, sync_response_state(state, decoded))
+
+      true ->
+        {[], state}
+    end
+  end
+
+  defp normalize_stream_event(_type, _decoded, state), do: {[], state}
+
+  defp maybe_role_chunk(%{role_sent?: true} = state), do: {[], state}
+
+  defp maybe_role_chunk(state) do
+    {chat_sse_chunk(%{"role" => "assistant"}, nil, %{state | role_sent?: true}),
+     %{state | role_sent?: true}}
+  end
+
+  defp text_delta_chunk("", state), do: {[], state}
+
+  defp text_delta_chunk(delta, %{role_sent?: false} = state) do
+    {prefix, state} = maybe_role_chunk(state)
+    {[prefix, chat_sse_chunk(%{"content" => delta}, nil, state)], state}
+  end
+
+  defp text_delta_chunk(delta, state),
+    do: {chat_sse_chunk(%{"content" => delta}, nil, state), state}
+
+  defp tool_call_item_chunk(%{"type" => "function_call"} = item, state) do
+    index = tool_call_index(state, item)
+
+    delta = %{
+      "tool_calls" => [
+        %{
+          "index" => index,
+          "id" => tool_call_id(item),
+          "type" => "function",
+          "function" => %{
+            "name" => decoded_string(item, "name") || "tool",
+            "arguments" => decoded_string(item, "arguments") || ""
+          }
+        }
+      ]
+    }
+
+    {chat_sse_chunk(delta, nil, state), state}
+  end
+
+  defp tool_call_item_chunk(_item, state), do: {[], state}
+
+  defp tool_call_arguments_chunk(decoded, state) do
+    index = Map.get(decoded, "output_index") || 0
+
+    delta = %{
+      "tool_calls" => [
+        %{
+          "index" => index,
+          "function" => %{"arguments" => decoded_string(decoded, "delta") || ""}
+        }
+      ]
+    }
+
+    {chat_sse_chunk(delta, nil, state), state}
+  end
+
+  defp terminal_stream_chunk(decoded, %{role_sent?: false} = state) do
+    {prefix, state} = maybe_role_chunk(state)
+    {[prefix, terminal_stream_chunk(decoded, state) |> elem(0)], state}
+  end
+
+  defp terminal_stream_chunk(decoded, state) do
+    finish_reason = finish_reason(response_map(decoded))
+
+    {[chat_sse_chunk(%{}, finish_reason, state), "data: [DONE]\n\n"], state}
+  end
+
+  defp chat_sse_chunk(delta, finish_reason, state) do
+    payload = %{
+      "id" => state.id,
+      "object" => "chat.completion.chunk",
+      "created" => state.created,
+      "model" => state.model,
+      "choices" => [
+        %{
+          "index" => 0,
+          "delta" => delta,
+          "finish_reason" => finish_reason
+        }
+      ]
+    }
+
+    ["data: ", Jason.encode!(payload), "\n\n"]
+  end
+
+  defp initial_state(chat_payload) do
+    %{
+      buffer: "",
+      id: "chatcmpl_" <> Ecto.UUID.generate(),
+      created: System.system_time(:second),
+      model: Map.get(chat_payload, "model"),
+      role_sent?: false
+    }
+  end
+
+  defp sync_response_state(state, decoded) do
+    response = response_map(decoded)
+
+    %{
+      state
+      | id: response_id(response),
+        created: created(response),
+        model: model(response, state)
+    }
+  end
+
+  defp response_id(decoded),
+    do: decoded_string(decoded, "id") || "chatcmpl_" <> Ecto.UUID.generate()
+
+  defp created(%{"created" => created}) when is_integer(created), do: created
+  defp created(%{"created_at" => created}) when is_integer(created), do: created
+  defp created(_decoded), do: System.system_time(:second)
+
+  defp model(decoded, %{"model" => model}) when is_binary(model),
+    do: decoded_string(decoded, "model") || model
+
+  defp model(decoded, %{model: model}) when is_binary(model),
+    do: decoded_string(decoded, "model") || model
+
+  defp model(decoded, _fallback), do: decoded_string(decoded, "model") || "unknown"
+
+  defp output_text(decoded) do
+    decoded
+    |> output_items()
+    |> Enum.flat_map(fn
+      %{"content" => content} -> List.wrap(content)
+      %{"text" => text} when is_binary(text) -> [%{"text" => text}]
+      _item -> []
+    end)
+    |> Enum.map(fn
+      %{"text" => text} when is_binary(text) -> text
+      %{"type" => "output_text", "text" => text} when is_binary(text) -> text
+      _content -> ""
+    end)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("")
+  end
+
+  defp output_tool_calls(decoded) do
+    decoded
+    |> output_items()
+    |> Enum.filter(&(Map.get(&1, "type") == "function_call"))
+    |> Enum.with_index()
+    |> Enum.map(fn {item, index} ->
+      %{
+        "id" => tool_call_id(item),
+        "type" => "function",
+        "function" => %{
+          "name" => decoded_string(item, "name") || "tool",
+          "arguments" => decoded_string(item, "arguments") || ""
+        },
+        "index" => index
+      }
+    end)
+    |> case do
+      [] -> nil
+      tool_calls -> tool_calls
+    end
+  end
+
+  defp output_items(decoded) do
+    decoded
+    |> response_map()
+    |> case do
+      %{"output" => output} -> List.wrap(output)
+      _response -> []
+    end
+  end
+
+  defp usage(decoded) do
+    usage = Map.get(decoded, "usage") || get_in(decoded, ["response", "usage"])
+
+    case usage do
+      %{} ->
+        prompt_tokens = Map.get(usage, "prompt_tokens") || Map.get(usage, "input_tokens")
+        completion_tokens = Map.get(usage, "completion_tokens") || Map.get(usage, "output_tokens")
+
+        %{
+          "prompt_tokens" => prompt_tokens,
+          "completion_tokens" => completion_tokens,
+          "total_tokens" =>
+            Map.get(usage, "total_tokens") || total_tokens(prompt_tokens, completion_tokens)
+        }
+        |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+        |> Map.new()
+
+      _usage ->
+        nil
+    end
+  end
+
+  defp total_tokens(prompt_tokens, completion_tokens)
+       when is_integer(prompt_tokens) and is_integer(completion_tokens),
+       do: prompt_tokens + completion_tokens
+
+  defp total_tokens(_prompt_tokens, _completion_tokens), do: nil
+
+  defp finish_reason(decoded) do
+    status = decoded_string(decoded, "status")
+
+    cond do
+      status in [nil, "completed", "in_progress"] -> "stop"
+      status == "incomplete" -> "length"
+      status == "failed" -> "stop"
+      true -> "stop"
+    end
+  end
+
+  defp response_map(%{"response" => %{} = response}), do: response
+  defp response_map(%{} = decoded), do: decoded
+
+  defp tool_call_id(item), do: decoded_string(item, "call_id") || decoded_string(item, "id")
+
+  defp tool_call_index(_state, %{"output_index" => index}) when is_integer(index), do: index
+  defp tool_call_index(_state, _item), do: 0
+
+  defp terminal_blocks?(blocks) do
+    Enum.any?(blocks, fn
+      "data: [DONE]" ->
+        true
+
+      block ->
+        event_type = StreamProtocol.sse_field(block, "event")
+        decoded = block |> StreamProtocol.sse_field("data") |> StreamProtocol.decode_sse_data()
+        terminal_event?(event_type || decoded_string(decoded, "type"))
+    end)
+  end
+
+  defp terminal_event?(type),
+    do: type in ["response.completed", "response.failed", "response.incomplete"]
+
+  defp codex_event?(type) when is_binary(type), do: String.starts_with?(type, "codex.")
+
+  defp decoded_string(decoded, key) when is_map(decoded) do
+    case Map.get(decoded, key) do
+      value when is_binary(value) -> value
+      _value -> nil
+    end
+  end
+
+  defp decoded_string(_decoded, _key), do: nil
+
+  defp put_if_present(map, _key, nil), do: map
+  defp put_if_present(map, key, value), do: Map.put(map, key, value)
+end

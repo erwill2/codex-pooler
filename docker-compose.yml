@@ -1,0 +1,78 @@
+name: codex-pooler
+
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-codex_pooler_prod}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - codex-pooler-postgres:/var/lib/postgresql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  migrate:
+    image: ${CODEX_POOLER_IMAGE:-ghcr.io/icoretech/codex-pooler}:${CODEX_POOLER_IMAGE_TAG:-latest}
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE in .env}
+      PHX_HOST: ${PHX_HOST:-localhost}
+      POOL_SIZE: ${POOL_SIZE:-10}
+      ECTO_IPV6: ${ECTO_IPV6:-false}
+      OBAN_MODE: web
+      OBAN_JOBS_QUEUE_LIMIT: ${OBAN_JOBS_QUEUE_LIMIT:-8}
+      CODEX_POOLER_TOTP_ENCRYPTION_KEY: ${CODEX_POOLER_TOTP_ENCRYPTION_KEY:?set CODEX_POOLER_TOTP_ENCRYPTION_KEY in .env}
+      CODEX_POOLER_TOTP_KEY_VERSION: ${CODEX_POOLER_TOTP_KEY_VERSION:-v1}
+      CODEX_POOLER_UPSTREAM_SECRET_KEY: ${CODEX_POOLER_UPSTREAM_SECRET_KEY:?set CODEX_POOLER_UPSTREAM_SECRET_KEY in .env}
+      CODEX_POOLER_UPSTREAM_SECRET_KEY_VERSION: ${CODEX_POOLER_UPSTREAM_SECRET_KEY_VERSION:-v1}
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -e
+        env -u PHX_SERVER /app/bin/codex_pooler eval "CodexPooler.Release.migrate()"
+        env -u PHX_SERVER /app/bin/codex_pooler eval "CodexPooler.Catalog.import_openai_pricing_from_priv()"
+
+  app:
+    image: ${CODEX_POOLER_IMAGE:-ghcr.io/icoretech/codex-pooler}:${CODEX_POOLER_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PHX_SERVER: "true"
+      PORT: "4000"
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      SECRET_KEY_BASE: ${SECRET_KEY_BASE:?set SECRET_KEY_BASE in .env}
+      PHX_HOST: ${PHX_HOST:-localhost}
+      POOL_SIZE: ${POOL_SIZE:-10}
+      ECTO_IPV6: ${ECTO_IPV6:-false}
+      OBAN_MODE: ${OBAN_MODE:-all}
+      OBAN_JOBS_QUEUE_LIMIT: ${OBAN_JOBS_QUEUE_LIMIT:-8}
+      CODEX_POOLER_TOTP_ENCRYPTION_KEY: ${CODEX_POOLER_TOTP_ENCRYPTION_KEY:?set CODEX_POOLER_TOTP_ENCRYPTION_KEY in .env}
+      CODEX_POOLER_TOTP_KEY_VERSION: ${CODEX_POOLER_TOTP_KEY_VERSION:-v1}
+      CODEX_POOLER_UPSTREAM_SECRET_KEY: ${CODEX_POOLER_UPSTREAM_SECRET_KEY:?set CODEX_POOLER_UPSTREAM_SECRET_KEY in .env}
+      CODEX_POOLER_UPSTREAM_SECRET_KEY_VERSION: ${CODEX_POOLER_UPSTREAM_SECRET_KEY_VERSION:-v1}
+    ports:
+      - "${CODEX_POOLER_HTTP_PORT:-4000}:4000"
+
+volumes:
+  codex-pooler-postgres:

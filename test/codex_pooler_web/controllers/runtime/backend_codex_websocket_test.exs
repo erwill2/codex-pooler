@@ -1,0 +1,3493 @@
+defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
+  use CodexPoolerWeb.ConnCase, async: false
+
+  import Ecto.Query
+  import ExUnit.CaptureLog
+  import CodexPoolerWeb.Runtime.BackendCodexTestSupport
+
+  alias CodexPooler.Access
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
+  alias CodexPooler.Events
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway
+  alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+
+  alias CodexPooler.Gateway.Persistence.{
+    BridgeAffinity,
+    BridgeDemotion,
+    BridgeOwnerLease,
+    BridgeSessionAlias,
+    CodexSession,
+    CodexTurn,
+    RoutingCircuitState
+  }
+
+  alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
+  alias CodexPooler.Gateway.Service
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
+  alias CodexPooler.Pools
+  alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Assignments.PoolAssignments
+  alias CodexPoolerWeb.CodexResponsesSocket
+  alias Ecto.Adapters.SQL.Sandbox
+
+  @websocket_frame_timeout 1_000
+  @large_websocket_frame_timeout 5_000
+
+  test "GET /backend-api/codex/responses requires websocket upgrade", %{conn: conn} do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+
+    conn = conn |> auth(setup) |> get("/backend-api/codex/responses")
+
+    assert json_response(conn, 400)["error"]["code"] == "websocket_upgrade_required"
+  end
+
+  test "GET /backend-api/codex/responses replaces whitespace-only websocket turn state" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    port = start_public_endpoint!()
+
+    {conn, _websocket, _ref, response_headers} =
+      public_websocket_connect_with_headers!(port, setup, "   ")
+
+    try do
+      assert {"x-codex-turn-state", turn_state} =
+               List.keyfind(response_headers, "x-codex-turn-state", 0)
+
+      assert {:ok, ^turn_state} = Ecto.UUID.cast(turn_state)
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  test "GET /backend-api/codex/responses upgrades and dispatches through the public websocket route" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_public_ws_route",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    turn_state = "public-ws-route-#{System.unique_integer([:positive])}"
+
+    {conn, websocket, ref} = public_websocket_connect!(port, setup, turn_state)
+
+    try do
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+      assert %{"id" => "resp_public_ws_route"} = Jason.decode!(frame)
+
+      assert_receive {Events,
+                      %{
+                        reason: "request_finalized",
+                        payload: %{"request_id" => request_id, "status" => "succeeded"}
+                      }},
+                     @websocket_frame_timeout
+
+      request = Repo.get!(Request, request_id)
+      assert request.endpoint == "/backend-api/codex/responses"
+      assert request.transport == "websocket"
+      assert request.status == "succeeded"
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.method == "WEBSOCKET"
+      assert captured.path == "/backend-api/codex/responses"
+      refute inspect({request.request_metadata, captured.json}) =~ setup.authorization
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  test "GET /backend-api/codex/v1/responses upgrades through the websocket alias route" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_public_ws_v1_alias_route",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    turn_state = "public-ws-v1-alias-route-#{System.unique_integer([:positive])}"
+
+    {conn, websocket, ref} =
+      public_websocket_connect!(port, setup, turn_state, "/backend-api/codex/v1/responses")
+
+    try do
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+      assert %{"id" => "resp_public_ws_v1_alias_route"} = Jason.decode!(frame)
+
+      assert_receive {Events,
+                      %{
+                        reason: "request_finalized",
+                        payload: %{"request_id" => request_id, "status" => "succeeded"}
+                      }},
+                     @websocket_frame_timeout
+
+      request = Repo.get!(Request, request_id)
+      assert request.endpoint == "/backend-api/codex/responses"
+      assert request.transport == "websocket"
+      assert request.status == "succeeded"
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.method == "WEBSOCKET"
+      assert captured.path == "/backend-api/codex/responses"
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  @tag :websocket_session_success
+  test "websocket response dispatch persists a succeeded session turn" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_backend",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-success"})
+
+    result =
+      execute_websocket_response(
+        auth,
+        Jason.encode!(%{"model" => setup.model.exposed_model_id, "input" => "hello over ws"}),
+        %{
+          request_id: "ws-request-#{System.unique_integer([:positive])}",
+          client_ip: "127.0.0.1",
+          codex_session: session
+        },
+        fn frame -> send(self(), {:websocket_frame, frame}) end
+      )
+
+    assert result == :ok
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_backend"} = Jason.decode!(frame)
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "websocket"
+    assert request.status == "succeeded"
+    assert request.request_metadata["codex_session_id"] == session.id
+
+    assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+    assert turn.request_id == request.id
+    assert turn.status == "succeeded"
+    assert turn.transport_kind == "websocket"
+    assert turn.completed_at
+    assert turn.first_visible_output_at
+
+    session = Repo.get!(CodexSession, session.id)
+    assert session.status == "active"
+    assert session.pool_upstream_assignment_id == setup.assignment.id
+  end
+
+  test "websocket response dispatch accepts prebuilt typed request options" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_typed_options",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-typed-options"})
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "input" => "hello over typed ws",
+      "stream" => true
+    }
+
+    options =
+      %{request_id: "ws-typed-options", client_ip: "127.0.0.1", codex_session: session}
+      |> RequestOptions.build("/backend-api/codex/responses", payload)
+      |> RequestOptions.put_routing(quota_decision: %{"summary" => "prebuilt"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(payload),
+               options,
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_typed_options"} = Jason.decode!(frame)
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "WEBSOCKET"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "websocket"
+    assert request.status == "succeeded"
+    assert request.request_metadata["codex_session_id"] == session.id
+  end
+
+  test "websocket response dispatch returns a structured error for non-text frames" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert {:error,
+            %{
+              status: 400,
+              code: "invalid_request",
+              message: "websocket message must be a text JSON frame"
+            }} =
+             execute_websocket_response(
+               auth,
+               {:binary, <<0, 1, 2>>},
+               %{},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    refute_received {:websocket_frame, _frame}
+    assert FakeUpstream.requests(upstream) == []
+  end
+
+  test "public gateway session and turn calls accept keyword and typed request options" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(
+        auth,
+        accepted_turn_state: "stable-ws-public-typed-options",
+        owner_instance_id: "node-a"
+      )
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "input" => "gateway typed options"
+    }
+
+    correlation_id = "ws-public-typed-options-#{System.unique_integer([:positive])}"
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               auth,
+               setup.model,
+               payload,
+               %{
+                 endpoint: "/backend-api/codex/responses",
+                 transport: "websocket",
+                 correlation_id: correlation_id,
+                 request_metadata: %{"codex_session_id" => session.id}
+               }
+             )
+
+    options =
+      %{
+        codex_turn_id: correlation_id,
+        pool_upstream_assignment_id: setup.assignment.id
+      }
+      |> RequestOptions.build("/backend-api/codex/responses", payload)
+
+    assert {:ok, turn} = Gateway.start_codex_turn(session, reserved.request, options)
+
+    assert turn.request_id == reserved.request.id
+    assert turn.transport_kind == "websocket"
+
+    session = Repo.get!(CodexSession, session.id)
+    assert session.owner_instance_id == "node-a"
+    assert session.pool_upstream_assignment_id == setup.assignment.id
+  end
+
+  @tag :websocket_response_create_envelope
+  test "websocket response.create envelopes are unwrapped and SSE events are pushed as websocket messages" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_sse",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-envelope"})
+
+    result =
+      execute_websocket_response(
+        auth,
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{"type" => "message", "role" => "user", "content" => "hello"},
+            %{
+              "type" => "message",
+              "role" => "assistant",
+              "content" => nil,
+              "encrypted_content" => "sample-encrypted-content"
+            }
+          ],
+          "tools" => [],
+          "tool_choice" => "auto",
+          "parallel_tool_calls" => true,
+          "store" => false,
+          "stream" => true,
+          "include" => [],
+          "generate" => true,
+          "previous_response_id" => "resp_ws_previous"
+        }),
+        %{request_id: "ws-envelope", codex_session: session},
+        fn frame -> send(self(), {:websocket_frame, frame}) end
+      )
+
+    assert result == :ok
+    assert_receive {:websocket_frame, completed_frame}, @websocket_frame_timeout
+
+    assert %{"id" => "resp_ws_sse"} = Jason.decode!(completed_frame)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "WEBSOCKET"
+    assert captured.json["type"] == "response.create"
+    assert captured.json["generate"] == true
+    assert captured.json["previous_response_id"] == "resp_ws_previous"
+    assert captured.json["instructions"] == ""
+
+    assert captured.json["input"] == [
+             %{"type" => "message", "role" => "user", "content" => "hello"},
+             %{
+               "type" => "message",
+               "role" => "assistant",
+               "content" => nil,
+               "encrypted_content" => "sample-encrypted-content"
+             }
+           ]
+
+    assert captured.json["stream"] == true
+    assert captured.path == "/backend-api/codex/responses"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "websocket"
+    assert request.status == "succeeded"
+    assert request.usage_status == "usage_known"
+  end
+
+  @tag :websocket_response_create_image_payload
+  test "websocket response.create preserves input_image payloads end to end" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          "event: response.created\r\ndata: #{Jason.encode!(%{"type" => "response.created", "response" => %{"id" => "resp_ws_image"}})}\r\n\r\n",
+          "event: response.completed\r\ndata: #{Jason.encode!(%{"type" => "response.completed", "response" => %{"id" => "resp_ws_image", "usage" => %{"input_tokens" => 5, "output_tokens" => 2, "total_tokens" => 7}}})}\r\n\r\n"
+        ])
+      )
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "supported_input_modalities" => ["text", "image"],
+          "supports_image_detail_original" => true
+        }
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-image-payload"})
+
+    input = [
+      %{
+        "type" => "message",
+        "role" => "user",
+        "content" => [
+          %{"type" => "input_text", "text" => "describe this image"},
+          %{
+            "type" => "input_image",
+            "image_url" => "https://example.com/test-image.png",
+            "detail" => "high"
+          }
+        ]
+      }
+    ]
+
+    result =
+      execute_websocket_response(
+        auth,
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => input,
+          "stream" => true,
+          "generate" => true
+        }),
+        %{request_id: "ws-image-payload", codex_session: session},
+        fn frame -> send(self(), {:websocket_frame, frame}) end
+      )
+
+    assert result == :ok
+    assert_receive {:websocket_frame, created_frame}, @websocket_frame_timeout
+    assert_receive {:websocket_frame, completed_frame}, @websocket_frame_timeout
+    assert %{"type" => "response.created"} = Jason.decode!(created_frame)
+    assert %{"type" => "response.completed"} = Jason.decode!(completed_frame)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "WEBSOCKET"
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["type"] == "response.create"
+    assert captured.json["input"] == input
+  end
+
+  test "websocket response.create rejects unsupported input_image references before dispatch" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_unexpected"}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "supported_input_modalities" => ["text", "image"],
+          "supports_image_detail_original" => true
+        }
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    sentinel_file_id = "file_ws_reference_do_not_log"
+
+    assert {:error,
+            %{
+              status: 400,
+              code: "unsupported_input_image_format",
+              param: "input",
+              message: message
+            }} =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [
+                   %{
+                     "type" => "message",
+                     "role" => "user",
+                     "content" => [
+                       %{"type" => "input_text", "text" => "describe this image"},
+                       %{"type" => "input_image", "file_id" => sentinel_file_id}
+                     ]
+                   }
+                 ],
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: "ws-unsupported-image"},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert message =~
+             "backend-api/files uploads are not valid Responses input_image.file_id references"
+
+    refute_received {:websocket_frame, _frame}
+    assert FakeUpstream.requests(upstream) == []
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "websocket"
+    assert request.status == "rejected"
+    assert request.last_error_code == "unsupported_input_image_format"
+    assert request.request_metadata["gateway_denial"]["param"] == "input"
+    refute inspect(request.request_metadata) =~ sentinel_file_id
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+  end
+
+  @tag :websocket_large_completion_frame
+  test "websocket streaming preserves large terminal response completed payloads" do
+    completed_payload = %{
+      "type" => "response.completed",
+      "response" => %{
+        "id" => "resp_ws_large_completed",
+        "metadata" => %{"padding" => String.duplicate("x", 17_000)},
+        "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+      }
+    }
+
+    completed_event = "event: response.completed\ndata: #{Jason.encode!(completed_payload)}\n\n"
+    {completed_prefix, completed_suffix} = String.split_at(completed_event, 17_000)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          "event: response.created\ndata: #{Jason.encode!(%{"type" => "response.created", "response" => %{"id" => "resp_ws_large_completed"}})}\n\n",
+          completed_prefix,
+          completed_suffix
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-large-completed"})
+
+    parent = self()
+
+    result =
+      execute_websocket_response(
+        auth,
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+          "stream" => true,
+          "generate" => true
+        }),
+        %{request_id: "ws-large-completed", codex_session: session},
+        fn frame -> send(parent, {:websocket_frame, frame}) end
+      )
+
+    assert result == :ok
+
+    # The completed event is intentionally split around a large payload; this
+    # regression only needs the recomposed terminal frame. Non-terminal frame
+    # forwarding is covered by the adjacent websocket streaming tests.
+    frames =
+      receive_websocket_frames_by_type(
+        ["response.completed"],
+        @large_websocket_frame_timeout
+      )
+
+    assert %{"type" => "response.completed", "response" => %{"id" => "resp_ws_large_completed"}} =
+             frames["response.completed"]
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "websocket"
+    assert request.status == "succeeded"
+    assert request.usage_status == "usage_known"
+  end
+
+  test "websocket stream conversion preserves response completed events split across SSE chunks" do
+    created_event =
+      "event: response.created\ndata: #{Jason.encode!(%{"type" => "response.created", "response" => %{"id" => "resp_ws_split_sse_completed"}})}\n\n"
+
+    completed_payload = %{
+      "type" => "response.completed",
+      "response" => %{
+        "id" => "resp_ws_split_sse_completed",
+        "metadata" => %{"padding" => String.duplicate("x", 17_000)},
+        "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+      }
+    }
+
+    completed_event = "event: response.completed\ndata: #{Jason.encode!(completed_payload)}\n\n"
+    completed_prefix = String.slice(completed_event, 0, 24)
+    completed_middle = String.slice(completed_event, 24, 17_000)
+    completed_suffix = String.slice(completed_event, 17_024..-1//1)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          created_event,
+          completed_prefix,
+          completed_middle,
+          completed_suffix
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    parent = self()
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+      "stream" => true
+    }
+
+    assert {:ok, %{websocket_stream: stream}} =
+             Service.execute(
+               auth,
+               "/backend-api/codex/responses",
+               payload,
+               RequestOptions.build(
+                 %{
+                   request_id: "ws-split-sse-conversion",
+                   upstream_endpoint: "/backend-api/codex/responses",
+                   websocket_writer: fn frame -> send(parent, {:websocket_frame, frame}) end
+                 },
+                 "/backend-api/codex/responses",
+                 payload
+               )
+             )
+
+    assert :ok = stream.()
+
+    frames =
+      receive_websocket_frames_by_type(
+        ["response.created", "response.completed"],
+        @large_websocket_frame_timeout
+      )
+
+    assert %{"type" => "response.created", "response" => %{"id" => "resp_ws_split_sse_completed"}} =
+             frames["response.created"]
+
+    assert %{
+             "type" => "response.completed",
+             "response" => %{"id" => "resp_ws_split_sse_completed"}
+           } =
+             frames["response.completed"]
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "POST"
+    assert captured.path == "/backend-api/codex/responses"
+  end
+
+  @tag :websocket_previous_response_bridge
+  test "websocket continuity turns preserve client supplied previous_response_id for upstream context" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_bridge",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-previous-bridge"})
+
+    first_payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+      "stream" => true,
+      "generate" => true
+    }
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(first_payload),
+               %{request_id: "ws-previous-bridge-first", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, :first, frame}) end
+             )
+
+    assert_received {:websocket_frame, :first, first_frame}
+    assert %{"id" => "resp_ws_bridge"} = Jason.decode!(first_frame)
+
+    second_payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "input" => [%{"type" => "message", "role" => "user", "content" => "second"}],
+      "stream" => true,
+      "generate" => true,
+      "previous_response_id" => "resp_ws_bridge"
+    }
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(second_payload),
+               %{request_id: "ws-previous-bridge-second", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, :second, frame}) end
+             )
+
+    assert_received {:websocket_frame, :second, second_frame}
+    assert %{"id" => "resp_ws_bridge"} = Jason.decode!(second_frame)
+
+    assert [first_request, second_request] = FakeUpstream.requests(upstream)
+    assert first_request.method == "WEBSOCKET"
+    assert second_request.method == "WEBSOCKET"
+    assert first_request.json["type"] == "response.create"
+    assert second_request.json["type"] == "response.create"
+    assert first_request.json["generate"] == true
+    assert second_request.json["generate"] == true
+    refute Map.has_key?(first_request.json, "previous_response_id")
+    assert second_request.json["previous_response_id"] == "resp_ws_bridge"
+
+    assert second_request.json["input"] == [
+             %{"type" => "message", "role" => "user", "content" => "second"}
+           ]
+
+    assert [first_log, second_log] =
+             Repo.all(
+               from request in Request,
+                 where: request.pool_id == ^setup.pool.id,
+                 order_by: [asc: request.admitted_at]
+             )
+
+    assert first_log.status == "succeeded"
+    assert second_log.status == "succeeded"
+    assert first_log.response_status_code == 200
+    assert second_log.response_status_code == 200
+
+    assert [first_turn, second_turn] =
+             Repo.all(
+               from turn in CodexTurn,
+                 where: turn.codex_session_id == ^session.id,
+                 order_by: [asc: turn.turn_sequence]
+             )
+
+    assert first_turn.status == "succeeded"
+    assert second_turn.status == "succeeded"
+    assert second_turn.turn_sequence == 2
+  end
+
+  @tag :websocket_persistent_upstream_session
+  test "downstream websocket keeps one upstream websocket session across continuation turns" do
+    previous_env =
+      Application.get_env(
+        :codex_pooler,
+        UpstreamWebSocketSession,
+        []
+      )
+
+    Application.put_env(:codex_pooler, UpstreamWebSocketSession, keepalive_interval_ms: 20)
+
+    on_exit(fn ->
+      Application.put_env(
+        :codex_pooler,
+        UpstreamWebSocketSession,
+        previous_env
+      )
+    end)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_persistent",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    FakeUpstream.notify_websocket_controls(upstream, self())
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-persistent-connection",
+          accepted_turn_state: "stable-ws-persistent-connection",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_persistent"} = Jason.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+      assert_receive {:fake_upstream_websocket_control, :ping, 1}, 1_000
+
+      processed_payload =
+        Jason.encode!(%{
+          "type" => "response.processed",
+          "response_id" => "resp_ws_persistent"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({processed_payload, [opcode: :text]}, state)
+
+      assert {:ok, state} = receive_socket_done(state)
+
+      second_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_sample",
+              "output" => "sample output"
+            }
+          ],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_persistent"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_persistent"} = Jason.decode!(second_frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, processed_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.method == "WEBSOCKET"
+      assert processed_request.method == "WEBSOCKET"
+      assert second_request.method == "WEBSOCKET"
+      assert first_request.websocket_connection_id == second_request.websocket_connection_id
+      assert processed_request.websocket_connection_id == first_request.websocket_connection_id
+      refute Map.has_key?(first_request.json, "previous_response_id")
+
+      assert processed_request.json == %{
+               "response_id" => "resp_ws_persistent",
+               "type" => "response.processed"
+             }
+
+      assert second_request.json["previous_response_id"] == "resp_ws_persistent"
+
+      assert second_request.json["input"] == [
+               %{
+                 "call_id" => "call_sample",
+                 "output" => "sample output",
+                 "type" => "function_call_output"
+               }
+             ]
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "persistent upstream websocket reconnects once when the prior connection closed before the next turn" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_reconnected",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-reconnect-stale-upstream",
+          accepted_turn_state: "stable-ws-reconnect-stale-upstream",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_reconnected"} = Jason.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      assert :ok = FakeUpstream.close_websocket_connections(upstream)
+
+      second_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "second"}],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_reconnected"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_reconnected"} = Jason.decode!(second_frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.websocket_connection_id != second_request.websocket_connection_id
+      assert second_request.json["previous_response_id"] == "resp_ws_reconnected"
+
+      assert [first_log, second_log] =
+               Repo.all(
+                 from(r in Request,
+                   where: r.pool_id == ^setup.pool.id,
+                   order_by: [asc: r.admitted_at]
+                 )
+               )
+
+      assert first_log.status == "succeeded"
+      assert second_log.status == "succeeded"
+      assert second_log.last_error_code == nil
+      assert Repo.all(from(d in BridgeDemotion)) == []
+      assert Repo.all(from(c in RoutingCircuitState)) == []
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "persistent upstream websocket does not reconnect after a partial response body" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_partial_close",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-partial-close-no-reconnect",
+          accepted_turn_state: "stable-ws-partial-close-no-reconnect",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_partial_close"} = Jason.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      FakeUpstream.set_mode(
+        upstream,
+        FakeUpstream.websocket_sse_then_close(
+          [
+            {"response.output_text.delta",
+             %{
+               "type" => "response.output_text.delta",
+               "response_id" => "resp_ws_partial_close",
+               "output_index" => 0,
+               "content_index" => 0,
+               "delta" => "partial"
+             }}
+          ],
+          reason: "fake upstream closed after partial frame"
+        )
+      )
+
+      second_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "second"}],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_partial_close"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, partial_frame}, state} = receive_socket_push(state)
+
+      assert %{"type" => "response.output_text.delta", "delta" => "partial"} =
+               Jason.decode!(partial_frame)
+
+      assert {:push, {:text, error_frame}, _state} = receive_socket_done(state)
+
+      assert %{"type" => "error", "error" => %{"code" => "upstream_request_failed"}} =
+               Jason.decode!(error_frame)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.websocket_connection_id == second_request.websocket_connection_id
+      assert second_request.json["previous_response_id"] == "resp_ws_partial_close"
+
+      assert [first_log, second_log] =
+               Repo.all(
+                 from(r in Request,
+                   where: r.pool_id == ^setup.pool.id,
+                   order_by: [asc: r.admitted_at]
+                 )
+               )
+
+      assert first_log.status == "succeeded"
+      assert second_log.status == "failed"
+      assert second_log.transport == "websocket"
+      assert second_log.last_error_code == "upstream_stream_error"
+
+      assert [demotion] = Repo.all(from(d in BridgeDemotion))
+      assert demotion.pool_upstream_assignment_id == setup.assignment.id
+      assert demotion.reason_code == "upstream_stream_error"
+
+      assert [circuit] =
+               Repo.all(from(c in RoutingCircuitState, where: c.route_class == "proxy_websocket"))
+
+      assert circuit.pool_upstream_assignment_id == setup.assignment.id
+      assert circuit.reason_code == "upstream_stream_error"
+      assert circuit.failure_count == 1
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "concurrent downstream websocket frames do not queue behind the active upstream turn" do
+    release_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.barrier_sse_stream(
+          [
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "id" => "resp_ws_parallel",
+                 "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+               }
+             }}
+          ],
+          barrier_after: 0,
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-concurrent-frames",
+          accepted_turn_state: "stable-ws-concurrent-frames",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "main turn"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert_receive {:fake_upstream_chunk_barrier, 0, first_upstream_pid, ^release_ref}, 1_000
+
+      second_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "sidecar turn"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      assert_receive {:fake_upstream_chunk_barrier, 0, second_upstream_pid, ^release_ref}, 1_000
+      send(first_upstream_pid, {:fake_upstream_release_chunk, release_ref})
+      send(second_upstream_pid, {:fake_upstream_release_chunk, release_ref})
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"type" => "response.completed"} = Jason.decode!(first_frame)
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"type" => "response.completed"} = Jason.decode!(second_frame)
+      assert {:ok, state} = receive_socket_done(state)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.websocket_connection_id != second_request.websocket_connection_id
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "downstream websocket does not inject last response id when continuation omits previous_response_id" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_auto_previous",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-no-auto-previous-response-id",
+          accepted_turn_state: "stable-ws-no-auto-previous-response-id",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "first"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_auto_previous"} = Jason.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      second_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "follow-up"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"id" => "resp_ws_auto_previous"} = Jason.decode!(second_frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      refute Map.has_key?(first_request.json, "previous_response_id")
+      refute Map.has_key?(second_request.json, "previous_response_id")
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "websocket tool output continuations keep previous_response_id for upstream context" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_tool_continuation",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-tool-continuation"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [
+                   %{
+                     "type" => "function_call_output",
+                     "call_id" => "call_sample",
+                     "output" => "sample output"
+                   }
+                 ],
+                 "stream" => true,
+                 "generate" => true,
+                 "previous_response_id" => "resp_ws_tool_origin"
+               }),
+               %{request_id: "ws-tool-continuation", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_tool_continuation"} = Jason.decode!(frame)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["previous_response_id"] == "resp_ws_tool_origin"
+    assert captured.json["type"] == "response.create"
+    assert captured.json["generate"] == true
+  end
+
+  test "websocket custom tool output continuations keep previous_response_id for upstream context" do
+    upstream =
+      start_upstream(
+        FakeUpstream.require_json_field(
+          "previous_response_id",
+          %{
+            "id" => "resp_ws_custom_tool_continuation",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          },
+          %{
+            "error" => %{
+              "type" => "invalid_request_error",
+              "message" =>
+                "No tool call found for custom tool call output with call_id call_sample.",
+              "param" => "input"
+            }
+          }
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-custom-tool"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [
+                   %{
+                     "type" => "custom_tool_call_output",
+                     "call_id" => "call_sample",
+                     "name" => "sample_tool",
+                     "output" => "sample output"
+                   }
+                 ],
+                 "stream" => true,
+                 "generate" => true,
+                 "previous_response_id" => "resp_ws_custom_tool_origin"
+               }),
+               %{request_id: "ws-custom-tool-continuation", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_custom_tool_continuation"} = Jason.decode!(frame)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["previous_response_id"] == "resp_ws_custom_tool_origin"
+    assert captured.json["type"] == "response.create"
+    assert captured.json["generate"] == true
+  end
+
+  test "future tool output continuations keep previous_response_id by shape" do
+    upstream =
+      start_upstream(
+        FakeUpstream.require_json_field(
+          "previous_response_id",
+          %{
+            "id" => "resp_ws_future_tool_continuation",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          },
+          %{"error" => %{"code" => "missing_future_tool_context"}}
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-future-tool"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [
+                   %{
+                     "type" => "future_tool_call_output",
+                     "call_id" => "future_call_sample",
+                     "output" => "future sample output"
+                   }
+                 ],
+                 "stream" => true,
+                 "generate" => true,
+                 "previous_response_id" => "resp_ws_future_tool_origin"
+               }),
+               %{request_id: "ws-future-tool-continuation", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_future_tool_continuation"} = Jason.decode!(frame)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["previous_response_id"] == "resp_ws_future_tool_origin"
+
+    assert captured.json["input"] |> List.first() |> Map.fetch!("type") ==
+             "future_tool_call_output"
+  end
+
+  test "HTTP custom tool output continuations keep previous_response_id", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.require_json_field(
+          "previous_response_id",
+          %{
+            "id" => "resp_http_custom_tool_continuation",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          },
+          %{"error" => %{"code" => "missing_custom_tool_context"}}
+        )
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "type" => "custom_tool_call_output",
+            "call_id" => "call_sample",
+            "name" => "sample_tool",
+            "output" => "sample output"
+          }
+        ],
+        "previous_response_id" => "resp_http_custom_tool_origin"
+      })
+
+    assert %{"id" => "resp_http_custom_tool_continuation"} = json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["previous_response_id"] == "resp_http_custom_tool_origin"
+    refute Map.has_key?(captured.json, "type")
+  end
+
+  test "gateway debug mode logs safe continuation decisions and stores request metadata" do
+    previous_env = Application.get_env(:codex_pooler, OperationalSettings)
+    previous_logger_level = Logger.level()
+
+    Application.put_env(:codex_pooler, OperationalSettings,
+      settings: %OperationalSettings{gateway_debug?: true}
+    )
+
+    Logger.configure(level: :info)
+
+    on_exit(fn ->
+      Logger.configure(level: previous_logger_level)
+
+      if previous_env,
+        do: Application.put_env(:codex_pooler, OperationalSettings, previous_env),
+        else: Application.delete_env(:codex_pooler, OperationalSettings)
+    end)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.require_json_field(
+          "previous_response_id",
+          %{
+            "id" => "resp_ws_debug_tool_continuation",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          },
+          %{"error" => %{"code" => "missing_debug_tool_context"}}
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-debug-tool"})
+
+    log =
+      ExUnit.CaptureLog.capture_log([level: :info], fn ->
+        assert :ok =
+                 execute_websocket_response(
+                   auth,
+                   Jason.encode!(%{
+                     "type" => "response.create",
+                     "model" => setup.model.exposed_model_id,
+                     "metadata" => %{"debug_note" => "metadata value must stay hidden"},
+                     "input" => [
+                       %{
+                         "type" => "custom_tool_call_output",
+                         "call_id" => "call_debug_sample",
+                         "output" => "debug output must stay hidden"
+                       }
+                     ],
+                     "stream" => true,
+                     "generate" => true,
+                     "previous_response_id" => "resp_ws_debug_tool_origin"
+                   }),
+                   %{request_id: "ws-debug-tool-continuation", codex_session: session},
+                   fn frame -> send(self(), {:websocket_frame, frame}) end
+                 )
+      end)
+
+    assert log =~ "codex_pooler gateway_debug payload"
+    assert log =~ "previous_response_id_action=preserved"
+    assert log =~ "client_json_bytes="
+    assert log =~ "client_approx_tokens="
+    assert log =~ "upstream_json_bytes="
+    assert log =~ "upstream_approx_tokens="
+    assert log =~ "client_entry_count=1"
+    assert log =~ "client_chat_entry_count=0"
+    assert log =~ "client_string_bytes="
+    assert log =~ "custom_tool_call_output"
+    refute log =~ "debug output must stay hidden"
+    refute log =~ "metadata value must stay hidden"
+    refute log =~ "resp_ws_debug_tool_origin"
+    refute log =~ "call_debug_sample"
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_debug_tool_continuation"} = Jason.decode!(frame)
+
+    attempt =
+      Repo.one!(
+        from(a in Attempt,
+          join: r in Request,
+          on: r.id == a.request_id,
+          where: r.endpoint == "/backend-api/codex/responses" and r.transport == "websocket"
+        )
+      )
+
+    debug = attempt.response_metadata["gateway_debug"]
+    assert debug["previous_response_id"]["action"] == "preserved"
+    assert debug["items"]["tool_result_types"] == ["custom_tool_call_output"]
+    assert debug["shape"]["client"]["json"]["bytes"] > 0
+    assert debug["shape"]["client"]["json"]["approx_tokens"] > 0
+    assert debug["shape"]["client"]["json"]["strategy"] == "json_bytes_div_4_ceil"
+
+    assert debug["shape"]["client"]["top_level_keys"] == [
+             "generate",
+             "input",
+             "metadata",
+             "model",
+             "previous_response_id",
+             "stream",
+             "type"
+           ]
+
+    assert debug["shape"]["client"]["entries"]["count"] == 1
+
+    assert debug["shape"]["client"]["entries"]["item_types"] == %{
+             "custom_tool_call_output" => 1
+           }
+
+    assert debug["shape"]["client"]["entries"]["tool_result_count"] == 1
+    assert debug["shape"]["client"]["chat_entries"]["kind"] == "absent"
+    assert debug["shape"]["client"]["string_stats"]["string_bytes"] > 0
+    assert debug["shape"]["client"]["string_stats"]["max_string_bytes"] > 0
+    assert debug["shape"]["client"]["flags"]["stream"] == true
+    assert debug["shape"]["client"]["flags"]["generate"] == true
+    assert debug["shape"]["client"]["flags"]["has_previous_response_id"] == true
+    assert debug["shape"]["upstream"]["json"]["bytes"] > 0
+    assert debug["shape"]["upstream"]["flags"]["has_instructions"] == true
+
+    metadata_text = inspect(debug)
+    refute metadata_text =~ "debug output must stay hidden"
+    refute metadata_text =~ "metadata value must stay hidden"
+    refute metadata_text =~ "resp_ws_debug_tool_origin"
+    refute metadata_text =~ "call_debug_sample"
+  end
+
+  test "HTTP backend continuity drops previous_response_id without tool outputs", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.reject_json_field(
+          "previous_response_id",
+          %{
+            "id" => "resp_http_bridge",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          },
+          %{"error" => %{"code" => "invalid_previous_response_id"}}
+        )
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "hello",
+        "previous_response_id" => "resp_http_previous"
+      })
+
+    assert %{"id" => "resp_http_bridge"} = json_response(conn, 200)
+    assert [captured] = FakeUpstream.requests(upstream)
+    refute Map.has_key?(captured.json, "previous_response_id")
+  end
+
+  test "websocket generate false warmup completes locally without upstream dispatch" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-warmup"})
+
+    result =
+      execute_websocket_response(
+        auth,
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "instructions" => "warmup",
+          "input" => [],
+          "tools" => [],
+          "tool_choice" => "auto",
+          "parallel_tool_calls" => true,
+          "store" => false,
+          "stream" => true,
+          "include" => [],
+          "generate" => false
+        }),
+        %{request_id: "ws-warmup", codex_session: session},
+        fn frame -> send(self(), {:websocket_frame, frame}) end
+      )
+
+    assert result == :ok
+    assert_received {:websocket_frame, created_frame}
+    assert_received {:websocket_frame, completed_frame}
+
+    assert %{"type" => "response.created", "response" => %{"id" => ""}} =
+             Jason.decode!(created_frame)
+
+    assert %{"type" => "response.completed", "response" => %{"id" => ""}} =
+             Jason.decode!(completed_frame)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id)) == []
+  end
+
+  test "websocket response processed fails without an upstream websocket session" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-processed"})
+
+    result =
+      execute_websocket_response(
+        auth,
+        Jason.encode!(%{"type" => "response.processed", "response_id" => "resp_ws_processed"}),
+        %{request_id: "ws-processed", codex_session: session},
+        fn frame -> send(self(), {:websocket_frame, frame}) end
+      )
+
+    assert {:error,
+            %{
+              status: 502,
+              code: "upstream_websocket_forward_failed",
+              message: message
+            }} = result
+
+    assert message =~ "upstream_websocket_session_missing"
+    refute_received {:websocket_frame, _frame}
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id)) == []
+  end
+
+  test "websocket response processed fails for stale upstream sessions" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-processed-stale"})
+
+    stale_pid = spawn(fn -> :ok end)
+    ref = Process.monitor(stale_pid)
+    assert_receive {:DOWN, ^ref, :process, ^stale_pid, _reason}
+
+    result =
+      execute_websocket_response(
+        auth,
+        Jason.encode!(%{"type" => "response.processed", "response_id" => "resp_stale"}),
+        %{
+          request_id: "ws-processed-stale",
+          codex_session: session,
+          upstream_websocket_session: stale_pid
+        },
+        fn frame -> send(self(), {:websocket_frame, frame}) end
+      )
+
+    assert {:error,
+            %{
+              status: 502,
+              code: "upstream_websocket_forward_failed",
+              message: message
+            }} = result
+
+    assert message =~ "upstream_websocket_session_unavailable"
+    refute_received {:websocket_frame, _frame}
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id)) == []
+  end
+
+  @tag :bridge_ring
+  test "websocket response dispatch keeps DB-backed sticky affinity for a persisted session" do
+    first_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_first",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    second_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_second",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(first_upstream)
+
+    second =
+      gateway_upstream(setup.pool, second_upstream, "upstream-token-second", compact?: false)
+
+    prime_routing_quota!(second.identity)
+
+    model =
+      setup.model
+      |> Ecto.Changeset.change(%{
+        source_assignment_count: 2,
+        metadata: %{"source_assignment_ids" => [setup.assignment.id, second.assignment.id]}
+      })
+      |> Repo.update!()
+
+    setup = Map.put(setup, :model, model)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-affinity"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{"model" => setup.model.exposed_model_id, "input" => "first ws"}),
+               %{request_id: "ws-affinity-first", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, :first, frame}) end
+             )
+
+    assert_received {:websocket_frame, :first, first_frame}
+    first_body = Jason.decode!(first_frame)
+
+    first_assignment =
+      assignment_for_response(first_body["id"], setup.assignment, second.assignment)
+
+    setup.pool
+    |> Pools.ensure_routing_settings()
+    |> Ecto.Changeset.change(%{
+      routing_strategy: "least_recent_success",
+      updated_at: DateTime.utc_now()
+    })
+    |> Repo.update!()
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{"model" => setup.model.exposed_model_id, "input" => "second ws"}),
+               %{request_id: "ws-affinity-second", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, :second, frame}) end
+             )
+
+    assert_received {:websocket_frame, :second, second_frame}
+    second_body = Jason.decode!(second_frame)
+
+    second_assignment =
+      assignment_for_response(second_body["id"], setup.assignment, second.assignment)
+
+    assert second_assignment.id == first_assignment.id
+    assert Repo.aggregate(BridgeAffinity, :count) == 1
+
+    assert [request | _rest] =
+             Repo.all(from request in Request, order_by: [desc: request.admitted_at])
+
+    assert request.request_metadata["routing"]["affinity_status"] == "hit"
+    assert request.request_metadata["routing"]["affinity_kind"] == "codex_session"
+  end
+
+  @tag :websocket_session_assignment_unavailable
+  test "websocket continuation fails closed when the persisted session assignment is unavailable" do
+    first_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_unavailable_first",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    second_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_unavailable_second_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(first_upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-unavailable"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{"model" => setup.model.exposed_model_id, "input" => "first ws"}),
+               %{request_id: "ws-unavailable-first", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, :first, frame}) end
+             )
+
+    assert_received {:websocket_frame, :first, first_frame}
+    assert %{"id" => "resp_ws_unavailable_first"} = Jason.decode!(first_frame)
+
+    persisted_session = Repo.get!(CodexSession, session.id)
+    assert persisted_session.pool_upstream_assignment_id == setup.assignment.id
+
+    second =
+      gateway_upstream(setup.pool, second_upstream, "upstream-token-second", compact?: false)
+
+    prime_routing_quota!(second.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, second.assignment])
+      )
+
+    assert {:ok, _assignment} =
+             PoolAssignments.disable_pool_assignment(setup.assignment)
+
+    assert {:error, %{code: "session_assignment_unavailable", status: 503}} =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "second ws",
+                 "previous_response_id" => "resp_ws_unavailable_first"
+               }),
+               %{request_id: "ws-unavailable-second", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, :second, frame}) end
+             )
+
+    refute_received {:websocket_frame, :second, _frame}
+    assert FakeUpstream.count(second_upstream) == 0
+
+    assert [denied_request] =
+             Repo.all(
+               from request in Request,
+                 where: request.correlation_id == "ws-unavailable-second"
+             )
+
+    assert denied_request.status == "rejected"
+    assert denied_request.last_error_code == "session_assignment_unavailable"
+    refute denied_request.last_error_code == "stream_incomplete"
+  end
+
+  @tag :task_6_websocket_resume
+  test "websocket reconnect resumes the same durable alias and owner lease before expiry" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_resume",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    turn_state = "stable-ws-resume"
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: turn_state,
+        session_header: "session-resume",
+        owner_instance_id: "node-a"
+      })
+
+    assert [turn_alias] =
+             Repo.all(
+               from alias_record in BridgeSessionAlias,
+                 where:
+                   alias_record.codex_session_id == ^session.id and
+                     alias_record.alias_kind == "turn_state"
+             )
+
+    assert turn_alias.alias_hash == :crypto.hash(:sha256, turn_state)
+
+    assert [lease] =
+             Repo.all(
+               from lease in BridgeOwnerLease,
+                 where: lease.codex_session_id == ^session.id and lease.status == "active"
+             )
+
+    assert lease.owner_instance_id == "node-a"
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "resume first"
+               }),
+               %{
+                 request_id: "ws-resume-first",
+                 codex_session: session,
+                 accepted_turn_state: turn_state
+               },
+               fn frame -> send(self(), {:websocket_frame, :first, frame}) end
+             )
+
+    assert_received {:websocket_frame, :first, first_frame}
+    assert %{"id" => "resp_ws_resume"} = Jason.decode!(first_frame)
+
+    Gateway.interrupt_codex_session(session, %{reconnect_window_seconds: 300})
+
+    {:ok, resumed} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: turn_state,
+        session_header: "session-resume",
+        owner_instance_id: "node-a"
+      })
+
+    assert resumed.id == session.id
+
+    assert [renewed_lease] =
+             Repo.all(
+               from lease in BridgeOwnerLease,
+                 where: lease.codex_session_id == ^session.id and lease.status == "active"
+             )
+
+    assert renewed_lease.id == lease.id
+    assert renewed_lease.lease_token == lease.lease_token
+    assert DateTime.compare(renewed_lease.renewed_at, lease.renewed_at) in [:gt, :eq]
+
+    assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 1
+
+    assert Repo.aggregate(from(t in CodexTurn, where: t.codex_session_id == ^session.id), :count) ==
+             1
+  end
+
+  @tag :task_6_http_websocket_continuity
+  test "HTTP response id continuity resumes the same durable session for websocket", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_http_to_ws",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 3, "output_tokens" => 2, "total_tokens" => 5}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> put_req_header("x-codex-turn-state", "http-turn-state")
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "http continuity"
+      })
+
+    assert %{"id" => "resp_http_to_ws"} = json_response(conn, 200)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert [http_session] = Repo.all(from(session in CodexSession))
+
+    assert [response_alias] =
+             Repo.all(
+               from alias_record in BridgeSessionAlias,
+                 where:
+                   alias_record.codex_session_id == ^http_session.id and
+                     alias_record.alias_kind == "previous_response_id"
+             )
+
+    assert response_alias.alias_hash == :crypto.hash(:sha256, "resp_http_to_ws")
+    refute inspect(response_alias) =~ "resp_http_to_ws"
+    refute inspect(response_alias) =~ "http continuity"
+
+    {:ok, websocket_session} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: "new-websocket-turn-state",
+        previous_response_id: "resp_http_to_ws",
+        owner_instance_id: "node-ws"
+      })
+
+    assert websocket_session.id == http_session.id
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "model" => setup.model.exposed_model_id,
+                 "previous_response_id" => "resp_http_to_ws",
+                 "input" => "ws continuity"
+               }),
+               %{
+                 request_id: "ws-continuity-turn",
+                 codex_session: websocket_session,
+                 previous_response_id: "resp_http_to_ws"
+               },
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_http_to_ws"} = Jason.decode!(frame)
+
+    assert websocket_request =
+             Enum.find(
+               FakeUpstream.requests(upstream),
+               &(&1.json["previous_response_id"] == "resp_http_to_ws")
+             )
+
+    assert websocket_request.json["previous_response_id"] == "resp_http_to_ws"
+
+    assert Repo.aggregate(
+             from(t in CodexTurn, where: t.codex_session_id == ^http_session.id),
+             :count
+           ) ==
+             2
+  end
+
+  test "HTTP response id continuity refreshes sticky session quota before fallback candidates", %{
+    conn: conn
+  } do
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    stale_quota_response = %{
+      "rate_limit" => %{
+        "primary_window" => %{
+          "used_percent" => 12,
+          "limit_window_seconds" => 18_000,
+          "reset_at" => DateTime.to_iso8601(reset_at)
+        }
+      }
+    }
+
+    first_stale_upstream =
+      start_upstream({:path_json, %{"/api/codex/usage" => {200, stale_quota_response}}})
+
+    second_stale_upstream =
+      start_upstream({:path_json, %{"/api/codex/usage" => {200, stale_quota_response}}})
+
+    sticky_upstream =
+      start_upstream(
+        {:path_json,
+         %{
+           "/api/codex/usage" => {200, stale_quota_response},
+           "/backend-api/codex/responses" =>
+             {200,
+              %{
+                "id" => "resp_sticky_refreshed_quota",
+                "object" => "response",
+                "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+              }}
+         }}
+      )
+
+    setup = gateway_setup(first_stale_upstream, quota?: false)
+
+    second_stale =
+      gateway_upstream(setup.pool, second_stale_upstream, "upstream-token-second-stale",
+        compact?: false
+      )
+
+    sticky =
+      gateway_upstream(setup.pool, sticky_upstream, "upstream-token-sticky", compact?: false)
+
+    prime_stale_routing_quota!(setup.identity)
+    prime_stale_routing_quota!(second_stale.identity)
+    prime_stale_routing_quota!(sticky.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [
+          setup.assignment,
+          second_stale.assignment,
+          sticky.assignment
+        ])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{previous_response_id: "resp_sticky_previous"})
+
+    session
+    |> Ecto.Changeset.change(%{pool_upstream_assignment_id: sticky.assignment.id})
+    |> Repo.update!()
+
+    {:ok, resumed_session} =
+      Gateway.start_codex_session(auth, %{previous_response_id: "resp_sticky_previous"})
+
+    assert resumed_session.id == session.id
+    assert resumed_session.pool_upstream_assignment_id == sticky.assignment.id
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "previous_response_id" => "resp_sticky_previous",
+        "input" => "recover sticky session quota"
+      })
+
+    assert %{"id" => "resp_sticky_refreshed_quota"} = json_response(conn, 200)
+
+    assert [] = FakeUpstream.requests(first_stale_upstream)
+    assert [] = FakeUpstream.requests(second_stale_upstream)
+
+    assert [usage_request, response_request] = FakeUpstream.requests(sticky_upstream)
+    assert usage_request.path == "/api/codex/usage"
+    assert response_request.path == "/backend-api/codex/responses"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.request_metadata["codex_session_id"] == session.id
+    assert get_in(request.request_metadata, ["quota_decision", "refreshed_stale_quota"]) == true
+
+    assert get_in(request.request_metadata, ["routing", "selected_bridge_candidate_id"]) ==
+             sticky.assignment.id
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+    assert attempt.pool_upstream_assignment_id == sticky.assignment.id
+  end
+
+  test "HTTP response id continuity survives expired owner leases", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_http_expired_lease",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 3, "output_tokens" => 2, "total_tokens" => 5}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> put_req_header("x-codex-turn-state", "http-expired-lease-turn")
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "http continuity past lease"
+      })
+
+    assert %{"id" => "resp_http_expired_lease"} = json_response(conn, 200)
+    assert [http_session] = Repo.all(from(session in CodexSession))
+
+    expired_at = DateTime.add(DateTime.utc_now(), -30, :second) |> DateTime.truncate(:microsecond)
+
+    http_session
+    |> Ecto.Changeset.change(%{owner_lease_expires_at: expired_at})
+    |> Repo.update!()
+
+    BridgeOwnerLease
+    |> where([lease], lease.codex_session_id == ^http_session.id)
+    |> Repo.update_all(set: [expires_at: expired_at, updated_at: expired_at])
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, resumed_session} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: "later-http-turn-state",
+        previous_response_id: "resp_http_expired_lease",
+        owner_instance_id: "node-after-http-lease"
+      })
+
+    assert resumed_session.id == http_session.id
+    assert DateTime.compare(resumed_session.owner_lease_expires_at, expired_at) == :gt
+
+    assert [%BridgeOwnerLease{owner_instance_id: "node-after-http-lease", status: "active"}] =
+             Repo.all(
+               from lease in BridgeOwnerLease,
+                 where: lease.codex_session_id == ^http_session.id and lease.status == "active"
+             )
+  end
+
+  @tag :task_6_same_connection_distinct_turns
+  test "distinct websocket messages sharing connection request id both dispatch and account" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_same_connection",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "same-connection"})
+    opts = %{request_id: "connection-request-id", codex_session: session}
+
+    first_payload = Jason.encode!(%{"model" => setup.model.exposed_model_id, "input" => "first"})
+
+    second_payload =
+      Jason.encode!(%{"model" => setup.model.exposed_model_id, "input" => "second"})
+
+    assert :ok =
+             execute_websocket_response(auth, first_payload, opts, fn frame ->
+               send(self(), {:websocket_frame, :first, frame})
+             end)
+
+    assert :ok =
+             execute_websocket_response(auth, second_payload, opts, fn frame ->
+               send(self(), {:websocket_frame, :second, frame})
+             end)
+
+    assert_received {:websocket_frame, :first, _frame}
+    assert_received {:websocket_frame, :second, _frame}
+    assert FakeUpstream.count(upstream) == 2
+    assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 2
+    assert Repo.aggregate(from(a in Attempt), :count) == 2
+
+    assert Repo.aggregate(from(t in CodexTurn, where: t.codex_session_id == ^session.id), :count) ==
+             2
+
+    assert Repo.aggregate(
+             from(entry in LedgerEntry, where: entry.entry_kind == "settlement"),
+             :count
+           ) == 2
+  end
+
+  @tag :task_6_duplicate_turn
+  test "duplicate explicit websocket turn id does not double account attempts or usage" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_duplicate_turn",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "duplicate-turn"})
+
+    opts = %{request_id: "connection-request-id", codex_session: session}
+
+    payload =
+      Jason.encode!(%{
+        "model" => setup.model.exposed_model_id,
+        "turn_id" => "duplicate-turn-id",
+        "input" => "dedupe me"
+      })
+
+    assert :ok =
+             execute_websocket_response(auth, payload, opts, fn frame ->
+               send(self(), {:websocket_frame, :first, frame})
+             end)
+
+    assert_received {:websocket_frame, :first, _frame}
+
+    assert {:error, %{code: "duplicate_turn"}} =
+             execute_websocket_response(auth, payload, opts, fn frame ->
+               send(self(), {:websocket_frame, :duplicate, frame})
+             end)
+
+    refute_received {:websocket_frame, :duplicate, _frame}
+    assert FakeUpstream.count(upstream) == 1
+    assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 1
+    assert Repo.aggregate(from(a in Attempt), :count) == 1
+
+    assert Repo.aggregate(from(t in CodexTurn, where: t.codex_session_id == ^session.id), :count) ==
+             1
+
+    assert Repo.aggregate(
+             from(entry in LedgerEntry, where: entry.entry_kind == "settlement"),
+             :count
+           ) == 1
+  end
+
+  @tag :task_6_duplicate_turn
+  test "concurrent duplicate explicit websocket turn id is atomically rejected" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_concurrent_duplicate_turn",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "duplicate-race"})
+
+    opts = %{request_id: "connection-request-id", codex_session: session}
+    parent = self()
+
+    payload =
+      Jason.encode!(%{
+        "model" => setup.model.exposed_model_id,
+        "turn_id" => "duplicate-race-turn-id",
+        "input" => "dedupe me concurrently"
+      })
+
+    tasks =
+      for label <- [:first, :second] do
+        Task.async(fn ->
+          Sandbox.allow(Repo, parent, self())
+          send(parent, {:duplicate_turn_task_ready, label, self()})
+
+          receive do
+            :run_duplicate_turn_request -> :ok
+          after
+            5_000 -> flunk("duplicate turn task #{label} was not released")
+          end
+
+          execute_websocket_response(auth, payload, opts, fn frame ->
+            send(parent, {:websocket_frame, label, frame})
+          end)
+        end)
+      end
+
+    task_pids =
+      for _label <- [:first, :second] do
+        assert_receive {:duplicate_turn_task_ready, _label, pid}, 5_000
+        pid
+      end
+
+    Enum.each(task_pids, &send(&1, :run_duplicate_turn_request))
+
+    results = Task.await_many(tasks, 10_000)
+
+    assert Enum.count(results, &match?(:ok, &1)) == 1
+    assert Enum.count(results, &match?({:error, %{code: "duplicate_turn"}}, &1)) == 1
+
+    assert_receive {:websocket_frame, _label, _frame}, @websocket_frame_timeout
+    refute_received {:websocket_frame, _label, _frame}
+
+    assert FakeUpstream.count(upstream) == 1
+    assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 1
+    assert Repo.aggregate(from(a in Attempt), :count) == 1
+
+    assert Repo.aggregate(from(t in CodexTurn, where: t.codex_session_id == ^session.id), :count) ==
+             1
+
+    assert Repo.aggregate(
+             from(entry in LedgerEntry, where: entry.entry_kind == "settlement"),
+             :count
+           ) == 1
+  end
+
+  @tag :task_6_demoted_owner
+  test "demoted backend does not receive the next websocket turn" do
+    demoted_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_demoted_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    active_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_after_demotion",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(demoted_upstream)
+
+    second =
+      gateway_upstream(setup.pool, active_upstream, "upstream-token-second", compact?: false)
+
+    prime_routing_quota!(second.identity)
+
+    model =
+      setup.model
+      |> Ecto.Changeset.change(%{
+        source_assignment_count: 2,
+        metadata: %{"source_assignment_ids" => [setup.assignment.id, second.assignment.id]}
+      })
+      |> Repo.update!()
+
+    setup = Map.put(setup, :model, model)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "demotion-turn"})
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %BridgeDemotion{
+      pool_id: setup.pool.id,
+      api_key_id: setup.api_key.id,
+      model_identifier: setup.model.exposed_model_id,
+      pool_upstream_assignment_id: setup.assignment.id,
+      upstream_identity_id: setup.identity.id,
+      reason_code: "upstream_5xx",
+      status: "active",
+      demoted_until: DateTime.add(now, 60, :second),
+      attempt_count: 1,
+      metadata: %{"source" => "test_demotion"},
+      created_at: now,
+      updated_at: now
+    }
+    |> Repo.insert!()
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "avoid demoted"
+               }),
+               %{request_id: "after-demotion-turn", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_after_demotion"} = Jason.decode!(frame)
+    assert FakeUpstream.count(demoted_upstream) == 0
+    assert FakeUpstream.count(active_upstream) == 1
+
+    assert [%BridgeDemotion{pool_upstream_assignment_id: demoted_assignment_id, status: "active"}] =
+             Repo.all(from(demotion in BridgeDemotion))
+
+    assert demoted_assignment_id == setup.assignment.id
+  end
+
+  test "assigned websocket session stays on its continuity backend despite demotion" do
+    sticky_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_sticky_demoted_session",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_sticky_fallback_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(sticky_upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-fallback", compact?: false)
+
+    prime_routing_quota!(fallback.identity)
+
+    model =
+      setup.model
+      |> Ecto.Changeset.change(%{
+        source_assignment_count: 2,
+        metadata: %{"source_assignment_ids" => [setup.assignment.id, fallback.assignment.id]}
+      })
+      |> Repo.update!()
+
+    setup = Map.put(setup, :model, model)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "sticky-demoted"})
+
+    session =
+      session
+      |> Ecto.Changeset.change(%{pool_upstream_assignment_id: setup.assignment.id})
+      |> Repo.update!()
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %BridgeDemotion{
+      pool_id: setup.pool.id,
+      api_key_id: setup.api_key.id,
+      model_identifier: setup.model.exposed_model_id,
+      pool_upstream_assignment_id: setup.assignment.id,
+      upstream_identity_id: setup.identity.id,
+      reason_code: "upstream_stream_error",
+      status: "active",
+      demoted_until: DateTime.add(now, 60, :second),
+      attempt_count: 1,
+      metadata: %{"source" => "test_demotion"},
+      created_at: now,
+      updated_at: now
+    }
+    |> Repo.insert!()
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "preserve sticky session assignment"
+               }),
+               %{request_id: "sticky-demoted-turn", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_sticky_demoted_session"} = Jason.decode!(frame)
+    assert FakeUpstream.count(sticky_upstream) == 1
+    assert FakeUpstream.count(fallback_upstream) == 0
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+    assert attempt.pool_upstream_assignment_id == setup.assignment.id
+  end
+
+  test "fresh websocket upgrade timeout before visible output tries the next eligible assignment" do
+    release_ref = make_ref()
+
+    timeout_upstream =
+      start_upstream(
+        FakeUpstream.websocket_upgrade_timeout(notify: self(), release_ref: release_ref)
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_upgrade_timeout_fallback",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(timeout_upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-fallback", compact?: false)
+
+    prime_routing_quota!(fallback.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    request_id =
+      seed_preferring_assignment(
+        [setup.assignment.id, fallback.assignment.id],
+        setup.assignment.id
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        Sandbox.allow(Repo, parent, self())
+
+        execute_websocket_response(
+          auth,
+          Jason.encode!(%{
+            "type" => "response.create",
+            "model" => setup.model.exposed_model_id,
+            "input" => "fail over before visible websocket output",
+            "stream" => true,
+            "generate" => true
+          }),
+          %{request_id: request_id, connect_timeout_ms: 25},
+          fn frame -> send(parent, {:websocket_frame, frame}) end
+        )
+      end)
+
+    assert_receive {:fake_upstream_timeout_barrier, :websocket_upgrade, upstream_pid,
+                    ^release_ref},
+                   1_000
+
+    try do
+      assert :ok = Task.await(task, 2_000)
+    after
+      send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+    end
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_upgrade_timeout_fallback"} = Jason.decode!(frame)
+
+    assert FakeUpstream.count(timeout_upstream) == 0
+    assert FakeUpstream.count(fallback_upstream) == 1
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert first_attempt.status == "retryable_failed"
+    assert first_attempt.retryable == true
+    assert first_attempt.network_error_code == "upstream_stream_error"
+
+    assert second_attempt.pool_upstream_assignment_id == fallback.assignment.id
+    assert second_attempt.status == "succeeded"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.retry_count == 1
+    assert request.last_error_code == nil
+
+    metadata_text = inspect({request.request_metadata, first_attempt.response_metadata})
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ "upstream-token"
+  end
+
+  @tag :task_8_websocket_failure
+  test "websocket terminal upstream failure demotes and circuit fails assignment" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.failed",
+             %{
+               "type" => "response.failed",
+               "response" => %{
+                 "id" => "resp_ws_failed",
+                 "error" => %{"code" => "upstream_terminal_failure"},
+                 "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+               }
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "terminal-failure"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "terminal failure",
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: "ws-terminal-failure", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"type" => "response.failed"} = Jason.decode!(frame)
+    assert FakeUpstream.count(upstream) == 1
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.transport == "websocket"
+    assert request.last_error_code == "upstream_terminal_failure"
+
+    assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+    assert turn.status == "failed"
+    assert turn.error_code == "upstream_terminal_failure"
+
+    assert [demotion] = Repo.all(from(d in BridgeDemotion))
+    assert demotion.pool_upstream_assignment_id == setup.assignment.id
+    assert demotion.reason_code == "upstream_terminal_failure"
+    assert demotion.status == "active"
+
+    assert [circuit] =
+             Repo.all(from(c in RoutingCircuitState, where: c.route_class == "proxy_websocket"))
+
+    assert circuit.pool_upstream_assignment_id == setup.assignment.id
+    assert circuit.reason_code == "upstream_terminal_failure"
+    assert circuit.failure_count == 1
+  end
+
+  test "websocket context length terminal failure does not demote or circuit the assignment" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.failed",
+             %{
+               "type" => "response.failed",
+               "response" => %{
+                 "id" => "resp_ws_context_too_large",
+                 "error" => %{"code" => "context_length_exceeded"},
+                 "usage" => %{"input_tokens" => 0, "output_tokens" => 0, "total_tokens" => 0}
+               }
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "context-large"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "too much context",
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: "ws-context-too-large", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"type" => "response.failed"} = Jason.decode!(frame)
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.response_status_code == 200
+    assert request.last_error_code == "context_length_exceeded"
+    refute get_in(request.request_metadata, ["routing", "demotion_reason"])
+
+    assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+    assert turn.status == "failed"
+    assert turn.error_code == "context_length_exceeded"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+  end
+
+  test "websocket top-level upstream error is canonicalized for Codex clients" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"error",
+             %{
+               "type" => "error",
+               "sequence_number" => 1,
+               "error" => %{
+                 "code" => "context_length_exceeded",
+                 "message" => "Input exceeds this model context window."
+               }
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "context-large"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "too much context",
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: "ws-top-level-context-error", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+
+    assert %{
+             "type" => "response.failed",
+             "response" => %{"error" => %{"code" => "context_length_exceeded"}}
+           } = Jason.decode!(frame)
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.response_status_code == 200
+    assert request.last_error_code == "context_length_exceeded"
+
+    assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+    assert turn.status == "failed"
+    assert turn.error_code == "context_length_exceeded"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+  end
+
+  test "websocket previous response terminal failure is masked without replaying or circuiting" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"error",
+             %{
+               "type" => "error",
+               "status" => 400,
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "param" => "previous_response_id",
+                 "message" => "Previous response with id 'resp_missing' not found."
+               }
+             }}
+          ],
+          done: false
+        )
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_previous_missing_fallback_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-fallback", compact?: false)
+
+    prime_routing_quota!(fallback.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "missing-previous"})
+
+    session =
+      session
+      |> Ecto.Changeset.change(%{pool_upstream_assignment_id: setup.assignment.id})
+      |> Repo.update!()
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [
+                   %{"type" => "message", "role" => "user", "content" => "continue"}
+                 ],
+                 "stream" => true,
+                 "generate" => true,
+                 "previous_response_id" => "resp_missing"
+               }),
+               %{request_id: "ws-previous-response-not-found", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+
+    assert %{
+             "type" => "response.failed",
+             "response" => %{"error" => %{"code" => "stream_incomplete"}}
+           } =
+             Jason.decode!(frame)
+
+    assert FakeUpstream.count(upstream) == 1
+    assert FakeUpstream.count(fallback_upstream) == 0
+    assert [_request] = FakeUpstream.requests(upstream)
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.response_status_code == 200
+    assert request.last_error_code == "stream_incomplete"
+    refute get_in(request.request_metadata, ["routing", "demotion_reason"])
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+    assert attempt.network_error_code == "stream_incomplete"
+    assert attempt.response_metadata["upstream_error_code"] == "previous_response_not_found"
+    assert attempt.response_metadata["masked_error_code"] == "stream_incomplete"
+
+    assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+    assert turn.status == "failed"
+    assert turn.error_code == "stream_incomplete"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+  end
+
+  for upstream_code <- ["previous_response_not_found", "invalid_previous_response_id"] do
+    @upstream_code upstream_code
+    test "websocket explicit #{upstream_code} terminal failure is masked without replaying or circuiting" do
+      upstream_code = @upstream_code
+
+      upstream =
+        start_upstream(
+          FakeUpstream.sse_stream(
+            [
+              {"error",
+               %{
+                 "type" => "error",
+                 "status" => 400,
+                 "error" => %{
+                   "type" => "invalid_request_error",
+                   "code" => upstream_code
+                 }
+               }}
+            ],
+            done: false
+          )
+        )
+
+      fallback_upstream =
+        start_upstream(
+          FakeUpstream.json_response(%{
+            "id" => "resp_ws_explicit_previous_fallback_should_not_run",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          })
+        )
+
+      setup = gateway_setup(upstream)
+
+      fallback =
+        gateway_upstream(setup.pool, fallback_upstream, "upstream-token-explicit-fallback",
+          compact?: false
+        )
+
+      prime_routing_quota!(fallback.identity)
+
+      setup =
+        Map.put(
+          setup,
+          :model,
+          put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+        )
+
+      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+      {:ok, session} =
+        Gateway.start_codex_session(auth, %{accepted_turn_state: "explicit-#{upstream_code}"})
+
+      session =
+        session
+        |> Ecto.Changeset.change(%{pool_upstream_assignment_id: setup.assignment.id})
+        |> Repo.update!()
+
+      assert :ok =
+               execute_websocket_response(
+                 auth,
+                 Jason.encode!(%{
+                   "type" => "response.create",
+                   "model" => setup.model.exposed_model_id,
+                   "input" => [
+                     %{"type" => "message", "role" => "user", "content" => "continue"}
+                   ],
+                   "stream" => true,
+                   "generate" => true,
+                   "previous_response_id" => "resp_explicit_#{upstream_code}"
+                 }),
+                 %{request_id: "ws-explicit-#{upstream_code}", codex_session: session},
+                 fn frame -> send(self(), {:websocket_frame, frame}) end
+               )
+
+      assert_received {:websocket_frame, frame}
+
+      assert %{
+               "type" => "response.failed",
+               "response" => %{
+                 "error" => %{
+                   "code" => "stream_incomplete",
+                   "message" => "upstream stream incomplete"
+                 }
+               }
+             } = Jason.decode!(frame)
+
+      refute frame =~ upstream_code
+      refute frame =~ "resp_explicit_"
+
+      assert FakeUpstream.count(upstream) == 1
+      assert FakeUpstream.count(fallback_upstream) == 0
+      assert [_request] = FakeUpstream.requests(upstream)
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.status == "failed"
+      assert request.response_status_code == 200
+      assert request.last_error_code == "stream_incomplete"
+      refute get_in(request.request_metadata, ["routing", "demotion_reason"])
+
+      assert [attempt] = Repo.all(from(a in Attempt))
+      assert attempt.network_error_code == "stream_incomplete"
+      assert attempt.response_metadata["upstream_error_code"] == upstream_code
+      assert attempt.response_metadata["masked_error_code"] == "stream_incomplete"
+
+      assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+      assert turn.status == "failed"
+      assert turn.error_code == "stream_incomplete"
+
+      assert Repo.all(from(d in BridgeDemotion)) == []
+      assert Repo.all(from(c in RoutingCircuitState)) == []
+    end
+  end
+
+  test "websocket previous response terminal failure after partial output is masked without replaying" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.output_text.delta",
+             %{"type" => "response.output_text.delta", "delta" => "partial"}},
+            {"error",
+             %{
+               "type" => "error",
+               "status" => 400,
+               "error" => %{
+                 "type" => "invalid_request_error",
+                 "param" => "previous_response_id",
+                 "message" => "Previous response with id 'resp_partial_missing' not found."
+               }
+             }}
+          ],
+          done: false
+        )
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_partial_missing_fallback_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-fallback", compact?: false)
+
+    prime_routing_quota!(fallback.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "partial-missing"})
+
+    session =
+      session
+      |> Ecto.Changeset.change(%{pool_upstream_assignment_id: setup.assignment.id})
+      |> Repo.update!()
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [
+                   %{"type" => "message", "role" => "user", "content" => "continue"}
+                 ],
+                 "stream" => true,
+                 "generate" => true,
+                 "previous_response_id" => "resp_partial_missing"
+               }),
+               %{request_id: "ws-partial-previous-response-not-found", codex_session: session},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, partial_frame}
+
+    assert %{"type" => "response.output_text.delta", "delta" => "partial"} =
+             Jason.decode!(partial_frame)
+
+    assert_received {:websocket_frame, terminal_frame}
+
+    assert %{
+             "type" => "response.failed",
+             "response" => %{
+               "error" => %{
+                 "code" => "stream_incomplete",
+                 "message" => "upstream stream incomplete"
+               }
+             }
+           } = Jason.decode!(terminal_frame)
+
+    refute terminal_frame =~ "previous_response_not_found"
+    refute terminal_frame =~ "resp_partial_missing"
+
+    assert FakeUpstream.count(upstream) == 1
+    assert FakeUpstream.count(fallback_upstream) == 0
+    assert [_request] = FakeUpstream.requests(upstream)
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.response_status_code == 200
+    assert request.last_error_code == "stream_incomplete"
+    refute get_in(request.request_metadata, ["routing", "demotion_reason"])
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+    assert attempt.network_error_code == "stream_incomplete"
+    assert attempt.response_metadata["upstream_error_code"] == "previous_response_not_found"
+    assert attempt.response_metadata["masked_error_code"] == "stream_incomplete"
+
+    assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+    assert turn.status == "failed"
+    assert turn.error_code == "stream_incomplete"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+  end
+
+  test "stable websocket session key is reused before timeout and replaced after timeout" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: "stable-reconnect",
+        owner_instance_id: "node-a"
+      })
+
+    assert [%BridgeOwnerLease{id: old_lease_id}] =
+             Repo.all(
+               from lease in BridgeOwnerLease, where: lease.codex_session_id == ^session.id
+             )
+
+    Gateway.interrupt_codex_session(session, %{reconnect_window_seconds: 300})
+
+    {:ok, reused} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: "stable-reconnect",
+        owner_instance_id: "node-a"
+      })
+
+    assert reused.id == session.id
+
+    expired_at = DateTime.add(DateTime.utc_now(), -30, :second) |> DateTime.truncate(:microsecond)
+
+    reused
+    |> Ecto.Changeset.change(%{status: "interrupted", owner_lease_expires_at: expired_at})
+    |> Repo.update!()
+
+    {:ok, replacement} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: "stable-reconnect",
+        owner_instance_id: "node-b"
+      })
+
+    assert replacement.id != session.id
+    assert Repo.get!(CodexSession, session.id).status == "closed"
+    assert Repo.get!(BridgeOwnerLease, old_lease_id).status == "expired"
+
+    assert [] =
+             Repo.all(
+               from alias_record in BridgeSessionAlias,
+                 where:
+                   alias_record.codex_session_id == ^session.id and
+                     alias_record.status == "active"
+             )
+
+    assert [%BridgeOwnerLease{owner_instance_id: "node-b", status: "active"}] =
+             Repo.all(
+               from lease in BridgeOwnerLease, where: lease.codex_session_id == ^replacement.id
+             )
+  end
+
+  @tag :websocket_disconnect_interrupts_turn
+  test "websocket disconnect interrupts active turn and request accounting" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-disconnect"})
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               auth,
+               setup.model,
+               %{"model" => setup.model.exposed_model_id, "input" => "disconnect me"},
+               %{
+                 endpoint: "/backend-api/codex/responses",
+                 transport: "websocket",
+                 correlation_id: "ws-disconnect-#{System.unique_integer([:positive])}",
+                 request_metadata: %{"codex_session_id" => session.id}
+               }
+             )
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+    assert {:ok, turn} = Gateway.start_codex_turn(session, reserved.request)
+
+    Gateway.interrupt_codex_session(session, %{
+      reason: "client_disconnected",
+      reconnect_window_seconds: 300
+    })
+
+    assert Repo.get!(CodexTurn, turn.id).status == "interrupted"
+    assert Repo.get!(CodexTurn, turn.id).final_attempt_id == attempt.id
+    assert Repo.get!(Request, reserved.request.id).status == "failed"
+    assert Repo.get!(Request, reserved.request.id).response_status_code == 499
+    assert Repo.get!(Request, reserved.request.id).last_error_code == "client_disconnected"
+    assert Repo.get!(CodexSession, session.id).status == "interrupted"
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+  end
+
+  test "websocket disconnect does not partially interrupt when accounting finalization fails" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-disconnect-failure"})
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               auth,
+               setup.model,
+               %{"model" => setup.model.exposed_model_id, "input" => "disconnect me"},
+               %{
+                 endpoint: "/backend-api/codex/responses",
+                 transport: "websocket",
+                 correlation_id: "ws-disconnect-failure-#{System.unique_integer([:positive])}",
+                 request_metadata: %{"codex_session_id" => session.id}
+               }
+             )
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+    assert {:ok, turn} = Gateway.start_codex_turn(session, reserved.request)
+
+    Repo.delete_all(
+      from entry in LedgerEntry,
+        where: entry.source_event_id == ^"request:#{reserved.request.id}:reservation"
+    )
+
+    assert {:error, {:interrupt_accounting_failed, %Ecto.NoResultsError{}}} =
+             Gateway.interrupt_codex_session(session, %{
+               reason: "client_disconnected",
+               reconnect_window_seconds: 300
+             })
+
+    assert Repo.get!(CodexTurn, turn.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, turn.id).final_attempt_id == nil
+    assert Repo.get!(Request, reserved.request.id).status == "in_progress"
+    assert Repo.get!(Attempt, attempt.id).status == "in_progress"
+    assert Repo.get!(CodexSession, session.id).status == "active"
+  end
+
+  test "websocket disconnect does not downgrade a completed turn" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-completed-disconnect"})
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               auth,
+               setup.model,
+               %{"model" => setup.model.exposed_model_id, "input" => "complete me"},
+               %{
+                 endpoint: "/backend-api/codex/responses",
+                 transport: "websocket",
+                 correlation_id: "ws-completed-disconnect-#{System.unique_integer([:positive])}",
+                 request_metadata: %{"codex_session_id" => session.id}
+               }
+             )
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+    assert {:ok, turn} = Gateway.start_codex_turn(session, reserved.request)
+
+    assert {:ok, _result} =
+             AttemptSettlement.finalize_success(
+               reserved.request,
+               attempt,
+               %{status: "usage_known", input_tokens: 1, output_tokens: 1, total_tokens: 2},
+               %{response_status_code: 200}
+             )
+
+    Gateway.interrupt_codex_session(session, %{
+      reason: "client_disconnected",
+      reconnect_window_seconds: 300
+    })
+
+    assert Repo.get!(CodexTurn, turn.id).status == "succeeded"
+    assert Repo.get!(CodexTurn, turn.id).error_code == nil
+    assert Repo.get!(Request, reserved.request.id).status == "succeeded"
+    assert Repo.get!(Request, reserved.request.id).last_error_code == nil
+    assert Repo.get!(CodexSession, session.id).status == "interrupted"
+  end
+
+  test "websocket response task exits are reported as structured websocket errors" do
+    payload =
+      Jason.encode!(%{
+        "type" => "response.create",
+        "model" => "gpt-test-model",
+        "input" => "sensitive prompt sentinel"
+      })
+
+    log =
+      capture_log(fn ->
+        assert {:ok, state} =
+                 CodexResponsesSocket.handle_in(
+                   {payload, [opcode: :text]},
+                   %{tasks: MapSet.new(), opts: %{request_id: "ws-task-crash-log"}}
+                 )
+
+        assert MapSet.size(state.tasks) == 1
+
+        assert {:push, {:text, frame}, state} =
+                 receive_socket_done(state, @large_websocket_frame_timeout)
+
+        assert Jason.decode!(frame) == %{
+                 "type" => "error",
+                 "status" => 500,
+                 "error" => %{
+                   "message" => "websocket response task failed",
+                   "type" => "invalid_request_error",
+                   "code" => "websocket_response_task_failed",
+                   "param" => nil
+                 }
+               }
+
+        assert MapSet.size(state.tasks) == 0
+      end)
+
+    assert log =~ "websocket response task failed"
+    assert log =~ "failure_kind=exception"
+    assert log =~ "failure_reason=KeyError"
+    assert log =~ "request_id=ws-task-crash-log"
+    assert log =~ "payload_type=response.create"
+    assert log =~ "payload_model=gpt-test-model"
+    refute log =~ "sensitive prompt sentinel"
+  end
+
+  test "websocket response task DOWN messages remove tasks that exit before done" do
+    pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    monitor = Process.monitor(pid)
+    state = %{tasks: MapSet.new([pid]), task_monitors: %{pid => monitor}}
+
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
+
+    assert {:ok, state} =
+             CodexResponsesSocket.handle_info({:DOWN, monitor, :process, pid, :killed}, state)
+
+    assert state.tasks == MapSet.new()
+    assert state.task_monitors == %{}
+  end
+
+  test "late websocket success after disconnect promotes an interrupted turn" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "late-success-disconnect"})
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               auth,
+               setup.model,
+               %{"model" => setup.model.exposed_model_id, "input" => "finish after disconnect"},
+               %{
+                 endpoint: "/backend-api/codex/responses",
+                 transport: "websocket",
+                 correlation_id: "ws-late-success-#{System.unique_integer([:positive])}",
+                 request_metadata: %{"codex_session_id" => session.id}
+               }
+             )
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+    assert {:ok, turn} = Gateway.start_codex_turn(session, reserved.request)
+
+    Gateway.interrupt_codex_session(session, %{
+      reason: "client_disconnected",
+      reconnect_window_seconds: 300
+    })
+
+    assert Repo.get!(CodexTurn, turn.id).status == "interrupted"
+    assert Repo.get!(Request, reserved.request.id).status == "failed"
+
+    assert {:ok, _result} =
+             AttemptSettlement.finalize_success(
+               reserved.request,
+               attempt,
+               %{status: "usage_known", input_tokens: 1, output_tokens: 1, total_tokens: 2},
+               %{response_status_code: 200}
+             )
+
+    assert Repo.get!(CodexTurn, turn.id).status == "succeeded"
+    assert Repo.get!(CodexTurn, turn.id).error_code == nil
+    assert Repo.get!(Request, reserved.request.id).status == "succeeded"
+    assert Repo.get!(Request, reserved.request.id).last_error_code == nil
+
+    reloaded_attempt = Repo.get!(Attempt, attempt.id)
+    assert reloaded_attempt.status == "succeeded"
+    assert reloaded_attempt.network_error_code == nil
+    assert reloaded_attempt.error_message == nil
+
+    assert %{items: [log]} =
+             Accounting.list_request_logs(setup.pool, filters: %{request_id: reserved.request.id})
+
+    assert log.status == "succeeded"
+    assert log.errors == []
+  end
+
+  test "websocket terminate lets a just-completed response task finish before interrupting" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "task-drain"})
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               auth,
+               setup.model,
+               %{"model" => setup.model.exposed_model_id, "input" => "complete me"},
+               %{
+                 endpoint: "/backend-api/codex/responses",
+                 transport: "websocket",
+                 correlation_id: "ws-task-drain-#{System.unique_integer([:positive])}",
+                 request_metadata: %{"codex_session_id" => session.id}
+               }
+             )
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+    assert {:ok, turn} = Gateway.start_codex_turn(session, reserved.request)
+
+    parent = self()
+
+    {:ok, pid} =
+      Task.start(fn ->
+        AttemptSettlement.finalize_success(
+          reserved.request,
+          attempt,
+          %{status: "usage_known", input_tokens: 1, output_tokens: 1, total_tokens: 2},
+          %{response_status_code: 200}
+        )
+
+        send(parent, {:codex_response_done, self(), :ok})
+      end)
+
+    assert :ok =
+             CodexResponsesSocket.terminate(:closed, %{
+               tasks: MapSet.new([pid]),
+               codex_session: session,
+               opts: %{reason: "client_disconnected", reconnect_window_seconds: 300}
+             })
+
+    assert Repo.get!(CodexTurn, turn.id).status == "succeeded"
+    assert Repo.get!(CodexTurn, turn.id).error_code == nil
+    assert Repo.get!(Request, reserved.request.id).status == "succeeded"
+    assert Repo.get!(Request, reserved.request.id).last_error_code == nil
+    assert Repo.get!(CodexSession, session.id).status == "interrupted"
+  end
+
+  test "websocket terminate wait preserves unrelated mailbox messages" do
+    unrelated = {:unrelated_websocket_mailbox_message, make_ref()}
+
+    task =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    send(self(), unrelated)
+
+    assert :ok =
+             CodexResponsesSocket.terminate(:closed, %{
+               tasks: MapSet.new([task]),
+               codex_session: nil,
+               opts: %{}
+             })
+
+    assert_receive ^unrelated
+  end
+
+  defp execute_websocket_response(auth, raw_payload, opts, push_frame) do
+    request_options = RequestOptions.for_websocket(opts)
+    Service.execute_websocket_response(auth, raw_payload, request_options, push_frame)
+  end
+end

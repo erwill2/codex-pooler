@@ -1,0 +1,362 @@
+defmodule CodexPoolerWeb.Admin.RequestLogsLive do
+  use CodexPoolerWeb, :live_view
+
+  alias CodexPooler.Accounting
+  alias CodexPooler.Events
+  alias CodexPooler.Pools
+  alias CodexPooler.Upstreams
+  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
+  alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.PoolEventSubscriptions
+  alias CodexPoolerWeb.Admin.RequestLogFilterForm
+  alias CodexPoolerWeb.Admin.RequestLogsDisplay
+
+  import CodexPoolerWeb.Admin.RequestLogsPresentation
+
+  import CodexPoolerWeb.Admin.RequestLogsPresentation.Filters,
+    only: [request_log_filter_dropdown: 1]
+
+  @page_size 50
+
+  @impl true
+  def mount(_params, _session, socket) do
+    {:ok,
+     socket
+     |> assign(
+       page_title: "Admin request logs",
+       pools: [],
+       selected_pool: nil,
+       request_logs: empty_request_logs(),
+       current_params: %{},
+       filter_form: to_form(%{}, as: :filters),
+       filter_values: %{},
+       filter_errors: [],
+       pool_filter_options: [],
+       model_filter_options: [],
+       upstream_account_options: [],
+       subscribed_pool_ids: MapSet.new()
+     )}
+  end
+
+  @impl true
+  def handle_params(params, _uri, socket) do
+    {:noreply, load_request_logs(socket, params)}
+  end
+
+  @impl true
+  def handle_event("filter", %{"filters" => filter_params}, socket) do
+    {:noreply,
+     push_patch(socket,
+       to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(filter_params)}"
+     )}
+  end
+
+  def handle_event("select_pool_filter", %{"pool-id" => pool_id}, socket) do
+    params = Map.put(socket.assigns.filter_values, "pool_id", pool_id)
+
+    {:noreply,
+     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+  end
+
+  def handle_event("select_status_filter", %{"status" => status}, socket) do
+    params = Map.put(socket.assigns.filter_values, "status", status)
+
+    {:noreply,
+     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+  end
+
+  def handle_event("select_upstream_filter", %{"upstream-id" => upstream_id}, socket) do
+    params = Map.put(socket.assigns.filter_values, "upstream_identity_id", upstream_id)
+
+    {:noreply,
+     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+  end
+
+  def handle_event("select_model_filter", %{"model" => model}, socket) do
+    params = Map.put(socket.assigns.filter_values, "model", model)
+
+    {:noreply,
+     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+  end
+
+  @impl true
+  def handle_info({Events, %{pool_id: pool_id, topics: topics}}, socket) do
+    if "request_logs" in topics and request_log_event_in_scope?(socket, pool_id) do
+      {:noreply, load_request_logs(socket, socket.assigns.current_params)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  @impl true
+  def render(assigns) do
+    ~H"""
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:request_logs}
+    >
+      <section id="admin-request-logs-live" class="grid gap-6">
+        <AdminComponents.page_header
+          id="request-log-page-header"
+          title="Request logs"
+          description="Review recent requests, quota routing, status, token usage, and pricing state without exposing request or response content."
+        />
+
+        <AdminComponents.filter_form
+          id="request-log-filter-form"
+          for={@filter_form}
+          phx-submit="filter"
+        >
+          <.request_log_filter_dropdown
+            id="request-log-pool-filter"
+            label="Pool"
+            field_name="pool_id"
+            hidden_id="filters_pool_id"
+            role="pool-filter"
+            event="select_pool_filter"
+            value_attr={:pool_id}
+            selected_value={@filter_values["pool_id"] || ""}
+            selected={selected_pool_filter_option(@pool_filter_options, @filter_values["pool_id"])}
+            options={@pool_filter_options}
+          />
+          <.request_log_filter_dropdown
+            id="request-log-status-filter"
+            label="Status"
+            field_name="status"
+            hidden_id="filters_status"
+            role="status-filter"
+            event="select_status_filter"
+            value_attr={:status}
+            selected_value={@filter_values["status"] || ""}
+            selected={RequestLogsDisplay.selected_status_filter_option(@filter_values["status"])}
+            options={RequestLogsDisplay.status_filter_options()}
+          />
+          <.request_log_filter_dropdown
+            id="request-log-upstream-filter"
+            label="Upstream account"
+            field_name="upstream_identity_id"
+            hidden_id="filters_upstream_identity_id"
+            role="upstream-filter"
+            event="select_upstream_filter"
+            value_attr={:upstream_id}
+            selected_value={@filter_values["upstream_identity_id"] || ""}
+            selected={
+              selected_upstream_filter_option(
+                @upstream_account_options,
+                @filter_values["upstream_identity_id"]
+              )
+            }
+            options={@upstream_account_options}
+          />
+          <.request_log_filter_dropdown
+            id="request-log-model-filter"
+            label="Model"
+            field_name="model"
+            hidden_id="filters_model"
+            role="model-filter"
+            event="select_model_filter"
+            value_attr={:model}
+            selected_value={@filter_values["model"] || ""}
+            selected={RequestLogsDisplay.selected_model_filter_option(@filter_values["model"])}
+            options={@model_filter_options}
+          />
+          <.input field={@filter_form[:date_from]} type="date" aria-label="Date from" />
+          <.input field={@filter_form[:date_to]} type="date" aria-label="Date to" />
+          <.input
+            field={@filter_form[:request_id]}
+            type="text"
+            aria-label="Request ID"
+            placeholder="correlation or row id"
+          />
+          <:actions>
+            <AdminComponents.action_button
+              id="request-log-filter-submit"
+              icon="hero-funnel"
+              label="Apply filters"
+              type="submit"
+              variant={:primary}
+            />
+            <AdminComponents.action_button
+              id="request-log-filter-reset"
+              icon="hero-arrow-path"
+              label="Reset"
+              navigate={~p"/admin/request-logs"}
+            />
+          </:actions>
+        </AdminComponents.filter_form>
+
+        <div
+          :if={@filter_errors != []}
+          id="request-log-filter-errors"
+          class="alert alert-warning items-start"
+        >
+          <.icon name="hero-exclamation-triangle" class="size-5" />
+          <div>
+            <p class="font-semibold">Some filters were ignored</p>
+            <ul class="mt-1 list-disc space-y-1 pl-5 text-sm">
+              <li :for={error <- @filter_errors}>{error.message}</li>
+            </ul>
+          </div>
+        </div>
+
+        <.request_logs_table request_logs={@request_logs} />
+      </section>
+    </AdminComponents.admin_shell>
+    """
+  end
+
+  defp load_request_logs(socket, params) do
+    pools = Pools.list_visible_pools(socket.assigns.current_scope)
+
+    visible_upstream_identities =
+      Upstreams.list_visible_upstream_identities(socket.assigns.current_scope)
+
+    visible_upstream_identity_ids =
+      visible_upstream_identities
+      |> Enum.map(& &1.id)
+      |> MapSet.new()
+
+    {selected_pool, pool_error} = RequestLogFilterForm.select_pool(pools, params["pool_id"])
+
+    {filters, form_values, filter_errors} =
+      RequestLogFilterForm.parse_filters(params, selected_pool, visible_upstream_identity_ids)
+
+    filter_errors = Enum.reject([pool_error | filter_errors], &is_nil/1)
+
+    request_logs =
+      if selected_pool do
+        Accounting.list_request_logs(selected_pool, limit: @page_size, filters: filters)
+      else
+        Accounting.list_request_logs_for_scope(
+          socket.assigns.current_scope,
+          limit: @page_size,
+          filters: filters
+        )
+      end
+
+    model_filter_models =
+      if selected_pool do
+        Accounting.list_request_log_models(selected_pool)
+      else
+        Accounting.list_request_log_models_for_scope(socket.assigns.current_scope)
+      end
+
+    socket = maybe_subscribe_pool_events(socket, pools, selected_pool)
+
+    assign(socket,
+      pools: pools,
+      selected_pool: selected_pool,
+      request_logs: request_logs,
+      current_params: params,
+      filter_form:
+        to_form(form_values,
+          as: :filters,
+          errors: RequestLogFilterForm.form_errors(filter_errors)
+        ),
+      filter_values: form_values,
+      filter_errors: filter_errors,
+      pool_filter_options: pool_filter_options(pools),
+      model_filter_options: model_filter_options(model_filter_models, form_values["model"]),
+      upstream_account_options: upstream_account_options(visible_upstream_identities)
+    )
+  end
+
+  defp maybe_subscribe_pool_events(socket, _pools, selected_pool)
+       when not is_nil(selected_pool) do
+    PoolEventSubscriptions.reconcile(socket, MapSet.new([selected_pool.id]))
+    |> elem(0)
+  end
+
+  defp maybe_subscribe_pool_events(socket, pools, _selected_pool) do
+    pools
+    |> PoolEventSubscriptions.pool_id_set()
+    |> then(fn target_pool_ids ->
+      {socket, _stale_pool_ids} = PoolEventSubscriptions.reconcile(socket, target_pool_ids)
+      socket
+    end)
+  end
+
+  defp selected_pool_id(%{assigns: %{selected_pool: %{id: pool_id}}}), do: pool_id
+  defp selected_pool_id(_socket), do: nil
+
+  defp request_log_event_in_scope?(socket, pool_id) do
+    case selected_pool_id(socket) do
+      nil -> Enum.any?(socket.assigns.pools, &(&1.id == pool_id))
+      selected_pool_id -> selected_pool_id == pool_id
+    end
+  end
+
+  defp pool_filter_options(pools) do
+    settings_by_pool_id = pools |> Enum.map(& &1.id) |> Pools.routing_settings_by_pool_ids()
+
+    pool_options =
+      pools
+      |> Enum.sort_by(&String.downcase(&1.name))
+      |> Enum.map(fn pool ->
+        strategy = Map.fetch!(settings_by_pool_id, pool.id).routing_strategy
+
+        %{
+          label: pool.name,
+          value: pool.id,
+          icon: AdminBadges.routing_strategy_icon(strategy),
+          strategy_label: AdminBadges.routing_strategy_label(strategy)
+        }
+      end)
+
+    [all_pool_filter_option() | pool_options]
+  end
+
+  defp all_pool_filter_option do
+    %{label: "All Pools", value: "", icon: "hero-server-stack", strategy_label: nil}
+  end
+
+  defp selected_pool_filter_option(options, pool_id) do
+    Enum.find(options, &(&1.value == pool_id)) || all_pool_filter_option()
+  end
+
+  defp model_filter_options(models, selected_model) do
+    models =
+      models
+      |> Enum.reject(&RequestLogFilterForm.blank?/1)
+      |> Enum.uniq()
+      |> Enum.sort_by(&String.downcase/1)
+
+    selected_models =
+      selected_model
+      |> RequestLogFilterForm.blank_to_nil()
+      |> List.wrap()
+
+    [
+      %{label: "Any model", value: "", icon: "hero-cpu-chip"}
+      | Enum.map(Enum.uniq(selected_models ++ models), fn model ->
+          %{label: model, value: model, icon: "hero-cpu-chip"}
+        end)
+    ]
+  end
+
+  defp upstream_account_options(visible_upstream_identities) do
+    [
+      any_upstream_filter_option()
+      | Enum.map(visible_upstream_identities, &upstream_account_option/1)
+    ]
+  end
+
+  defp any_upstream_filter_option do
+    %{label: "Any account", value: "", icon: "hero-cloud-arrow-up"}
+  end
+
+  defp selected_upstream_filter_option(options, upstream_identity_id) do
+    Enum.find(options, &(&1.value == upstream_identity_id)) || any_upstream_filter_option()
+  end
+
+  defp upstream_account_option(identity) do
+    %{
+      label: identity.account_label || identity.chatgpt_account_id || "upstream account",
+      value: identity.id,
+      icon: "hero-cloud-arrow-up"
+    }
+  end
+
+  defp empty_request_logs, do: %{items: [], total: 0, limit: @page_size, offset: 0}
+end

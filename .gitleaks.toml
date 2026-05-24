@@ -1,0 +1,27 @@
+title = "codex-pooler gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Ignore generated, dependency, and local runtime directories"
+paths = [
+  '''^_build/''',
+  '''^deps/''',
+  '''^doc/''',
+  '''^cover/''',
+  '''^tmp/''',
+  '''^assets/node_modules/''',
+  '''^priv/static/assets/''',
+  '''^priv/static/cache_manifest\.json$''',
+  '''^priv/static/.*\.gz$''',
+  '''^priv/static/.*-[0-9a-f]{32}\.[^/]+$''',
+  '''^\.agents/''',
+  '''^\.desloppify/''',
+  '''^\.elixir_ls/''',
+  '''^\.impeccable/''',
+  '''^\.omo/''',
+  '''^\.playwright-mcp/''',
+  '''^\.sisyphus/''',
+  '''^var/codex_pooler/files/''',
+]

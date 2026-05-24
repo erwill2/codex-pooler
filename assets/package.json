@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "daisyui": "^5.5.20",
+    "topbar": "^3.0.1",
+    "uqr": "^0.1.3"
+  }
+}

@@ -1,0 +1,14 @@
+/_build/
+/deps/
+/assets/node_modules/
+/.elixir_ls/
+/.git/
+/cover/
+/doc/
+/tmp/
+/.sisyphus/
+/.env*
+!.env.example
+erl_crash.dump
+*.ez
+codex_pooler-*.tar

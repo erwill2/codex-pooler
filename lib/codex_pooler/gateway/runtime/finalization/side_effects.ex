@@ -1,0 +1,73 @@
+defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
+  @moduledoc false
+
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Routing.RouteLifecycle, as: RoutingRouteLifecycle
+  alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
+  alias CodexPooler.Gateway.Runtime.RateLimitObserver
+  alias CodexPooler.Gateway.Runtime.Routing.RouteLifecycle
+  alias CodexPooler.Jobs
+  alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
+
+  @spec record_success(DispatchContext.t(), map(), binary(), RequestOptions.t() | map(), map()) ::
+          :ok
+  def record_success(%DispatchContext{} = context, payload, body, request_options, callbacks) do
+    RoutingRouteLifecycle.log_optional_result(
+      "route_lifecycle_success",
+      route_lifecycle_metadata(context),
+      RouteLifecycle.success(context)
+    )
+
+    callbacks.register_continuity.(
+      with_assignment(request_options, context.assignment),
+      payload,
+      body
+    )
+
+    :ok
+  end
+
+  @spec maybe_enqueue_gateway_reconciliation(Jobs.pool_ref(), PoolUpstreamAssignment.t()) :: :ok
+  def maybe_enqueue_gateway_reconciliation(pool_id, assignment) do
+    result =
+      Jobs.enqueue_account_reconciliation(pool_id, assignment,
+        trigger_kind: "gateway",
+        unique: [
+          fields: [:args, :queue, :worker],
+          keys: [:pool_id, :pool_upstream_assignment_id, :trigger_kind],
+          states: [:scheduled, :available, :executing, :retryable, :completed],
+          period: 60
+        ]
+      )
+
+    case result do
+      {:ok, _job} ->
+        :ok
+
+      {:error, reason} ->
+        RateLimitObserver.log_failure(
+          "gateway_reconciliation_enqueue",
+          [pool_id: pool_id, pool_upstream_assignment_id: assignment.id],
+          reason
+        )
+    end
+  end
+
+  defp route_lifecycle_metadata(%DispatchContext{} = context) do
+    [
+      pool_upstream_assignment_id: context.assignment.id,
+      route_class: context.route_class
+    ]
+  end
+
+  defp with_assignment(%RequestOptions{} = request_options, %PoolUpstreamAssignment{
+         id: assignment_id
+       }),
+       do:
+         RequestOptions.put_file_bridge(request_options,
+           pool_upstream_assignment_id: assignment_id
+         )
+
+  defp with_assignment(opts, %PoolUpstreamAssignment{id: assignment_id}),
+    do: Map.put(opts, :pool_upstream_assignment_id, assignment_id)
+end

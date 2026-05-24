@@ -1,0 +1,532 @@
+defmodule CodexPooler.Gateway.Service do
+  @moduledoc """
+  Codex backend gateway execution.
+  """
+
+  alias CodexPooler.Access
+  alias CodexPooler.Accounting
+  alias CodexPooler.Catalog
+  alias CodexPooler.Catalog.Model
+  alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.Denials
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Payloads.TranscriptionPayload
+  alias CodexPooler.Gateway.Persistence.CodexSession
+  alias CodexPooler.Gateway.Persistence.SessionContinuity, as: PersistenceSessionContinuity
+  alias CodexPooler.Gateway.Routing.CandidateEligibility
+  alias CodexPooler.Gateway.Routing.RouteFiltering
+  alias CodexPooler.Gateway.Routing.SessionContinuity
+  alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
+  alias CodexPooler.Gateway.Runtime.Dispatch.CandidateDispatch
+  alias CodexPooler.Gateway.Runtime.Dispatch.FileDispatch
+  alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
+  alias CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt
+  alias CodexPooler.Gateway.Runtime.Finalization.Metadata, as: FinalizationMetadata
+  alias CodexPooler.Gateway.Transports.Streaming.WebSocketCodec
+  alias CodexPooler.Gateway.Transports.UpstreamDispatch
+  alias CodexPooler.Repo
+  alias CodexPooler.RouteClass
+
+  @backend_transcription_model "gpt-4o-transcribe"
+
+  @type auth :: Access.auth_context()
+  @type payload :: map()
+  @type opts :: RequestOptions.t()
+  @type gateway_error :: Contracts.gateway_error()
+  @type gateway_result :: Contracts.gateway_result()
+
+  @spec backend_transcription_model() :: String.t()
+  def backend_transcription_model, do: @backend_transcription_model
+
+  @spec create_upstream_file(auth(), map(), opts()) :: FileDispatch.file_result()
+  def create_upstream_file(auth, params, %RequestOptions{} = opts),
+    do: FileDispatch.create_upstream_file(auth, params, opts)
+
+  @spec create_v1_file(
+          auth(),
+          %{required(:purpose) => String.t(), required(:file) => map()},
+          opts()
+        ) :: FileDispatch.file_result()
+  def create_v1_file(auth, params, %RequestOptions{} = opts),
+    do: FileDispatch.create_v1_file(auth, params, opts)
+
+  @spec mark_uploaded(auth(), String.t(), opts()) :: FileDispatch.file_result()
+  def mark_uploaded(auth, file_id, %RequestOptions{} = opts),
+    do: FileDispatch.mark_uploaded(auth, file_id, opts)
+
+  defp normalize_policy_or_log(auth, endpoint, payload, opts) do
+    case Access.normalize_api_key_policy(auth.api_key) do
+      {:ok, policy} ->
+        {:ok, policy}
+
+      {:error, reason} ->
+        Denials.log_policy(denial_context(auth, nil, reason, endpoint, payload, opts))
+    end
+  end
+
+  defp effective_model_name(%{enforced_model_identifier: model}, _requested_model)
+       when is_binary(model),
+       do: model
+
+  defp effective_model_name(_policy, requested_model), do: requested_model
+
+  defp policy_request_opts(
+         %RequestOptions{} = request_options,
+         policy,
+         requested_model,
+         effective_model
+       ) do
+    RequestOptions.put_routing(request_options,
+      api_key_policy: policy,
+      requested_model: requested_model,
+      effective_model: effective_model
+    )
+  end
+
+  @spec request_options(opts(), String.t(), payload()) :: RequestOptions.t()
+  defp request_options(%RequestOptions{} = request_options, endpoint, payload),
+    do: RequestOptions.for_payload(request_options, endpoint, payload)
+
+  @spec execute_request_options(opts(), String.t(), payload(), String.t()) :: RequestOptions.t()
+  defp execute_request_options(
+         %RequestOptions{} = request_options,
+         endpoint,
+         payload,
+         requested_model
+       ) do
+    request_options
+    |> request_options(endpoint, payload)
+    |> RequestOptions.put_routing(requested_model: requested_model)
+  end
+
+  @spec execute(auth(), String.t(), payload(), opts()) ::
+          {:ok, gateway_result()} | {:error, gateway_error()}
+  def execute(auth, endpoint, payload, %RequestOptions{} = opts) when is_map(payload) do
+    case requested_model(payload) do
+      {:ok, model_name} ->
+        request_options = execute_request_options(opts, endpoint, payload, model_name)
+        execute_requested_model(auth, endpoint, payload, request_options, model_name)
+
+      {:error, %{code: _code} = reason} ->
+        {:error, reason}
+    end
+  end
+
+  def execute(_auth, _endpoint, _payload, %RequestOptions{}),
+    do: {:error, error(400, "invalid_request", "request body must be a JSON object")}
+
+  defp execute_requested_model(auth, endpoint, payload, request_options, model_name) do
+    case normalize_policy_or_log(auth, endpoint, payload, request_options) do
+      {:ok, policy} ->
+        effective_model_name = effective_model_name(policy, model_name)
+
+        request_options =
+          policy_request_opts(request_options, policy, model_name, effective_model_name)
+
+        case visible_model(auth.pool, effective_model_name) do
+          %Model{} = model ->
+            execute_visible_model(auth, endpoint, payload, request_options, model)
+
+          nil ->
+            reason = error(400, "invalid_model", "model is not available for this pool", "model")
+
+            Denials.log_gateway(
+              denial_context(auth, nil, reason, endpoint, payload, request_options)
+            )
+        end
+
+      {:error, %{code: _code} = reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp execute_visible_model(auth, endpoint, payload, request_options, model) do
+    case PreDispatch.prepare(auth, endpoint, payload, request_options, model) do
+      {:ok, prepared} ->
+        execute_session_routable_model(
+          auth,
+          endpoint,
+          payload,
+          prepared.request_options,
+          model,
+          prepared.candidates
+        )
+
+      {:error, %{code: "duplicate_turn"} = reason} ->
+        {:error, reason}
+
+      {:error, %{code: _code} = reason} ->
+        Denials.log_gateway(
+          denial_context(auth, model, reason, endpoint, payload, request_options)
+        )
+    end
+  end
+
+  defp execute_session_routable_model(
+         auth,
+         endpoint,
+         payload,
+         request_options,
+         model,
+         candidates
+       ) do
+    with {:ok, candidates, request_options} <-
+           route_filter_input(
+             auth,
+             model,
+             endpoint,
+             payload,
+             request_options,
+             candidates
+           )
+           |> RouteFiltering.filter_candidates(),
+         :ok <- SessionContinuity.ensure_unique_turn(request_options),
+         {:ok, reserved} <-
+           reserve_and_start_turn(auth, model, payload, endpoint, request_options) do
+      dispatch_candidates(auth, endpoint, payload, model, reserved, candidates, request_options)
+    else
+      {:error, %{code: "duplicate_turn"} = reason} ->
+        {:error, reason}
+
+      {:error, %{code: _code} = reason} ->
+        Denials.log_gateway(
+          denial_context(auth, model, reason, endpoint, payload, request_options)
+        )
+    end
+  end
+
+  defp route_filter_input(auth, model, endpoint, payload, request_options, candidates) do
+    CandidateEligibility.FilterInput.new(%{
+      auth: auth,
+      model: model,
+      endpoint: endpoint,
+      payload: payload,
+      request_options: request_options,
+      candidates: candidates
+    })
+  end
+
+  @spec execute_multipart(auth(), String.t(), payload(), opts()) ::
+          {:ok, gateway_result()} | {:error, gateway_error()}
+  def execute_multipart(
+        auth,
+        "/backend-api/transcribe" = endpoint,
+        payload,
+        %RequestOptions{} = opts
+      )
+      when is_map(payload) do
+    request_options =
+      opts
+      |> request_options(endpoint, payload)
+      |> RequestOptions.put_payload_context(
+        forced_transcription_model: @backend_transcription_model
+      )
+
+    case TranscriptionPayload.normalize(payload, request_options) do
+      {:ok, safe_payload, media_opts} -> execute(auth, endpoint, safe_payload, media_opts)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def execute_multipart(_auth, _endpoint, _payload, %RequestOptions{}),
+    do: {:error, error(400, "invalid_request", "request body must be multipart/form-data")}
+
+  @spec execute_websocket_response(auth(), binary(), opts(), (binary() -> any())) ::
+          :ok | {:error, gateway_error()}
+  def execute_websocket_response(auth, raw_payload, %RequestOptions{} = opts, push_frame)
+      when is_binary(raw_payload) and is_function(push_frame, 1) do
+    with {:ok, payload} <- decode_websocket_payload(raw_payload),
+         {:ok, result} <-
+           execute_websocket_payload(auth, payload, opts, push_frame) do
+      WebSocketCodec.deliver_result(result, push_frame)
+    end
+  end
+
+  def execute_websocket_response(_auth, _raw_payload, _opts, _push_frame) do
+    {:error, error(400, "invalid_request", "websocket message must be a text JSON frame")}
+  end
+
+  defp execute_websocket_payload(auth, payload, opts, push_frame) do
+    cond do
+      WebSocketCodec.response_processed_payload?(payload) ->
+        handle_websocket_response_processed(auth, payload, opts)
+
+      WebSocketCodec.warmup_payload?(payload) ->
+        {:ok, WebSocketCodec.warmup_result()}
+
+      true ->
+        request_options =
+          opts
+          |> request_options("/backend-api/codex/responses", payload)
+          |> RequestOptions.put_transport(
+            transport: "websocket",
+            upstream_endpoint: "/backend-api/codex/responses",
+            route_class: RouteClass.proxy_websocket(),
+            websocket_writer: push_frame
+          )
+          |> RequestOptions.put_continuity(
+            codex_turn_id: SessionContinuity.websocket_turn_id(payload)
+          )
+
+        execute(
+          auth,
+          "/backend-api/codex/responses",
+          payload,
+          request_options
+        )
+    end
+  end
+
+  defp handle_websocket_response_processed(auth, payload, opts) do
+    request_options =
+      opts
+      |> request_options("/backend-api/codex/responses", payload)
+      |> RequestOptions.put_transport(
+        transport: "websocket",
+        upstream_endpoint: "/backend-api/codex/responses",
+        route_class: RouteClass.proxy_websocket()
+      )
+
+    case forward_websocket_response_processed(payload, request_options) do
+      :ok ->
+        with :ok <- record_websocket_response_processed(auth, payload, request_options) do
+          {:ok, WebSocketCodec.ack_result()}
+        end
+
+      {:error, reason} ->
+        {:error, response_processed_forward_error(reason)}
+    end
+  end
+
+  defp dispatch_candidates(auth, endpoint, payload, model, reserved, candidates, request_options) do
+    CandidateDispatch.dispatch(
+      %{
+        auth: auth,
+        endpoint: endpoint,
+        payload: payload,
+        model: model,
+        reserved: reserved,
+        candidates: candidates,
+        request_options: request_options
+      },
+      &dispatch_decrypted_candidate/1
+    )
+  end
+
+  defp dispatch_decrypted_candidate(prepared_context) do
+    UpstreamAttempt.dispatch(prepared_context, upstream_attempt_callbacks())
+  end
+
+  defp upstream_attempt_callbacks do
+    %{
+      register_continuity: &register_codex_continuity/3,
+      retry_dispatch: &dispatch_decrypted_candidate/1
+    }
+  end
+
+  defp denial_context(auth, model, reason, endpoint, payload, opts) do
+    %Denials.Context{
+      auth: auth,
+      model: model,
+      reason: reason,
+      endpoint: endpoint,
+      payload: payload,
+      opts: request_options(opts, endpoint, payload)
+    }
+  end
+
+  defp reserve(auth, model, payload, endpoint, %RequestOptions{} = request_options) do
+    Accounting.reserve(
+      auth,
+      model,
+      payload,
+      AccountingReservation.attrs(auth, payload, endpoint, request_options)
+    )
+  end
+
+  defp reserve_and_start_turn(auth, model, payload, endpoint, %RequestOptions{} = request_options) do
+    Repo.transaction(fn ->
+      with {:ok, reserved} <- reserve(auth, model, payload, endpoint, request_options),
+           {:ok, reserved} <- SessionContinuity.start_turn(reserved, request_options) do
+        reserved
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, reserved} -> {:ok, reserved}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    error in Ecto.ConstraintError ->
+      if duplicate_turn_reservation_constraint?(error, request_options) do
+        {:error, duplicate_turn_error()}
+      else
+        reraise(error, __STACKTRACE__)
+      end
+  end
+
+  defp duplicate_turn_reservation_constraint?(
+         %Ecto.ConstraintError{constraint: "requests_correlation_id_uq"},
+         %RequestOptions{
+           transport: %{transport: "websocket"},
+           continuity: %{codex_turn_id: turn_id}
+         }
+       )
+       when is_binary(turn_id),
+       do: true
+
+  defp duplicate_turn_reservation_constraint?(_error, _opts), do: false
+
+  defp duplicate_turn_error do
+    error(
+      409,
+      "duplicate_turn",
+      "duplicate Codex turn was already recorded for this session",
+      "request_id"
+    )
+  end
+
+  defp visible_model(pool, requested_model) do
+    requested = String.downcase(String.trim(requested_model))
+
+    Enum.find(Catalog.list_visible_models(pool), fn model ->
+      String.downcase(model.exposed_model_id) == requested
+    end)
+  end
+
+  defp requested_model(payload) do
+    case Map.get(payload, "model") || Map.get(payload, :model) do
+      model when is_binary(model) ->
+        case String.trim(model) do
+          "" -> {:error, error(400, "invalid_request", "model is required", "model")}
+          trimmed -> {:ok, trimmed}
+        end
+
+      _value ->
+        {:error, error(400, "invalid_request", "model is required", "model")}
+    end
+  end
+
+  defp register_codex_continuity(
+         %RequestOptions{continuity: %{codex_session: %CodexSession{} = session}} =
+           request_options,
+         payload,
+         body
+       ) do
+    PersistenceSessionContinuity.register_codex_session_continuity(
+      session,
+      payload,
+      body,
+      request_options
+    )
+  end
+
+  defp register_codex_continuity(_opts, _payload, _body), do: :ok
+
+  defp decode_websocket_payload(payload) do
+    case WebSocketCodec.decode_payload(payload) do
+      {:ok, decoded} ->
+        {:ok, decoded}
+
+      {:error, :not_object} ->
+        {:error, error(400, "invalid_request", "websocket message must be a JSON object")}
+
+      {:error, :invalid_json} ->
+        {:error, error(400, "invalid_request", "websocket message must be valid JSON")}
+    end
+  end
+
+  defp forward_websocket_response_processed(payload, %RequestOptions{} = request_options) do
+    UpstreamDispatch.forward_response_processed(payload, request_options)
+  end
+
+  defp record_websocket_response_processed(auth, payload, %RequestOptions{} = request_options) do
+    attrs = %{
+      endpoint: "/backend-api/codex/responses",
+      transport: "websocket",
+      status: "succeeded",
+      correlation_id: websocket_processed_correlation_id(payload, request_options),
+      client_ip: request_options.request_metadata.client_ip,
+      user_agent: request_options.request_metadata.user_agent,
+      request_metadata: websocket_processed_metadata(auth, payload, request_options),
+      response_status_code: 200
+    }
+
+    case Accounting.record_metadata_request(auth, attrs) do
+      {:ok, %{request: _request}} -> :ok
+      {:error, reason} -> {:error, accounting_failure_error(reason)}
+    end
+  end
+
+  defp websocket_processed_metadata(auth, _payload, request_options) do
+    %{
+      "key_prefix" => auth.key_prefix,
+      "transport" => "websocket",
+      "requested_stream" => false,
+      "endpoint" => "/backend-api/codex/responses",
+      "request_bytes" => request_options.request_metadata.request_bytes,
+      "response_processed" => true
+    }
+    |> Map.merge(websocket_owner_forwarding_metadata(request_options))
+    |> maybe_put_codex_session_metadata(request_options)
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp websocket_owner_forwarding_metadata(%RequestOptions{
+         transport: %{
+           websocket_owner_forwarding_enabled?: true,
+           websocket_owner_downstream_epoch: downstream_epoch,
+           websocket_owner_proxy_instance_id: proxy_instance_id,
+           websocket_owner_instance_id: owner_instance_id
+         }
+       }) do
+    %{
+      "websocket_owner_forwarding" => %{
+        "enabled" => true,
+        "downstream_epoch" => downstream_epoch,
+        "proxy_instance_id" => proxy_instance_id,
+        "owner_instance_id" => owner_instance_id
+      }
+    }
+  end
+
+  defp websocket_owner_forwarding_metadata(_request_options), do: %{}
+
+  defp maybe_put_codex_session_metadata(metadata, %RequestOptions{
+         continuity: %{codex_session: %CodexSession{} = session}
+       }) do
+    metadata
+    |> Map.put("codex_session_id", session.id)
+    |> Map.put("codex_session_key", session.session_key)
+  end
+
+  defp maybe_put_codex_session_metadata(metadata, %RequestOptions{}), do: metadata
+
+  defp websocket_processed_correlation_id(payload, request_options) do
+    SessionContinuity.websocket_turn_id(payload) || request_options.request_metadata.request_id ||
+      Ecto.UUID.generate()
+  end
+
+  defp accounting_failure_error(reason) do
+    error(500, "gateway_accounting_failed", "gateway accounting failed", nil, %{
+      accounting_error: FinalizationMetadata.safe_reason(reason)
+    })
+  end
+
+  defp response_processed_forward_error(:missing_response_id) do
+    error(400, "invalid_request", "response.processed requires response_id")
+  end
+
+  defp response_processed_forward_error(reason) do
+    error(
+      502,
+      "upstream_websocket_forward_failed",
+      "response.processed could not be forwarded upstream: #{FinalizationMetadata.safe_reason(reason)}"
+    )
+  end
+
+  defp error(status, code, message, param \\ nil, metadata \\ %{}),
+    do: Map.merge(%{status: status, code: code, message: message, param: param}, metadata)
+end

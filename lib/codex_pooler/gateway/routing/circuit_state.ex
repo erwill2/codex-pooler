@@ -1,0 +1,360 @@
+defmodule CodexPooler.Gateway.Routing.CircuitState do
+  @moduledoc false
+
+  import Ecto.Query
+
+  alias CodexPooler.Access.APIKey
+  alias CodexPooler.Catalog.Model
+  alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Persistence.RoutingCircuitState
+  alias CodexPooler.Pools.Pool
+  alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
+
+  @circuit_probe_in_flight_key "probe_in_flight_count"
+  @closed_status RoutingCircuitState.closed_status()
+  @open_status RoutingCircuitState.open_status()
+  @half_open_status RoutingCircuitState.half_open_status()
+
+  @type auth :: CodexPooler.Access.auth_context()
+
+  @spec eligible?(auth(), Model.t(), PoolUpstreamAssignment.t(), String.t()) :: boolean()
+  def eligible?(
+        %{pool: %Pool{}, api_key: %APIKey{}} = auth,
+        %Model{} = model,
+        %PoolUpstreamAssignment{} = assignment,
+        route_class
+      ) do
+    now = now()
+    settings = OperationalSettings.current()
+
+    case latest(auth, model, assignment, route_class) do
+      %RoutingCircuitState{status: @open_status, next_probe_at: %DateTime{} = next_probe_at} ->
+        DateTime.compare(next_probe_at, now) != :gt
+
+      %RoutingCircuitState{status: @open_status} ->
+        false
+
+      %RoutingCircuitState{status: @half_open_status} = state ->
+        probe_available?(state, settings, now)
+
+      _state ->
+        true
+    end
+  end
+
+  @spec begin_attempt(auth(), Model.t(), PoolUpstreamAssignment.t(), String.t()) ::
+          {:ok, RoutingCircuitState.t() | nil} | {:error, term()}
+  def begin_attempt(
+        %{pool: %Pool{}, api_key: %APIKey{}} = auth,
+        %Model{} = model,
+        %PoolUpstreamAssignment{} = assignment,
+        route_class
+      )
+      when is_binary(route_class) and route_class != "" do
+    now = now()
+    settings = OperationalSettings.current()
+
+    Repo.transaction(fn ->
+      state = latest_for_update(auth, model, assignment, route_class)
+      begin_state(state, settings, now)
+    end)
+    |> case do
+      {:ok, state} -> {:ok, state}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def begin_attempt(
+        %{pool: %Pool{}, api_key: %APIKey{}},
+        %Model{},
+        %PoolUpstreamAssignment{},
+        _route_class
+      ),
+      do: {:error, :invalid_route_class}
+
+  @spec record_success(auth(), Model.t(), PoolUpstreamAssignment.t(), String.t()) ::
+          {:ok, :ok | RoutingCircuitState.t()} | {:error, term()}
+  def record_success(
+        %{pool: %Pool{}, api_key: %APIKey{}} = auth,
+        %Model{} = model,
+        %PoolUpstreamAssignment{} = assignment,
+        route_class
+      )
+      when is_binary(route_class) and route_class != "" do
+    now = now()
+    settings = OperationalSettings.current()
+
+    Repo.transaction(fn ->
+      case latest_for_update(auth, model, assignment, route_class) do
+        %RoutingCircuitState{} = state ->
+          state
+          |> RoutingCircuitState.changeset(success_attrs(state, settings, now))
+          |> persist_or_rollback(:update)
+
+        nil ->
+          :ok
+      end
+    end)
+    |> unwrap_transaction()
+  end
+
+  def record_success(
+        %{pool: %Pool{}, api_key: %APIKey{}},
+        %Model{},
+        %PoolUpstreamAssignment{},
+        _route_class
+      ),
+      do: {:error, :invalid_route_class}
+
+  @spec record_failure(auth(), Model.t(), PoolUpstreamAssignment.t(), String.t(), term()) ::
+          {:ok, RoutingCircuitState.t()} | {:error, term()}
+  def record_failure(
+        %{pool: %Pool{}, api_key: %APIKey{}} = auth,
+        %Model{} = model,
+        %PoolUpstreamAssignment{} = assignment,
+        route_class,
+        reason_code
+      )
+      when is_binary(route_class) and route_class != "" do
+    reason_code = sanitize_reason_code(reason_code)
+    now = now()
+    settings = OperationalSettings.current()
+
+    Repo.transaction(fn ->
+      state = latest_for_update(auth, model, assignment, route_class)
+
+      attrs =
+        failure_attrs(
+          auth,
+          model,
+          assignment,
+          route_class,
+          reason_code,
+          state,
+          settings,
+          now
+        )
+
+      case state do
+        %RoutingCircuitState{} = state ->
+          state |> RoutingCircuitState.changeset(attrs) |> persist_or_rollback(:update)
+
+        nil ->
+          %RoutingCircuitState{}
+          |> RoutingCircuitState.changeset(Map.put(attrs, :created_at, now))
+          |> persist_or_rollback(:insert)
+      end
+    end)
+    |> unwrap_transaction()
+  end
+
+  def record_failure(
+        %{pool: %Pool{}, api_key: %APIKey{}},
+        %Model{},
+        %PoolUpstreamAssignment{},
+        _route_class,
+        _reason_code
+      ),
+      do: {:error, :invalid_route_class}
+
+  defp begin_state(
+         %RoutingCircuitState{status: @open_status, next_probe_at: %DateTime{} = next_probe_at} =
+           state,
+         _settings,
+         now
+       ) do
+    if DateTime.compare(next_probe_at, now) == :gt do
+      Repo.rollback(:routing_circuit_open)
+    else
+      state
+      |> RoutingCircuitState.changeset(%{
+        status: @half_open_status,
+        half_opened_at: now,
+        success_count: 0,
+        metadata: probe_metadata(state, 1),
+        updated_at: now
+      })
+      |> persist_or_rollback(:update)
+    end
+  end
+
+  defp begin_state(%RoutingCircuitState{status: @open_status}, _settings, _now),
+    do: Repo.rollback(:routing_circuit_open)
+
+  defp begin_state(%RoutingCircuitState{status: @half_open_status} = state, settings, now) do
+    stale? = probe_stale?(state, settings, now)
+    in_flight = if stale?, do: 0, else: probe_in_flight_count(state)
+
+    if in_flight >= settings.circuit_half_open_probe_limit do
+      Repo.rollback(:routing_circuit_probe_in_flight)
+    else
+      attrs = %{
+        metadata: probe_metadata(state, in_flight + 1),
+        updated_at: now
+      }
+
+      attrs =
+        if stale? do
+          Map.put(attrs, :half_opened_at, now)
+        else
+          attrs
+        end
+
+      state
+      |> RoutingCircuitState.changeset(attrs)
+      |> persist_or_rollback(:update)
+    end
+  end
+
+  defp begin_state(state, _settings, _now), do: state
+
+  defp success_attrs(%RoutingCircuitState{status: @half_open_status} = state, settings, now) do
+    success_count = state.success_count + 1
+    probe_count = max(probe_in_flight_count(state) - 1, 0)
+
+    attrs = %{
+      success_count: success_count,
+      last_success_at: now,
+      metadata: probe_metadata(state, probe_count),
+      updated_at: now
+    }
+
+    if success_count >= settings.circuit_success_threshold do
+      Map.merge(attrs, %{
+        status: @closed_status,
+        reason_code: nil,
+        failure_count: 0,
+        closed_at: now,
+        next_probe_at: nil
+      })
+    else
+      attrs
+    end
+  end
+
+  defp success_attrs(%RoutingCircuitState{} = state, _settings, now) do
+    %{
+      status: @closed_status,
+      reason_code: nil,
+      failure_count: 0,
+      success_count: state.success_count + 1,
+      closed_at: now,
+      next_probe_at: nil,
+      last_success_at: now,
+      metadata: probe_metadata(state, 0),
+      updated_at: now
+    }
+  end
+
+  defp failure_attrs(auth, model, assignment, route_class, reason_code, state, settings, now) do
+    failure_count = failure_count(state)
+    open? = open_after_failure?(state, failure_count, settings)
+
+    %{
+      pool_id: auth.pool.id,
+      api_key_id: nil,
+      pool_upstream_assignment_id: assignment.id,
+      upstream_identity_id: assignment.upstream_identity_id,
+      model_identifier: model.exposed_model_id,
+      route_class: route_class,
+      status: if(open?, do: @open_status, else: @closed_status),
+      reason_code: reason_code,
+      failure_count: failure_count,
+      success_count: 0,
+      opened_at: if(open?, do: now),
+      half_opened_at: nil,
+      closed_at: if(open?, do: nil, else: now),
+      next_probe_at: if(open?, do: DateTime.add(now, settings.circuit_open_seconds, :second)),
+      last_failure_at: now,
+      metadata: probe_metadata(state, probe_count_after_failure(state)),
+      updated_at: now
+    }
+  end
+
+  defp failure_count(nil), do: 1
+  defp failure_count(state), do: state.failure_count + 1
+
+  defp probe_count_after_failure(nil), do: 0
+  defp probe_count_after_failure(state), do: max(probe_in_flight_count(state) - 1, 0)
+
+  defp probe_available?(state, settings, now) do
+    probe_in_flight_count(state) < settings.circuit_half_open_probe_limit or
+      probe_stale?(state, settings, now)
+  end
+
+  defp probe_stale?(
+         %RoutingCircuitState{status: @half_open_status, updated_at: %DateTime{} = updated_at},
+         settings,
+         now
+       ) do
+    DateTime.diff(now, updated_at, :second) >= settings.circuit_open_seconds
+  end
+
+  defp probe_stale?(_state, _settings, _now), do: false
+
+  defp open_after_failure?(state, failure_count, settings) do
+    failure_count >= settings.circuit_failure_threshold or
+      match?(%RoutingCircuitState{status: @half_open_status}, state)
+  end
+
+  defp latest(auth, model, assignment, route_class) do
+    Repo.one(query(auth, model, assignment, route_class))
+  end
+
+  defp latest_for_update(auth, model, assignment, route_class) do
+    auth
+    |> query(model, assignment, route_class)
+    |> lock("FOR UPDATE")
+    |> Repo.one()
+  end
+
+  defp query(auth, model, assignment, route_class) do
+    from state in RoutingCircuitState,
+      where:
+        state.pool_id == ^auth.pool.id and
+          is_nil(state.api_key_id) and
+          state.pool_upstream_assignment_id == ^assignment.id and
+          state.model_identifier == ^model.exposed_model_id and
+          state.route_class == ^route_class,
+      order_by: [desc: state.updated_at, desc: state.created_at],
+      limit: 1
+  end
+
+  defp probe_in_flight_count(%RoutingCircuitState{metadata: metadata}) when is_map(metadata) do
+    case Map.get(metadata, @circuit_probe_in_flight_key) do
+      value when is_integer(value) and value > 0 -> value
+      _value -> 0
+    end
+  end
+
+  defp probe_in_flight_count(_state), do: 0
+
+  defp probe_metadata(%RoutingCircuitState{metadata: metadata}, count) when is_map(metadata) do
+    Map.put(metadata, @circuit_probe_in_flight_key, max(count, 0))
+  end
+
+  defp probe_metadata(_state, count), do: %{@circuit_probe_in_flight_key => max(count, 0)}
+
+  defp sanitize_reason_code(code) when is_binary(code), do: String.slice(code, 0, 80)
+  defp sanitize_reason_code(code), do: code |> to_string() |> String.slice(0, 80)
+
+  defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+  defp unwrap_transaction({:ok, value}), do: {:ok, value}
+  defp unwrap_transaction({:error, reason}), do: {:error, reason}
+
+  defp persist_or_rollback(changeset, :insert) do
+    case Repo.insert(changeset) do
+      {:ok, state} -> state
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp persist_or_rollback(changeset, :update) do
+    case Repo.update(changeset) do
+      {:ok, state} -> state
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+end

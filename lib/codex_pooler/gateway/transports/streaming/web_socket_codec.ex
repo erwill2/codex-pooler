@@ -1,0 +1,130 @@
+defmodule CodexPooler.Gateway.Transports.Streaming.WebSocketCodec do
+  @moduledoc """
+  Conversion helpers for Codex public websocket frames and upstream stream data.
+  """
+
+  alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+
+  @type decode_error :: :invalid_json | :not_object
+  @type gateway_error :: Contracts.gateway_error()
+  @type deliver_result :: :ok | {:error, gateway_error()}
+
+  @spec decode_payload(binary()) :: {:ok, map()} | {:error, decode_error()}
+  def decode_payload(payload) when is_binary(payload) do
+    case Jason.decode(payload) do
+      {:ok, decoded} when is_map(decoded) ->
+        {:ok, decoded}
+
+      {:ok, _decoded} ->
+        {:error, :not_object}
+
+      {:error, _reason} ->
+        {:error, :invalid_json}
+    end
+  end
+
+  @spec deliver_result(map(), (binary() -> any())) :: deliver_result()
+  def deliver_result(%{websocket_stream: stream}, _push_frame) do
+    stream.()
+    |> normalize_websocket_stream_result()
+  end
+
+  def deliver_result(%{websocket_messages: messages}, push_frame) do
+    Enum.each(messages, fn message -> push_frame.(Jason.encode!(message)) end)
+    :ok
+  end
+
+  def deliver_result(%{raw_body: body}, push_frame) do
+    push_frame.(body)
+    :ok
+  end
+
+  def deliver_result(%{body: body}, push_frame) do
+    push_frame.(Jason.encode!(body))
+    :ok
+  end
+
+  defp normalize_websocket_stream_result(:ok), do: :ok
+  defp normalize_websocket_stream_result({:ok, _result}), do: :ok
+
+  defp normalize_websocket_stream_result(
+         {:error, %{status: status, code: code, message: message}} = error
+       )
+       when is_integer(status) and status > 0 and (is_binary(code) or is_atom(code)) and
+              is_binary(message),
+       do: error
+
+  defp normalize_websocket_stream_result(_result) do
+    {:error,
+     %{
+       status: 502,
+       code: "websocket_stream_error",
+       message: "websocket stream failed"
+     }}
+  end
+
+  @spec warmup_result() :: map()
+  def warmup_result do
+    response = %{"id" => "", "usage" => nil, "end_turn" => true}
+
+    %{
+      websocket_messages: [
+        %{"type" => "response.created", "response" => response},
+        %{"type" => "response.completed", "response" => response}
+      ]
+    }
+  end
+
+  @spec ack_result() :: map()
+  def ack_result, do: %{websocket_messages: []}
+
+  @spec response_processed_payload?(map()) :: boolean()
+  def response_processed_payload?(%{"type" => "response.processed"}), do: true
+  def response_processed_payload?(_payload), do: false
+
+  @spec warmup_payload?(map()) :: boolean()
+  def warmup_payload?(%{"generate" => false}), do: true
+  def warmup_payload?(_payload), do: false
+
+  @spec stream_messages(Ecto.UUID.t() | %{optional(:id) => Ecto.UUID.t()}, term()) :: [binary()]
+  def stream_messages(request, data) do
+    {messages, _buffer} = stream_messages(request, data, "")
+    messages
+  end
+
+  @spec stream_messages(Ecto.UUID.t() | %{optional(:id) => Ecto.UUID.t()}, term(), binary()) ::
+          {[binary()], binary()}
+  def stream_messages(%{id: request_id}, data, buffer),
+    do: stream_messages(request_id, data, buffer)
+
+  def stream_messages(request_id, data, buffer)
+      when is_binary(request_id) and is_binary(data) and is_binary(buffer) do
+    {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffer <> data, bounded?: false)
+
+    messages =
+      case messages_from_sse_blocks(blocks) do
+        [] -> direct_json_message(data)
+        messages -> messages
+      end
+
+    {messages, buffer}
+  end
+
+  def stream_messages(_request_id, _data, _buffer), do: {[], ""}
+
+  defp messages_from_sse_blocks(blocks) do
+    blocks
+    |> Enum.map(&StreamProtocol.normalize_codex_responses_sse_block/1)
+    |> Enum.map(&IO.iodata_to_binary/1)
+    |> Enum.map(&StreamProtocol.sse_field(&1, "data"))
+    |> Enum.reject(&(&1 in [nil, "[DONE]"]))
+    |> Enum.filter(&StreamProtocol.valid_json?/1)
+  end
+
+  defp direct_json_message(data) do
+    data = StreamProtocol.canonicalize_codex_responses_json_message(data)
+
+    if StreamProtocol.valid_json?(data), do: [data], else: []
+  end
+end

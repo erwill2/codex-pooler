@@ -1,0 +1,113 @@
+defmodule CodexPooler.Files.RequestLog do
+  @moduledoc false
+
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.FailureResponse
+  alias CodexPooler.Accounting.Request
+  alias CodexPooler.Files.RequestMetadata
+
+  @type gateway_error :: %{
+          required(:status) => pos_integer(),
+          required(:code) => String.t(),
+          required(:message) => String.t()
+        }
+
+  @spec record_file_request(map(), String.t(), pos_integer(), RequestMetadata.t(), map()) ::
+          {:ok, Request.t()} | {:error, gateway_error()}
+  def record_file_request(
+        auth,
+        status,
+        response_status,
+        %RequestMetadata{} = request_metadata,
+        metadata
+      ) do
+    attrs =
+      %{
+        endpoint: request_metadata.endpoint,
+        transport: request_metadata.transport,
+        status: status,
+        response_status_code: response_status,
+        correlation_id: request_metadata.request_id,
+        idempotency_key: request_idempotency_key(request_metadata),
+        client_ip: request_metadata.client_ip,
+        user_agent: request_metadata.user_agent,
+        request_metadata: file_request_metadata(request_metadata, metadata),
+        now: request_metadata.now
+      }
+      |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+      |> Map.new()
+
+    case Accounting.record_metadata_request(auth, attrs) do
+      {:ok, %{request: request}} ->
+        {:ok, request}
+
+      {:error, reason} ->
+        FailureResponse.accounting_failure(:record_file_request, nil, nil, reason)
+    end
+  end
+
+  @spec merge_bridge_route_metadata(Request.t(), map()) ::
+          {:ok, Request.t()} | {:error, gateway_error()}
+  def merge_bridge_route_metadata(request, %{route_metadata: route_metadata})
+      when is_map(route_metadata) and map_size(route_metadata) > 0 do
+    case Accounting.merge_request_metadata(request, route_metadata) do
+      {:ok, request} ->
+        {:ok, request}
+
+      {:error, reason} ->
+        FailureResponse.accounting_failure(:merge_file_request_metadata, request, nil, reason)
+    end
+  end
+
+  def merge_bridge_route_metadata(request, _bridge_result), do: {:ok, request}
+
+  @spec bridge_route_metadata(map()) :: map()
+  def bridge_route_metadata(%{upstream: upstream}) when is_map(upstream) do
+    Map.take(upstream, ["routing", "candidate_exclusions", :candidate_exclusions])
+  end
+
+  def bridge_route_metadata(_bridge_error), do: %{}
+
+  defp request_idempotency_key(%RequestMetadata{} = request_metadata) do
+    case request_metadata.endpoint do
+      endpoint
+      when endpoint in [
+             "/backend-api/files",
+             "/backend-api/files/uploaded",
+             "/v1/files",
+             "/v1/files/content",
+             "/v1/files/delete"
+           ] ->
+        nil
+
+      _endpoint ->
+        request_metadata.idempotency_key
+    end
+  end
+
+  defp file_request_metadata(%RequestMetadata{} = request_metadata, metadata) do
+    metadata
+    |> Map.merge(%{
+      "request" =>
+        drop_nil_values(%{
+          "request_bytes" => request_metadata.request_bytes,
+          "upload_bytes" => request_metadata.upload_bytes,
+          "request_content_type" => request_metadata.request_content_type
+        }),
+      "routing" => drop_nil_values(%{"route_class" => request_metadata.route_class})
+    })
+    |> drop_empty_maps()
+  end
+
+  defp drop_empty_maps(metadata) do
+    metadata
+    |> Enum.reject(fn {_key, value} -> is_map(value) and map_size(value) == 0 end)
+    |> Map.new()
+  end
+
+  defp drop_nil_values(metadata) do
+    metadata
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+end

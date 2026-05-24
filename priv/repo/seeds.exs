@@ -1,0 +1,1 @@
+CodexPooler.Dev.Seeds.compact()
