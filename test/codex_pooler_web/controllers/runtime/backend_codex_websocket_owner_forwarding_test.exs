@@ -1435,6 +1435,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
       assert active_owner_lease(session.id).owner_instance_id == Atom.to_string(node())
       assert [request] = await_upstream_requests(upstream, 1)
       assert request.json["input"] |> List.first() |> Map.get("content") == "dispatch takeover"
+
+      assert [request_log] = request_logs(setup.pool.id)
+      assert request_log.status == "succeeded"
+      assert request_log.response_status_code == 200
+      assert is_nil(request_log.last_error_code)
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request_log.id))
+      assert attempt.status == "succeeded"
+      assert attempt.upstream_status_code == 200
+      assert is_nil(attempt.network_error_code)
     after
       CodexResponsesSocket.terminate(:closed, state)
     end
