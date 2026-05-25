@@ -536,8 +536,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   defp schedule_idle_shutdown(state), do: state
 
-  defp schedule_owner_renewal(%{owner_renewal_ref: ref} = state) when is_reference(ref), do: state
-
   defp schedule_owner_renewal(%{owner_renewal_ms: timeout, codex_session_id: session_id} = state)
        when is_integer(timeout) and timeout > 0 do
     if uuid?(session_id) do
