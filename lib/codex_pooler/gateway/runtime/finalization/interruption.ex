@@ -196,6 +196,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
 
   defp owner_recovery_reason(:owner_drained), do: "owner_drained"
   defp owner_recovery_reason("owner_drained"), do: "owner_drained"
+  defp owner_recovery_reason(:owner_crashed), do: "owner_crashed"
+  defp owner_recovery_reason("owner_crashed"), do: "owner_crashed"
   defp owner_recovery_reason(_reason), do: "owner_unavailable"
 
   defp log_owner_lifecycle_recovery_failure(session_id, reason, failure) do

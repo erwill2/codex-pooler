@@ -19,13 +19,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
          websocket_owner_lease_token: owner_lease_token,
          websocket_owner_downstream: downstream
        }} ->
-        {:ok,
-         state
-         |> Map.put(:tasks, MapSet.new())
-         |> Map.put(:task_monitors, %{})
-         |> Map.put(:codex_session, session)
-         |> Map.put(:websocket_owner_lease_token, owner_lease_token)
-         |> Map.put(:websocket_owner_downstream, downstream)}
+        {:ok, put_owner_runtime_state(state, session, owner_lease_token, downstream)}
 
       {:ok, %{codex_session: session, upstream_websocket_session: upstream_websocket_session}} ->
         {:ok,
@@ -91,6 +85,20 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     {:push, {:text, Jason.encode!(websocket_error(reason))}, state}
   end
 
+  def handle_info({:DOWN, ref, :process, pid, reason}, %{websocket_owner_monitor: ref} = state) do
+    state = clear_websocket_owner_monitor(state, pid)
+
+    {:error, :owner_crashed}
+    |> recover_owner_lifecycle_leftovers(state)
+    |> log_owner_monitor_recovery(state, reason)
+
+    state
+    |> release_owner_lease("owner_crashed")
+    |> log_owner_monitor_lease_release(state, reason)
+
+    {:stop, :owner_crashed, {1011, "websocket owner crashed"}, state}
+  end
+
   def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
     state =
       state
@@ -137,6 +145,79 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   defp failure_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
   defp failure_reason(%module{}), do: inspect(module)
   defp failure_reason(_reason), do: "unknown"
+
+  defp put_owner_runtime_state(state, session, owner_lease_token, downstream) do
+    state
+    |> Map.put(:tasks, MapSet.new())
+    |> Map.put(:task_monitors, %{})
+    |> Map.put(:codex_session, session)
+    |> Map.put(:websocket_owner_lease_token, owner_lease_token)
+    |> Map.put(:websocket_owner_downstream, downstream)
+    |> put_websocket_owner_monitor(session)
+  end
+
+  defp put_websocket_owner_monitor(state, session) do
+    case Gateway.monitor_websocket_owner(session) do
+      {:ok, owner_pid, owner_monitor} ->
+        state
+        |> Map.put(:websocket_owner_pid, owner_pid)
+        |> Map.put(:websocket_owner_monitor, owner_monitor)
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp clear_websocket_owner_monitor(state, owner_pid) do
+    if Map.get(state, :websocket_owner_pid) == owner_pid do
+      state
+      |> Map.delete(:websocket_owner_pid)
+      |> Map.delete(:websocket_owner_monitor)
+    else
+      state
+    end
+  end
+
+  defp log_owner_monitor_recovery({:ok, _result}, _state, _reason), do: :ok
+  defp log_owner_monitor_recovery(:ok, _state, _reason), do: :ok
+
+  defp log_owner_monitor_recovery({:error, recovery_reason}, state, owner_reason) do
+    Logger.warning(
+      "websocket owner monitor recovery failed " <>
+        "codex_session_id=#{codex_session_id(state)} " <>
+        "owner_instance_id=#{owner_instance_id(state)} " <>
+        "request_id=#{request_id(Map.get(state, :opts))} " <>
+        "owner_reason=#{failure_reason(owner_reason)} " <>
+        "failure_reason=#{failure_reason(recovery_reason)}"
+    )
+
+    :ok
+  end
+
+  defp release_owner_lease(state, reason) do
+    Gateway.release_websocket_owner_lease(
+      Map.get(state, :codex_session),
+      Map.get(state, :websocket_owner_lease_token),
+      reason
+    )
+  end
+
+  defp log_owner_monitor_lease_release(:ok, _state, _reason), do: :ok
+
+  defp log_owner_monitor_lease_release({:error, :stale_owner}, _state, _reason), do: :ok
+
+  defp log_owner_monitor_lease_release({:error, release_reason}, state, owner_reason) do
+    Logger.warning(
+      "websocket owner monitor lease release failed " <>
+        "codex_session_id=#{codex_session_id(state)} " <>
+        "owner_instance_id=#{owner_instance_id(state)} " <>
+        "request_id=#{request_id(Map.get(state, :opts))} " <>
+        "owner_reason=#{failure_reason(owner_reason)} " <>
+        "failure_reason=#{failure_reason(release_reason)}"
+    )
+
+    :ok
+  end
 
   defp start_response_task(parent, payload, state) do
     Task.start(fn ->
@@ -339,25 +420,40 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
        when reason in [:owner_unavailable, :owner_forward_timeout, :owner_crashed] do
     state
     |> Map.get(:codex_session)
-    |> Gateway.recover_owner_lifecycle_leftovers(reason, owner_lifecycle_recovery_opts(state))
+    |> Gateway.recover_owner_lifecycle_leftovers(
+      reason,
+      owner_lifecycle_recovery_opts(state, reason)
+    )
     |> log_owner_lifecycle_recovery_failure(state)
   end
 
   defp recover_owner_lifecycle_leftovers(_result, _state), do: :ok
 
-  defp owner_lifecycle_recovery_opts(%{opts: %RequestOptions{} = opts}) do
+  defp owner_lifecycle_recovery_opts(state, reason) do
+    interrupt_reason = reason |> failure_reason() |> owner_lifecycle_interrupt_reason()
+
+    put_owner_lifecycle_recovery_opts(state, interrupt_reason)
+  end
+
+  defp put_owner_lifecycle_recovery_opts(%{opts: %RequestOptions{} = opts}, interrupt_reason) do
     opts
-    |> RequestOptions.put_runtime_context(interrupt_reason: "owner_unavailable")
+    |> RequestOptions.put_runtime_context(interrupt_reason: interrupt_reason)
     |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
   end
 
-  defp owner_lifecycle_recovery_opts(state) do
+  defp put_owner_lifecycle_recovery_opts(state, interrupt_reason) do
     state
     |> Map.get(:opts, %{})
     |> RequestOptions.for_websocket()
-    |> RequestOptions.put_runtime_context(interrupt_reason: "owner_unavailable")
+    |> RequestOptions.put_runtime_context(interrupt_reason: interrupt_reason)
     |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
   end
+
+  defp owner_lifecycle_interrupt_reason(reason)
+       when reason in ["owner_unavailable", "owner_forward_timeout", "owner_crashed"],
+       do: reason
+
+  defp owner_lifecycle_interrupt_reason(_reason), do: "owner_unavailable"
 
   defp owner_downstream_interrupt_opts(%{opts: %RequestOptions{} = opts}) do
     opts

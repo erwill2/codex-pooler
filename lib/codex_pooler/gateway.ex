@@ -351,6 +351,34 @@ defmodule CodexPooler.Gateway do
   def recover_websocket_owner_response_options(%RequestOptions{}),
     do: {:error, :owner_unavailable}
 
+  @spec monitor_websocket_owner(CodexSession.t() | nil) ::
+          {:ok, pid(), reference()} | {:error, :owner_unavailable}
+  def monitor_websocket_owner(%CodexSession{owner_instance_id: owner_instance_id, id: id})
+      when is_binary(owner_instance_id) and is_binary(id) do
+    if owner_instance_id == Atom.to_string(node()) do
+      with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(id) do
+        {:ok, owner_pid, Process.monitor(owner_pid)}
+      end
+    else
+      {:error, :owner_unavailable}
+    end
+  end
+
+  def monitor_websocket_owner(_session), do: {:error, :owner_unavailable}
+
+  @spec release_websocket_owner_lease(
+          CodexSession.t() | nil,
+          Ecto.UUID.t() | String.t() | nil,
+          String.t()
+        ) :: :ok | {:error, :stale_owner | :owner_unavailable}
+  def release_websocket_owner_lease(%CodexSession{} = session, owner_lease_token, reason)
+      when is_binary(reason) do
+    SessionContinuity.release_owner_lease(session, owner_lease_token, reason)
+  end
+
+  def release_websocket_owner_lease(_session, _owner_lease_token, _reason),
+    do: {:error, :owner_unavailable}
+
   defp recovered_websocket_owner_response_options({:ok, runtime}, opts) do
     {:ok,
      websocket_owner_response_options(
