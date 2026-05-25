@@ -330,6 +330,33 @@ defmodule CodexPooler.Gateway do
     )
   end
 
+  @spec recover_websocket_owner_response_options(RequestOptions.t()) ::
+          {:ok, RequestOptions.t()} | {:error, term()}
+  def recover_websocket_owner_response_options(
+        %RequestOptions{
+          continuity: %{codex_session: %CodexSession{} = session}
+        } = opts
+      ) do
+    if session.owner_instance_id == Atom.to_string(node()) do
+      opts = owner_websocket_opts(opts)
+
+      with {:ok, runtime} <- prepare_owner_websocket_session_with_recovery(session, opts, false) do
+        {:ok,
+         websocket_owner_response_options(
+           opts,
+           runtime.codex_session,
+           runtime.websocket_owner_lease_token,
+           runtime.websocket_owner_downstream
+         )}
+      end
+    else
+      {:error, :owner_unavailable}
+    end
+  end
+
+  def recover_websocket_owner_response_options(%RequestOptions{}),
+    do: {:error, :owner_unavailable}
+
   @spec run_websocket_response(auth(), binary(), opts(), (binary() -> any())) ::
           :ok | {:error, Service.gateway_error()}
   def run_websocket_response(auth, payload, opts, push_frame)
@@ -573,11 +600,20 @@ defmodule CodexPooler.Gateway do
     with :ok <- SessionContinuity.validate_owner_token(session, session.owner_lease_token),
          {:ok, owner} <-
            WebsocketOwnerForwarder.resolve_owner(session, owner_forwarder_opts(opts)) do
-      attach_owner(owner, session.id, %{pid: self(), correlation_id: Ecto.UUID.generate()}, opts)
+      attach_owner(owner, session.id, owner_downstream_target(opts), opts)
     else
       {:error, reason} -> owner_attach_error(reason)
     end
   end
+
+  defp owner_downstream_target(%RequestOptions{
+         transport: %{websocket_owner_downstream: %{pid: pid, correlation_id: correlation_id}}
+       })
+       when is_pid(pid) and is_binary(correlation_id) do
+    %{pid: pid, correlation_id: correlation_id}
+  end
+
+  defp owner_downstream_target(_opts), do: %{pid: self(), correlation_id: Ecto.UUID.generate()}
 
   defp attach_owner({:local, owner_instance_id}, codex_session_id, downstream, opts) do
     with {:ok, pid} <-

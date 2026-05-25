@@ -1,6 +1,7 @@
 defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
   @moduledoc false
 
+  alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Runtime.Dispatch.PreparedContext
   alias CodexPooler.Gateway.Runtime.Finalization
   alias CodexPooler.Gateway.Runtime.Streaming.StreamDispatch
@@ -50,7 +51,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
         writer: writer
       )
 
-    case UpstreamDispatch.websocket_request(dispatch_request) do
+    case dispatch_websocket_request_with_owner_recovery(prepared_context, dispatch_request) do
       {:ok, %{terminal: "response.completed"} = response} ->
         Finalization.finalize_completed_websocket_response(
           context,
@@ -70,6 +71,40 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
           context,
           Map.put(response, :started, started)
         )
+    end
+  end
+
+  defp dispatch_websocket_request_with_owner_recovery(prepared_context, dispatch_request) do
+    case UpstreamDispatch.websocket_request(dispatch_request) do
+      {:error, %{body: "", reason: :owner_unavailable}} = error ->
+        retry_owner_websocket_request(prepared_context, dispatch_request, error)
+
+      result ->
+        result
+    end
+  end
+
+  defp retry_owner_websocket_request(prepared_context, dispatch_request, original_error) do
+    request_options = prepared_context.context.request_options
+
+    if owner_forwarded_websocket_request?(request_options) do
+      case Gateway.recover_websocket_owner_response_options(request_options) do
+        {:ok, recovered_options} ->
+          recovered_context = %{prepared_context.context | request_options: recovered_options}
+          recovered_prepared_context = %{prepared_context | context: recovered_context}
+
+          recovered_prepared_context
+          |> dispatch_request(
+            accounting_request: dispatch_request.accounting_request,
+            writer: dispatch_request.writer
+          )
+          |> UpstreamDispatch.websocket_request()
+
+        {:error, _reason} ->
+          original_error
+      end
+    else
+      original_error
     end
   end
 
@@ -102,6 +137,13 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
   defp websocket_upstream?(payload, opts) do
     opts.transport == "websocket" and RouteClass.streaming?(payload) and
       is_function(opts.websocket_writer, 1)
+  end
+
+  defp owner_forwarded_websocket_request?(%{transport: transport}) do
+    transport.websocket_owner_forwarding_enabled? == true and
+      not is_nil(transport.websocket_owner_session) and
+      is_binary(transport.websocket_owner_lease_token) and
+      is_map(transport.websocket_owner_downstream)
   end
 
   defp elapsed_ms(started), do: max(System.monotonic_time(:millisecond) - started, 0)

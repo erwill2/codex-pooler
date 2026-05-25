@@ -1407,6 +1407,39 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     end
   end
 
+  test "owner-forwarded turn takes over when the local owner disappears after socket init" do
+    upstream =
+      start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_dispatch_takeover"}))
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} = owner_socket(auth, "ws-owner-dispatch-takeover", "dispatch-takeover")
+    session = state.codex_session
+    old_lease = active_owner_lease(session.id)
+
+    {:ok, owner_pid} = WebsocketOwnerSession.lookup(session.id)
+    owner_ref = Process.monitor(owner_pid)
+    Process.exit(owner_pid, :kill)
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner_pid, :killed}
+
+    try do
+      payload = websocket_payload(setup, "dispatch takeover")
+
+      assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+      assert {:push, {:text, frame}, state} = receive_owner_socket_push(state)
+      assert %{"id" => "resp_owner_dispatch_takeover"} = Jason.decode!(frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert active_owner_lease(session.id).lease_token == old_lease.lease_token
+      assert active_owner_lease(session.id).owner_instance_id == Atom.to_string(node())
+      assert [request] = await_upstream_requests(upstream, 1)
+      assert request.json["input"] |> List.first() |> Map.get("content") == "dispatch takeover"
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
   test "owner forwarding keeps authenticated attaches scoped to the same api key" do
     upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_auth"}))
     setup = gateway_setup(upstream)
