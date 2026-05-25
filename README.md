@@ -204,7 +204,6 @@ behavior even when the request is routed through Codex Pooler.
 ```toml
 model = "gpt-5.5"
 model_provider = "codex-pooler-ws"
-chatgpt_base_url = "http://localhost:4000/backend-api"
 
 [model_providers.codex-pooler-ws]
 name = "OpenAI"
@@ -228,12 +227,9 @@ bearer_token_env_var = "CODEX_POOLER_MCP_KEY"
 ```
 
 Use the websocket provider for normal Codex backend behavior, and keep the HTTP
-provider when you need to force SSE-only coverage. `chatgpt_base_url` keeps
-Codex account, usage, and agent-identity helper calls on the same Pooler
-instance. For deployed instances, change both `base_url` values to
-`https://pooler.example.com/backend-api/codex`, `chatgpt_base_url` to
-`https://pooler.example.com/backend-api`, and the MCP `url` to
-`https://pooler.example.com/mcp`.
+provider when you need to force SSE-only coverage. For deployed instances,
+change both `base_url` values to `https://pooler.example.com/backend-api/codex`
+and the MCP `url` to `https://pooler.example.com/mcp`.
 
 </details>
 
