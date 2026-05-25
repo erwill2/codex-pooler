@@ -952,8 +952,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
     logs = capture_log(fn -> assert :ok = CodexResponsesSocket.terminate(:closed, state) end)
 
-    assert logs =~ "websocket owner detach failed"
-    assert logs =~ "owner_unavailable"
+    refute logs =~ "websocket owner detach failed"
+    refute logs =~ "owner_unavailable"
     assert_no_leak!("late owner drain detach logs", logs)
 
     assert_owner_success_preserved!(%{request: request, attempt: attempt, turn: turn})
@@ -1013,8 +1013,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
       logs =
         capture_log(fn -> assert :ok = CodexResponsesSocket.terminate(:closed, remote_state) end)
 
-      assert logs =~ "websocket owner detach failed"
-      assert logs =~ "owner_unavailable"
+      refute logs =~ "websocket owner detach failed"
+      refute logs =~ "owner_unavailable"
       assert_no_leak!("owner recovery success logs", logs)
       assert_owner_success_preserved!(%{request: request, attempt: attempt, turn: turn})
     after
@@ -1094,8 +1094,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
       logs =
         capture_log(fn -> assert :ok = CodexResponsesSocket.terminate(:closed, remote_state) end)
 
-      assert logs =~ "websocket owner detach failed"
-      assert logs =~ "owner_unavailable"
+      refute logs =~ "websocket owner detach failed"
+      refute logs =~ "owner_unavailable"
       refute logs =~ "Protocol.UndefinedError"
       assert_no_leak!("owner recovery cleanup logs", logs)
       assert_owner_success_preserved!(%{request: request, attempt: attempt, turn: turn})

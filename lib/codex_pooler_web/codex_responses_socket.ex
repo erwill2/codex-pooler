@@ -290,9 +290,17 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     |> log_interrupt_failure(state)
   end
 
-  defp log_owner_detach_failure(:ok, _state), do: :ok
+  defp log_owner_detach_failure(:ok, _state, _recovery_result), do: :ok
 
-  defp log_owner_detach_failure({:error, reason}, state) do
+  defp log_owner_detach_failure({:error, reason}, state, {:ok, recovery}) do
+    if interrupted_turn_count(recovery) > 0 do
+      log_owner_detach_failure({:error, reason}, state, :log_warning)
+    else
+      :ok
+    end
+  end
+
+  defp log_owner_detach_failure({:error, reason}, state, :log_warning) do
     Logger.warning(
       "websocket owner detach failed " <>
         "codex_session_id=#{codex_session_id(state)} " <>
@@ -305,9 +313,16 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     :ok
   end
 
+  defp log_owner_detach_failure({:error, reason}, state, {:error, _recovery_failure}) do
+    log_owner_detach_failure({:error, reason}, state, :log_warning)
+  end
+
+  defp interrupted_turn_count(%{interrupted_turn_count: count}) when is_integer(count), do: count
+  defp interrupted_turn_count(_recovery), do: 0
+
   defp after_owner_detach(result, state) do
-    log_owner_detach_failure(result, state)
-    recover_owner_lifecycle_leftovers(result, state)
+    recovery_result = recover_owner_lifecycle_leftovers(result, state)
+    log_owner_detach_failure(result, state, recovery_result)
   end
 
   defp recover_owner_lifecycle_leftovers({:error, reason}, state)
@@ -334,7 +349,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
   end
 
-  defp log_owner_lifecycle_recovery_failure({:ok, _result}, _state), do: :ok
+  defp log_owner_lifecycle_recovery_failure({:ok, _result} = result, _state), do: result
 
   defp log_owner_lifecycle_recovery_failure({:error, reason}, state) do
     Logger.warning(
@@ -346,7 +361,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
         "failure_reason=#{failure_reason(reason)}"
     )
 
-    :ok
+    {:error, reason}
   end
 
   defp run_response(parent, auth, payload, opts) do

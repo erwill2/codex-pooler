@@ -56,9 +56,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
     Repo.transaction(fn ->
       case Repo.get(CodexSession, session_id, lock: "FOR UPDATE") do
         %CodexSession{} = session ->
-          session_id
-          |> in_progress_turns_for_session()
-          |> Enum.each(&interrupt_turn!(&1, reason, now))
+          in_progress_turns = in_progress_turns_for_session(session_id)
+          Enum.each(in_progress_turns, &interrupt_turn!(&1, reason, now))
 
           session
           |> Ecto.Changeset.change(%{
@@ -71,8 +70,10 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
           })
           |> Repo.update!()
 
+          %{interrupted_turn_count: length(in_progress_turns)}
+
         nil ->
-          :ok
+          %{interrupted_turn_count: 0}
       end
     end)
     |> unwrap_transaction()
