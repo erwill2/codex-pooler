@@ -1450,6 +1450,48 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     end
   end
 
+  test "owner-forwarded turn takes over when local owner drained after socket init" do
+    upstream =
+      start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_dispatch_drain_takeover"}))
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} = owner_socket(auth, "ws-owner-dispatch-drain-takeover", "dispatch-drain")
+    session = state.codex_session
+    old_lease = active_owner_lease(session.id)
+
+    {:ok, owner_pid} = WebsocketOwnerSession.lookup(session.id)
+    owner_ref = Process.monitor(owner_pid)
+    :ok = GenServer.stop(owner_pid)
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner_pid, :normal}
+
+    try do
+      payload = websocket_payload(setup, "dispatch drain takeover")
+
+      assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+      assert {:push, {:text, frame}, state} = receive_owner_socket_push(state)
+      assert %{"id" => "resp_owner_dispatch_drain_takeover"} = Jason.decode!(frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      active_lease = active_owner_lease(session.id)
+      assert active_lease.lease_token != old_lease.lease_token
+      assert active_lease.owner_instance_id == Atom.to_string(node())
+
+      assert [request] = await_upstream_requests(upstream, 1)
+
+      assert request.json["input"] |> List.first() |> Map.get("content") ==
+               "dispatch drain takeover"
+
+      assert [request_log] = request_logs(setup.pool.id)
+      assert request_log.status == "succeeded"
+      assert request_log.response_status_code == 200
+      assert is_nil(request_log.last_error_code)
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
   test "owner-forwarded socket replaces a local owner with a dead upstream before first dispatch" do
     upstream =
       start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_stale_upstream"}))

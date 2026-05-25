@@ -340,15 +340,9 @@ defmodule CodexPooler.Gateway do
     if session.owner_instance_id == Atom.to_string(node()) do
       opts = owner_websocket_opts(opts)
 
-      with {:ok, runtime} <- prepare_owner_websocket_session_with_recovery(session, opts, false) do
-        {:ok,
-         websocket_owner_response_options(
-           opts,
-           runtime.codex_session,
-           runtime.websocket_owner_lease_token,
-           runtime.websocket_owner_downstream
-         )}
-      end
+      session
+      |> prepare_owner_websocket_session_with_recovery(opts, true)
+      |> recovered_websocket_owner_response_options(opts)
     else
       {:error, :owner_unavailable}
     end
@@ -356,6 +350,18 @@ defmodule CodexPooler.Gateway do
 
   def recover_websocket_owner_response_options(%RequestOptions{}),
     do: {:error, :owner_unavailable}
+
+  defp recovered_websocket_owner_response_options({:ok, runtime}, opts) do
+    {:ok,
+     websocket_owner_response_options(
+       opts,
+       runtime.codex_session,
+       runtime.websocket_owner_lease_token,
+       runtime.websocket_owner_downstream
+     )}
+  end
+
+  defp recovered_websocket_owner_response_options({:error, reason}, _opts), do: {:error, reason}
 
   @spec run_websocket_response(auth(), binary(), opts(), (binary() -> any())) ::
           :ok | {:error, Service.gateway_error()}
