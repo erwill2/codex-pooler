@@ -161,6 +161,8 @@ codex-pooler.icoretech.io/cluster-member: "true"
   value: {{ .Values.config.ectoIpv6 | quote }}
 - name: OBAN_JOBS_QUEUE_LIMIT
   value: {{ .Values.config.obanJobsQueueLimit | quote }}
+- name: OBAN_SHUTDOWN_GRACE_PERIOD_MS
+  value: {{ .Values.config.obanShutdownGracePeriodMs | quote }}
 - name: LANG
   value: {{ .Values.config.lang | quote }}
 - name: LC_ALL

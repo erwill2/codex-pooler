@@ -12,8 +12,8 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 0
+      maxUnavailable: {{ .Values.oban.scheduler.strategy.maxUnavailable }}
+      maxSurge: {{ .Values.oban.scheduler.strategy.maxSurge }}
   selector:
     matchLabels:
       {{- include "codex-pooler.selectorLabels" . | nindent 6 }}
@@ -30,6 +30,7 @@ spec:
       {{- if and .Values.clustering.enabled .Values.clustering.participants.scheduler }}
       subdomain: {{ include "codex-pooler.clusteringHeadlessServiceName" . }}
       {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.oban.scheduler.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "codex-pooler.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
