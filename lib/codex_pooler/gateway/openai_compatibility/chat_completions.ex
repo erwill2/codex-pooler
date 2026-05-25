@@ -29,7 +29,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
           required(:id) => String.t(),
           required(:created) => integer(),
           required(:model) => String.t() | nil,
-          required(:role_sent?) => boolean()
+          required(:role_sent?) => boolean(),
+          required(:include_usage?) => boolean()
         }
 
   @spec stream_state(map()) :: stream_state()
@@ -158,9 +159,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   end
 
   defp terminal_stream_chunk(decoded, state) do
-    finish_reason = finish_reason(response_map(decoded))
+    response = response_map(decoded)
+    finish_reason = finish_reason(response)
 
-    {[chat_sse_chunk(%{}, finish_reason, state), "data: [DONE]\n\n"], state}
+    {[
+       chat_sse_chunk(%{}, finish_reason, state),
+       usage_stream_chunk(response, state),
+       "data: [DONE]\n\n"
+     ], state}
   end
 
   defp chat_sse_chunk(delta, finish_reason, state) do
@@ -187,23 +193,53 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
       id: "chatcmpl_" <> Ecto.UUID.generate(),
       created: System.system_time(:second),
       model: Map.get(chat_payload, "model"),
-      role_sent?: false
+      role_sent?: false,
+      include_usage?: get_in(chat_payload, ["stream_options", "include_usage"]) == true
     }
   end
+
+  defp usage_stream_chunk(decoded, %{include_usage?: true} = state) do
+    case usage(decoded) do
+      usage when is_map(usage) and usage != %{} ->
+        payload = %{
+          "id" => state.id,
+          "object" => "chat.completion.chunk",
+          "created" => state.created,
+          "model" => state.model,
+          "choices" => [],
+          "usage" => usage
+        }
+
+        ["data: ", Jason.encode!(payload), "\n\n"]
+
+      _usage ->
+        []
+    end
+  end
+
+  defp usage_stream_chunk(_decoded, _state), do: []
 
   defp sync_response_state(state, decoded) do
     response = response_map(decoded)
 
     %{
       state
-      | id: response_id(response),
-        created: created(response),
+      | id: decoded_string(response, "id") || state.id,
+        created: created(response, state.created),
         model: model(response, state)
     }
   end
 
   defp response_id(decoded),
     do: decoded_string(decoded, "id") || "chatcmpl_" <> Ecto.UUID.generate()
+
+  defp created(decoded, fallback) do
+    case decoded do
+      %{"created" => created} when is_integer(created) -> created
+      %{"created_at" => created} when is_integer(created) -> created
+      _decoded -> fallback
+    end
+  end
 
   defp created(%{"created" => created}) when is_integer(created), do: created
   defp created(%{"created_at" => created}) when is_integer(created), do: created

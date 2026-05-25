@@ -119,6 +119,44 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     refute Map.has_key?(captured.json, "response_format")
   end
 
+  test "POST /v1/chat/completions non-streaming backfills collected text deltas", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.created",
+           %{
+             "type" => "response.created",
+             "response" => %{"id" => "resp_chat_delta_collect", "status" => "in_progress"}
+           }},
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => "delta"}},
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => " answer"}},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{"id" => "resp_chat_delta_collect", "status" => "completed"}
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/chat/completions", chat_payload(setup))
+
+    assert %{
+             "id" => "resp_chat_delta_collect",
+             "choices" => [
+               %{"message" => %{"role" => "assistant", "content" => "delta answer"}}
+             ]
+           } = json_response(conn, 200)
+  end
+
   test "POST /v1/chat/completions maps Responses function calls to chat tool calls", %{
     conn: conn
   } do
@@ -194,7 +232,12 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     conn =
       conn
       |> auth(setup)
-      |> post("/v1/chat/completions", Map.put(chat_payload(setup), "stream", true))
+      |> post(
+        "/v1/chat/completions",
+        chat_payload(setup)
+        |> Map.put("stream", true)
+        |> Map.put("stream_options", %{"include_usage" => true})
+      )
 
     assert [content_type] = get_resp_header(conn, "content-type")
     assert content_type =~ "text/event-stream"
@@ -203,13 +246,20 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert conn.resp_body =~ "\"role\":\"assistant\""
     assert conn.resp_body =~ "\"content\":\"streamed answer\""
     assert conn.resp_body =~ "\"finish_reason\":\"stop\""
+    assert conn.resp_body =~ "\"choices\":[]"
+
+    assert conn.resp_body =~
+             "\"usage\":{\"completion_tokens\":4,\"prompt_tokens\":3,\"total_tokens\":7}"
+
     assert conn.resp_body =~ "data: [DONE]\n\n"
+    assert conn.resp_body |> chat_chunk_ids() |> Enum.uniq() == ["resp_chat_stream"]
     refute conn.resp_body =~ "response.output_text.delta"
     refute conn.resp_body =~ "codex.rate_limits"
 
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["stream"] == true
+    refute Map.has_key?(captured.json, "stream_options")
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.transport == "http_sse"
@@ -534,5 +584,11 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
         }
       }
     }
+  end
+
+  defp chat_chunk_ids(body) do
+    ~r/"id":"([^"]+)"/
+    |> Regex.scan(body)
+    |> Enum.map(fn [_match, id] -> id end)
   end
 end
