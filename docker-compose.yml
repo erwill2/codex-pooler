@@ -46,7 +46,7 @@ services:
       - |
         set -e
         env -u PHX_SERVER /app/bin/codex_pooler eval "CodexPooler.Release.migrate()"
-        env -u PHX_SERVER /app/bin/codex_pooler eval "CodexPooler.Catalog.import_openai_pricing_from_priv()"
+        env -u PHX_SERVER /app/bin/codex_pooler eval "CodexPooler.Release.import_openai_pricing_from_priv()"
 
   app:
     image: ${CODEX_POOLER_IMAGE:-ghcr.io/icoretech/codex-pooler}:${CODEX_POOLER_IMAGE_TAG:-latest}

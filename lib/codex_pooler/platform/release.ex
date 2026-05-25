@@ -32,8 +32,11 @@ defmodule CodexPooler.Release do
     load_app()
 
     for repo <- repos() do
-      {:ok, _apps, result} =
-        Ecto.Migrator.with_repo(repo, fn _repo -> Catalog.import_openai_pricing_from_priv() end)
+      {:ok, result, _started} =
+        Ecto.Migrator.with_repo(repo, fn _repo ->
+          {:ok, import_result} = Catalog.import_openai_pricing_from_priv()
+          import_result
+        end)
 
       result
     end
