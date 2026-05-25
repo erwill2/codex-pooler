@@ -35,6 +35,39 @@ defmodule CodexPoolerWeb.Operations.HealthControllerTest do
     assert json_response(conn, 200) == %{"status" => "ready"}
   end
 
+  test "GET /readyz stays ready when configured drain marker is absent", %{conn: conn} do
+    drain_marker_path = drain_marker_path()
+
+    Application.put_env(:codex_pooler, CodexPoolerWeb.Operations.HealthController,
+      drain_marker_path: drain_marker_path,
+      readiness_probe: __MODULE__.AvailableReadinessProbe
+    )
+
+    conn = get(conn, ~p"/readyz")
+
+    assert json_response(conn, 200) == %{"status" => "ready"}
+    assert_receive :available_readiness_probe_called
+  end
+
+  test "GET /readyz returns unavailable while drain marker exists without probing DB", %{
+    conn: conn
+  } do
+    drain_marker_path = drain_marker_path()
+    File.write!(drain_marker_path, "draining")
+    on_exit(fn -> File.rm(drain_marker_path) end)
+
+    Application.put_env(:codex_pooler, CodexPoolerWeb.Operations.HealthController,
+      drain_marker_path: drain_marker_path,
+      readiness_probe: __MODULE__.UnexpectedReadinessProbe
+    )
+
+    {conn, log} = with_log([level: :info], fn -> get(conn, ~p"/readyz") end)
+
+    assert json_response(conn, 503) == %{"status" => "unavailable"}
+    refute log =~ "readiness probe failed"
+    refute_received :unexpected_readiness_probe_called
+  end
+
   test "healthy probes disable endpoint info request logging and request rows", %{conn: conn} do
     before_count = Repo.aggregate(Request, :count)
 
@@ -129,6 +162,27 @@ defmodule CodexPoolerWeb.Operations.HealthControllerTest do
     case Keyword.fetch!(options, :log) do
       {module, function, args} -> apply(module, function, [conn | args])
       level -> level
+    end
+  end
+
+  defp drain_marker_path do
+    Path.join(
+      System.tmp_dir!(),
+      "codex-pooler-drain-#{System.unique_integer([:positive])}"
+    )
+  end
+
+  defmodule AvailableReadinessProbe do
+    def query(_repo, _statement, _params, _opts) do
+      send(self(), :available_readiness_probe_called)
+      {:ok, %{}}
+    end
+  end
+
+  defmodule UnexpectedReadinessProbe do
+    def query(_repo, _statement, _params, _opts) do
+      send(self(), :unexpected_readiness_probe_called)
+      raise "drain marker should short-circuit readiness probe"
     end
   end
 

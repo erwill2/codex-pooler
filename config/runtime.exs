@@ -11,6 +11,9 @@ config :codex_pooler,
        :websocket_owner_forwarding_enabled,
        CodexPooler.Gateway.OperationalSettings.parse_websocket_owner_forwarding_env!()
 
+config :codex_pooler, CodexPoolerWeb.Operations.HealthController,
+  drain_marker_path: System.get_env("CODEX_POOLER_DRAIN_MARKER_PATH")
+
 if config_env() == :prod do
   database_url =
     System.get_env("DATABASE_URL") ||
@@ -39,27 +42,27 @@ if config_env() == :prod do
 
   oban_queues = [jobs: String.to_integer(System.get_env("OBAN_JOBS_QUEUE_LIMIT", "8"))]
 
+  oban_shutdown_grace_period =
+    String.to_integer(System.get_env("OBAN_SHUTDOWN_GRACE_PERIOD_MS", "55000"))
+
+  base_oban_runtime_config = [
+    repo: CodexPooler.Repo,
+    shutdown_grace_period: oban_shutdown_grace_period
+  ]
+
   oban_runtime_config =
     case oban_mode do
       "worker" ->
-        [repo: CodexPooler.Repo, queues: oban_queues, plugins: false]
+        Keyword.merge(base_oban_runtime_config, queues: oban_queues, plugins: false)
 
       "scheduler" ->
-        [
-          repo: CodexPooler.Repo,
-          queues: false,
-          plugins: oban_plugins
-        ]
+        Keyword.merge(base_oban_runtime_config, queues: false, plugins: oban_plugins)
 
       "all" ->
-        [
-          repo: CodexPooler.Repo,
-          queues: oban_queues,
-          plugins: oban_plugins
-        ]
+        Keyword.merge(base_oban_runtime_config, queues: oban_queues, plugins: oban_plugins)
 
       _web_or_unknown ->
-        [repo: CodexPooler.Repo, queues: false, plugins: false]
+        Keyword.merge(base_oban_runtime_config, queues: false, plugins: false)
     end
 
   config :codex_pooler, Oban, oban_runtime_config
