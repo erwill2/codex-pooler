@@ -1,6 +1,7 @@
 // Include phoenix_html to handle method=PUT/DELETE in forms and buttons.
 import "phoenix_html"
 // Establish Phoenix Socket and LiveView configuration.
+import ApexCharts from "apexcharts"
 import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"
 import {hooks as colocatedHooks} from "phoenix-colocated/codex_pooler"
@@ -9,6 +10,34 @@ import topbar from "topbar"
 import {classifyLiveSocketConnection} from "./live_socket_connection.mjs"
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
+const resolveCssColor = (root, color) => {
+  const probe = document.createElement("span")
+  probe.style.color = color
+  probe.style.position = "absolute"
+  probe.style.pointerEvents = "none"
+  probe.style.visibility = "hidden"
+  root.appendChild(probe)
+  const resolved = window.getComputedStyle(probe).color
+  probe.remove()
+
+  return resolved || color
+}
+const parseChartJSON = (value, fallback) => {
+  try {
+    return JSON.parse(value || "")
+  } catch (_error) {
+    return fallback
+  }
+}
+const formatChartNumber = value => {
+  const number = Number(value || 0)
+
+  if (!Number.isFinite(number)) return "0"
+
+  return new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: Number.isInteger(number) ? 0 : 1,
+  }).format(number)
+}
 const ClipboardCopy = {
   mounted() {
     this.el.addEventListener("click", async () => {
@@ -74,6 +103,196 @@ const TotpSetupTools = {
     }
   },
 }
+const QuotaPressureChart = {
+  mounted() {
+    this.renderChart()
+  },
+  updated() {
+    this.renderChart()
+  },
+  destroyed() {
+    this.chart?.destroy()
+    this.chart = null
+  },
+  renderChart() {
+    const value = Number.parseFloat(this.el.dataset.value || "0")
+    const boundedValue = Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0
+    const label = this.el.dataset.label || "remaining"
+    const color = resolveCssColor(this.el, this.el.dataset.color || "var(--color-success)")
+    const trackColor = resolveCssColor(this.el, this.el.dataset.trackColor || "var(--color-base-300)")
+    const options = {
+      chart: {
+        type: "radialBar",
+        height: 96,
+        width: 96,
+        sparkline: {enabled: true},
+        animations: {enabled: false},
+      },
+      colors: [color],
+      labels: [label],
+      series: [boundedValue],
+      stroke: {lineCap: "round"},
+      plotOptions: {
+        radialBar: {
+          hollow: {
+            margin: 0,
+            size: "58%",
+            background: "transparent",
+          },
+          track: {
+            background: trackColor,
+            strokeWidth: "100%",
+            margin: 0,
+          },
+          dataLabels: {
+            show: false,
+          },
+        },
+      },
+      states: {
+        hover: {filter: {type: "none"}},
+        active: {filter: {type: "none"}},
+      },
+      tooltip: {enabled: false},
+    }
+
+    if (this.chart) {
+      this.chart.updateOptions(options, false, true)
+      return
+    }
+
+    this.chart = new ApexCharts(this.el, options)
+    this.chart.render()
+  },
+}
+function buildChartYaxis({compact, axisColor, units, yaxisConfig}) {
+  const axisLabels = {
+    show: !compact,
+    style: {colors: axisColor, fontSize: "11px", fontFamily: "inherit"},
+    formatter: value => formatChartNumber(value),
+  }
+
+  if (Array.isArray(yaxisConfig)) {
+    return yaxisConfig.map((axis, index) => ({
+      seriesName: axis.seriesName,
+      opposite: axis.opposite === true,
+      show: !compact,
+      labels: axisLabels,
+      title: {
+        text: compact ? undefined : axis.title || units[index],
+        style: {color: axisColor, fontSize: "11px", fontFamily: "inherit", fontWeight: 600},
+      },
+    }))
+  }
+
+  return {
+    labels: axisLabels,
+  }
+}
+const ApexTimeSeriesChart = {
+  mounted() {
+    this.renderChart()
+  },
+  updated() {
+    this.renderChart()
+  },
+  destroyed() {
+    this.chart?.destroy()
+    this.chart = null
+  },
+  renderChart() {
+    const categories = parseChartJSON(this.el.dataset.chartCategories, [])
+    const series = parseChartJSON(this.el.dataset.chartSeries, [{name: "Value", data: []}])
+      .map(item => ({...item, type: item.type || "column"}))
+    const unit = this.el.dataset.chartUnit || "value"
+    const units = parseChartJSON(this.el.dataset.chartUnits, series.map(() => unit))
+    const yaxisConfig = parseChartJSON(this.el.dataset.chartYaxis, null)
+    const compact = this.el.dataset.chartCompact === "true"
+    const showLabels = this.el.dataset.chartLabels === "true"
+    const height = Number.parseInt(this.el.dataset.chartHeight || "260", 10)
+    const colors = parseChartJSON(this.el.dataset.chartColors, [this.el.dataset.chartColor || "var(--color-primary)"])
+      .map(color => resolveCssColor(this.el, color))
+    const axisColor = resolveCssColor(this.el, "color-mix(in oklab, var(--color-base-content) 62%, transparent)")
+    const gridColor = resolveCssColor(this.el, "color-mix(in oklab, var(--color-base-content) 12%, transparent)")
+    const seriesTypes = series.map(item => item.type || "column")
+    const yaxis = buildChartYaxis({compact, axisColor, units, yaxisConfig})
+    const options = {
+      chart: {
+        type: "line",
+        height,
+        toolbar: {show: false},
+        sparkline: {enabled: compact},
+        animations: {enabled: false},
+      },
+      colors,
+      dataLabels: {enabled: false},
+      fill: {
+        opacity: seriesTypes.map(type => type === "line" ? 1 : 0.88),
+      },
+      grid: {
+        show: !compact,
+        borderColor: gridColor,
+        strokeDashArray: 4,
+        padding: {
+          left: compact ? -8 : 0,
+          right: compact ? -8 : 8,
+        },
+      },
+      plotOptions: {
+        bar: {
+          borderRadius: compact ? 2 : 4,
+          borderRadiusApplication: "end",
+          columnWidth: compact ? "72%" : "58%",
+        },
+      },
+      markers: {
+        size: 0,
+        hover: {size: compact ? 3 : 4},
+      },
+      series,
+      states: {
+        hover: {filter: {type: "lighten", value: 0.08}},
+        active: {filter: {type: "none"}},
+      },
+      stroke: {
+        curve: "smooth",
+        lineCap: "round",
+        width: seriesTypes.map(type => type === "line" ? 2.4 : 0),
+      },
+      tooltip: {
+        shared: true,
+        intersect: false,
+        x: {show: true},
+        y: {
+          formatter: (value, {seriesIndex}) => `${formatChartNumber(value)} ${units[seriesIndex] || unit}`,
+          title: {formatter: seriesName => `${seriesName}: `},
+        },
+      },
+      xaxis: {
+        categories,
+        tickAmount: compact ? undefined : Math.min(Math.max(categories.length - 1, 1), 8),
+        axisBorder: {show: !compact, color: gridColor},
+        axisTicks: {show: false},
+        labels: {
+          show: showLabels && !compact,
+          rotate: -45,
+          style: {colors: axisColor, fontSize: "11px", fontFamily: "inherit"},
+          trim: true,
+        },
+      },
+      yaxis,
+    }
+
+    if (this.chart) {
+      this.chart.updateOptions(options, false, true)
+      return
+    }
+
+    this.chart = new ApexCharts(this.el, options)
+    this.chart.render()
+  },
+}
+const ApexBarChart = ApexTimeSeriesChart
 const FlashAutoDismiss = {
   mounted() {
     if (this.el.hasAttribute("hidden")) return
@@ -332,7 +551,17 @@ forgetMemorizedLongPollFallback()
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 8000,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, ClipboardCopy, FlashAutoDismiss, OtpInput, TotpSetupTools, WebSocketState},
+  hooks: {
+    ...colocatedHooks,
+    ApexBarChart,
+    ApexTimeSeriesChart,
+    ClipboardCopy,
+    FlashAutoDismiss,
+    OtpInput,
+    QuotaPressureChart,
+    TotpSetupTools,
+    WebSocketState,
+  },
 })
 
 topbar.config({barColors: {0: "#29d"}, shadowColor: "rgba(0, 0, 0, .3)"})
