@@ -83,13 +83,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
         :erlang.yield()
         start_owner(opts, attempts - 1)
 
-      not uuid?(Keyword.fetch!(opts, :codex_session_id)) or owner_matches?(pid, opts) ->
+      not uuid?(Keyword.fetch!(opts, :codex_session_id)) or owner_reusable?(pid, opts) ->
         log_owner_reused(pid, opts)
         {:ok, pid, :existing}
 
       true ->
         log_owner_stale_replaced(pid, opts)
-        _result = GenServer.stop(pid, :stale_owner, owner_call_timeout())
+        _result = GenServer.stop(pid, {:shutdown, :stale_owner}, owner_call_timeout())
         :erlang.yield()
         start_owner(opts, attempts - 1)
     end
@@ -221,6 +221,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
         codex_session_id: state.codex_session_id,
         owner_lease_token: state.owner_lease_token,
         owner_instance_id: state.owner_instance_id
+      }}, state}
+  end
+
+  def handle_call(:owner_status, _from, state) do
+    {:reply,
+     {:ok,
+      %{
+        codex_session_id: state.codex_session_id,
+        owner_lease_token: state.owner_lease_token,
+        owner_instance_id: state.owner_instance_id,
+        upstream_alive?: Process.alive?(state.upstream_pid),
+        draining?: state.draining?
       }}, state}
   end
 
@@ -378,16 +390,19 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     :ok
   end
 
-  defp owner_matches?(pid, opts) do
+  defp owner_reusable?(pid, opts) do
     expected = %{
       codex_session_id: Keyword.fetch!(opts, :codex_session_id),
       owner_lease_token: Keyword.fetch!(opts, :owner_lease_token),
       owner_instance_id: Keyword.fetch!(opts, :owner_instance_id)
     }
 
-    case GenServer.call(pid, :owner_identity, owner_call_timeout()) do
-      {:ok, ^expected} -> true
-      _other -> false
+    case GenServer.call(pid, :owner_status, owner_call_timeout()) do
+      {:ok, %{upstream_alive?: true, draining?: false} = status} ->
+        Map.take(status, Map.keys(expected)) == expected
+
+      _other ->
+        false
     end
   catch
     :exit, _reason -> false
@@ -559,21 +574,23 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   defp release_owner_lease(state, reason) do
     safe_persist_owner_exit(:release_owner_lease, state, reason, fn ->
-      if uuid?(state.codex_session_id) do
+      if reason == :stale_owner or not uuid?(state.codex_session_id) do
+        :ok
+      else
         state.persistence.release_owner_lease.(
           state.codex_session_id,
           state.owner_lease_token,
           Atom.to_string(reason)
         )
-      else
-        :ok
       end
     end)
   end
 
   defp interrupt_codex_session(state, reason) do
     safe_persist_owner_exit(:interrupt_codex_session, state, reason, fn ->
-      if uuid?(state.codex_session_id) do
+      if reason == :stale_owner or not uuid?(state.codex_session_id) do
+        :ok
+      else
         opts =
           %{
             interrupt_reason: Atom.to_string(reason),
@@ -582,8 +599,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
           |> RequestOptions.for_websocket()
 
         state.persistence.interrupt_codex_session.(state.codex_session_id, opts)
-      else
-        :ok
       end
     end)
   end
@@ -741,6 +756,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   defp uuid?(_value), do: false
 
   defp owner_exit_reason(:owner_drained, _state), do: :owner_drained
+  defp owner_exit_reason(:stale_owner, _state), do: :stale_owner
+  defp owner_exit_reason({:shutdown, :stale_owner}, _state), do: :stale_owner
   defp owner_exit_reason(:normal, %{draining?: true}), do: :owner_drained
   defp owner_exit_reason(:normal, _state), do: :owner_drained
   defp owner_exit_reason(:shutdown, _state), do: :owner_drained

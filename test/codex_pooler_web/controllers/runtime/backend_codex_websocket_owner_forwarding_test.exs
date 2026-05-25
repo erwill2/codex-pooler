@@ -1440,6 +1440,48 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     end
   end
 
+  test "owner-forwarded socket replaces a local owner with a dead upstream before first dispatch" do
+    upstream =
+      start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_stale_upstream"}))
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, first_state} = owner_socket(auth, "ws-owner-stale-upstream-first", "stale-upstream")
+    session = first_state.codex_session
+    old_lease = active_owner_lease(session.id)
+
+    {:ok, owner_pid} = WebsocketOwnerSession.lookup(session.id)
+    %{upstream_pid: upstream_pid} = :sys.get_state(owner_pid)
+    upstream_ref = Process.monitor(upstream_pid)
+    Process.exit(upstream_pid, :kill)
+    assert_receive {:DOWN, ^upstream_ref, :process, ^upstream_pid, :killed}
+
+    {:ok, second_state} = owner_socket(auth, "ws-owner-stale-upstream-second", "stale-upstream")
+
+    try do
+      {:ok, replacement_owner_pid} = WebsocketOwnerSession.lookup(session.id)
+      assert replacement_owner_pid != owner_pid
+      assert active_owner_lease(session.id).lease_token == old_lease.lease_token
+      assert second_state.websocket_owner_downstream.epoch == 1
+
+      payload = websocket_payload(setup, "after stale upstream")
+
+      assert {:ok, second_state} =
+               CodexResponsesSocket.handle_in({payload, [opcode: :text]}, second_state)
+
+      assert {:push, {:text, frame}, second_state} = receive_owner_socket_push(second_state)
+      assert %{"id" => "resp_owner_stale_upstream"} = Jason.decode!(frame)
+      assert {:ok, _second_state} = receive_socket_done(second_state)
+
+      assert [request] = await_upstream_requests(upstream, 1)
+      assert request.json["input"] |> List.first() |> Map.get("content") == "after stale upstream"
+    after
+      CodexResponsesSocket.terminate(:closed, first_state)
+      CodexResponsesSocket.terminate(:closed, second_state)
+    end
+  end
+
   test "owner forwarding keeps authenticated attaches scoped to the same api key" do
     upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_auth"}))
     setup = gateway_setup(upstream)
