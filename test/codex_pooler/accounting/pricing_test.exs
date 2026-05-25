@@ -398,6 +398,158 @@ defmodule CodexPooler.Accounting.PricingTest do
       assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(5_440_080))
     end
 
+    test "websocket final usage overrides reservation estimate for settled tokens and cost" do
+      setup = accounting_setup()
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{
+                   "model" => setup.model.exposed_model_id,
+                   "input" => "short reservation seed",
+                   "max_output_tokens" => 1
+                 },
+                 %{correlation_id: "corr-websocket-final-usage", transport: "websocket"}
+               )
+
+      refute reserved.reservation.input_tokens == 100
+      refute reserved.reservation.cached_input_tokens == 40
+      refute reserved.reservation.output_tokens == 12
+      refute reserved.reservation.total_tokens == 112
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 100,
+                   cached_input_tokens: 40,
+                   output_tokens: 12,
+                   reasoning_tokens: 3,
+                   total_tokens: 112,
+                   source: "websocket_upstream_usage"
+                 },
+                 %{response_status_code: 200}
+               )
+
+      assert result.settlement.usage_status == "usage_known"
+      assert result.settlement.input_tokens == 100
+      assert result.settlement.cached_input_tokens == 40
+      assert result.settlement.output_tokens == 12
+      assert result.settlement.reasoning_tokens == 3
+      assert result.settlement.total_tokens == 112
+      assert result.settlement.details["estimated_from_reserve"] == false
+      assert result.settlement.details["usage_source"] == "websocket_upstream_usage"
+      assert result.settlement.details["pricing_status"] == "priced"
+      assert result.settlement.details["price_bucket"] == "default"
+      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(910))
+
+      assert %{items: [log], total: 1} = Accounting.list_request_logs(setup.pool, limit: 1)
+      assert log.id == result.request.id
+      assert log.transport == "websocket"
+      assert log.token_counts.input_tokens == 100
+      assert log.token_counts.cached_input_tokens == 40
+      assert log.token_counts.output_tokens == 12
+      assert log.token_counts.reasoning_tokens == 3
+      assert log.token_counts.total_tokens == 112
+      assert log.cost.status == "priced"
+      assert Decimal.equal?(log.cost.usd, Decimal.new("0.000910"))
+    end
+
+    test "websocket final usage can reselect the long-context price bucket" do
+      setup = accounting_setup()
+
+      long_context_pricing =
+        pricing_snapshot_fixture(setup.pricing, %{
+          config: pricing_config(%{"price_bucket" => "long_context"}),
+          input_token_micros: Decimal.new(20),
+          cached_input_token_micros: Decimal.new(2),
+          output_token_micros: Decimal.new(30),
+          reasoning_token_micros: Decimal.new(30)
+        })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{
+                   "model" => setup.model.exposed_model_id,
+                   "input" => "short reservation seed",
+                   "max_output_tokens" => 1
+                 },
+                 %{correlation_id: "corr-websocket-long-context", transport: "websocket"}
+               )
+
+      assert reserved.pricing_snapshot.id == setup.pricing.id
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{
+                   status: "usage_known",
+                   input_tokens: 272_001,
+                   output_tokens: 2,
+                   total_tokens: 272_003,
+                   source: "websocket_upstream_usage"
+                 },
+                 %{response_status_code: 200}
+               )
+
+      assert result.settlement.pricing_snapshot_id == long_context_pricing.id
+      assert result.settlement.usage_status == "usage_known"
+      assert result.settlement.input_tokens == 272_001
+      assert result.settlement.output_tokens == 2
+      assert result.settlement.total_tokens == 272_003
+      assert result.settlement.details["pricing_status"] == "priced"
+      assert result.settlement.details["price_bucket"] == "long_context"
+      assert result.settlement.details["estimated_from_reserve"] == false
+      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(5_440_080))
+    end
+
+    test "websocket usage_unknown fallback rows keep reservation tokens but no priced cost" do
+      setup = accounting_setup()
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "input" => "unknown usage seed"},
+                 %{correlation_id: "corr-websocket-usage-unknown", transport: "websocket"}
+               )
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{status: "usage_unknown", source: "websocket_usage_missing"},
+                 %{response_status_code: 200}
+               )
+
+      assert result.settlement.usage_status == "usage_unknown"
+      assert result.settlement.input_tokens == reserved.reservation.input_tokens
+      assert result.settlement.output_tokens == reserved.reservation.output_tokens
+      assert result.settlement.total_tokens == reserved.reservation.total_tokens
+      assert result.settlement.details["estimated_from_reserve"] == true
+      assert result.settlement.details["usage_source"] == "websocket_usage_missing"
+      assert result.settlement.details["settled_cost_micros"] == nil
+      assert Decimal.equal?(result.settlement.settled_cost_micros, Decimal.new(0))
+
+      assert %{items: [log], total: 1} = Accounting.list_request_logs(setup.pool, limit: 1)
+      assert log.id == result.request.id
+      assert log.token_counts.usage_status == "usage_unknown"
+      assert log.cost.status == "unpriced"
+      assert is_nil(log.cost.usd)
+    end
+
     test "fractional imported pricing settles exact total micros" do
       setup = accounting_setup()
       Repo.delete!(setup.pricing)
