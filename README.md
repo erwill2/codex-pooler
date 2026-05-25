@@ -1,25 +1,36 @@
-# Codex Pooler
+<h1 align="center">Codex Pooler</h1>
 
-![Codex Pooler gateway overview](.github/assets/codex-pooler-readme-banner.png)
+<p align="center">
+  <strong>One gateway for many Codex accounts.</strong><br>
+  Pool capacity, preserve sessions, route requests, and expose stable API keys
+  for agents and tools.
+</p>
 
-Codex Pooler lets you create managed pools of Codex accounts.
+<p align="center">
+  <a href="#quick-start-with-docker-compose">Quick start</a>
+  ·
+  <a href="#highlights">Highlights</a>
+  ·
+  <a href="./RUNBOOK.md">Runbook</a>
+  ·
+  <a href="./docs/runtime-contract.md">Runtime contract</a>
+</p>
 
-Add your Codex accounts, group them into Pools, and give each client a Pool API
-key. The client sends one request; Codex Pooler chooses which account should
-handle it based on model support, available limits, session continuity, routing
-strategy, and recent health.
+<p align="center">
+  <img src=".github/assets/codex-pooler-readme-banner.png" alt="Codex Pooler gateway overview">
+</p>
 
-That makes Codex limits easier to share. A client key can draw from the
-accounts assigned to its Pool, while operators still get request accounting,
-audit logs, account health, routing controls, and a browser UI for managing
-pools.
+Codex Pooler is a self-hosted gateway for sharing Codex account capacity across
+agents, tools, and teams.
 
-Codex Pooler also exposes selected OpenAI `/v1` endpoints for agents and tools
-that only know how to talk to an OpenAI-compatible API key. Those calls can keep
-their familiar SDK shape while Codex Pooler routes them through pooled Codex
-accounts, where subscription limits and raw API costs follow a different model.
-Supported `/v1/responses`, `/v1/chat/completions`, files, audio, and image
-requests use the same Pool rules and account selection logic.
+Instead of binding each client to one Codex account, you add accounts to Pools
+and issue stable Pool API keys. Clients send familiar Codex backend or
+OpenAI-compatible requests; Codex Pooler selects the right account based on
+model support, limits, session continuity, routing policy, and health.
+
+Operators get one place to manage accounts, keys, routing, request accounting,
+audit logs, and health without storing prompts, files, audio, images, bearer
+tokens, or raw Codex secrets.
 
 ## Highlights
 
