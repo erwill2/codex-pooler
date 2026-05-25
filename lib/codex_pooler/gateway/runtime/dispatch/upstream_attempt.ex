@@ -1,11 +1,15 @@
 defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
   @moduledoc false
 
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.FailureResponse
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Runtime.Dispatch.PreparedContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
   alias CodexPooler.Gateway.Runtime.Finalization
   alias CodexPooler.Gateway.Runtime.Streaming.StreamDispatch
   alias CodexPooler.Gateway.Runtime.Streaming.StreamLifecycle
+  alias CodexPooler.Gateway.Transports.Streaming.WebSocketCodec
   alias CodexPooler.Gateway.Transports.UpstreamDispatch
   alias CodexPooler.Gateway.Transports.UpstreamDispatch.Request, as: DispatchRequest
   alias CodexPooler.RouteClass
@@ -51,7 +55,23 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
         writer: writer
       )
 
+    dispatch_websocket_result(prepared_context, dispatch_request, callbacks, started)
+  end
+
+  defp dispatch_websocket_result(prepared_context, dispatch_request, callbacks, started) do
+    context = prepared_context.context
+
     case dispatch_websocket_request_with_owner_recovery(prepared_context, dispatch_request) do
+      {:error, %{reason: {:retryable_first_event, failure}} = response} ->
+        handle_retryable_first_websocket_event(
+          prepared_context,
+          dispatch_request,
+          callbacks,
+          response,
+          failure,
+          started
+        )
+
       {:ok, %{terminal: "response.completed"} = response} ->
         Finalization.finalize_completed_websocket_response(
           context,
@@ -73,6 +93,107 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
         )
     end
   end
+
+  defp handle_retryable_first_websocket_event(
+         %PreparedContext{context: %{allow_retry?: true} = context} = prepared_context,
+         dispatch_request,
+         callbacks,
+         response,
+         failure,
+         _started
+       ) do
+    response_context = retryable_websocket_response_context(context, response)
+
+    with {:ok, _recorded_failure} <-
+           Finalization.record_retryable_first_event_stream_failure(
+             Map.get(response, :body, ""),
+             failure,
+             response_context,
+             record_health?: false
+           ),
+         {:ok, retry_context} <- create_same_assignment_retry_context(context) do
+      retry_prepared_context = %{prepared_context | context: retry_context}
+
+      retry_dispatch_request =
+        dispatch_request(retry_prepared_context,
+          accounting_request: dispatch_request.accounting_request,
+          writer: dispatch_request.writer
+        )
+
+      dispatch_websocket_result(
+        retry_prepared_context,
+        retry_dispatch_request,
+        callbacks,
+        System.monotonic_time(:millisecond)
+      )
+    end
+  end
+
+  defp handle_retryable_first_websocket_event(
+         %PreparedContext{context: context},
+         dispatch_request,
+         _callbacks,
+         response,
+         failure,
+         _started
+       ) do
+    deliver_retry_exhausted_websocket_failure(dispatch_request, response)
+
+    response_context = retryable_websocket_response_context(context, response)
+
+    Finalization.finalize_first_event_stream_failure(
+      Map.get(response, :body, ""),
+      failure,
+      response_context
+    )
+  end
+
+  defp create_same_assignment_retry_context(context) do
+    case Accounting.create_attempt(context.reserved.request, context.assignment, %{
+           response_metadata:
+             Map.merge(context.request_options.routing.routing_attempt_metadata || %{}, %{
+               "pool_upstream_assignment_id" => context.assignment.id,
+               "upstream_identity_id" => context.identity.id
+             })
+         }) do
+      {:ok, attempt} ->
+        {:ok,
+         %{
+           context
+           | attempt: attempt,
+             started: System.monotonic_time(:millisecond),
+             retry_count: (context.retry_count || 0) + 1,
+             allow_retry?: false
+         }}
+
+      {:error, reason} ->
+        FailureResponse.accounting_failure(
+          :create_same_assignment_websocket_retry_attempt,
+          context.reserved.request,
+          context.attempt,
+          reason
+        )
+    end
+  end
+
+  defp retryable_websocket_response_context(context, response) do
+    %ResponseContext{
+      context: context,
+      response: %Req.Response{status: 200, headers: Map.get(response, :headers, [])}
+    }
+  end
+
+  defp deliver_retry_exhausted_websocket_failure(
+         %DispatchRequest{accounting_request: %{id: _request_id} = request, writer: writer},
+         upstream_response
+       )
+       when is_function(writer, 1) do
+    request.id
+    |> WebSocketCodec.stream_messages(Map.get(upstream_response, :body, ""))
+    |> Enum.each(writer)
+  end
+
+  defp deliver_retry_exhausted_websocket_failure(_dispatch_request, _upstream_response), do: :ok
 
   defp dispatch_websocket_request_with_owner_recovery(prepared_context, dispatch_request) do
     case UpstreamDispatch.websocket_request(dispatch_request) do

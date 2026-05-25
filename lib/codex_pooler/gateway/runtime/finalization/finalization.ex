@@ -178,11 +178,17 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   @spec record_retryable_first_event_stream_failure(
           binary(),
           stream_failure(),
-          ResponseContext.t()
+          ResponseContext.t(),
+          keyword()
         ) :: stream_finalization_result()
-  defdelegate record_retryable_first_event_stream_failure(body, failure, response_context),
-    to: Streaming,
-    as: :record_retryable_first_event_failure
+  defdelegate record_retryable_first_event_stream_failure(
+                body,
+                failure,
+                response_context,
+                opts \\ []
+              ),
+              to: Streaming,
+              as: :record_retryable_first_event_failure
 
   @spec finalize_first_event_stream_failure(binary(), stream_failure(), ResponseContext.t()) ::
           stream_finalization_result()

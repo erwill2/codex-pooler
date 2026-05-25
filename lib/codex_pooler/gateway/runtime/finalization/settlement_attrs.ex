@@ -10,7 +10,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SettlementAttrs do
   def success(%DispatchContext{} = context, status, attempt_metadata, opts) do
     %{
       response_status_code: status,
-      retry_count: context.index,
+      retry_count: context.retry_count || context.index,
       latency_ms: latency(context, opts),
       attempt_metadata: attempt_metadata
     }
@@ -21,7 +21,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SettlementAttrs do
   def failure(%DispatchContext{} = context, status, code, message, attempt_metadata, opts) do
     %{
       response_status_code: status,
-      retry_count: context.index,
+      retry_count: context.retry_count || context.index,
       last_error_code: code,
       error_message: message,
       latency_ms: latency(context, opts),
@@ -48,7 +48,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SettlementAttrs do
       ) do
     %{
       response_status_code: status,
-      retry_count: context.index,
+      retry_count: context.retry_count || context.index,
       latency_ms: latency(context, opts),
       last_error_code: code,
       error_message: message,

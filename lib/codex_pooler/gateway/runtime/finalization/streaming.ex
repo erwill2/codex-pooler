@@ -56,17 +56,28 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     end
   end
 
-  @spec record_retryable_first_event_failure(binary(), stream_failure(), ResponseContext.t()) ::
+  @spec record_retryable_first_event_failure(
+          binary(),
+          stream_failure(),
+          ResponseContext.t(),
+          keyword()
+        ) ::
           finalization_result()
   def record_retryable_first_event_failure(
         body,
         failure,
-        %ResponseContext{context: context, response: response}
+        %ResponseContext{context: context, response: response},
+        opts \\ []
       ) do
     code = failure.code
     health_code = failure.upstream_code || code
 
-    with :ok <- record_health_failure(health_code, health_code, context) do
+    health_result =
+      if Keyword.get(opts, :record_health?, true),
+        do: record_health_failure(health_code, health_code, context),
+        else: :ok
+
+    with :ok <- health_result do
       AttemptSettlement.record_retryable_failure(
         context.reserved.request,
         context.attempt,
