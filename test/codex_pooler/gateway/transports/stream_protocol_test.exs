@@ -162,4 +162,84 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       assert response["error"]["code"] == "server_error"
     end
   end
+
+  describe "websocket_error_frame_headers/1" do
+    test "extracts allowlisted scalar headers from status wrapped errors" do
+      frame =
+        wrapped_error_frame(%{
+          "status" => 429,
+          "headers" => %{
+            "X-Request-ID" => "req-first",
+            "x-request-id" => "req-last",
+            "OpenAI-Request-ID" => "openai-req",
+            "X-OpenAI-Request-ID" => "x-openai-req",
+            "X-Codex-Rate-Limit-Reached-Type" => "primary",
+            "X-RateLimit-Limit-Requests" => 1200,
+            "X-RateLimit-Remaining-Requests" => 0,
+            "X-RateLimit-Reset-Requests" => 1_717_171_717,
+            "X-Codex-Primary-Used-Percent" => 88.5,
+            "X-Codex-Primary-Window-Minutes" => 300,
+            "X-Codex-Primary-Reset-At" => "2026-05-25T12:00:00Z",
+            "X-Codex-Secondary-Used-Percent" => true,
+            "X-Codex-Secondary-Window-Minutes" => false,
+            "X-Codex-Secondary-Reset-At" => "2026-05-25T12:30:00Z"
+          }
+        })
+
+      assert websocket_error_frame_headers(frame) == %{
+               "openai-request-id" => "openai-req",
+               "x-codex-primary-reset-at" => "2026-05-25T12:00:00Z",
+               "x-codex-primary-used-percent" => "88.5",
+               "x-codex-primary-window-minutes" => "300",
+               "x-codex-rate-limit-reached-type" => "primary",
+               "x-codex-secondary-reset-at" => "2026-05-25T12:30:00Z",
+               "x-codex-secondary-used-percent" => "true",
+               "x-codex-secondary-window-minutes" => "false",
+               "x-openai-request-id" => "x-openai-req",
+               "x-ratelimit-limit-requests" => "1200",
+               "x-ratelimit-remaining-requests" => "0",
+               "x-ratelimit-reset-requests" => "1717171717",
+               "x-request-id" => "req-last"
+             }
+    end
+
+    test "drops sensitive, arbitrary, arrays, objects, and null values from status_code wrapped errors" do
+      frame =
+        wrapped_error_frame(%{
+          "status_code" => 429,
+          "headers" => %{
+            "Authorization" => "synthetic-auth-redacted",
+            "Cookie" => "synthetic-session-cookie",
+            "Set-Cookie" => "synthetic-session-cookie=drop",
+            "Proxy-Authorization" => "synthetic-proxy-auth-redacted",
+            "Should-Not-Persist" => "synthetic-sentinel",
+            "OpenAI-Organization" => "not-explicitly-allowed",
+            "X-Request-ID" => ["array-value"],
+            "X-OpenAI-Request-ID" => %{"nested" => "object-value"},
+            "OpenAI-Request-ID" => nil,
+            "X-Codex-Primary-Reset-At" => "2026-05-25T13:00:00Z"
+          }
+        })
+
+      assert websocket_error_frame_headers(frame) == %{
+               "x-codex-primary-reset-at" => "2026-05-25T13:00:00Z"
+             }
+    end
+  end
+
+  defp websocket_error_frame_headers(frame) do
+    StreamProtocol.websocket_error_frame_headers(frame)
+  end
+
+  defp wrapped_error_frame(attrs) do
+    attrs
+    |> Map.merge(%{
+      "type" => "error",
+      "error" => %{
+        "code" => "rate_limit_exceeded",
+        "message" => "rate limited"
+      }
+    })
+    |> Jason.encode!()
+  end
 end

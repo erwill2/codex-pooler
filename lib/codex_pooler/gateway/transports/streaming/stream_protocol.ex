@@ -6,12 +6,25 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponses
 
   @terminal_event_types ["response.failed", "response.incomplete", "error"]
+  @downstream_visible_event_types @terminal_event_types ++
+                                    ["response.created", "response.in_progress"]
   @retryable_first_event_codes [
     "upstream_request_timeout",
     "stream_incomplete",
     "server_error",
-    "overloaded_error"
+    "overloaded_error",
+    "websocket_connection_limit_reached"
   ]
+  @metadata_header_names ~w(openai-request-id x-openai-request-id x-request-id)
+  @quota_header_prefixes ~w(x-ratelimit-limit- x-ratelimit-remaining- x-ratelimit-reset-)
+  @quota_window_header_suffixes ~w(
+    -primary-reset-at
+    -primary-used-percent
+    -primary-window-minutes
+    -secondary-reset-at
+    -secondary-used-percent
+    -secondary-window-minutes
+  )
 
   @type terminal_failure :: %{
           required(:code) => String.t(),
@@ -24,6 +37,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
           required(:created?) => boolean(),
           required(:text_delta?) => boolean()
         }
+  @type websocket_frame_headers :: %{optional(String.t()) => String.t()}
 
   @spec public_openai_responses_stream_state() :: public_openai_responses_stream_state()
   def public_openai_responses_stream_state do
@@ -71,6 +85,19 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
       _other -> data
     end
   end
+
+  @spec websocket_error_frame_headers(binary()) :: websocket_frame_headers()
+  def websocket_error_frame_headers(data) when is_binary(data) do
+    case Jason.decode(data) do
+      {:ok, %{"type" => "error", "headers" => %{} = headers}} ->
+        sanitized_websocket_error_headers(headers)
+
+      _other ->
+        %{}
+    end
+  end
+
+  def websocket_error_frame_headers(_data), do: %{}
 
   @spec complete_sse_blocks(binary(), keyword()) :: {[binary()], binary()}
   def complete_sse_blocks(data, opts) do
@@ -143,6 +170,39 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
 
   def retryable_first_terminal_failure(_event), do: :error
 
+  @spec internal_rate_limit_event?(term()) :: boolean()
+  def internal_rate_limit_event?(%{} = event) do
+    event_type = Map.get(event, :event_type) || Map.get(event, "event_type")
+
+    data_type =
+      Map.get(event, :data_type) || Map.get(event, "data_type") || Map.get(event, "type")
+
+    event_type == "codex.rate_limits" or data_type == "codex.rate_limits"
+  end
+
+  def internal_rate_limit_event?(data) when is_binary(data) do
+    case incomplete_sse_or_direct_stream_event_summary(data) do
+      {:ok, event} -> internal_rate_limit_event?(event)
+      :incomplete -> false
+    end
+  end
+
+  def internal_rate_limit_event?(_data), do: false
+
+  @spec downstream_visible_event?(term()) :: boolean()
+  def downstream_visible_event?(%{} = event) do
+    not internal_rate_limit_event?(event) and visible_downstream_event?(event)
+  end
+
+  def downstream_visible_event?(data) when is_binary(data) do
+    case incomplete_sse_or_direct_stream_event_summary(data) do
+      {:ok, event} -> downstream_visible_event?(event)
+      :incomplete -> false
+    end
+  end
+
+  def downstream_visible_event?(_event), do: false
+
   @spec stream_data_visible?(term()) :: boolean()
   def stream_data_visible?(data) when is_binary(data) do
     {blocks, _buffer} = complete_sse_blocks(data, bounded?: false)
@@ -151,7 +211,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
       event_type = sse_field(block, "event")
       decoded = block |> sse_field("data") |> decode_sse_data()
       data_type = decoded_string(decoded, "type")
-      visible_stream_event_type?(event_type) or visible_stream_event_type?(data_type)
+      downstream_visible_event?(%{event_type: event_type, data_type: data_type})
     end)
   end
 
@@ -263,10 +323,45 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
     response = canonical_codex_responses_error_response(decoded, error)
 
     decoded
+    |> Map.drop(["headers"])
     |> Map.put("type", "response.failed")
     |> Map.put("error", error)
     |> Map.put("response", response)
   end
+
+  defp sanitized_websocket_error_headers(headers) do
+    Enum.reduce(headers, %{}, fn header, acc ->
+      put_allowed_websocket_error_header(acc, header)
+    end)
+  end
+
+  defp put_allowed_websocket_error_header(acc, {name, value}) do
+    name = name |> to_string() |> String.downcase()
+
+    case allowed_scalar_header_value(name, value) do
+      {:ok, value} -> Map.put(acc, name, value)
+      :error -> acc
+    end
+  end
+
+  defp allowed_scalar_header_value(name, value) do
+    if allowed_websocket_error_header?(name), do: scalar_header_value(value), else: :error
+  end
+
+  defp allowed_websocket_error_header?(name) when name in @metadata_header_names, do: true
+  defp allowed_websocket_error_header?("x-codex-rate-limit-reached-type"), do: true
+
+  defp allowed_websocket_error_header?(name) do
+    Enum.any?(@quota_header_prefixes, &String.starts_with?(name, &1)) or
+      (String.starts_with?(name, "x-") and
+         Enum.any?(@quota_window_header_suffixes, &String.ends_with?(name, &1)))
+  end
+
+  defp scalar_header_value(value) when is_binary(value), do: {:ok, value}
+  defp scalar_header_value(value) when is_integer(value), do: {:ok, Integer.to_string(value)}
+  defp scalar_header_value(value) when is_float(value), do: {:ok, to_string(value)}
+  defp scalar_header_value(value) when is_boolean(value), do: {:ok, to_string(value)}
+  defp scalar_header_value(_value), do: :error
 
   defp canonical_codex_responses_error(decoded) do
     error = canonical_codex_responses_error_source(decoded) || %{}
@@ -351,12 +446,29 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
     end
   end
 
-  defp visible_stream_event_type?(type) when is_binary(type) do
+  defp visible_downstream_event?(event) do
+    {event_type, data_type} = event_stream_types(event)
+
+    visible_event_type?(event_type) or visible_event_type?(data_type)
+  end
+
+  defp event_stream_types(event) do
+    event_type = Map.get(event, :event_type) || Map.get(event, "event_type")
+
+    data_type =
+      Map.get(event, :data_type) || Map.get(event, "data_type") || Map.get(event, "type")
+
+    {event_type, data_type}
+  end
+
+  defp visible_event_type?(type) when type in @downstream_visible_event_types, do: true
+
+  defp visible_event_type?(type) when is_binary(type) do
     String.contains?(type, ".delta") or String.contains?(type, "output") or
       String.contains?(type, "message") or String.contains?(type, "tool")
   end
 
-  defp visible_stream_event_type?(_type), do: false
+  defp visible_event_type?(_type), do: false
 
   defp error_code_from_decoded(%{"response" => %{"error" => %{} = error}}) do
     error_code_from_nested_error(error)
