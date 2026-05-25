@@ -5,9 +5,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   alias CodexPooler.Gateway.Payloads.{InputShape, RequestOptions, StrictSchema, ToolResultShape}
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
-  @reasoning_efforts ~w(minimal low medium high xhigh)
+  @reasoning_efforts ~w(none minimal low medium high xhigh)
   @reasoning_summaries ~w(auto concise detailed)
-  @service_tiers ~w(auto default flex priority ultrafast)
+  @service_tiers ~w(auto default flex priority scale ultrafast)
+  @locally_unsupported_fields ~w(background context_management conversation max_tool_calls prompt top_logprobs truncation user)
   @input_audio_formats ~w(mp3 wav)
 
   @endpoint "/backend-api/codex/responses"
@@ -18,12 +19,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
          :ok <- Validation.reject_high_impact_fields(payload),
          :ok <- Validation.reject_unsupported_fields(payload, :responses),
          :ok <- Validation.require_model(payload),
+         :ok <- reject_locally_unsupported_fields(payload),
          :ok <- validate_input(payload),
          :ok <- validate_previous_response_continuation(payload),
          :ok <- validate_tools(payload),
          :ok <- validate_tool_choice(payload),
+         :ok <- validate_max_output_tokens(payload),
          :ok <- validate_reasoning(payload),
          :ok <- validate_service_tier(payload),
+         :ok <- validate_stream_options(payload),
          :ok <- StrictSchema.validate(payload),
          :ok <- InputShape.validate(payload) do
       {:ok, payload}
@@ -37,7 +41,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     with {:ok, payload} <- validate(payload),
          {:ok, payload} <-
            payload
-           |> Map.take(Matrix.supported_fields(:responses))
+           |> Map.take(Matrix.forwarded_fields(:responses))
+           |> normalize_forwarded_enums()
            |> normalize_input() do
       payload =
         maybe_force_backend_streaming(payload, opts)
@@ -212,7 +217,44 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
         _event -> []
       end)
 
-    if output_items == [], do: response, else: Map.put(response, "output", output_items)
+    cond do
+      output_items != [] ->
+        Map.put(response, "output", output_items)
+
+      output_text = output_text_from_events(events) ->
+        Map.put(response, "output", [
+          %{"type" => "message", "content" => [%{"type" => "output_text", "text" => output_text}]}
+        ])
+
+      true ->
+        response
+    end
+  end
+
+  defp output_text_from_events(events) do
+    deltas =
+      events
+      |> Enum.flat_map(fn
+        %{"type" => "response.output_text.delta", "delta" => delta} when is_binary(delta) ->
+          [delta]
+
+        _event ->
+          []
+      end)
+
+    done_texts =
+      events
+      |> Enum.flat_map(fn
+        %{"type" => "response.output_text.done", "text" => text} when is_binary(text) -> [text]
+        _event -> []
+      end)
+
+    [deltas, done_texts]
+    |> Enum.find(&(&1 != []))
+    |> case do
+      nil -> nil
+      parts -> Enum.join(parts)
+    end
   end
 
   defp validate_input(%{"input" => input}) when is_binary(input), do: :ok
@@ -233,6 +275,16 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     do: {:error, Error.invalid_request("input must be a string or array", "input")}
 
   defp validate_input(_payload), do: :ok
+
+  defp reject_locally_unsupported_fields(payload) do
+    payload
+    |> Map.keys()
+    |> Enum.find(&(&1 in @locally_unsupported_fields))
+    |> case do
+      nil -> :ok
+      field -> {:error, Error.unsupported_parameter(field)}
+    end
+  end
 
   defp validate_input_item(%{"type" => "message"} = item, _payload),
     do: validate_message_item(item)
@@ -337,6 +389,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
 
   defp validate_reasoning(_payload), do: :ok
 
+  defp validate_max_output_tokens(%{"max_output_tokens" => value})
+       when is_integer(value) and value > 0,
+       do: :ok
+
+  defp validate_max_output_tokens(%{"max_output_tokens" => _value}),
+    do:
+      {:error,
+       Error.invalid_request("max_output_tokens must be a positive integer", "max_output_tokens")}
+
+  defp validate_max_output_tokens(_payload), do: :ok
+
   defp validate_reasoning_map(reasoning) do
     with :ok <- validate_reasoning_keys(reasoning),
          :ok <- validate_reasoning_effort(Map.get(reasoning, "effort")) do
@@ -398,6 +461,68 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     do: {:error, Error.invalid_request("service_tier is not supported", "service_tier")}
 
   defp validate_service_tier(_payload), do: :ok
+
+  defp validate_stream_options(%{"stream_options" => options}) when is_map(options) do
+    with :ok <- validate_stream_option_keys(options, ["include_obfuscation"]) do
+      case Map.get(options, "include_obfuscation") do
+        nil ->
+          :ok
+
+        value when is_boolean(value) ->
+          :ok
+
+        _value ->
+          {:error,
+           Error.invalid_request(
+             "stream_options.include_obfuscation must be a boolean",
+             "stream_options.include_obfuscation"
+           )}
+      end
+    end
+  end
+
+  defp validate_stream_options(%{"stream_options" => _options}),
+    do: {:error, Error.invalid_request("stream_options must be an object", "stream_options")}
+
+  defp validate_stream_options(_payload), do: :ok
+
+  defp validate_stream_option_keys(options, allowed_keys) do
+    case options |> Map.keys() |> Enum.reject(&(&1 in allowed_keys)) do
+      [] ->
+        :ok
+
+      [key | _rest] ->
+        {:error,
+         Error.invalid_request("stream_options field is not supported", "stream_options." <> key)}
+    end
+  end
+
+  defp normalize_forwarded_enums(payload) do
+    payload
+    |> normalize_string_field("service_tier")
+    |> normalize_reasoning_fields()
+  end
+
+  defp normalize_string_field(payload, field) do
+    case Map.fetch(payload, field) do
+      {:ok, value} when is_binary(value) -> Map.put(payload, field, normalize_enum(value))
+      _other -> payload
+    end
+  end
+
+  defp normalize_reasoning_fields(%{"reasoning" => reasoning} = payload) when is_map(reasoning) do
+    reasoning =
+      reasoning
+      |> normalize_string_field("effort")
+      |> normalize_string_field("summary")
+
+    Map.put(payload, "reasoning", reasoning)
+  end
+
+  defp normalize_reasoning_fields(payload), do: payload
+
+  defp normalize_enum(value) when is_binary(value),
+    do: value |> String.trim() |> String.downcase()
 
   defp bare_item_reference?(item),
     do: map_size(item) == 2 and Map.has_key?(item, "id") and Map.has_key?(item, "type")

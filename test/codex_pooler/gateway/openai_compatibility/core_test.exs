@@ -21,6 +21,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert "input_fidelity" in Matrix.supported_fields(:images)
   end
 
+  test "supported field matrix tracks current SDK top-level request fields" do
+    openai_chat_fields =
+      ~w(audio frequency_penalty function_call functions logit_bias logprobs max_completion_tokens max_tokens messages metadata modalities model n parallel_tool_calls prediction presence_penalty prompt_cache_key prompt_cache_retention reasoning_effort response_format safety_identifier seed service_tier stop store stream stream_options temperature tool_choice tools top_logprobs top_p user verbosity web_search_options)
+
+    openai_responses_fields =
+      ~w(background context_management conversation include input instructions max_output_tokens metadata model parallel_tool_calls previous_response_id prompt prompt_cache_key prompt_cache_retention reasoning safety_identifier service_tier store stream stream_options temperature text tool_choice tools top_logprobs top_p truncation user)
+
+    assert MapSet.subset?(
+             MapSet.new(openai_chat_fields),
+             MapSet.new(Matrix.supported_fields(:chat))
+           )
+
+    assert MapSet.subset?(
+             MapSet.new(openai_responses_fields),
+             MapSet.new(Matrix.supported_fields(:responses))
+           )
+  end
+
   @tag :responses_coercion
   test "accepted Responses fields coerce to gateway payload and request options" do
     payload = %{
@@ -146,6 +164,53 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   end
 
   @tag :responses_coercion
+  test "Chat maps supported SDK controls instead of silently dropping them" do
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "messages" => [%{"role" => "user", "content" => "Synthetic user"}],
+      "max_completion_tokens" => 123,
+      "metadata" => %{"fixture" => "true"},
+      "prompt_cache_key" => "fixture-cache-key",
+      "prompt_cache_retention" => "24h",
+      "reasoning_effort" => "low",
+      "safety_identifier" => "fixture-safety-id",
+      "service_tier" => "priority",
+      "temperature" => 0.2,
+      "top_p" => 0.9,
+      "verbosity" => "low"
+    }
+
+    assert {:ok, result} = Chat.coerce(payload, collect_openai_response_stream: true)
+    assert result.payload["max_output_tokens"] == 123
+    assert result.payload["metadata"] == %{"fixture" => "true"}
+    assert result.payload["prompt_cache_key"] == "fixture-cache-key"
+    assert result.payload["prompt_cache_retention"] == "24h"
+    assert result.payload["reasoning"] == %{"effort" => "low"}
+    assert result.payload["safety_identifier"] == "fixture-safety-id"
+    assert result.payload["service_tier"] == "priority"
+    assert result.payload["temperature"] == 0.2
+    assert result.payload["top_p"] == 0.9
+    assert result.payload["text"]["verbosity"] == "low"
+  end
+
+  @tag :responses_coercion
+  test "Chat normalizes enum controls before forwarding them" do
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "messages" => [%{"role" => "user", "content" => "Synthetic user"}],
+      "reasoning_effort" => " LOW ",
+      "service_tier" => " Priority ",
+      "verbosity" => " HIGH "
+    }
+
+    assert {:ok, result} = Chat.coerce(payload, collect_openai_response_stream: true)
+
+    assert result.payload["reasoning"] == %{"effort" => "low"}
+    assert result.payload["service_tier"] == "priority"
+    assert result.payload["text"]["verbosity"] == "high"
+  end
+
+  @tag :responses_coercion
   test "Images generation validates parameters and builds an image_generation Responses payload" do
     payload = %{
       "model" => "gpt-image-1",
@@ -236,6 +301,84 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              message: "Unsupported parameter: logprobs",
              param: "logprobs"
            }
+  end
+
+  @tag :unsupported_fields
+  test "known but locally unsupported SDK fields return deterministic errors" do
+    for field <- ["n", "prediction", "stop", "web_search_options"] do
+      assert {:error, %{status: 400, code: "unsupported_parameter", param: ^field}} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [%{"role" => "user", "content" => "synthetic"}],
+                 field => unsupported_value(field)
+               })
+    end
+
+    for field <- ["background", "conversation", "prompt", "truncation"] do
+      assert {:error, %{status: 400, code: "unsupported_parameter", param: ^field}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => "synthetic input",
+                 field => unsupported_value(field)
+               })
+    end
+  end
+
+  @tag :unsupported_fields
+  test "unknown stream_options keys return deterministic errors" do
+    assert {:error, %{status: 400, code: "invalid_request", param: "stream_options.unknown"}} =
+             Chat.coerce(%{
+               "model" => "gpt-fixture-text",
+               "messages" => [%{"role" => "user", "content" => "synthetic"}],
+               "stream_options" => %{"include_usage" => true, "unknown" => true}
+             })
+
+    assert {:error, %{status: 400, code: "invalid_request", param: "stream_options.unknown"}} =
+             Responses.coerce(%{
+               "model" => "gpt-fixture-text",
+               "input" => "synthetic input",
+               "stream_options" => %{"include_obfuscation" => false, "unknown" => true}
+             })
+  end
+
+  @tag :unsupported_fields
+  test "token limit fields require positive integers before forwarding" do
+    for {field, value} <- [{"max_tokens", "128"}, {"max_completion_tokens", 0}] do
+      assert {:error, %{status: 400, code: "invalid_request", param: ^field}} =
+               Chat.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "messages" => [%{"role" => "user", "content" => "synthetic"}],
+                 field => value
+               })
+    end
+
+    assert {:error, %{status: 400, code: "invalid_request", param: "max_output_tokens"}} =
+             Responses.coerce(%{
+               "model" => "gpt-fixture-text",
+               "input" => "synthetic input",
+               "max_output_tokens" => -1
+             })
+  end
+
+  @tag :responses_coercion
+  test "Responses forwards supported SDK scalar controls" do
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "input" => "synthetic input",
+      "max_output_tokens" => 321,
+      "metadata" => %{"fixture" => "true"},
+      "prompt_cache_key" => "fixture-cache-key",
+      "prompt_cache_retention" => "24h",
+      "safety_identifier" => "fixture-safety-id",
+      "stream_options" => %{"include_obfuscation" => false},
+      "temperature" => 0.3,
+      "top_p" => 0.8
+    }
+
+    assert {:ok, result} = Responses.coerce(payload, collect_openai_response_stream: true)
+
+    assert Map.take(result.payload, Map.keys(payload) -- ["input"]) ==
+             Map.delete(payload, "input")
   end
 
   @tag :unsupported_fields
@@ -1485,4 +1628,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   defp upload_metadata do
     %{"filename" => "fixture.txt", "content_type" => "text/plain", "bytes" => 12}
   end
+
+  defp unsupported_value("conversation"), do: "conv_fixture"
+  defp unsupported_value("n"), do: 2
+  defp unsupported_value("prediction"), do: %{"type" => "content", "content" => "synthetic"}
+  defp unsupported_value("prompt"), do: %{"id" => "prompt_fixture"}
+  defp unsupported_value("stop"), do: ["STOP"]
+  defp unsupported_value("stream_options"), do: %{"include_usage" => true}
+  defp unsupported_value("truncation"), do: "auto"
+  defp unsupported_value("web_search_options"), do: %{"search_context_size" => "low"}
+  defp unsupported_value(_field), do: true
 end
