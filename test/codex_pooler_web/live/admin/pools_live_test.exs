@@ -305,12 +305,130 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-row-#{pool.id}-quota-primary-5h", "700")
     assert has_element?(view, "#pool-row-#{pool.id}-quota-primary-5h", "Total 1.5K")
 
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-quota-primary-5h [data-role='pool-quota-center-value']",
+             "800"
+           )
+
     assert has_element?(view, "#pool-row-#{pool.id}-quota-weekly", "Weekly Remaining")
     assert has_element?(view, "#pool-row-#{pool.id}-quota-weekly", "Sample Team Account")
     assert has_element?(view, "#pool-row-#{pool.id}-quota-weekly", "1.8K")
     assert has_element?(view, "#pool-row-#{pool.id}-quota-weekly", "Used")
     assert has_element?(view, "#pool-row-#{pool.id}-quota-weekly", "200")
     assert has_element?(view, "#pool-row-#{pool.id}-quota-weekly", "Total 2K")
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-quota-weekly [data-role='pool-quota-center-value']",
+             "1.8K"
+           )
+  end
+
+  test "renders partial quota evidence without absolute zero remaining", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "quota-partial-pool", name: "Quota Partial Pool"})
+
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    %{identity: percent_identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Partial Percent Account",
+        assignment_label: "Partial Percent Account"
+      })
+
+    %{identity: limit_identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Partial Limit Account",
+        assignment_label: "Partial Limit Account"
+      })
+
+    assert {:ok, _windows} =
+             QuotaWindows.upsert_quota_windows(percent_identity, [
+               percent_only_quota_window_attrs("primary", 300, "42", reset_at)
+             ])
+
+    assert {:ok, _windows} =
+             QuotaWindows.upsert_quota_windows(limit_identity, [
+               active_limit_only_quota_window_attrs("primary", 300, 100, reset_at)
+             ])
+
+    {:ok, view, _html} = live(conn, ~p"/admin/pools")
+
+    card_selector = "#pool-row-#{pool.id}-quota-primary-5h"
+
+    assert has_element?(view, card_selector, "5h Remaining")
+    assert has_element?(view, card_selector, "Quota evidence only")
+    assert has_element?(view, "#{card_selector} [data-role='pool-quota-center-label']", "Partial")
+
+    assert has_element?(
+             view,
+             "#{card_selector} [data-role='pool-quota-center-value']",
+             "Evidence only"
+           )
+
+    assert has_element?(
+             view,
+             "#{card_selector} .pool-quota-legend-row",
+             "Partial Percent Account"
+           )
+
+    assert has_element?(view, "#{card_selector} .pool-quota-legend-row", "42% used")
+    assert has_element?(view, "#{card_selector} .pool-quota-legend-row", "Partial Limit Account")
+    assert has_element?(view, "#{card_selector} .pool-quota-legend-row", "Evidence only")
+
+    refute has_element?(
+             view,
+             "#{card_selector} .pool-quota-donut[aria-label='5h Remaining: 0 remaining']"
+           )
+
+    refute has_element?(view, "#{card_selector} [data-role='pool-quota-center-value']", "0")
+    refute has_element?(view, "#{card_selector} [data-role='pool-quota-legend-value']", "0")
+  end
+
+  test "renders known exhausted quota as true zero remaining", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "quota-exhausted-pool", name: "Quota Exhausted Pool"})
+
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Exhausted Account",
+        assignment_label: "Exhausted Account"
+      })
+
+    assert {:ok, _windows} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               token_backed_quota_window_attrs("primary", 300, 1000, 0, reset_at)
+             ])
+
+    {:ok, view, _html} = live(conn, ~p"/admin/pools")
+
+    card_selector = "#pool-row-#{pool.id}-quota-primary-5h"
+
+    assert has_element?(view, card_selector, "5h Remaining")
+
+    assert has_element?(
+             view,
+             "#{card_selector} [data-role='pool-quota-center-label']",
+             "Remaining"
+           )
+
+    assert has_element?(view, "#{card_selector} [data-role='pool-quota-center-value']", "0")
+
+    assert has_element?(
+             view,
+             "#{card_selector} .pool-quota-donut[aria-label='5h Remaining: 0 remaining']"
+           )
+
+    assert has_element?(view, card_selector, "Quota exhausted")
   end
 
   test "renders 5h pool usage KPIs from settled usage", %{
@@ -1438,6 +1556,58 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
       window_minutes: window_minutes,
       active_limit: active_limit,
       used_percent: Decimal.new(used_percent),
+      reset_at: reset_at,
+      source: "codex_response_headers",
+      source_precision: "observed",
+      quota_scope: "account",
+      quota_family: "account",
+      freshness_state: "fresh"
+    }
+  end
+
+  defp percent_only_quota_window_attrs(window_kind, window_minutes, used_percent, reset_at) do
+    %{
+      quota_key: "account",
+      window_kind: window_kind,
+      window_minutes: window_minutes,
+      used_percent: Decimal.new(used_percent),
+      reset_at: reset_at,
+      source: "codex_response_headers",
+      source_precision: "observed",
+      quota_scope: "account",
+      quota_family: "account",
+      freshness_state: "fresh"
+    }
+  end
+
+  defp active_limit_only_quota_window_attrs(window_kind, window_minutes, active_limit, reset_at) do
+    %{
+      quota_key: "account",
+      window_kind: window_kind,
+      window_minutes: window_minutes,
+      active_limit: active_limit,
+      reset_at: reset_at,
+      source: "codex_response_headers",
+      source_precision: "observed",
+      quota_scope: "account",
+      quota_family: "account",
+      freshness_state: "fresh"
+    }
+  end
+
+  defp token_backed_quota_window_attrs(
+         window_kind,
+         window_minutes,
+         active_limit,
+         credits,
+         reset_at
+       ) do
+    %{
+      quota_key: "account",
+      window_kind: window_kind,
+      window_minutes: window_minutes,
+      active_limit: active_limit,
+      credits: credits,
       reset_at: reset_at,
       source: "codex_response_headers",
       source_precision: "observed",

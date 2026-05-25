@@ -444,14 +444,14 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
               aria-label={card.aria_label}
             >
               <div class="pool-quota-donut-center">
-                <span>Remaining</span>
-                <strong>{card.remaining_label}</strong>
+                <span data-role="pool-quota-center-label">{card.center_label}</span>
+                <strong data-role="pool-quota-center-value">{card.remaining_label}</strong>
               </div>
             </div>
 
             <div class="pool-quota-legend">
-              <p :if={card.empty?} class="pool-quota-empty-copy">
-                No current quota evidence
+              <p :if={card.empty_copy} class="pool-quota-empty-copy">
+                {card.empty_copy}
               </p>
               <div
                 :for={segment <- card.legend_segments}
@@ -461,7 +461,9 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
                   <span class={["pool-quota-dot", segment.dot_class]}></span>
                   <span>{segment.label}</span>
                 </span>
-                <span class="pool-quota-legend-value">{segment.value_label}</span>
+                <span data-role="pool-quota-legend-value" class="pool-quota-legend-value">
+                  {segment.value_label}
+                </span>
               </div>
             </div>
           </div>
@@ -553,25 +555,30 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
   end
 
   defp quota_remaining_card(chart) do
-    capacity_total = Map.get(chart, :capacity_total)
-    remaining_total = decimal_or_zero(Map.get(chart, :remaining_total))
-    used_total = Map.get(chart, :used_total)
+    capacity_total = decimal_value(Map.get(chart, :capacity_total))
+    used_total = decimal_value(Map.get(chart, :used_total))
+    used_percent = decimal_value(Map.get(chart, :used_percent))
     items = Map.get(chart, :items, [])
-    item_segments = Enum.map(items, &quota_item_segment(&1, capacity_total, remaining_total))
-    used_segment = quota_used_segment(used_total, Map.get(chart, :used_percent), capacity_total)
+    remaining_total = quota_remaining_total(chart, items)
+    exhausted? = quota_exhausted?(chart)
+    display_remaining = if exhausted?, do: Decimal.new(0), else: remaining_total
+
+    item_segments = Enum.map(items, &quota_item_segment(&1, capacity_total, display_remaining))
+    used_segment = quota_used_segment(used_total, used_percent, capacity_total)
     legend_segments = item_segments ++ Enum.reject([used_segment], &is_nil/1)
-    empty? = legend_segments == []
+    empty_copy = quota_empty_copy(chart, legend_segments, exhausted?)
+    title = Map.get(chart, :title, "Quota Remaining")
 
     %{
       id_suffix: quota_chart_id_suffix(Map.get(chart, :key)),
-      title: Map.get(chart, :title, "Quota Remaining"),
-      summary_label: quota_summary_label(capacity_total, Map.get(chart, :used_percent)),
-      remaining_label: format_quota_value(remaining_total),
-      gradient: quota_gradient(legend_segments, capacity_total, remaining_total),
+      title: title,
+      summary_label: quota_summary_label(display_remaining, capacity_total, used_percent),
+      center_label: quota_center_label(display_remaining, items, exhausted?, empty_copy),
+      remaining_label: quota_remaining_label(display_remaining, items, exhausted?, empty_copy),
+      gradient: quota_gradient(legend_segments, capacity_total, display_remaining),
       legend_segments: legend_segments,
-      empty?: empty?,
-      aria_label:
-        "#{Map.get(chart, :title, "Quota remaining")}: #{format_quota_value(remaining_total)} remaining"
+      empty_copy: empty_copy,
+      aria_label: quota_aria_label(title, display_remaining, items, exhausted?, empty_copy)
     }
   end
 
@@ -581,13 +588,13 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
 
   defp quota_item_segment(item, capacity_total, remaining_total) do
     {dot_class, color} = quota_color(Map.get(item, :color_index, 0))
-    remaining = decimal_or_zero(Map.get(item, :remaining))
+    remaining = decimal_value(Map.get(item, :remaining))
 
     %{
       label: Map.get(item, :label) || "Upstream account",
       value: remaining,
-      value_label: format_quota_value(remaining),
-      percent: quota_segment_percent(remaining, capacity_total, remaining_total),
+      value_label: quota_item_value_label(item, remaining),
+      percent: quota_item_percent(item, remaining, capacity_total, remaining_total),
       dot_class: dot_class,
       color: color
     }
@@ -610,10 +617,92 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     end
   end
 
-  defp quota_summary_label(nil, _used_percent), do: "Quota evidence only"
+  defp quota_remaining_total(chart, []) do
+    if Map.get(chart, :state) == "empty",
+      do: nil,
+      else: decimal_value(Map.get(chart, :remaining_total))
+  end
 
-  defp quota_summary_label(capacity_total, used_percent) do
+  defp quota_remaining_total(chart, _items), do: decimal_value(Map.get(chart, :remaining_total))
+
+  defp quota_exhausted?(chart) do
+    Map.get(chart, :state) == "blocked" and
+      chart
+      |> Map.get(:excluded_reasons, %{})
+      |> Map.get("exhausted", 0)
+      |> then(&(&1 > 0))
+  end
+
+  defp quota_empty_copy(_chart, [_segment | _segments], _exhausted?), do: nil
+  defp quota_empty_copy(_chart, [], true), do: "Quota exhausted"
+  defp quota_empty_copy(%{state: "empty"}, [], false), do: "No current quota evidence"
+  defp quota_empty_copy(_chart, [], false), do: "No usable quota evidence"
+
+  defp quota_summary_label(nil, _capacity_total, _used_percent), do: "Quota evidence only"
+  defp quota_summary_label(_remaining_total, nil, _used_percent), do: "Quota evidence only"
+
+  defp quota_summary_label(_remaining_total, capacity_total, used_percent) do
     "Total #{format_quota_value(capacity_total)} · #{format_quota_percent(used_percent)} used"
+  end
+
+  defp quota_center_label(%Decimal{}, _items, _exhausted?, _empty_copy), do: "Remaining"
+  defp quota_center_label(nil, [_item | _items], false, _empty_copy), do: "Partial"
+  defp quota_center_label(nil, _items, _exhausted?, _empty_copy), do: "Evidence"
+
+  defp quota_remaining_label(%Decimal{} = remaining_total, _items, _exhausted?, _empty_copy) do
+    format_quota_value(remaining_total)
+  end
+
+  defp quota_remaining_label(nil, [_item | _items], false, _empty_copy), do: "Evidence only"
+  defp quota_remaining_label(nil, _items, _exhausted?, "No current quota evidence"), do: "No data"
+  defp quota_remaining_label(nil, _items, _exhausted?, _empty_copy), do: "Evidence only"
+
+  defp quota_aria_label(title, %Decimal{} = remaining_total, _items, _exhausted?, _empty_copy) do
+    "#{title}: #{format_quota_value(remaining_total)} remaining"
+  end
+
+  defp quota_aria_label(title, nil, [_item | _items], false, _empty_copy) do
+    "#{title}: partial quota evidence only"
+  end
+
+  defp quota_aria_label(title, nil, _items, _exhausted?, "No current quota evidence") do
+    "#{title}: no current quota evidence"
+  end
+
+  defp quota_aria_label(title, nil, _items, _exhausted?, _empty_copy) do
+    "#{title}: quota evidence only"
+  end
+
+  defp quota_item_value_label(_item, %Decimal{} = remaining), do: format_quota_value(remaining)
+
+  defp quota_item_value_label(item, nil) do
+    cond do
+      remaining_percent = decimal_value(Map.get(item, :remaining_percent)) ->
+        "#{format_quota_percent(remaining_percent)} remaining"
+
+      used_percent = decimal_value(Map.get(item, :used_percent)) ->
+        "#{format_quota_percent(used_percent)} used"
+
+      true ->
+        "Evidence only"
+    end
+  end
+
+  defp quota_item_percent(_item, %Decimal{} = remaining, capacity_total, remaining_total) do
+    quota_segment_percent(remaining, capacity_total, remaining_total)
+  end
+
+  defp quota_item_percent(item, nil, _capacity_total, _remaining_total) do
+    cond do
+      remaining_percent = decimal_value(Map.get(item, :remaining_percent)) ->
+        decimal_to_float(remaining_percent)
+
+      used_percent = decimal_value(Map.get(item, :used_percent)) ->
+        max(100.0 - decimal_to_float(used_percent), 0.0)
+
+      true ->
+        100.0
+    end
   end
 
   defp quota_segment_percent(value, capacity_total, remaining_total) do
@@ -671,14 +760,12 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
   end
 
   defp decimal_positive?(%Decimal{} = value), do: Decimal.compare(value, Decimal.new(0)) == :gt
-  defp decimal_positive?(value) when is_integer(value), do: value > 0
-  defp decimal_positive?(value) when is_float(value), do: value > 0
   defp decimal_positive?(_value), do: false
 
-  defp decimal_or_zero(%Decimal{} = value), do: value
-  defp decimal_or_zero(value) when is_integer(value), do: Decimal.new(value)
-  defp decimal_or_zero(value) when is_float(value), do: Decimal.from_float(value)
-  defp decimal_or_zero(_value), do: Decimal.new(0)
+  defp decimal_value(%Decimal{} = value), do: value
+  defp decimal_value(value) when is_integer(value), do: Decimal.new(value)
+  defp decimal_value(value) when is_float(value), do: Decimal.from_float(value)
+  defp decimal_value(_value), do: nil
 
   defp decimal_to_float(%Decimal{} = value), do: Decimal.to_float(value)
 
@@ -691,8 +778,6 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
   end
 
   defp format_quota_percent(_percent), do: "unknown"
-
-  defp format_quota_value(nil), do: "unknown"
 
   defp format_quota_value(%Decimal{} = value) do
     number = value |> decimal_to_float() |> max(0.0)
