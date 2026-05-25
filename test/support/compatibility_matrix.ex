@@ -75,7 +75,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :responses_chat,
       contract:
-        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path, keep safe OpenAI Responses fields like text, store, include, parallel_tool_calls, prompt_cache_key, and metadata, and strip unsupported upstream controls before dispatch"
+        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path, keep safe OpenAI Responses fields like text, store, include, parallel_tool_calls, prompt_cache_key, and metadata, reject known locally unsupported SDK controls, and strip backend-only unsupported controls before dispatch"
     },
     %{
       slug: :backend_v1_alias_surface,
@@ -118,13 +118,13 @@ defmodule CodexPooler.CompatibilityMatrix do
     %{
       slug: :unsupported_upstream_fields,
       status: :supported,
-      current: :stripped_before_upstream_dispatch,
+      current: :rejected_or_stripped_by_scope,
       categories: [:route, :auth, :ownership],
       routes: [%{method: :post, path: "/backend-api/codex/responses"}],
       future_routes: [],
       fixture: :unsupported_upstream_fields,
       contract:
-        "OpenAI compatibility controls unsupported by the Codex backend are removed before upstream dispatch"
+        "OpenAI compatibility rejects known SDK request controls that cannot be translated locally and strips backend-only upstream-unsupported controls before dispatch"
     },
     %{
       slug: :firewall,

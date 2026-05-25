@@ -103,6 +103,18 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert fixture.privacy == "metadata_only"
     end
 
+    test "documents reject versus strip behavior for unsupported OpenAI controls" do
+      responses_chat = CompatibilityMatrix.by_slug!(:responses_chat)
+      unsupported_upstream_fields = CompatibilityMatrix.by_slug!(:unsupported_upstream_fields)
+
+      assert responses_chat.contract =~ "reject known locally unsupported SDK controls"
+      assert unsupported_upstream_fields.current == :rejected_or_stripped_by_scope
+      assert unsupported_upstream_fields.contract =~ "rejects known SDK request controls"
+
+      assert unsupported_upstream_fields.contract =~
+               "strips backend-only upstream-unsupported controls"
+    end
+
     test "documents v1 supported surface as authenticated OpenAI compatibility" do
       feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
       fixture = CompatibilityMatrix.fixture!(:v1_supported_surface)
