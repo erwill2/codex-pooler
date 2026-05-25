@@ -50,6 +50,32 @@ defmodule CodexPooler.Admin.GatewayReadModel do
     |> Map.new()
   end
 
+  @spec hourly_request_counts_by_pool_ids([Ecto.UUID.t()], DateTime.t(), DateTime.t()) :: [
+          %{
+            required(:pool_id) => Ecto.UUID.t(),
+            required(:bucket) => DateTime.t(),
+            required(:requests) => non_neg_integer()
+          }
+        ]
+  def hourly_request_counts_by_pool_ids([], _started_at, _ended_at), do: []
+
+  def hourly_request_counts_by_pool_ids(pool_ids, started_at, ended_at) do
+    Repo.all(
+      from request in Request,
+        where:
+          request.pool_id in ^pool_ids and request.admitted_at >= ^started_at and
+            request.admitted_at <= ^ended_at,
+        group_by: [request.pool_id, fragment("date_trunc('hour', ?)", request.admitted_at)],
+        order_by: [asc: fragment("date_trunc('hour', ?)", request.admitted_at)],
+        select: %{
+          pool_id: request.pool_id,
+          bucket:
+            type(fragment("date_trunc('hour', ?)", request.admitted_at), :utc_datetime_usec),
+          requests: count(request.id)
+        }
+    )
+  end
+
   @spec attempts_for_pool_ids([Ecto.UUID.t()], DateTime.t(), DateTime.t()) :: [map()]
   def attempts_for_pool_ids([], _started_at, _ended_at), do: []
 

@@ -23,6 +23,7 @@ defmodule CodexPooler.Accounting.Reporting do
             entry.occurred_at <= ^ended_at,
         order_by: [desc: entry.occurred_at, desc: entry.created_at],
         select: %{
+          pool_id: entry.pool_id,
           api_key_id: entry.api_key_id,
           upstream_identity_id: entry.upstream_identity_id,
           request_count: entry.request_count,

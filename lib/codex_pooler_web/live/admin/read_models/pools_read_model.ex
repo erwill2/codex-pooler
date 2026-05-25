@@ -37,6 +37,8 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
           required(:tokens_per_second) => number() | nil,
           required(:token_usage_5h) => token_usage(),
           required(:token_usage_weekly) => token_usage(),
+          required(:token_histogram_24h) => [map()],
+          required(:request_histogram_24h) => [map()],
           required(:quota_remaining_charts) => quota_remaining_charts(),
           required(:routing_strategy) => String.t()
         }
@@ -115,6 +117,8 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
         tokens_per_second: usage.tokens_per_second,
         token_usage_5h: usage.token_usage_5h,
         token_usage_weekly: usage.token_usage_weekly,
+        token_histogram_24h: usage.token_histogram_24h,
+        request_histogram_24h: usage.request_histogram_24h,
         quota_remaining_charts:
           Map.get(quota_remaining_charts, pool.id, empty_quota_remaining_charts()),
         routing_strategy: Map.get(routing_settings, pool.id).routing_strategy
@@ -124,8 +128,8 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
 
   defp empty_quota_remaining_charts do
     %{
-      primary_5h: empty_quota_remaining_chart(:primary_5h, "5h Remaining"),
-      weekly: empty_quota_remaining_chart(:weekly, "Weekly Remaining")
+      primary_5h: empty_quota_remaining_chart(:primary_5h, "5h quota"),
+      weekly: empty_quota_remaining_chart(:weekly, "Weekly quota")
     }
   end
 
@@ -133,10 +137,17 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
     %{
       key: key,
       title: title,
+      account_count: 0,
+      evidence_count: 0,
+      usable_count: 0,
+      blocked_count: 0,
+      missing_count: 0,
       remaining_total: Decimal.new(0),
       capacity_total: nil,
       used_total: nil,
       used_percent: nil,
+      lowest_remaining_percent: nil,
+      next_reset_at: nil,
       items: [],
       excluded_count: 0,
       excluded_reasons: %{},

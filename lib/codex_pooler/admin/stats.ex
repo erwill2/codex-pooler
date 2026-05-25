@@ -18,6 +18,7 @@ defmodule CodexPooler.Admin.Stats do
   @succeeded "succeeded"
   @failed_statuses ~w(failed rejected interrupted cancelled)
   @pool_usage_window_seconds 5 * 60 * 60
+  @pool_histogram_window_seconds 24 * 60 * 60
 
   @type access_error :: %{required(:code) => atom(), required(:message) => String.t()}
 
@@ -63,6 +64,31 @@ defmodule CodexPooler.Admin.Stats do
     token_usage_weekly =
       AccountingReporting.token_usage_by_pool_ids(pool_ids, weekly_started_at, ended_at)
 
+    histogram_started_at =
+      Keyword.get(
+        opts,
+        :histogram_started_at,
+        DateTime.add(ended_at, -@pool_histogram_window_seconds, :second)
+      )
+
+    token_histograms =
+      pool_token_histograms(
+        pool_ids,
+        AccountingReporting.settlements_for_pool_ids(pool_ids, histogram_started_at, ended_at),
+        ended_at
+      )
+
+    request_histograms =
+      pool_request_histograms(
+        pool_ids,
+        GatewayReadModel.hourly_request_counts_by_pool_ids(
+          pool_ids,
+          histogram_started_at,
+          ended_at
+        ),
+        ended_at
+      )
+
     Enum.into(pool_ids, %{}, fn pool_id ->
       tokens_per_second =
         pool_tokens_per_second(
@@ -75,7 +101,9 @@ defmodule CodexPooler.Admin.Stats do
          request_count_5h: Map.get(request_counts, pool_id, 0),
          tokens_per_second: tokens_per_second,
          token_usage_5h: Map.get(token_usage_5h, pool_id, empty_token_usage()),
-         token_usage_weekly: Map.get(token_usage_weekly, pool_id, empty_token_usage())
+         token_usage_weekly: Map.get(token_usage_weekly, pool_id, empty_token_usage()),
+         token_histogram_24h: Map.fetch!(token_histograms, pool_id),
+         request_histogram_24h: Map.fetch!(request_histograms, pool_id)
        }}
     end)
   end
@@ -189,6 +217,50 @@ defmodule CodexPooler.Admin.Stats do
     do: Float.round(total_tokens / (latency_ms / 1000), 2)
 
   defp pool_tokens_per_second(_total_tokens, _latency_ms), do: nil
+
+  defp pool_token_histograms(pool_ids, settlements, ended_at) do
+    labels = bucket_labels(%{window: :twenty_four_hours, ended_at: ended_at})
+
+    entries_by_pool_bucket =
+      Enum.group_by(settlements, fn settlement ->
+        {settlement.pool_id, bucket_label(settlement.occurred_at, :twenty_four_hours)}
+      end)
+
+    Map.new(pool_ids, fn pool_id ->
+      rows =
+        Enum.map(labels, fn label ->
+          entries = Map.get(entries_by_pool_bucket, {pool_id, label}, [])
+
+          %{
+            bucket: label,
+            total_tokens: sum_integer(entries, :total_tokens)
+          }
+        end)
+
+      {pool_id, rows}
+    end)
+  end
+
+  defp pool_request_histograms(pool_ids, request_counts, ended_at) do
+    labels = bucket_labels(%{window: :twenty_four_hours, ended_at: ended_at})
+
+    requests_by_pool_bucket =
+      Map.new(request_counts, fn row ->
+        {{row.pool_id, bucket_label(row.bucket, :twenty_four_hours)}, row.requests}
+      end)
+
+    Map.new(pool_ids, fn pool_id ->
+      rows =
+        Enum.map(labels, fn label ->
+          %{
+            bucket: label,
+            requests: Map.get(requests_by_pool_bucket, {pool_id, label}, 0)
+          }
+        end)
+
+      {pool_id, rows}
+    end)
+  end
 
   defp request_kpi(requests) do
     %{
