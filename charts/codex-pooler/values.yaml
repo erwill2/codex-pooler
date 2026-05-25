@@ -31,6 +31,7 @@ config:
   poolSize: 10
   ectoIpv6: "false"
   obanJobsQueueLimit: "8"
+  obanShutdownGracePeriodMs: "55000"
   lang: "C.UTF-8"
   lcAll: "C.UTF-8"
 
@@ -70,8 +71,21 @@ app:
     ownerForwarding:
       enabled: false
   strategy:
-    maxUnavailable: 1
+    maxUnavailable: 0
     maxSurge: 1
+  terminationGracePeriodSeconds: 75
+  drainMarkerPath: /tmp/codex-pooler-draining
+  startupProbe:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    failureThreshold: 12
+    timeoutSeconds: 2
+  lifecycle:
+    preStop:
+      enabled: true
+      sleepSeconds: 10
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
@@ -104,6 +118,10 @@ oban:
   worker:
     enabled: true
     replicaCount: 1
+    strategy:
+      maxUnavailable: 0
+      maxSurge: 1
+    terminationGracePeriodSeconds: 75
     resources:
       requests:
         cpu: 75m
@@ -117,6 +135,10 @@ oban:
   scheduler:
     enabled: true
     replicaCount: 1
+    strategy:
+      maxUnavailable: 0
+      maxSurge: 1
+    terminationGracePeriodSeconds: 75
     resources:
       requests:
         cpu: 50m

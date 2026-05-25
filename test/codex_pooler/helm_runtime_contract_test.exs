@@ -17,6 +17,7 @@ defmodule CodexPooler.HelmRuntimeContractTest do
     "POOL_SIZE" => ~s("10"),
     "ECTO_IPV6" => ~s("false"),
     "OBAN_JOBS_QUEUE_LIMIT" => ~s("8"),
+    "OBAN_SHUTDOWN_GRACE_PERIOD_MS" => ~s("55000"),
     "LANG" => ~s("C.UTF-8"),
     "LC_ALL" => ~s("C.UTF-8")
   }
@@ -81,11 +82,28 @@ defmodule CodexPooler.HelmRuntimeContractTest do
     assert_env_value(app, "PHX_SERVER", ~s("true"))
     assert_env_value(app, "OBAN_MODE", "web")
     assert app =~ ~r/replicas: 1\b/
+    assert_rolling_strategy(app, 0, 1)
+    assert app =~ ~r/terminationGracePeriodSeconds: 75\b/
 
-    assert app =~ "path: /readyz"
-    assert app =~ "path: /healthz"
+    assert app =~ ~r/readinessProbe:\n\s+httpGet:\n\s+path: \/readyz/
+    assert app =~ ~r/livenessProbe:\n\s+httpGet:\n\s+path: \/healthz/
+    assert app =~ ~r/startupProbe:\n\s+httpGet:\n\s+path: \/healthz/
+    assert app =~ ~r/startupProbe:[\s\S]*timeoutSeconds: 2/
     assert app =~ "name: X-Forwarded-Proto"
     assert app =~ "value: https"
+    assert_env_value(app, "CODEX_POOLER_DRAIN_MARKER_PATH", ~s("/tmp/codex-pooler-draining"))
+
+    assert app =~
+             ~s(command: ["/bin/sh", "-c", "touch \\\"$CODEX_POOLER_DRAIN_MARKER_PATH\\\"; sleep 10"])
+
+    assert_rolling_strategy(worker, 0, 1)
+    assert worker =~ ~r/terminationGracePeriodSeconds: 75\b/
+    refute worker =~ "preStop"
+
+    assert_rolling_strategy(scheduler, 0, 1)
+    assert scheduler =~ ~r/terminationGracePeriodSeconds: 75\b/
+    refute scheduler =~ "preStop"
+
     assert_env_value(worker, "OBAN_MODE", "worker")
     assert_env_value(scheduler, "OBAN_MODE", "scheduler")
     assert_env_value(migration, "OBAN_MODE", "web")
@@ -332,6 +350,11 @@ defmodule CodexPooler.HelmRuntimeContractTest do
 
   defp assert_env_value(doc, name, value) do
     assert doc =~ ~r/- name: #{Regex.escape(name)}\n\s+value: #{Regex.escape(value)}(?:\n|$)/
+  end
+
+  defp assert_rolling_strategy(doc, max_unavailable, max_surge) do
+    assert doc =~
+             ~r/strategy:\n\s+type: RollingUpdate\n\s+rollingUpdate:\n\s+maxUnavailable: #{max_unavailable}\n\s+maxSurge: #{max_surge}/
   end
 
   defp refute_env(doc, name) do

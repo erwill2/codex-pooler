@@ -35,6 +35,7 @@ spec:
       {{- if and .Values.clustering.enabled .Values.clustering.participants.app }}
       subdomain: {{ include "codex-pooler.clusteringHeadlessServiceName" . }}
       {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.app.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "codex-pooler.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
@@ -58,6 +59,8 @@ spec:
               value: "true"
             - name: OBAN_MODE
               value: web
+            - name: CODEX_POOLER_DRAIN_MARKER_PATH
+              value: {{ .Values.app.drainMarkerPath | quote }}
             {{- include "codex-pooler.clusteringEnv" (dict "root" . "role" "app") | nindent 12 }}
             {{- include "codex-pooler.websocketOwnerForwardingEnv" . | nindent 12 }}
             {{- include "codex-pooler.env" . | nindent 12 }}
@@ -79,6 +82,25 @@ spec:
                   value: https
             initialDelaySeconds: 10
             periodSeconds: 20
+          {{- if .Values.app.startupProbe.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.app.startupProbe.path }}
+              port: http
+              httpHeaders:
+                - name: X-Forwarded-Proto
+                  value: https
+            initialDelaySeconds: {{ .Values.app.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.app.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.app.startupProbe.failureThreshold }}
+            timeoutSeconds: {{ .Values.app.startupProbe.timeoutSeconds }}
+          {{- end }}
+          {{- if .Values.app.lifecycle.preStop.enabled }}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "touch \"$CODEX_POOLER_DRAIN_MARKER_PATH\"; sleep {{ .Values.app.lifecycle.preStop.sleepSeconds }}"]
+          {{- end }}
           resources:
             {{- toYaml .Values.app.resources | nindent 12 }}
       {{- with .Values.app.nodeSelector }}
