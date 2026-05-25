@@ -9,11 +9,11 @@
 <p align="center">
   <a href="#quick-start-with-docker-compose">Quick start</a>
   ·
-  <a href="#highlights">Highlights</a>
+  <a href="#harness-configuration">Harness Configuration</a>
   ·
-  <a href="./RUNBOOK.md">Runbook</a>
+  <a href="#configuration">Configuration</a>
   ·
-  <a href="./docs/runtime-contract.md">Runtime contract</a>
+  <a href="#deployment-options">Deployment</a>
 </p>
 
 <p align="center">
