@@ -771,6 +771,55 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     end
   end
 
+  test "local owner crash interrupts active turn without waiting for lease expiry" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_crash"}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-owner-crash",
+          accepted_turn_state: "stable-ws-owner-crash",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    %{request: request, attempt: attempt, turn: turn} =
+      active_turn_fixture(setup, auth, state.codex_session)
+
+    {:ok, owner_pid} = WebsocketOwnerSession.lookup(state.codex_session.id)
+    owner_ref = Process.monitor(owner_pid)
+
+    Process.exit(owner_pid, :kill)
+    assert_receive {:DOWN, ^owner_ref, :process, ^owner_pid, :killed}
+
+    owner_monitor = state.websocket_owner_monitor
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner_pid, :killed} = owner_down
+
+    assert {:stop, :owner_crashed, {1011, "websocket owner crashed"}, stopped_state} =
+             CodexResponsesSocket.handle_info(owner_down, state)
+
+    assert_owner_interruption_state!(%{
+      request: request,
+      attempt: attempt,
+      turn: turn,
+      session: state.codex_session,
+      error_code: "owner_crashed"
+    })
+
+    assert released_owner_lease(
+             state.codex_session.id,
+             state.codex_session.owner_lease_token
+           ).metadata["release_reason"] == "owner_crashed"
+
+    CodexResponsesSocket.terminate(
+      :closed,
+      Map.delete(stopped_state, :websocket_owner_downstream)
+    )
+  end
+
   test "stale owner token rejects before upstream send" do
     upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
     setup = gateway_setup(upstream)
