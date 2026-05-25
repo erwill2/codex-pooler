@@ -6,6 +6,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
 
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Persistence.CodexSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
@@ -61,6 +62,50 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
     assert WebsocketOwnerNodeHarness.fake_upstream_frames(upstream_pid) == [@frame]
     assert_receive {:websocket_owner_frame, "corr-remote", 1, {:data, "remote-delta"}}
     assert_receive {:websocket_owner_frame, "corr-remote", 1, :complete}
+  end
+
+  test "remote request recovers missing owner on the owner node", %{auth: auth} do
+    remote_node = :"codex_pooler@recover-owner-app.example"
+    remote_node_string = Atom.to_string(remote_node)
+    %{session: session, token: token} = owner_session_fixture(auth, remote_node_string)
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(), messages: ["recovered-delta"])
+
+    opts =
+      WebsocketOwnerNodeHarness.node_client_opts([remote_node],
+        calls: %{remote_node => :success}
+      )
+      |> Keyword.put(:local_node_string, remote_node_string)
+      |> Keyword.put(:upstream, upstream)
+
+    request = %UpstreamWebSocketSession.Request{
+      url: "https://example.com/backend-api/codex/responses",
+      headers: [],
+      payload: "request-frame",
+      timeouts: %{}
+    }
+
+    assert :ok =
+             WebsocketOwnerForwarder.submit_request(
+               session,
+               token,
+               downstream("corr-recovered-owner"),
+               request,
+               opts
+             )
+
+    assert_receive {:websocket_owner_harness_node_call,
+                    %{node: ^remote_node, function: :remote_submit_request, arity: 4}}
+
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+
+    assert [%UpstreamWebSocketSession.Request{payload: "request-frame"}] =
+             WebsocketOwnerNodeHarness.fake_upstream_frames(upstream_pid)
+
+    assert_receive {:websocket_owner_frame, "corr-recovered-owner", 1, {:data, "recovered-delta"}}
+
+    assert_receive {:websocket_owner_frame, "corr-recovered-owner", 1, :complete}
   end
 
   test "remote timeout maps to owner_forward_timeout within configured timeout", %{auth: auth} do

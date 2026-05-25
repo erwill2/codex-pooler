@@ -13,6 +13,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
+  alias CodexPooler.Repo
 
   @type owner_node :: node()
   @type owner_resolution :: {:local, binary()} | {:remote, owner_node(), binary()}
@@ -20,7 +21,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
   @type submit_opts :: [
           timeout: pos_integer(),
           node_client: module(),
-          app_node_names: [binary()]
+          app_node_names: [binary()],
+          local_node_string: binary(),
+          upstream: map(),
+          request_id: binary()
         ]
 
   @spec submit_frame(
@@ -117,11 +121,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
   end
 
   @doc false
-  @spec remote_submit_frame(binary(), WebsocketOwnerSession.downstream(), binary()) ::
+  @spec remote_submit_frame(
+          binary(),
+          WebsocketOwnerSession.downstream(),
+          binary(),
+          submit_opts()
+        ) ::
           :ok | {:error, WebsocketOwnerContract.owner_error()}
-  def remote_submit_frame(codex_session_id, downstream, frame)
+  def remote_submit_frame(codex_session_id, downstream, frame, opts \\ [])
       when is_binary(codex_session_id) and is_map(downstream) and is_binary(frame) do
-    with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(codex_session_id) do
+    with {:ok, {owner_pid, downstream}} <- ensure_remote_owner(codex_session_id, downstream, opts) do
       WebsocketOwnerSession.submit_frame(owner_pid, downstream, frame)
     end
   end
@@ -130,13 +139,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
   @spec remote_submit_request(
           binary(),
           WebsocketOwnerSession.downstream(),
-          UpstreamWebSocketSession.Request.t()
+          UpstreamWebSocketSession.Request.t(),
+          submit_opts()
         ) ::
           :ok | {:error, WebsocketOwnerContract.owner_error()}
-  def remote_submit_request(codex_session_id, downstream, request)
+  def remote_submit_request(codex_session_id, downstream, request, opts \\ [])
       when is_binary(codex_session_id) and is_map(downstream) and
              is_struct(request, UpstreamWebSocketSession.Request) do
-    with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(codex_session_id) do
+    with {:ok, {owner_pid, downstream}} <- ensure_remote_owner(codex_session_id, downstream, opts) do
       WebsocketOwnerSession.submit_request(owner_pid, downstream, request)
     end
   end
@@ -189,7 +199,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
          frame,
          opts
        ) do
-    result = call_remote(node, :remote_submit_frame, [codex_session_id, downstream, frame], opts)
+    result =
+      call_remote(node, :remote_submit_frame, [codex_session_id, downstream, frame, opts], opts)
 
     if result == {:error, :owner_forward_timeout} do
       best_effort_cancel_downstream(node, codex_session_id, downstream, opts)
@@ -216,7 +227,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
          opts
        ) do
     result =
-      call_remote(node, :remote_submit_request, [codex_session_id, downstream, request], opts)
+      call_remote(
+        node,
+        :remote_submit_request,
+        [codex_session_id, downstream, request, opts],
+        opts
+      )
 
     if result == {:error, :owner_forward_timeout} do
       best_effort_cancel_downstream(node, codex_session_id, downstream, opts)
@@ -232,6 +248,72 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
   defp dispatch_push({:remote, node, _owner_instance_id}, codex_session_id, payload, opts) do
     call_remote(node, :remote_push_downstream, [codex_session_id, payload], opts)
   end
+
+  defp ensure_remote_owner(codex_session_id, downstream, opts) do
+    case WebsocketOwnerSession.lookup(codex_session_id) do
+      {:ok, owner_pid} ->
+        {:ok, {owner_pid, downstream}}
+
+      {:error, :owner_unavailable} ->
+        recover_remote_owner(codex_session_id, downstream, opts)
+    end
+  end
+
+  defp recover_remote_owner(codex_session_id, downstream, opts) do
+    with %CodexSession{} = session <- Repo.get(CodexSession, codex_session_id),
+         :ok <- local_owner_session?(session, opts),
+         {:ok, owner_pid} <- start_recovered_remote_owner(session, opts),
+         {:ok, downstream} <- attach_recovered_downstream(owner_pid, downstream) do
+      {:ok, {owner_pid, downstream}}
+    else
+      nil -> {:error, :owner_unavailable}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp local_owner_session?(
+         %CodexSession{
+           owner_instance_id: owner_instance_id,
+           owner_lease_token: token
+         },
+         opts
+       )
+       when is_binary(owner_instance_id) and is_binary(token) do
+    if owner_instance_id == local_node_string(opts), do: :ok, else: {:error, :owner_unavailable}
+  end
+
+  defp local_owner_session?(%CodexSession{}, _opts), do: {:error, :owner_unavailable}
+
+  defp start_recovered_remote_owner(%CodexSession{} = session, opts) do
+    start_opts = [
+      codex_session_id: session.id,
+      owner_lease_token: session.owner_lease_token,
+      owner_instance_id: session.owner_instance_id,
+      request_id: Keyword.get(opts, :request_id)
+    ]
+
+    start_opts = maybe_put_recovery_upstream(start_opts, opts)
+
+    case WebsocketOwnerSession.start_owner(start_opts) do
+      {:ok, owner_pid} -> {:ok, owner_pid}
+      {:ok, owner_pid, :existing} -> {:ok, owner_pid}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp maybe_put_recovery_upstream(start_opts, opts) do
+    case Keyword.fetch(opts, :upstream) do
+      {:ok, upstream} -> Keyword.put(start_opts, :upstream, upstream)
+      :error -> start_opts
+    end
+  end
+
+  defp attach_recovered_downstream(owner_pid, %{pid: pid, correlation_id: correlation_id})
+       when is_pid(pid) and is_binary(correlation_id) do
+    WebsocketOwnerSession.attach_downstream(owner_pid, %{pid: pid, correlation_id: correlation_id})
+  end
+
+  defp attach_recovered_downstream(_owner_pid, _downstream), do: {:error, :stale_downstream}
 
   defp best_effort_cancel_downstream(node, codex_session_id, downstream, opts) do
     _result =
@@ -323,6 +405,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
   defp safe_node_string(_node), do: nil
 
   defp local_node_string, do: Atom.to_string(node())
+
+  defp local_node_string(opts), do: Keyword.get(opts, :local_node_string, local_node_string())
 
   defp node_client(opts), do: Keyword.get(opts, :node_client, __MODULE__.ERPCNodeClient)
 
