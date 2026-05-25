@@ -1,6 +1,6 @@
 defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
   @moduledoc """
-  Extracts accounting usage metadata from upstream JSON and SSE response bodies.
+  Extracts accounting usage metadata from upstream JSON, SSE, and websocket response bodies.
   """
 
   @type usage :: %{
@@ -23,19 +23,45 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
   end
 
   @spec from_sse(binary()) :: usage()
-  def from_sse(body) when is_binary(body) do
+  def from_sse(body) when is_binary(body), do: from_sse_body(body, "sse_usage_missing")
+
+  @spec from_websocket_body(binary()) :: usage()
+  def from_websocket_body(body) when is_binary(body) do
+    case from_sse_body(body, "websocket_usage_missing") do
+      %{status: "usage_known"} = usage ->
+        usage
+
+      %{status: "usage_unknown"} ->
+        from_delimited_json_messages(body) ||
+          %{status: "usage_unknown", source: "websocket_usage_missing"}
+    end
+  end
+
+  defp from_sse_body(body, missing_source) do
     body
     |> String.split("\n")
     |> Enum.filter(&String.starts_with?(&1, "data: "))
     |> Enum.map(&String.replace_prefix(&1, "data: ", ""))
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == "[DONE]"))
-    |> Enum.find_value(fn line ->
+    |> usage_from_json_lines()
+    |> Kernel.||(%{status: "usage_unknown", source: missing_source})
+  end
+
+  defp from_delimited_json_messages(body) do
+    body
+    |> String.split(~r/\r?\n/)
+    |> Enum.map(&String.trim/1)
+    |> usage_from_json_lines()
+  end
+
+  defp usage_from_json_lines(lines) do
+    Enum.find_value(lines, fn line ->
       case Jason.decode(line) do
         {:ok, decoded} -> usage_from_decoded(decoded, false)
         {:error, _reason} -> nil
       end
-    end) || %{status: "usage_unknown", source: "sse_usage_missing"}
+    end)
   end
 
   defp usage_from_decoded(decoded, default \\ true)
