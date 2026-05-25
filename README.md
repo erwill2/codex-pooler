@@ -285,6 +285,71 @@ OpenAI.
 </details>
 
 <details>
+<summary><img src=".github/assets/hermes-favicon.png" alt="Hermes Agent logo" width="16" height="16"> Hermes Agent <code>~/.hermes/config.yaml</code> + <code>auth.json</code></summary>
+
+Hermes works best through its `openai-api` provider with the Responses transport
+forced explicitly. Keep the Pool API key in `~/.hermes/.env` and point both the
+provider URL and model config at Codex Pooler's `/v1` surface.
+
+```bash
+OPENAI_API_KEY=<pool-api-key>
+OPENAI_BASE_URL=http://localhost:4000/v1
+```
+
+```yaml
+model:
+  default: gpt-5.5
+  provider: openai-api
+  base_url: http://localhost:4000/v1
+  api_mode: codex_responses
+```
+
+Smoke-test with a one-shot prompt:
+
+```bash
+hermes -z 'Reply with exactly: hermes openai api ok' --ignore-rules
+```
+
+Hermes can also be made to use its `openai-codex` provider against Codex
+Pooler. This is less direct because Hermes treats `openai-codex` as an OAuth
+provider by default; add a Pool API key credential ahead of any existing
+device-code credential and keep the entry's `base_url` on `/v1`. This variant
+stores the key in `auth.json` because Hermes credential pools live there.
+
+```bash
+HERMES_CODEX_BASE_URL=http://localhost:4000/v1
+```
+
+```yaml
+model:
+  default: gpt-5.5
+  provider: openai-codex
+  base_url: http://localhost:4000/v1
+```
+
+```json
+{
+  "active_provider": "openai-codex",
+  "credential_pool": {
+    "openai-codex": [
+      {
+        "label": "codex-pooler",
+        "auth_type": "api_key",
+        "priority": -10,
+        "source": "manual",
+        "access_token": "<pool-api-key>",
+        "base_url": "http://localhost:4000/v1"
+      }
+    ]
+  }
+}
+```
+
+For deployed instances, change each URL to `https://pooler.example.com/v1`.
+
+</details>
+
+<details>
 <summary><img src=".github/assets/python-favicon.png" alt="Python logo" width="16" height="16"> OpenAI Python SDK</summary>
 
 OpenAI Python SDK clients can use the OpenAI-compatible `/v1` surface by setting
