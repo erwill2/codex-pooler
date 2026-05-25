@@ -114,6 +114,129 @@ Pool, not a single Codex account, so Codex Pooler can pick the best eligible
 account for each request. Raw API keys are shown only once when created or
 rotated.
 
+## Harness Configuration
+
+Keep Pool API keys and MCP tokens in environment variables, not in harness
+config files. For a local instance, the runtime URLs are:
+
+```text
+Codex backend base URL: http://localhost:4000/backend-api/codex
+OpenAI SDK base URL:    http://localhost:4000/v1
+MCP URL:                http://localhost:4000/mcp
+```
+
+For a deployed instance, replace `http://localhost:4000` with your HTTPS host,
+for example `https://pooler.example.com`.
+
+<details>
+<summary>opencode <code>~/.config/opencode/opencode.jsonc</code></summary>
+
+opencode talks to Codex Pooler through the OpenAI-compatible `/v1` surface. The
+provider uses the Pool API key, and the optional remote MCP entry uses an
+operator-owned MCP token.
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "openai": {
+      "npm": "@ai-sdk/openai",
+      "name": "Codex Pooler",
+      "options": {
+        "baseURL": "http://localhost:4000/v1",
+        "apiKey": "{env:CODEX_POOLER_API_KEY}",
+        "reasoningEffort": "high",
+        "reasoningSummary": "auto",
+        "textVerbosity": "medium",
+        "include": ["reasoning.encrypted_content"],
+        "store": false
+      },
+      "models": {
+        "gpt-5.5": {
+          "id": "gpt-5.5",
+          "name": "GPT-5.5",
+          "family": "gpt",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": false,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 400000,
+            "input": 256000,
+            "output": 128000
+          }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "codex_pooler": {
+      "type": "remote",
+      "url": "http://localhost:4000/mcp",
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer {env:CODEX_POOLER_MCP_KEY}"
+      },
+      "enabled": true,
+      "timeout": 30000
+    }
+  }
+}
+```
+
+Define only models that your assigned Pool can serve. For deployed instances,
+change `baseURL` to `https://pooler.example.com/v1` and the MCP `url` to
+`https://pooler.example.com/mcp`.
+
+</details>
+
+<details>
+<summary>Codex CLI <code>~/.codex/config.toml</code></summary>
+
+Codex CLI should use the backend compatibility route, not the `/v1` SDK route.
+Keep the provider `name` as `OpenAI`; Codex uses that value for provider-family
+behavior even when the request is routed through Codex Pooler.
+
+```toml
+model = "gpt-5.5"
+model_provider = "codex-pooler-ws"
+chatgpt_base_url = "http://localhost:4000/backend-api"
+
+[model_providers.codex-pooler-ws]
+name = "OpenAI"
+base_url = "http://localhost:4000/backend-api/codex"
+env_key = "CODEX_POOLER_API_KEY"
+wire_api = "responses"
+supports_websockets = true
+requires_openai_auth = true
+
+[model_providers.codex-pooler-http]
+name = "OpenAI"
+base_url = "http://localhost:4000/backend-api/codex"
+env_key = "CODEX_POOLER_API_KEY"
+wire_api = "responses"
+supports_websockets = false
+requires_openai_auth = true
+
+[mcp_servers.codex_pooler]
+url = "http://localhost:4000/mcp"
+bearer_token_env_var = "CODEX_POOLER_MCP_KEY"
+```
+
+Use the websocket provider for normal Codex backend behavior, and keep the HTTP
+provider when you need to force SSE-only coverage. `chatgpt_base_url` keeps
+Codex account, usage, and agent-identity helper calls on the same Pooler
+instance. For deployed instances, change both `base_url` values to
+`https://pooler.example.com/backend-api/codex`, `chatgpt_base_url` to
+`https://pooler.example.com/backend-api`, and the MCP `url` to
+`https://pooler.example.com/mcp`.
+
+</details>
+
 ## Runtime Compatibility
 
 Codex Pooler supports two client-facing shapes:
