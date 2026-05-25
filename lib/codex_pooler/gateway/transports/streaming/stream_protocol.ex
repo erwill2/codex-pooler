@@ -187,6 +187,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
   @spec error_code_from_nested_error(map()) :: String.t() | nil
   def error_code_from_nested_error(error) do
     explicit_code = nested_string(error, ["code"])
+    explicit_type = nested_string(error, ["type"])
     semantic_code = websocket_error_code_from_error(error)
 
     cond do
@@ -200,7 +201,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
         "previous_response_not_found"
 
       true ->
-        explicit_code || semantic_code
+        useful_error_code(explicit_code) || useful_error_code(explicit_type) || semantic_code
     end
   end
 
@@ -268,13 +269,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
   end
 
   defp canonical_codex_responses_error(decoded) do
-    error =
-      first_map([
-        get_in(decoded, ["response", "error"]),
-        get_in(decoded, ["error"]),
-        get_in(decoded, ["response", "status_details", "error"]),
-        get_in(decoded, ["status_details", "error"])
-      ]) || %{}
+    error = canonical_codex_responses_error_source(decoded) || %{}
 
     upstream_code = upstream_error_code(decoded)
     code = client_visible_error_code(upstream_code)
@@ -311,6 +306,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
       nested_string(decoded, ["error", "message"]) ||
       nested_string(decoded, ["response", "status_details", "error", "message"]) ||
       nested_string(decoded, ["status_details", "error", "message"]) ||
+      nested_string(decoded, ["message"]) ||
       "upstream stream returned terminal event #{code}"
   end
 
@@ -392,9 +388,66 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
     |> first_map()
     |> case do
       %{} = error -> error_code_from_nested_error(error)
-      _error -> nil
+      _error -> wrapped_error_envelope_code(decoded)
     end
   end
+
+  defp canonical_codex_responses_error_source(decoded) do
+    first_map([
+      get_in(decoded, ["response", "error"]),
+      get_in(decoded, ["error"]),
+      get_in(decoded, ["response", "status_details", "error"]),
+      get_in(decoded, ["status_details", "error"]),
+      wrapped_top_level_error(decoded)
+    ])
+  end
+
+  defp wrapped_top_level_error(%{"type" => "error"} = decoded) do
+    decoded
+    |> Map.take(["code", "message", "param"])
+    |> reject_nil_values()
+    |> case do
+      map when map == %{} -> nil
+      map -> map
+    end
+  end
+
+  defp wrapped_top_level_error(_decoded), do: nil
+
+  defp wrapped_error_envelope_code(%{"type" => "error"} = decoded) do
+    decoded
+    |> wrapped_top_level_error()
+    |> case do
+      %{} = error -> error_code_from_nested_error(error)
+      _error -> nil
+    end || status_error_code(decoded_status(decoded))
+  end
+
+  defp wrapped_error_envelope_code(_decoded), do: nil
+
+  defp status_error_code(status) when is_integer(status) and status >= 500 and status <= 599,
+    do: "server_error"
+
+  defp status_error_code(429), do: "rate_limit_exceeded"
+  defp status_error_code(_status), do: nil
+
+  defp decoded_status(decoded) do
+    case Map.fetch(decoded, "status") do
+      {:ok, status} -> parse_status(status)
+      :error -> parse_status(Map.get(decoded, "status_code"))
+    end
+  end
+
+  defp parse_status(status) when is_integer(status), do: status
+
+  defp parse_status(status) when is_binary(status) do
+    case Integer.parse(status) do
+      {status, ""} -> status
+      _other -> nil
+    end
+  end
+
+  defp parse_status(_status), do: nil
 
   defp websocket_error_code_from_error(%{"param" => "previous_response_id", "message" => message})
        when is_binary(message) do
@@ -411,7 +464,12 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
     end
   end
 
-  defp websocket_error_code_from_error(%{"code" => code}) when is_binary(code), do: code
+  defp websocket_error_code_from_error(%{"code" => code}) when is_binary(code),
+    do: useful_error_code(code)
+
+  defp websocket_error_code_from_error(%{"type" => type}) when is_binary(type),
+    do: useful_error_code(type)
+
   defp websocket_error_code_from_error(_error), do: nil
 
   defp sse_error_code(decoded) when is_map(decoded) do
@@ -448,6 +506,14 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
 
   defp previous_response_id_param?(%{"param" => "previous_response_id"}), do: true
   defp previous_response_id_param?(_error), do: false
+
+  defp useful_error_code("error"), do: nil
+  defp useful_error_code(code) when is_binary(code) and code != "", do: code
+  defp useful_error_code(_code), do: nil
+
+  defp reject_nil_values(map) do
+    Map.reject(map, fn {_key, value} -> is_nil(value) end)
+  end
 
   defp maybe_bound_incomplete_sse_block(buffer, false), do: buffer
   defp first_map(values), do: Enum.find(values, &is_map/1)
