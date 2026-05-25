@@ -482,6 +482,57 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     assert get_in(event.details, ["changed_categories"]) == ["catalog"]
   end
 
+  test "saving the pricing catalog source ignores missing legacy development helper flags", %{
+    conn: conn,
+    user: user
+  } do
+    legacy = InstanceSettings.ensure_singleton!()
+
+    Repo.query!("""
+    UPDATE instance_settings
+    SET catalog = '{"openai_pricing_url": "https://pricing.example.com/catalog.json"}'::jsonb,
+        development = '{"impeccable_live_enabled": false}'::jsonb
+    """)
+
+    InstanceSettings.reset_cache_for_test()
+
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    html =
+      view
+      |> element("#instance-settings-catalog-form")
+      |> render_submit(%{
+        "instance_settings" => %{
+          "lock_version" => Integer.to_string(legacy.lock_version),
+          "catalog" => %{
+            "openai_pricing_url" => "https://icoretech.github.io/openai-json-pricing/pricing.json"
+          }
+        }
+      })
+
+    assert html =~ "Pricing catalog source saved"
+    assert has_element?(view, "#instance-settings-catalog-status", "Saved")
+
+    refute has_element?(
+             view,
+             "#instance-settings-catalog-errors",
+             "Development Account reconciliation paused can't be blank"
+           )
+
+    refute has_element?(view, "#instance-settings-catalog-errors", "Review this card")
+
+    settings = InstanceSettings.get!()
+
+    assert settings.catalog.openai_pricing_url ==
+             "https://icoretech.github.io/openai-json-pricing/pricing.json"
+
+    assert settings.development.impeccable_live_enabled == false
+    assert settings.development.account_reconciliation_paused == false
+
+    event = Repo.get_by!(AuditEvent, action: "instance_settings.update", actor_user_id: user.id)
+    assert get_in(event.details, ["changed_keys"]) == ["catalog.openai_pricing_url"]
+  end
+
   test "saves the global MCP switch, audits only the setting, and gates valid tokens live", %{
     conn: conn,
     user: user
