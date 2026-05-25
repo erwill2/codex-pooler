@@ -30,6 +30,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
   alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
+  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPoolerWeb.CodexResponsesSocket
   alias Ecto.Adapters.SQL.Sandbox
 
@@ -604,6 +605,321 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert request.transport == "websocket"
     assert request.status == "succeeded"
     assert request.usage_status == "usage_known"
+  end
+
+  test "websocket stream conversion persists codex.rate_limits events through StreamDispatch" do
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"codex.rate_limits", codex_rate_limits_payload(34, reset_at)},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_ws_streamdispatch_rate_limits",
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+      "stream" => true
+    }
+
+    assert {:ok, %{websocket_stream: stream}} =
+             Service.execute(
+               auth,
+               "/backend-api/codex/responses",
+               payload,
+               RequestOptions.build(
+                 %{
+                   request_id: "ws-streamdispatch-rate-limits",
+                   upstream_endpoint: "/backend-api/codex/responses",
+                   websocket_writer: fn frame -> send(self(), {:websocket_frame, frame}) end
+                 },
+                 "/backend-api/codex/responses",
+                 payload
+               )
+             )
+
+    assert :ok = stream.()
+
+    frames = receive_websocket_frames_by_type(["response.completed"], @websocket_frame_timeout)
+
+    assert %{
+             "type" => "response.completed",
+             "response" => %{"id" => "resp_ws_streamdispatch_rate_limits"}
+           } = frames["response.completed"]
+
+    assert window = wait_for_rate_limit_event_window(setup.identity, "primary")
+    assert window.source == "codex_rate_limit_event"
+    assert Decimal.equal?(window.used_percent, Decimal.new("34.0"))
+    assert DateTime.compare(window.reset_at, reset_at) == :eq
+    wait_for_rate_limit_event_tasks()
+  end
+
+  test "websocket success path persists body codex.rate_limits events" do
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"codex.rate_limits", codex_rate_limits_payload(36, reset_at)},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_ws_success_rate_limits",
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: "ws-success-rate-limits"},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    frames = receive_websocket_frames_by_type(["response.completed"], @websocket_frame_timeout)
+
+    assert %{
+             "type" => "response.completed",
+             "response" => %{"id" => "resp_ws_success_rate_limits"}
+           } = frames["response.completed"]
+
+    assert window = wait_for_rate_limit_event_window(setup.identity, "primary")
+    assert window.source == "codex_rate_limit_event"
+    assert Decimal.equal?(window.used_percent, Decimal.new("36.0"))
+    assert DateTime.compare(window.reset_at, reset_at) == :eq
+    wait_for_rate_limit_event_tasks()
+  end
+
+  test "websocket terminal error path persists prior body codex.rate_limits events" do
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"codex.rate_limits", codex_rate_limits_payload(91, reset_at)},
+            {"error",
+             %{
+               "type" => "error",
+               "status" => 429,
+               "error" => %{
+                 "code" => "rate_limit_exceeded",
+                 "message" => "rate limit reached",
+                 "type" => "invalid_request_error"
+               }
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: "ws-terminal-error-rate-limits"},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    frames = receive_websocket_frames_by_type(["response.failed"], @websocket_frame_timeout)
+
+    assert %{
+             "type" => "response.failed",
+             "response" => %{
+               "error" => %{"code" => "rate_limit_exceeded"}
+             }
+           } = frames["response.failed"]
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "websocket"
+    assert request.status == "failed"
+    assert request.last_error_code == "rate_limit_exceeded"
+
+    assert window = wait_for_rate_limit_event_window(setup.identity, "primary")
+    assert window.source == "codex_rate_limit_event"
+    assert Decimal.equal?(window.used_percent, Decimal.new("91.0"))
+    assert DateTime.compare(window.reset_at, reset_at) == :eq
+    wait_for_rate_limit_event_tasks()
+  end
+
+  test "websocket malformed partial codex.rate_limits body event does not crash or persist" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          "event: codex.rate_limits\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{\"primary\":\n\n",
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_ws_malformed_rate_limits",
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: "ws-malformed-rate-limits"},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_receive {:websocket_frame, malformed_frame}, @websocket_frame_timeout
+    assert {:error, _reason} = Jason.decode(malformed_frame)
+
+    frames = receive_websocket_frames_by_type(["response.completed"], @websocket_frame_timeout)
+
+    assert %{
+             "type" => "response.completed",
+             "response" => %{"id" => "resp_ws_malformed_rate_limits"}
+           } = frames["response.completed"]
+
+    wait_for_rate_limit_event_tasks()
+    refute_rate_limit_event_windows(setup.identity)
+  end
+
+  test "websocket header and body quota conflict keeps rate limit event precedence" do
+    body_reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    header_reset_at =
+      DateTime.add(DateTime.utc_now(), 1_800, :second) |> DateTime.truncate(:second)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"codex.rate_limits", codex_rate_limits_payload(43, body_reset_at)},
+            {"error",
+             %{
+               "type" => "error",
+               "status_code" => 429,
+               "error" => %{
+                 "code" => "rate_limit_exceeded",
+                 "message" => "rate limited"
+               },
+               "headers" => %{
+                 "X-Request-ID" => "ws-frame-conflict-request",
+                 "X-Codex-Primary-Used-Percent" => 82,
+                 "X-Codex-Primary-Window-Minutes" => 300,
+                 "X-Codex-Primary-Reset-At" => DateTime.to_iso8601(header_reset_at),
+                 "Authorization" => "synthetic-auth-redacted",
+                 "Should-Not-Persist" => "synthetic-sentinel"
+               }
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "header body quota conflict",
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: "ws-quota-header-body-conflict"},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    frames =
+      receive_websocket_frames_by_type(
+        ["codex.rate_limits", "response.failed"],
+        @websocket_frame_timeout
+      )
+
+    assert %{"type" => "codex.rate_limits"} = frames["codex.rate_limits"]
+
+    assert %{
+             "type" => "response.failed",
+             "response" => %{"error" => %{"code" => "rate_limit_exceeded"}}
+           } = frames["response.failed"]
+
+    failed_frame = Jason.encode!(frames["response.failed"])
+    refute failed_frame =~ "headers"
+    refute failed_frame =~ "ws-frame-conflict-request"
+    refute failed_frame =~ "synthetic-auth-redacted"
+    refute failed_frame =~ "synthetic-sentinel"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.last_error_code == "rate_limit_exceeded"
+    refute Map.has_key?(request.request_metadata || %{}, "websocket_frame_headers")
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+
+    assert attempt.response_metadata["websocket_frame_headers"] == %{
+             "x-codex-primary-reset-at" => DateTime.to_iso8601(header_reset_at),
+             "x-codex-primary-used-percent" => "82",
+             "x-codex-primary-window-minutes" => "300",
+             "x-request-id" => "ws-frame-conflict-request"
+           }
+
+    metadata_text = inspect({request.request_metadata, attempt.response_metadata})
+    refute metadata_text =~ "synthetic-auth-redacted"
+    refute metadata_text =~ "synthetic-sentinel"
+
+    wait_for_rate_limit_event_tasks()
+    assert window = wait_for_rate_limit_event_window(setup.identity, "primary")
+    assert window.source == "codex_rate_limit_event"
+    assert Decimal.equal?(window.used_percent, Decimal.new("43.0"))
+    assert DateTime.compare(window.reset_at, body_reset_at) == :eq
+
+    refute Enum.any?(
+             QuotaWindows.list_quota_windows(setup.identity),
+             &(&1.source == "codex_response_headers" and &1.window_kind == "primary")
+           )
   end
 
   test "websocket stream conversion preserves response completed events split across SSE chunks" do
@@ -2659,6 +2975,228 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     refute metadata_text =~ "upstream-token"
   end
 
+  test "websocket connection limit first event retries same assignment without demotion" do
+    upstream =
+      start_upstream(
+        {:sequence,
+         [
+           FakeUpstream.sse_stream(
+             [
+               {"error",
+                %{
+                  "type" => "error",
+                  "status" => 400,
+                  "code" => "websocket_connection_limit_reached",
+                  "message" => "open a replacement websocket connection"
+                }}
+             ],
+             done: false
+           ),
+           FakeUpstream.json_response(%{
+             "id" => "resp_ws_connection_limit_retry",
+             "object" => "response",
+             "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+           })
+         ]}
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_connection_limit_fallback_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-limit-fallback",
+        compact?: false
+      )
+
+    prime_routing_quota!(fallback.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    request_id =
+      seed_preferring_assignment(
+        [setup.assignment.id, fallback.assignment.id],
+        setup.assignment.id
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "retry first websocket connection limit",
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: request_id},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_connection_limit_retry"} = Jason.decode!(frame)
+    refute_received {:websocket_frame, _unexpected}
+
+    assert FakeUpstream.count(upstream) == 2
+    assert FakeUpstream.count(fallback_upstream) == 0
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert first_attempt.status == "retryable_failed"
+    assert first_attempt.retryable == true
+    assert first_attempt.network_error_code == "websocket_connection_limit_reached"
+    assert first_attempt.response_metadata["stream_failure_stage"] == "first_event"
+
+    assert first_attempt.response_metadata["stream_error_code"] ==
+             "websocket_connection_limit_reached"
+
+    assert second_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert second_attempt.status == "succeeded"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.retry_count == 1
+    assert request.last_error_code == nil
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+
+    metadata_text = inspect({request.request_metadata, first_attempt.response_metadata})
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ "upstream-token"
+  end
+
+  test "websocket connection limit retries after internal rate limit event" do
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    upstream =
+      start_upstream(
+        {:sequence,
+         [
+           FakeUpstream.sse_stream(
+             [
+               {"codex.rate_limits", codex_rate_limits_payload(29, reset_at)},
+               {"error",
+                %{
+                  "type" => "error",
+                  "status" => 400,
+                  "code" => "websocket_connection_limit_reached",
+                  "message" => "open a replacement websocket connection"
+                }}
+             ],
+             done: false
+           ),
+           FakeUpstream.json_response(%{
+             "id" => "resp_ws_connection_limit_after_rate_limits",
+             "object" => "response",
+             "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+           })
+         ]}
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_connection_limit_after_rate_limits_fallback_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-rate-limit-retry-fallback",
+        compact?: false
+      )
+
+    prime_routing_quota!(fallback.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    request_id =
+      seed_preferring_assignment(
+        [setup.assignment.id, fallback.assignment.id],
+        setup.assignment.id
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "retry after internal websocket rate limits",
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: request_id},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    frames = receive_websocket_frames_by_type(["codex.rate_limits"], @websocket_frame_timeout)
+    assert %{"type" => "codex.rate_limits"} = frames["codex.rate_limits"]
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_connection_limit_after_rate_limits"} = Jason.decode!(frame)
+    refute_received {:websocket_frame, _unexpected}
+
+    assert FakeUpstream.count(upstream) == 2
+    assert FakeUpstream.count(fallback_upstream) == 0
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert first_attempt.status == "retryable_failed"
+    assert first_attempt.retryable == true
+    assert first_attempt.network_error_code == "websocket_connection_limit_reached"
+    assert first_attempt.response_metadata["stream_failure_stage"] == "first_event"
+
+    assert first_attempt.response_metadata["stream_error_code"] ==
+             "websocket_connection_limit_reached"
+
+    assert second_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert second_attempt.status == "succeeded"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.retry_count == 1
+    assert request.last_error_code == nil
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+
+    wait_for_rate_limit_event_tasks()
+    assert window = wait_for_rate_limit_event_window(setup.identity, "primary")
+    assert window.source == "codex_rate_limit_event"
+    assert Decimal.equal?(window.used_percent, Decimal.new("29.0"))
+    assert DateTime.compare(window.reset_at, reset_at) == :eq
+  end
+
   @tag :task_8_websocket_failure
   test "websocket terminal upstream failure demotes and circuit fails assignment" do
     upstream =
@@ -2835,6 +3373,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
   end
 
   test "websocket wrapped status_code previous response error is masked without replaying or circuiting" do
+    reset_at = DateTime.utc_now() |> DateTime.add(30, :minute) |> DateTime.truncate(:second)
+
     upstream =
       start_upstream(
         FakeUpstream.sse_stream(
@@ -2847,6 +3387,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                  "code" => "previous_response_not_found",
                  "message" => "Previous response with id 'resp_status_code_missing' not found.",
                  "param" => "previous_response_id"
+               },
+               "headers" => %{
+                 "X-Request-ID" => "ws-frame-previous-request",
+                 "X-Codex-Primary-Used-Percent" => 81,
+                 "X-Codex-Primary-Window-Minutes" => 300,
+                 "X-Codex-Primary-Reset-At" => DateTime.to_iso8601(reset_at),
+                 "Should-Not-Persist" => "synthetic-sentinel"
                }
              }}
           ],
@@ -2923,6 +3470,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
 
     refute frame =~ "previous_response_not_found"
     refute frame =~ "resp_status_code_missing"
+    refute frame =~ "headers"
+    refute frame =~ "ws-frame-previous-request"
+    refute frame =~ "synthetic-sentinel"
 
     assert FakeUpstream.count(upstream) == 1
     assert FakeUpstream.count(fallback_upstream) == 0
@@ -2938,7 +3488,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert attempt.network_error_code == "stream_incomplete"
     assert attempt.response_metadata["upstream_error_code"] == "previous_response_not_found"
     assert attempt.response_metadata["masked_error_code"] == "stream_incomplete"
+
+    assert attempt.response_metadata["websocket_frame_headers"] == %{
+             "x-codex-primary-reset-at" => DateTime.to_iso8601(reset_at),
+             "x-codex-primary-used-percent" => "81",
+             "x-codex-primary-window-minutes" => "300",
+             "x-request-id" => "ws-frame-previous-request"
+           }
+
     refute attempt.response_metadata["upstream_error_code"] == "error"
+
+    assert window = wait_for_response_header_window(setup.identity, "primary")
+    assert window.source == "codex_response_headers"
+    assert Decimal.eq?(window.used_percent, Decimal.new("81"))
 
     assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
     assert turn.status == "failed"
@@ -2949,6 +3511,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
   end
 
   test "websocket wrapped status_code rate limit error records useful upstream metadata" do
+    reset_at = DateTime.utc_now() |> DateTime.add(90, :minute) |> DateTime.truncate(:second)
+
     upstream =
       start_upstream(
         FakeUpstream.sse_stream(
@@ -2960,6 +3524,18 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                "error" => %{
                  "code" => "rate_limit_exceeded",
                  "message" => "rate limited"
+               },
+               "headers" => %{
+                 "OpenAI-Request-ID" => "ws-frame-openai-request",
+                 "X-Codex-Rate-Limit-Reached-Type" => "workspace_member_usage_limit_reached",
+                 "X-Codex-Primary-Used-Percent" => 96,
+                 "X-Codex-Primary-Window-Minutes" => 300,
+                 "X-Codex-Primary-Reset-At" => DateTime.to_iso8601(reset_at),
+                 "Authorization" => "synthetic-auth-redacted",
+                 "Set-Cookie" => "synthetic-session-cookie=drop",
+                 "Should-Not-Persist" => "synthetic-sentinel",
+                 "X-Arbitrary-Debug" => "drop-me",
+                 "X-Request-ID" => ["drop-array"]
                }
              }}
           ],
@@ -2994,18 +3570,44 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
 
     refute frame =~ ~s("code":"error")
     refute frame =~ "stream_incomplete"
+    refute frame =~ "headers"
+    refute frame =~ "ws-frame-openai-request"
+    refute frame =~ "synthetic-auth-redacted"
+    refute frame =~ "synthetic-session-cookie"
+    refute frame =~ "synthetic-sentinel"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "failed"
     assert request.response_status_code == 200
     assert request.last_error_code == "rate_limit_exceeded"
+    refute Map.has_key?(request.request_metadata || %{}, "websocket_frame_headers")
 
     assert [attempt] = Repo.all(from(a in Attempt))
     assert attempt.network_error_code == "rate_limit_exceeded"
     assert attempt.response_metadata["error_kind"] == "rate_limit_exceeded"
     assert attempt.response_metadata["status_code"] == 200
+
+    assert attempt.response_metadata["websocket_frame_headers"] == %{
+             "openai-request-id" => "ws-frame-openai-request",
+             "x-codex-primary-reset-at" => DateTime.to_iso8601(reset_at),
+             "x-codex-primary-used-percent" => "96",
+             "x-codex-primary-window-minutes" => "300",
+             "x-codex-rate-limit-reached-type" => "workspace_member_usage_limit_reached"
+           }
+
     refute attempt.response_metadata["upstream_error_code"] == "error"
     refute Map.has_key?(attempt.response_metadata, "masked_error_code")
+
+    metadata_text = inspect({request.request_metadata, attempt.response_metadata})
+    refute metadata_text =~ "synthetic-auth-redacted"
+    refute metadata_text =~ "synthetic-session-cookie"
+    refute metadata_text =~ "synthetic-sentinel"
+    refute metadata_text =~ "drop-me"
+
+    assert window = wait_for_response_header_window(setup.identity, "primary")
+    assert window.source == "codex_response_headers"
+    assert Decimal.eq?(window.used_percent, Decimal.new("96"))
+    assert window.metadata["rate_limit_reached_type"] == "workspace_member_usage_limit_reached"
 
     assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
     assert turn.status == "failed"
@@ -3782,6 +4384,89 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
              })
 
     assert_receive ^unrelated
+  end
+
+  defp codex_rate_limits_payload(used_percent, reset_at) do
+    %{
+      "type" => "codex.rate_limits",
+      "rate_limits" => %{
+        "primary" => %{
+          "used_percent" => used_percent,
+          "window_minutes" => 300,
+          "reset_at" => DateTime.to_unix(reset_at)
+        }
+      }
+    }
+  end
+
+  defp wait_for_rate_limit_event_window(identity, window_kind, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 1_000
+
+    identity
+    |> QuotaWindows.list_quota_windows()
+    |> Enum.find(&(&1.source == "codex_rate_limit_event" and &1.window_kind == window_kind))
+    |> case do
+      nil ->
+        if System.monotonic_time(:millisecond) < deadline do
+          receive do
+          after
+            10 -> wait_for_rate_limit_event_window(identity, window_kind, deadline)
+          end
+        else
+          flunk("expected codex.rate_limits quota window for #{window_kind}")
+        end
+
+      window ->
+        window
+    end
+  end
+
+  defp wait_for_response_header_window(identity, window_kind, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 1_000
+
+    identity
+    |> QuotaWindows.list_quota_windows()
+    |> Enum.find(&(&1.source == "codex_response_headers" and &1.window_kind == window_kind))
+    |> case do
+      nil ->
+        if System.monotonic_time(:millisecond) < deadline do
+          receive do
+          after
+            10 -> wait_for_response_header_window(identity, window_kind, deadline)
+          end
+        else
+          flunk("expected Codex response header quota window for #{window_kind}")
+        end
+
+      window ->
+        window
+    end
+  end
+
+  defp wait_for_rate_limit_event_tasks(deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 1_000
+
+    case Task.Supervisor.children(CodexPooler.RateLimitEventSupervisor) do
+      [] ->
+        :ok
+
+      _children ->
+        if System.monotonic_time(:millisecond) < deadline do
+          receive do
+          after
+            10 -> wait_for_rate_limit_event_tasks(deadline)
+          end
+        else
+          flunk("expected codex.rate_limits persistence tasks to finish")
+        end
+    end
+  end
+
+  defp refute_rate_limit_event_windows(identity) do
+    refute Enum.any?(
+             QuotaWindows.list_quota_windows(identity),
+             &(&1.source == "codex_rate_limit_event")
+           )
   end
 
   defp execute_websocket_response(auth, raw_payload, opts, push_frame) do
