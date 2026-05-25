@@ -149,14 +149,14 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-kpi-active-sessions", "1")
       assert has_element?(view, "#stats-kpi-active-sessions", "1 turns")
       assert has_element?(view, "#stats-kpi-quota-health", "Available")
-      assert has_element?(view, "#stats-traffic-chart-plot svg")
-      refute has_element?(view, "#stats-traffic-chart-plot[phx-hook]")
+      assert has_element?(view, "#stats-traffic-chart-plot[phx-hook='ApexTimeSeriesChart']")
       assert has_element?(view, "#stats-traffic-chart-plot[data-chart-unit='requests']")
       assert has_element?(view, "#stats-traffic-chart", "2 requests")
-      assert has_element?(view, "#stats-token-chart-plot svg")
-      refute has_element?(view, "#stats-token-chart-plot[phx-hook]")
+      refute has_element?(view, "#stats-traffic-chart-plot svg")
+      assert has_element?(view, "#stats-token-chart-plot[phx-hook='ApexTimeSeriesChart']")
       assert has_element?(view, "#stats-token-chart-plot[data-chart-unit='tokens']")
       assert has_element?(view, "#stats-token-chart", "100 tokens")
+      refute has_element?(view, "#stats-token-chart-plot svg")
       assert has_element?(view, "#stats-api-key-table", "Stats UI key")
       assert has_element?(view, "#stats-api-key-table", "$1.500000")
       assert has_element?(view, "#stats-upstream-table", "Stats assignment")
@@ -171,8 +171,8 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       traffic_chart_html = view |> element("#stats-traffic-chart-plot") |> render()
       token_chart_html = view |> element("#stats-token-chart-plot") |> render()
 
-      assert traffic_chart_html =~ "<rect"
-      assert token_chart_html =~ "<rect"
+      assert traffic_chart_html =~ "ApexTimeSeriesChart"
+      assert token_chart_html =~ "ApexTimeSeriesChart"
 
       html = render(view)
       refute html =~ sensitive_marker
