@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   require Logger
 
+  alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Finalization.{Interruption, Metadata}
@@ -28,7 +29,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     :request_id,
     :draining?,
     :idle_shutdown_ms,
-    :idle_shutdown_ref
+    :idle_shutdown_ref,
+    :owner_renewal_ms,
+    :owner_renewal_ref
   ]
 
   @type downstream :: %{
@@ -185,6 +188,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     owner_instance_id = Keyword.fetch!(opts, :owner_instance_id)
     request_id = Keyword.get(opts, :request_id)
     idle_shutdown_ms = Keyword.get(opts, :idle_shutdown_ms, 300_000)
+    owner_renewal_ms = Keyword.get(opts, :owner_renewal_ms, owner_renewal_ms())
     upstream = upstream_boundary(opts)
     persistence = persistence_boundary(opts)
 
@@ -200,8 +204,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
          persistence: persistence,
          request_id: request_id,
          idle_shutdown_ms: idle_shutdown_ms,
+         owner_renewal_ms: owner_renewal_ms,
          draining?: false
-       }}
+       }
+       |> schedule_owner_renewal()}
     end
   end
 
@@ -370,10 +376,28 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     {:noreply, %{state | idle_shutdown_ref: nil}}
   end
 
+  def handle_info(:renew_owner_lease, state) do
+    state = %{state | owner_renewal_ref: nil}
+
+    case renew_owner_lease(state) do
+      {:ok, state} ->
+        {:noreply, schedule_owner_renewal(state)}
+
+      {:error, reason} when reason in [:stale_owner, :owner_unavailable] ->
+        log_owner_renewal_stale(reason, state)
+        {:stop, {:shutdown, :stale_owner}, %{state | draining?: true}}
+
+      {:error, reason} ->
+        log_owner_renewal_failed(reason, state)
+        {:noreply, schedule_owner_renewal(state)}
+    end
+  end
+
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl GenServer
   def terminate(reason, state) do
+    state = cancel_owner_renewal(state)
     owner_exit_reason = owner_exit_reason(reason, state)
     log_owner_terminated(reason, owner_exit_reason, state)
     _result = release_owner_lease(state, owner_exit_reason)
@@ -512,6 +536,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   defp schedule_idle_shutdown(state), do: state
 
+  defp schedule_owner_renewal(%{owner_renewal_ref: ref} = state) when is_reference(ref), do: state
+
+  defp schedule_owner_renewal(%{owner_renewal_ms: timeout, codex_session_id: session_id} = state)
+       when is_integer(timeout) and timeout > 0 do
+    if uuid?(session_id) do
+      %{state | owner_renewal_ref: Process.send_after(self(), :renew_owner_lease, timeout)}
+    else
+      state
+    end
+  end
+
+  defp schedule_owner_renewal(state), do: state
+
+  defp cancel_owner_renewal(%{owner_renewal_ref: ref} = state) when is_reference(ref) do
+    Process.cancel_timer(ref)
+    %{state | owner_renewal_ref: nil}
+  end
+
+  defp cancel_owner_renewal(state), do: state
+
   defp cancel_idle_shutdown(%{idle_shutdown_ref: ref} = state) when is_reference(ref) do
     Process.cancel_timer(ref)
     %{state | idle_shutdown_ref: nil}
@@ -535,9 +579,31 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     Keyword.get_lazy(opts, :persistence, fn ->
       %{
         release_owner_lease: &SessionContinuity.release_owner_lease/3,
+        renew_owner_token: &SessionContinuity.renew_owner_token/3,
         interrupt_codex_session: &Interruption.interrupt_codex_session/2
       }
     end)
+  end
+
+  defp renew_owner_lease(state) do
+    opts = RequestOptions.for_websocket(%{})
+
+    case state.persistence.renew_owner_token.(
+           state.codex_session_id,
+           state.owner_lease_token,
+           opts
+         ) do
+      {:ok, %{owner_lease_token: owner_lease_token, owner_instance_id: owner_instance_id}} ->
+        {:ok,
+         %{state | owner_lease_token: owner_lease_token, owner_instance_id: owner_instance_id}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    exception -> {:error, exception}
+  catch
+    _kind, reason -> {:error, reason}
   end
 
   defp send_owner_upstream(upstream_pid, payload, _writer) when is_binary(payload) do
@@ -593,6 +659,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
         state.persistence.interrupt_codex_session.(state.codex_session_id, opts)
       end
     end)
+  end
+
+  defp owner_renewal_ms do
+    OperationalSettings.current().bridge_owner_lease_renewal_seconds * 1_000
   end
 
   defp safe_persist_owner_exit(operation, state, owner_exit_reason, fun) do
@@ -695,6 +765,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
       owner_pid: pid,
       reason: reason,
       request_id: Keyword.get(metadata, :request_id)
+    )
+  end
+
+  defp log_owner_renewal_stale(reason, state) do
+    log_owner_event(:warning, "websocket owner renewal stale",
+      codex_session_id: state.codex_session_id,
+      owner_instance_id: state.owner_instance_id,
+      owner_pid: self(),
+      reason: Metadata.safe_reason(reason),
+      request_id: state.request_id
+    )
+  end
+
+  defp log_owner_renewal_failed(reason, state) do
+    log_owner_event(:warning, "websocket owner renewal failed",
+      codex_session_id: state.codex_session_id,
+      owner_instance_id: state.owner_instance_id,
+      owner_pid: self(),
+      reason: Metadata.safe_reason(reason),
+      request_id: state.request_id
     )
   end
 

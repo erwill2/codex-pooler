@@ -1,9 +1,13 @@
 defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
   use CodexPooler.DataCase, async: false
 
+  import CodexPooler.AccountsFixtures
+  import CodexPooler.PoolerFixtures
   import ExUnit.CaptureLog
 
+  alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession}
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
@@ -129,6 +133,77 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     assert logs =~ "owner_exit_reason=owner_drained"
     refute logs =~ context.owner_lease_token
     refute logs =~ @sentinel
+  end
+
+  test "renews persisted owner lease while owner remains alive" do
+    context = db_owner_context()
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+
+    stale_soon = DateTime.utc_now() |> DateTime.add(1, :second) |> DateTime.truncate(:microsecond)
+    set_owner_lease_expiry!(context.session.id, stale_soon)
+    stale_session = Repo.get!(CodexSession, context.session.id)
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream, owner_renewal_ms: 60_000)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    send(owner, :renew_owner_lease)
+    _state = :sys.get_state(owner)
+
+    renewed_session = Repo.get!(CodexSession, context.session.id)
+    renewed_lease = active_lease!(context.session.id)
+
+    assert renewed_lease.lease_token == context.owner_lease_token
+    assert renewed_lease.owner_instance_id == context.owner_instance_id
+    assert DateTime.compare(renewed_lease.expires_at, stale_soon) == :gt
+    assert renewed_session.owner_lease_token == context.owner_lease_token
+    assert renewed_session.owner_instance_id == context.owner_instance_id
+    assert DateTime.compare(renewed_session.owner_lease_expires_at, stale_soon) == :gt
+
+    assert DateTime.compare(renewed_session.last_heartbeat_at, stale_session.last_heartbeat_at) ==
+             :gt
+
+    assert {:ok, ^owner, :existing} = start_owner(context, upstream: upstream)
+  end
+
+  test "stops as stale owner when renewal token is no longer current", context do
+    upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
+    parent = self()
+
+    persistence = %{
+      renew_owner_token: fn session_id, owner_lease_token, %RequestOptions{} ->
+        send(parent, {:websocket_owner_renewal_attempt, session_id, owner_lease_token})
+        {:error, :stale_owner}
+      end,
+      release_owner_lease: fn _session_id, _owner_lease_token, _reason ->
+        send(parent, :unexpected_owner_release)
+        :ok
+      end,
+      interrupt_codex_session: fn _session_id, _opts ->
+        send(parent, :unexpected_owner_interrupt)
+        :ok
+      end
+    }
+
+    assert {:ok, owner} = start_owner(context, upstream: upstream, persistence: persistence)
+    assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
+
+    owner_ref = Process.monitor(owner)
+
+    logs =
+      capture_log(fn ->
+        send(owner, :renew_owner_lease)
+
+        codex_session_id = context.codex_session_id
+        owner_lease_token = context.owner_lease_token
+
+        assert_receive {:websocket_owner_renewal_attempt, ^codex_session_id, ^owner_lease_token}
+        assert_receive {:DOWN, ^owner_ref, :process, ^owner, {:shutdown, :stale_owner}}
+      end)
+
+    assert logs =~ "websocket owner renewal stale"
+    assert_receive {:websocket_owner_harness_upstream_closed, ^upstream_pid}
+    refute_received :unexpected_owner_release
+    refute_received :unexpected_owner_interrupt
   end
 
   test "serializes accepted frame sends in upstream writer order", context do
@@ -415,6 +490,45 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
         owner_instance_id: context.owner_instance_id
       )
     )
+  end
+
+  defp db_owner_context do
+    %{user: owner} = bootstrap_owner_fixture()
+    pool = pool_fixture(%{created_by_user_id: owner.id})
+    %{api_key: api_key} = active_api_key_fixture(pool, %{created_by_user_id: owner.id})
+
+    assert {:ok, %CodexSession{} = session} =
+             Gateway.start_codex_session(%{pool: pool, api_key: api_key}, %{
+               accepted_turn_state: "owner-renewal-#{System.unique_integer([:positive])}",
+               owner_instance_id: Atom.to_string(node())
+             })
+
+    session = Repo.get!(CodexSession, session.id)
+
+    %{
+      codex_session_id: session.id,
+      owner_lease_token: session.owner_lease_token,
+      owner_instance_id: session.owner_instance_id,
+      session: session
+    }
+  end
+
+  defp active_lease!(session_id) do
+    Repo.one!(
+      from lease in BridgeOwnerLease,
+        where: lease.codex_session_id == ^session_id and lease.status == "active",
+        limit: 1
+    )
+  end
+
+  defp set_owner_lease_expiry!(session_id, expires_at) do
+    Repo.get!(CodexSession, session_id)
+    |> Ecto.Changeset.change(%{owner_lease_expires_at: expires_at, updated_at: expires_at})
+    |> Repo.update!()
+
+    active_lease!(session_id)
+    |> Ecto.Changeset.change(%{expires_at: expires_at, updated_at: expires_at})
+    |> Repo.update!()
   end
 
   defp downstream_target(correlation_id), do: %{pid: self(), correlation_id: correlation_id}
