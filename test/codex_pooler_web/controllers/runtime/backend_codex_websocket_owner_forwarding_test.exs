@@ -1562,30 +1562,39 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     :ok = GenServer.stop(owner_pid)
     assert_receive {:DOWN, ^owner_ref, :process, ^owner_pid, :normal}
 
-    try do
-      payload = websocket_payload(setup, "dispatch drain takeover")
+    logs =
+      capture_log(fn ->
+        try do
+          payload = websocket_payload(setup, "dispatch drain takeover")
 
-      assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
-      assert {:push, {:text, frame}, state} = receive_owner_socket_push(state)
-      assert %{"id" => "resp_owner_dispatch_drain_takeover"} = Jason.decode!(frame)
-      assert {:ok, _state} = receive_socket_done(state)
+          assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+          assert {:push, {:text, frame}, state} = receive_owner_socket_push(state)
+          assert %{"id" => "resp_owner_dispatch_drain_takeover"} = Jason.decode!(frame)
+          assert {:ok, _state} = receive_socket_done(state)
 
-      active_lease = active_owner_lease(session.id)
-      assert active_lease.lease_token != old_lease.lease_token
-      assert active_lease.owner_instance_id == Atom.to_string(node())
+          active_lease = active_owner_lease(session.id)
+          assert active_lease.lease_token != old_lease.lease_token
+          assert active_lease.owner_instance_id == Atom.to_string(node())
 
-      assert [request] = await_upstream_requests(upstream, 1)
+          assert [request] = await_upstream_requests(upstream, 1)
 
-      assert request.json["input"] |> List.first() |> Map.get("content") ==
-               "dispatch drain takeover"
+          assert request.json["input"] |> List.first() |> Map.get("content") ==
+                   "dispatch drain takeover"
 
-      assert [request_log] = request_logs(setup.pool.id)
-      assert request_log.status == "succeeded"
-      assert request_log.response_status_code == 200
-      assert is_nil(request_log.last_error_code)
-    after
-      CodexResponsesSocket.terminate(:closed, state)
-    end
+          assert [request_log] = request_logs(setup.pool.id)
+          assert request_log.status == "succeeded"
+          assert request_log.response_status_code == 200
+          assert is_nil(request_log.last_error_code)
+        after
+          CodexResponsesSocket.terminate(:closed, state)
+        end
+      end)
+
+    assert logs =~ "websocket owner takeover attempted"
+    assert logs =~ "websocket owner takeover succeeded"
+    assert logs =~ "codex_session_id=#{session.id}"
+    assert logs =~ "request_id=ws-owner-dispatch-drain-takeover"
+    refute logs =~ old_lease.lease_token
   end
 
   test "owner-forwarded socket replaces a local owner with a dead upstream before first dispatch" do
@@ -1896,8 +1905,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     payload = websocket_payload(setup, "close while owner request is active")
 
     assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
-    assert_receive {:blocking_owner_upstream_received, _owner_worker_pid, ^release_ref}
+    assert_receive {:blocking_owner_upstream_received, owner_worker_pid, ^release_ref}
     assert :ok = CodexResponsesSocket.terminate(:closed, state)
+    send(owner_worker_pid, {:blocking_owner_upstream_release, release_ref})
 
     session = Repo.get_by!(CodexSession, session_key: "close-during-request")
     assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
@@ -2429,16 +2439,21 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
   end
 
   defp cleanup_local_owner_sessions do
-    WebsocketOwnerSession.Registry
-    |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
-    |> Enum.each(fn codex_session_id ->
-      try do
-        with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(codex_session_id) do
-          _result = GenServer.stop(owner_pid, :shutdown, 1_000)
-        end
-      catch
-        :exit, _reason -> :ok
-      end
-    end)
+    logs =
+      capture_log(fn ->
+        WebsocketOwnerSession.Registry
+        |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
+        |> Enum.each(fn codex_session_id ->
+          try do
+            with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(codex_session_id) do
+              _result = GenServer.stop(owner_pid, :shutdown, 1_000)
+            end
+          catch
+            :exit, _reason -> :ok
+          end
+        end)
+      end)
+
+    assert_no_leak!("owner cleanup logs", logs)
   end
 end

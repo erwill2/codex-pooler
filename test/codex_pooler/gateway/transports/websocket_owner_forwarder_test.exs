@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
 
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
+  import ExUnit.CaptureLog
 
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Persistence.CodexSession
@@ -430,16 +431,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
   end
 
   defp cleanup_local_owner_sessions do
-    WebsocketOwnerSession.Registry
-    |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
-    |> Enum.each(fn codex_session_id ->
-      try do
-        with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(codex_session_id) do
-          _result = GenServer.stop(owner_pid, :shutdown, 1_000)
+    capture_log(fn ->
+      WebsocketOwnerSession.Registry
+      |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
+      |> Enum.each(fn codex_session_id ->
+        try do
+          with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(codex_session_id) do
+            _result = GenServer.stop(owner_pid, :shutdown, 1_000)
+          end
+        catch
+          :exit, _reason -> :ok
         end
-      catch
-        :exit, _reason -> :ok
-      end
+      end)
     end)
+
+    :ok
   end
 end
