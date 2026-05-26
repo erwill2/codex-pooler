@@ -51,6 +51,16 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "succeeded"
     assert request.endpoint == "/backend-api/codex/responses"
+    assert get_in(request.request_metadata, ["openai_compatibility", "surface"]) == "openai_v1"
+
+    assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+             "/v1/responses"
+
+    assert get_in(request.request_metadata, ["openai_compatibility", "translated_endpoint"]) ==
+             "/backend-api/codex/responses"
+
+    refute inspect(request.request_metadata) =~ "synthetic v1 response"
+
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.status == "succeeded"
   end

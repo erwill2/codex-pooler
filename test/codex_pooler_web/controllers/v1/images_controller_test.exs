@@ -56,6 +56,14 @@ defmodule CodexPoolerWeb.V1.ImagesControllerTest do
     assert request.endpoint == "/backend-api/codex/responses"
     assert request.transport == "http_sse"
     assert request.status == "succeeded"
+    assert get_in(request.request_metadata, ["openai_compatibility", "surface"]) == "openai_v1"
+
+    assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+             "/v1/images/generations"
+
+    assert get_in(request.request_metadata, ["openai_compatibility", "translated_endpoint"]) ==
+             "/backend-api/codex/responses"
+
     refute inspect(request.request_metadata) =~ "synthetic image request"
     refute inspect(request.request_metadata) =~ "B64_GENERATED"
   end

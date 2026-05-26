@@ -55,6 +55,13 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
          payload: payload,
          request_options: %RequestOptions{} = request_options
        }) do
+    request_options =
+      RequestOptions.mark_openai_compatibility_origin(
+        request_options,
+        conn.request_path,
+        endpoint
+      )
+
     route_class = RequestOptions.route_class(request_options)
 
     GatewayHelpers.admit(conn, route_class, %{endpoint: endpoint}, fn ->
