@@ -77,39 +77,153 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
                  upstream_model: "sample-codex-spark-upstream"
                )
     end
+
+    test "account primary routing blocks resetless quota evidence" do
+      assert %{
+               eligible?: false,
+               routing_state: :blocked,
+               exclusions: [
+                 %{
+                   code: "quota_window_unusable",
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   reason_codes: ["reset_missing"]
+                 }
+               ]
+             } =
+               Windows.routing_quota_eligibility_from_windows(
+                 [account_primary_window(reset_at: nil, source_precision: "inferred")],
+                 at: @observed_at,
+                 model: "sample-codex-standard",
+                 requested_model: "sample-codex-standard",
+                 upstream_model: "sample-codex-standard-upstream"
+               )
+    end
+
+    test "account primary routing blocks exhausted quota evidence" do
+      assert %{
+               eligible?: false,
+               routing_state: :blocked,
+               exclusions: [
+                 %{
+                   code: "quota_window_unusable",
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   reason_codes: ["exhausted"]
+                 }
+               ]
+             } =
+               Windows.routing_quota_eligibility_from_windows(
+                 [account_primary_window(used_percent: Decimal.new("100"))],
+                 at: @observed_at,
+                 model: "sample-codex-standard",
+                 requested_model: "sample-codex-standard",
+                 upstream_model: "sample-codex-standard-upstream"
+               )
+    end
+
+    test "account primary routing blocks stale and unknown freshness quota evidence" do
+      for freshness_state <- ["stale", "unknown"] do
+        assert %{
+                 eligible?: false,
+                 routing_state: :blocked,
+                 exclusions: [
+                   %{
+                     code: "quota_window_unusable",
+                     quota_key: "account",
+                     quota_scope: "account",
+                     quota_family: "account",
+                     freshness_state: ^freshness_state,
+                     reason_codes: ["not_fresh"]
+                   }
+                 ]
+               } =
+                 Windows.routing_quota_eligibility_from_windows(
+                   [account_primary_window(freshness_state: freshness_state)],
+                   at: @observed_at,
+                   model: "sample-codex-standard",
+                   requested_model: "sample-codex-standard",
+                   upstream_model: "sample-codex-standard-upstream"
+                 )
+      end
+    end
+
+    test "model-scoped routing evidence for the wrong model stays out of scope" do
+      assert %{
+               eligible?: false,
+               routing_state: :blocked,
+               exclusions: [
+                 %{
+                   code: "quota_evidence_out_of_scope",
+                   message: "recorded quota evidence does not match the requested model scope"
+                 }
+               ],
+               selection: %{routing_windows: []}
+             } =
+               Windows.routing_quota_eligibility_from_windows(
+                 [
+                   model_window(
+                     model: "sample-codex-other",
+                     upstream_model: "sample-codex-other-upstream"
+                   )
+                 ],
+                 at: @observed_at,
+                 model: "sample-codex-spark",
+                 requested_model: "sample-codex-spark",
+                 upstream_model: "sample-codex-spark-upstream"
+               )
+    end
   end
 
-  defp account_primary_window do
-    %AccountQuotaWindow{
-      quota_key: "account",
-      window_kind: "primary",
-      window_minutes: 300,
-      used_percent: Decimal.new("12"),
-      reset_at: DateTime.add(@observed_at, 900, :second),
-      source: "codex_usage_api",
-      source_precision: "observed",
-      quota_scope: "account",
-      quota_family: "account",
-      freshness_state: "fresh",
-      observed_at: @observed_at
-    }
+  defp account_primary_window(attrs \\ []) do
+    struct!(
+      AccountQuotaWindow,
+      Keyword.merge(
+        [
+          quota_key: "account",
+          window_kind: "primary",
+          window_minutes: 300,
+          used_percent: Decimal.new("12"),
+          reset_at: DateTime.add(@observed_at, 900, :second),
+          source: "codex_usage_api",
+          source_precision: "observed",
+          quota_scope: "account",
+          quota_family: "account",
+          freshness_state: "fresh",
+          observed_at: @observed_at
+        ],
+        attrs
+      )
+    )
   end
 
   defp exhausted_spark_window do
-    %AccountQuotaWindow{
-      quota_key: "codex_spark",
-      window_kind: "primary",
-      window_minutes: 300,
-      used_percent: Decimal.new("100"),
-      reset_at: DateTime.add(@observed_at, 900, :second),
-      source: "codex_usage_api",
-      source_precision: "observed",
-      quota_scope: "model",
-      quota_family: "codex_model",
-      model: "sample-codex-spark",
-      upstream_model: "sample-codex-spark-upstream",
-      freshness_state: "fresh",
-      observed_at: @observed_at
-    }
+    model_window(used_percent: Decimal.new("100"))
+  end
+
+  defp model_window(attrs) do
+    struct!(
+      AccountQuotaWindow,
+      Keyword.merge(
+        [
+          quota_key: "codex_spark",
+          window_kind: "primary",
+          window_minutes: 300,
+          used_percent: Decimal.new("12"),
+          reset_at: DateTime.add(@observed_at, 900, :second),
+          source: "codex_usage_api",
+          source_precision: "observed",
+          quota_scope: "model",
+          quota_family: "codex_model",
+          model: "sample-codex-spark",
+          upstream_model: "sample-codex-spark-upstream",
+          freshness_state: "fresh",
+          observed_at: @observed_at
+        ],
+        attrs
+      )
+    )
   end
 end

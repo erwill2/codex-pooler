@@ -11,7 +11,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
   alias CodexPooler.Pools
   alias CodexPooler.Repo
 
-  describe "plan_route/5 ordering" do
+  describe "plan_route/5 leaf ordering" do
     test "bridge_ring keeps rendezvous ordering stable for the same seed and candidate set" do
       setup = routing_setup(3)
       seed = "bridge-ring-stable-seed"
@@ -46,6 +46,64 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
 
       assert candidate_ids(first_plan.candidates) == candidate_ids(second_plan.candidates)
       assert first_plan.selected_assignment_id == second_plan.selected_assignment_id
+    end
+  end
+
+  describe "plan_route/5 deterministic distribution" do
+    test "bridge_ring distributes first selection across fixed request seeds" do
+      setup = routing_setup(3)
+
+      assignment_ids = candidate_ids(setup.candidates)
+
+      seeds =
+        setup.assignments
+        |> Enum.flat_map(fn assignment ->
+          seeds_preferring_assignment(assignment_ids, assignment.id, 4)
+        end)
+
+      selected_ids =
+        Enum.map(seeds, fn seed ->
+          expected_ids = rendezvous_order_ids(setup.candidates, seed)
+          plan = plan_for(setup, "bridge_ring", seed)
+
+          assert candidate_ids(plan.candidates) == expected_ids
+          assert plan.selected_assignment_id == hd(expected_ids)
+
+          plan.selected_assignment_id
+        end)
+
+      expected_selected_ids = Enum.flat_map(setup.assignments, &List.duplicate(&1.id, 4))
+
+      assert length(seeds) == 12
+      assert selected_ids == expected_selected_ids
+
+      selection_counts = Enum.frequencies(selected_ids)
+
+      assert Enum.map(setup.assignments, &Map.fetch!(selection_counts, &1.id)) == [4, 4, 4]
+    end
+
+    test "deterministic_rotation distributes first selection across fixed request seeds" do
+      setup = routing_setup(4)
+      base_ids = candidate_ids(setup.candidates)
+
+      seeds =
+        0..3
+        |> Enum.map(fn rotation_index ->
+          seed_rotating_to_index(rotation_index, length(base_ids))
+        end)
+
+      selected_ids =
+        Enum.map(seeds, fn seed ->
+          expected_ids = rotated_ids(base_ids, seed)
+          plan = plan_for(setup, "deterministic_rotation", seed)
+
+          assert candidate_ids(plan.candidates) == expected_ids
+          assert plan.selected_assignment_id == hd(expected_ids)
+
+          plan.selected_assignment_id
+        end)
+
+      assert selected_ids == base_ids
     end
 
     test "least_recent_success uses assignment-global succeeded attempt recency and ignores failures" do
@@ -109,6 +167,40 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert plan.selected_assignment_id == third.id
     end
 
+    test "least_recent_success puts no-success candidates before older successes and ties them by rendezvous" do
+      setup = routing_setup(4)
+      [first, second, third, fourth] = setup.assignments
+      shared_time = ~U[2026-05-09 12:00:00.000000Z]
+      seed = seed_preferring_assignment([first.id, third.id], third.id)
+
+      shared_request =
+        request_fixture(setup.auth, %{model_id: setup.model.id, correlation_id: "no-success-tie"})
+
+      attempt_fixture(shared_request, second, %{attempt_number: 1, completed_at: shared_time})
+      attempt_fixture(shared_request, fourth, %{attempt_number: 2, completed_at: shared_time})
+
+      plan = plan_for(setup, "least_recent_success", seed)
+
+      no_success_candidates = [
+        {first, Enum.at(setup.identities, 0)},
+        {third, Enum.at(setup.identities, 2)}
+      ]
+
+      equal_success_candidates = [
+        {second, Enum.at(setup.identities, 1)},
+        {fourth, Enum.at(setup.identities, 3)}
+      ]
+
+      expected_ids =
+        rendezvous_order_ids(no_success_candidates, seed) ++
+          rendezvous_order_ids(equal_success_candidates, seed)
+
+      assert candidate_ids(plan.candidates) == expected_ids
+      assert plan.selected_assignment_id == hd(expected_ids)
+    end
+  end
+
+  describe "plan_route/5 quota-first edge cases" do
     test "quota_first orders by quota headroom before rendezvous tie-breaking" do
       setup = routing_setup(3)
       [low_headroom, high_headroom, middle_headroom] = setup.assignments
@@ -124,6 +216,73 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert hd(quota_first_plan.candidates) == {high_headroom, high_identity}
     end
 
+    test "quota_first breaks equal headroom ties by rendezvous order" do
+      setup = routing_setup(2)
+      [first, second] = setup.assignments
+      seed = seed_preferring_assignment([first.id, second.id], second.id)
+
+      prime_account_quota!(setup, first, Decimal.new("40"))
+      prime_account_quota!(setup, second, Decimal.new("40"))
+
+      quota_first_plan = plan_for(setup, "quota_first", seed)
+      expected_ids = rendezvous_order_ids(setup.candidates, seed)
+
+      assert candidate_ids(quota_first_plan.candidates) == expected_ids
+      assert quota_first_plan.selected_assignment_id == hd(expected_ids)
+    end
+
+    test "quota_first gives missing usable quota a zero headroom score" do
+      setup = routing_setup(3)
+      [unknown_quota, high_headroom, low_headroom] = setup.assignments
+      seed = seed_preferring_assignment([unknown_quota.id, high_headroom.id], unknown_quota.id)
+
+      prime_account_quota!(setup, high_headroom, Decimal.new("20"))
+      prime_account_quota!(setup, low_headroom, Decimal.new("95"))
+
+      quota_first_plan = plan_for(setup, "quota_first", seed)
+
+      assert candidate_ids(quota_first_plan.candidates) == [
+               high_headroom.id,
+               low_headroom.id,
+               unknown_quota.id
+             ]
+
+      assert quota_first_plan.selected_assignment_id == high_headroom.id
+    end
+
+    test "quota_first scores model-scoped quota with only in-scope usable windows" do
+      setup = routing_setup(2)
+      [requested_model_headroom, fallback_headroom] = setup.assignments
+
+      seed =
+        seed_preferring_assignment(
+          [requested_model_headroom.id, fallback_headroom.id],
+          fallback_headroom.id
+        )
+
+      prime_account_quota!(setup, requested_model_headroom, Decimal.new("5"))
+      prime_model_quota!(setup, requested_model_headroom, Decimal.new("30"))
+
+      prime_model_quota!(setup, requested_model_headroom, Decimal.new("99"),
+        model: "other-model",
+        upstream_model: "other-upstream-model"
+      )
+
+      prime_account_quota!(setup, fallback_headroom, Decimal.new("5"))
+      prime_model_quota!(setup, fallback_headroom, Decimal.new("40"))
+
+      quota_first_plan = plan_for(setup, "quota_first", seed)
+
+      assert candidate_ids(quota_first_plan.candidates) == [
+               requested_model_headroom.id,
+               fallback_headroom.id
+             ]
+
+      assert quota_first_plan.selected_assignment_id == requested_model_headroom.id
+    end
+  end
+
+  describe "plan_route/5 affinity/demotion recovery" do
     test "affinity cannot resurrect a filtered assignment that is absent from eligible candidates" do
       setup = routing_setup(3)
       seed = "filtered-affinity-seed"
@@ -177,6 +336,57 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
                Enum.reject(base_ids, &(&1 == sticky_id)) ++ [sticky_id]
 
       assert plan.selected_assignment_id == hd(Enum.reject(base_ids, &(&1 == sticky_id)))
+    end
+
+    test "expired demotion is ignored when ordering candidates" do
+      setup = routing_setup(3)
+      seed = "expired-demotion-seed"
+      base_ids = rendezvous_order_ids(setup.candidates, seed)
+      selected_id = hd(base_ids)
+      {selected_assignment, selected_identity} = candidate_by_id!(setup.candidates, selected_id)
+
+      insert_demotion!(setup, selected_assignment, selected_identity, "upstream_5xx",
+        demoted_until: ~U[2026-05-09 10:00:00.000000Z],
+        now: ~U[2026-05-09 09:59:00.000000Z]
+      )
+
+      plan = plan_for(setup, "bridge_ring", seed)
+
+      assert plan.demotions == %{}
+      assert candidate_ids(plan.candidates) == base_ids
+      assert plan.selected_assignment_id == selected_id
+    end
+
+    test "record_success resolves active demotions for the successful assignment" do
+      setup = routing_setup(3)
+      seed = "success-resolves-demotion-seed"
+      base_ids = rendezvous_order_ids(setup.candidates, seed)
+      demoted_id = hd(base_ids)
+      {demoted_assignment, demoted_identity} = candidate_by_id!(setup.candidates, demoted_id)
+
+      insert_demotion!(setup, demoted_assignment, demoted_identity, "upstream_5xx",
+        demoted_until: nil,
+        now: ~U[2026-05-09 10:00:00.000000Z]
+      )
+
+      demoted_plan = plan_for(setup, "bridge_ring", seed)
+
+      assert Map.has_key?(demoted_plan.demotions, demoted_id)
+      assert candidate_ids(demoted_plan.candidates) == tl(base_ids) ++ [demoted_id]
+
+      assert :ok = BridgeRing.record_success(demoted_plan, demoted_assignment, demoted_identity)
+
+      assert [] = active_demotions(setup, demoted_assignment)
+
+      resolved_demotions = all_demotions(setup, demoted_assignment)
+      assert [%BridgeDemotion{} = resolved_demotion] = resolved_demotions
+      assert resolved_demotion.status == "resolved"
+
+      recovered_plan = plan_for(setup, "bridge_ring", seed)
+
+      assert recovered_plan.demotions == %{}
+      assert candidate_ids(recovered_plan.candidates) == base_ids
+      assert recovered_plan.selected_assignment_id == demoted_id
     end
 
     test "bridge_ring_size truncates candidates after strategy ordering affinity and demotion" do
@@ -355,8 +565,17 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     |> Repo.insert!()
   end
 
-  defp insert_demotion!(setup, assignment, identity, reason_code) do
-    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+  defp insert_demotion!(setup, assignment, identity, reason_code, opts \\ []) do
+    now =
+      opts
+      |> Keyword.get_lazy(:now, fn -> DateTime.utc_now() end)
+      |> DateTime.truncate(:microsecond)
+
+    demoted_until =
+      case Keyword.get_lazy(opts, :demoted_until, fn -> DateTime.add(now, 60, :second) end) do
+        nil -> nil
+        value -> DateTime.truncate(value, :microsecond)
+      end
 
     %BridgeDemotion{
       pool_id: setup.pool.id,
@@ -366,7 +585,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       upstream_identity_id: identity.id,
       reason_code: reason_code,
       status: "active",
-      demoted_until: DateTime.add(now, 60, :second),
+      demoted_until: demoted_until,
       attempt_count: 1,
       metadata: %{"source" => "test_demotion"},
       created_at: now,
@@ -376,6 +595,33 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
   end
 
   defp prime_account_quota!(setup, assignment, used_percent) do
+    prime_quota_window!(setup, assignment, %{
+      quota_key: "account",
+      window_kind: "primary",
+      window_minutes: 300,
+      quota_scope: "account",
+      quota_family: "account",
+      used_percent: used_percent
+    })
+  end
+
+  defp prime_model_quota!(setup, assignment, used_percent, opts \\ []) do
+    model = Keyword.get(opts, :model, setup.model.exposed_model_id)
+    upstream_model = Keyword.get(opts, :upstream_model, setup.model.upstream_model_id)
+
+    prime_quota_window!(setup, assignment, %{
+      quota_key: "codex_model",
+      window_kind: "primary",
+      window_minutes: 300,
+      quota_scope: "model",
+      quota_family: "codex_model",
+      model: model,
+      upstream_model: upstream_model,
+      used_percent: used_percent
+    })
+  end
+
+  defp prime_quota_window!(setup, assignment, attrs) do
     {_assignment, identity} = candidate_by_id!(setup.candidates, assignment.id)
 
     reset_at =
@@ -383,19 +629,18 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       |> DateTime.add(900, :second)
       |> DateTime.truncate(:second)
 
-    assert {:ok, [_window]} =
-             QuotaWindows.upsert_quota_windows(identity, [
-               %{
-                 quota_key: "account",
-                 window_kind: "primary",
-                 window_minutes: 300,
-                 used_percent: used_percent,
-                 reset_at: reset_at,
-                 source: "codex_response_headers",
-                 source_precision: "observed",
-                 freshness_state: "fresh"
-               }
-             ])
+    attrs =
+      Map.merge(
+        %{
+          reset_at: reset_at,
+          source: "codex_response_headers",
+          source_precision: "observed",
+          freshness_state: "fresh"
+        },
+        attrs
+      )
+
+    assert {:ok, [_window]} = QuotaWindows.upsert_quota_windows(identity, [attrs])
   end
 
   defp affinity_hash(setup, kind, key_value) do
@@ -424,6 +669,17 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
             demotion.model_identifier == ^setup.model.exposed_model_id and
             demotion.pool_upstream_assignment_id == ^assignment.id and
             demotion.status == "active"
+    )
+  end
+
+  defp all_demotions(setup, assignment) do
+    Repo.all(
+      from demotion in BridgeDemotion,
+        where:
+          demotion.pool_id == ^setup.pool.id and demotion.api_key_id == ^setup.auth.api_key.id and
+            demotion.model_identifier == ^setup.model.exposed_model_id and
+            demotion.pool_upstream_assignment_id == ^assignment.id,
+        order_by: [asc: demotion.created_at]
     )
   end
 
@@ -470,6 +726,26 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     candidates
     |> Enum.sort_by(fn {assignment, _identity} -> -rendezvous_score(seed, assignment.id) end)
     |> candidate_ids()
+  end
+
+  defp seed_rotating_to_index(rotation_index, candidate_count) do
+    Enum.find(1..500, fn index ->
+      :erlang.phash2("rotation-distribution-#{index}", candidate_count) == rotation_index
+    end)
+    |> then(&"rotation-distribution-#{&1}")
+  end
+
+  defp seeds_preferring_assignment(assignment_ids, desired_assignment_id, count) do
+    1..2_000
+    |> Enum.reduce_while([], fn index, seeds ->
+      seed = "bridge-ring-distribution-seed-#{index}"
+
+      selected_assignment_id = Enum.max_by(assignment_ids, &rendezvous_score(seed, &1))
+
+      seeds = if selected_assignment_id == desired_assignment_id, do: [seed | seeds], else: seeds
+
+      if length(seeds) == count, do: {:halt, Enum.reverse(seeds)}, else: {:cont, seeds}
+    end)
   end
 
   defp seed_preferring_assignment(assignment_ids, desired_assignment_id) do
