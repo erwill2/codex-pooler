@@ -3,6 +3,7 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
 
   alias CodexPooler.Accounting
   alias CodexPooler.Catalog.PricingSnapshot
+  alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
   alias CodexPooler.Repo
 
   import CodexPooler.PoolerFixtures
@@ -192,5 +193,105 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
     refute inspect(log.errors) =~ raw_body
     refute inspect(log) =~ secret_token
     refute inspect(log) =~ raw_body
+  end
+
+  test "request log debug detail attempts are bounded to latest ten in ascending order" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-debug-detail-attempts",
+        status: "failed",
+        correlation_id: "debug-detail-attempts",
+        request_metadata: %{"codex_session_id" => "session-detail-attempts"}
+      })
+      |> Ecto.Changeset.change(last_error_code: "final_failure")
+      |> Repo.update!()
+
+    attempts =
+      for attempt_number <- 1..12 do
+        request
+        |> attempt_fixture(assignment, %{
+          attempt_number: attempt_number,
+          status: if(attempt_number == 12, do: "failed", else: "retryable_failed"),
+          retryable: attempt_number < 12,
+          upstream_status_code: 500 + attempt_number
+        })
+        |> Ecto.Changeset.change(%{
+          latency_ms: attempt_number * 10,
+          network_error_code: "attempt_error_#{attempt_number}",
+          error_message: "raw attempt #{attempt_number} must not enter debug"
+        })
+        |> Repo.update!()
+      end
+
+    final_attempt = List.last(attempts)
+    turn = debug_turn_fixture(pool, api_key, assignment, request, final_attempt.id)
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+
+    assert log.debug.attempt.attempt_count == 12
+    assert log.debug.attempt.latest_attempt_number == 12
+    assert log.debug.attempt.latest_attempt_status == "failed"
+    assert log.debug.turn.turn_ref == stable_ref(:turn, turn.id)
+    assert log.debug.turn.final_attempt_ref == stable_attempt_ref(request.id, 12)
+
+    assert Enum.map(log.debug.attempts, & &1.attempt_number) == Enum.to_list(3..12)
+    assert length(log.debug.attempts) == 10
+    assert hd(log.debug.attempts).attempt_ref == stable_attempt_ref(request.id, 3)
+    assert List.last(log.debug.attempts).attempt_ref == stable_attempt_ref(request.id, 12)
+    assert List.last(log.debug.attempts).final == true
+    assert Enum.count(log.debug.attempts, & &1.final) == 1
+    refute inspect(log.debug) =~ "raw attempt"
+  end
+
+  defp debug_turn_fixture(pool, api_key, assignment, request, final_attempt_id) do
+    now = ~U[2026-05-26 00:00:00.000000Z]
+
+    session =
+      %CodexSession{
+        pool_id: pool.id,
+        api_key_id: api_key.id,
+        session_key: "session-key-#{request.correlation_id}",
+        conversation_key: "conversation-#{request.correlation_id}",
+        pool_upstream_assignment_id: assignment.id,
+        status: "active",
+        owner_instance_id: "test-instance",
+        owner_lease_token: Ecto.UUID.generate(),
+        owner_lease_expires_at: DateTime.add(now, 60, :second),
+        last_heartbeat_at: now,
+        created_at: now,
+        updated_at: now
+      }
+      |> Repo.insert!()
+
+    %CodexTurn{
+      codex_session_id: session.id,
+      request_id: request.id,
+      turn_sequence: 1,
+      transport_kind: request.transport,
+      status: "failed",
+      error_code: "turn_failed",
+      first_visible_output_at: now,
+      final_attempt_id: final_attempt_id,
+      started_at: now,
+      completed_at: now,
+      created_at: now,
+      updated_at: DateTime.add(now, 1, :second)
+    }
+    |> Repo.insert!()
+  end
+
+  defp stable_ref(:turn, value), do: "turn_" <> stable_hash("codex_turn:" <> value)
+
+  defp stable_attempt_ref(request_id, attempt_number) do
+    "attempt_" <> stable_hash("request_attempt:#{request_id}:#{attempt_number}")
+  end
+
+  defp stable_hash(value) do
+    :crypto.hash(:sha256, value)
+    |> Base.encode16(case: :lower)
+    |> String.slice(0, 12)
   end
 end

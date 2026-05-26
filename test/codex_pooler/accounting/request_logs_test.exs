@@ -1,11 +1,14 @@
 defmodule CodexPooler.Accounting.RequestLogsTest do
   use CodexPooler.DataCase, async: false
 
+  import CodexPooler.AccountsFixtures
+  import CodexPooler.PoolerFixtures
+
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
   alias CodexPooler.Repo
-
-  import CodexPooler.PoolerFixtures
 
   test "request logs present latest settlement token counts and persisted costs" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
@@ -181,6 +184,55 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
 
     assert %{items: [], total: 0} =
              Accounting.list_request_logs(first_pool, filters: [status: "failed"])
+  end
+
+  test "exact scoped request log lookup is not affected by fuzzy correlation matches" do
+    reset_bootstrap_state_fixture!()
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    scope = Scope.for_user(owner, [])
+
+    visible_pool = pool_fixture(%{slug: "request-log-exact-visible", name: "Exact Visible"})
+    hidden_pool = pool_fixture(%{slug: "request-log-exact-hidden", name: "Exact Hidden"})
+    %{api_key: visible_key} = active_api_key_fixture(visible_pool)
+    %{api_key: hidden_key} = active_api_key_fixture(hidden_pool)
+    hidden_pool = hidden_pool |> Ecto.Changeset.change(status: "disabled") |> Repo.update!()
+    older_time = ~U[2026-05-26 00:00:00.000000Z]
+    newer_time = DateTime.add(older_time, 60, :second)
+
+    hidden_request =
+      request_fixture(%{pool: hidden_pool, api_key: hidden_key}, %{
+        requested_model: "gpt-exact-hidden",
+        correlation_id: "hidden-exact-request"
+      })
+
+    target_request =
+      request_fixture(%{pool: visible_pool, api_key: visible_key}, %{
+        requested_model: "gpt-exact-target",
+        correlation_id: "target-exact-request"
+      })
+      |> Ecto.Changeset.change(admitted_at: older_time)
+      |> Repo.update!()
+
+    distractor_request =
+      request_fixture(%{pool: visible_pool, api_key: visible_key}, %{
+        requested_model: "gpt-exact-distractor",
+        correlation_id: "newer-visible-correlation-containing-#{target_request.id}"
+      })
+      |> Ecto.Changeset.change(admitted_at: newer_time)
+      |> Repo.update!()
+
+    assert %{items: [fuzzy_match]} =
+             Accounting.list_request_logs_for_scope(scope,
+               limit: 1,
+               filters: [request_id: target_request.id]
+             )
+
+    assert fuzzy_match.id == distractor_request.id
+
+    assert exact_match = Accounting.get_request_log_for_scope(scope, target_request.id)
+    assert exact_match.id == target_request.id
+    assert exact_match.requested_model == "gpt-exact-target"
+    assert is_nil(Accounting.get_request_log_for_scope(scope, hidden_request.id))
   end
 
   test "policy denial request logs keep sanitized reason metadata only" do
@@ -385,6 +437,262 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     after
       :telemetry.detach(handler_id)
     end
+  end
+
+  test "request log debug projection reports terminal linked failed turn" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-debug-terminal",
+        status: "failed",
+        correlation_id: "debug-terminal",
+        response_status_code: 499,
+        request_metadata: %{
+          "codex_session_id" => "session-example-1",
+          "codex_session_key" => "session-key-example-1"
+        }
+      })
+      |> Ecto.Changeset.change(last_error_code: "client_disconnected")
+      |> Repo.update!()
+
+    attempt =
+      request
+      |> attempt_fixture(assignment, %{
+        status: "failed",
+        retryable: true,
+        upstream_status_code: 499
+      })
+      |> Ecto.Changeset.change(%{
+        latency_ms: 321,
+        network_error_code: "owner_drained",
+        error_message: "raw attempt error must not enter debug"
+      })
+      |> Repo.update!()
+
+    turn =
+      debug_turn_fixture(pool, api_key, assignment, request, %{
+        status: "failed",
+        error_code: "turn_owner_drained",
+        final_attempt_id: attempt.id
+      })
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+
+    assert log.debug.continuity == %{
+             status: "available",
+             session_ref: stable_ref(:session, "session-example-1"),
+             session_source: "continuity",
+             turn_ref: stable_ref(:turn, turn.id),
+             turn_status: "failed",
+             turn_status_source: "turn_state",
+             has_open_turn: false,
+             terminal_state: "terminal",
+             terminal_state_source: "turn_state"
+           }
+
+    assert log.debug.failure == %{error_code: "turn_owner_drained", error_source: "turn_error"}
+
+    assert log.debug.attempt == %{
+             latest_attempt_number: 1,
+             latest_attempt_status: "failed",
+             latest_attempt_retryable: true,
+             latest_upstream_status_code: 499,
+             attempt_count: 1
+           }
+
+    assert log.debug.terminal_state.state == "terminal"
+    assert log.debug.terminal_state.mismatch == false
+
+    assert log.debug.terminal_state.sources == [
+             %{source: "request_state", status: "failed", error_code: "client_disconnected"},
+             %{source: "turn_state", status: "failed", error_code: "turn_owner_drained"},
+             %{source: "attempt_state", status: "failed", error_code: "owner_drained"}
+           ]
+
+    assert log.debug.turn.turn_ref == stable_ref(:turn, turn.id)
+    assert log.debug.turn.final_attempt_ref == stable_attempt_ref(request.id, 1)
+    assert log.debug.turn.status == "failed"
+    assert log.debug.turn.error_code == "turn_owner_drained"
+    assert log.debug.turn.inserted_at == DateTime.to_iso8601(turn.created_at)
+    assert log.debug.turn.updated_at == DateTime.to_iso8601(turn.updated_at)
+    assert log.debug.turn.completed_at == DateTime.to_iso8601(turn.completed_at)
+
+    assert [attempt_debug] = log.debug.attempts
+
+    assert attempt_debug == %{
+             attempt_ref: stable_attempt_ref(request.id, 1),
+             attempt_number: 1,
+             status: "failed",
+             retryable: true,
+             upstream_status_code: 499,
+             network_error_code: "owner_drained",
+             latency_ms: 321,
+             final: true
+           }
+
+    refute inspect(log.debug) =~ "session-example-1"
+    refute inspect(log.debug) =~ "session-key-example-1"
+    refute inspect(log.debug) =~ "raw attempt error"
+  end
+
+  test "request log debug projection reports failed request with linked open turn as mismatch" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-debug-mismatch",
+        status: "failed",
+        correlation_id: "debug-mismatch",
+        request_metadata: %{"codex_session_id" => "session-example-2"}
+      })
+      |> Ecto.Changeset.change(last_error_code: "owner_unavailable")
+      |> Repo.update!()
+
+    request
+    |> attempt_fixture(assignment, %{status: "failed"})
+    |> Ecto.Changeset.change(network_error_code: "upstream_timeout")
+    |> Repo.update!()
+
+    turn =
+      debug_turn_fixture(pool, api_key, assignment, request, %{
+        status: "in_progress",
+        completed_at: nil
+      })
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+
+    assert log.debug.continuity.status == "mismatch"
+    assert log.debug.continuity.session_ref == stable_ref(:session, "session-example-2")
+    assert log.debug.continuity.turn_ref == stable_ref(:turn, turn.id)
+    assert log.debug.continuity.turn_status == "in_progress"
+    assert log.debug.continuity.has_open_turn == true
+    assert log.debug.continuity.terminal_state == "mismatch"
+    assert log.debug.continuity.terminal_state_source == "turn_state"
+    assert log.debug.failure == %{error_code: "owner_unavailable", error_source: "request_error"}
+
+    assert log.debug.terminal_state == %{
+             state: "mismatch",
+             mismatch: true,
+             sources: [
+               %{source: "request_state", status: "failed", error_code: "owner_unavailable"},
+               %{source: "turn_state", status: "in_progress", error_code: nil},
+               %{source: "attempt_state", status: "failed", error_code: "upstream_timeout"}
+             ]
+           }
+  end
+
+  test "request log debug projection reports failed no-turn request from request state" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-debug-no-turn",
+        status: "failed",
+        correlation_id: "debug-no-turn",
+        request_metadata: %{}
+      })
+      |> Ecto.Changeset.change(last_error_code: "request_failed")
+      |> Repo.update!()
+
+    request
+    |> attempt_fixture(assignment, %{
+      status: "failed",
+      retryable: false,
+      upstream_status_code: 502
+    })
+    |> Ecto.Changeset.change(network_error_code: "upstream_status", latency_ms: 111)
+    |> Repo.update!()
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+
+    assert log.debug.continuity == %{
+             status: "not_applicable",
+             session_ref: nil,
+             session_source: nil,
+             turn_ref: nil,
+             turn_status: nil,
+             turn_status_source: nil,
+             has_open_turn: nil,
+             terminal_state: "terminal",
+             terminal_state_source: "request_state"
+           }
+
+    assert log.debug.failure == %{error_code: "request_failed", error_source: "request_error"}
+    assert log.debug.attempt.attempt_count == 1
+    assert log.debug.attempt.latest_attempt_number == 1
+
+    assert log.debug.attempts == [
+             %{
+               attempt_ref: stable_attempt_ref(request.id, 1),
+               attempt_number: 1,
+               status: "failed",
+               retryable: false,
+               upstream_status_code: 502,
+               network_error_code: "upstream_status",
+               latency_ms: 111,
+               final: false
+             }
+           ]
+  end
+
+  test "request log debug projection reports no-continuity rejected rows as not applicable" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-debug-rejected",
+        status: "rejected",
+        correlation_id: "debug-rejected",
+        response_status_code: 403,
+        request_metadata: %{}
+      })
+      |> Ecto.Changeset.change(last_error_code: "model_not_allowed")
+      |> Repo.update!()
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+    assert log.id == request.id
+
+    assert log.debug.continuity == %{
+             status: "not_applicable",
+             session_ref: nil,
+             session_source: nil,
+             turn_ref: nil,
+             turn_status: nil,
+             turn_status_source: nil,
+             has_open_turn: nil,
+             terminal_state: "not_applicable",
+             terminal_state_source: nil
+           }
+
+    assert log.debug.failure == %{error_code: "model_not_allowed", error_source: "request_error"}
+    assert log.debug.attempt.attempt_count == 0
+    assert log.debug.attempts == []
+  end
+
+  test "request log debug projection reports malformed legacy continuity as unknown" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-debug-legacy",
+        status: "failed",
+        correlation_id: "debug-legacy",
+        request_metadata: %{"codex_session_id" => %{"legacy" => "bad-shape"}}
+      })
+      |> Ecto.Changeset.change(last_error_code: "legacy_failure")
+      |> Repo.update!()
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+    assert log.id == request.id
+    assert log.debug.continuity.status == "unknown"
+    assert log.debug.continuity.session_ref == nil
+    assert log.debug.continuity.turn_ref == nil
+    assert log.debug.continuity.terminal_state == "unknown"
+    assert log.debug.failure == %{error_code: "legacy_failure", error_source: "request_error"}
   end
 
   test "request log model listing returns distinct models for the full pool history" do
@@ -743,5 +1051,57 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
 
     assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
     refute inspect(log) =~ raw_idempotency_key
+  end
+
+  defp debug_turn_fixture(pool, api_key, assignment, request, attrs) do
+    now = ~U[2026-05-26 00:00:00.000000Z]
+
+    session =
+      %CodexSession{
+        pool_id: pool.id,
+        api_key_id: api_key.id,
+        session_key: "session-key-#{request.correlation_id}",
+        conversation_key: "conversation-#{request.correlation_id}",
+        pool_upstream_assignment_id: assignment.id,
+        status: "active",
+        owner_instance_id: "test-instance",
+        owner_lease_token: Ecto.UUID.generate(),
+        owner_lease_expires_at: DateTime.add(now, 60, :second),
+        last_heartbeat_at: now,
+        created_at: now,
+        updated_at: now
+      }
+      |> Repo.insert!()
+
+    completed_at = Map.get(attrs, :completed_at, now)
+
+    %CodexTurn{
+      codex_session_id: session.id,
+      request_id: request.id,
+      turn_sequence: 1,
+      transport_kind: request.transport,
+      status: Map.fetch!(attrs, :status),
+      error_code: Map.get(attrs, :error_code),
+      first_visible_output_at: now,
+      final_attempt_id: Map.get(attrs, :final_attempt_id),
+      started_at: now,
+      completed_at: completed_at,
+      created_at: now,
+      updated_at: DateTime.add(now, 1, :second)
+    }
+    |> Repo.insert!()
+  end
+
+  defp stable_ref(:session, value), do: "session_" <> stable_hash("codex_session:" <> value)
+  defp stable_ref(:turn, value), do: "turn_" <> stable_hash("codex_turn:" <> value)
+
+  defp stable_attempt_ref(request_id, attempt_number) do
+    "attempt_" <> stable_hash("request_attempt:#{request_id}:#{attempt_number}")
+  end
+
+  defp stable_hash(value) do
+    :crypto.hash(:sha256, value)
+    |> Base.encode16(case: :lower)
+    |> String.slice(0, 12)
   end
 end
