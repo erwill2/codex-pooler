@@ -28,6 +28,17 @@
   },
   "packageRules": [
     {
+      "description": "Automerge non-major dependency updates after one day",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "automerge": true,
+      "minimumReleaseAge": "1 day"
+    },
+    {
       "description": "Require explicit review for major updates",
       "matchUpdateTypes": [
         "major"
@@ -40,13 +51,6 @@
         "mix"
       ],
       "rangeStrategy": "pin"
-    },
-    {
-      "description": "Keep websock_adapter on Phoenix-compatible releases",
-      "matchPackageNames": [
-        "websock_adapter"
-      ],
-      "allowedVersions": "< 0.6.0"
     },
     {
       "description": "Keep Erlang/Elixir runtime image updates together",
