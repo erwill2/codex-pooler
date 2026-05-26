@@ -463,6 +463,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
     cases = [
       {"codex_pooler_list_request_logs", %{"limit" => 10}, "nextOffset"},
       {"codex_pooler_list_audit_logs", %{"limit" => 10}, "nextOffset"},
+      {"codex_pooler_get_request_log", %{"id" => Ecto.UUID.generate()}, "item"},
       {"codex_pooler_get_operator", %{"selector" => "missing-operator-selector"}, "item"},
       {"codex_pooler_get_invite", %{"selector" => "missing-invite-selector"}, "item"},
       {"codex_pooler_get_upstream_quota", %{"selector" => "missing-quota-selector"}, "item"}
