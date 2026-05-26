@@ -131,9 +131,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
     close_upstream_websocket_session(state)
 
-    state
-    |> remaining_response_tasks_after_cleanup(remaining_tasks)
-    |> Enum.each(&Process.exit(&1, :shutdown))
+    _remaining_tasks = remaining_response_tasks_after_cleanup(state, remaining_tasks)
 
     :ok
   end
@@ -427,18 +425,18 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
   defp after_owner_detach(result, state) do
     recovery_result = recover_owner_lifecycle_leftovers(result, state)
-    _interrupt_result = interrupt_owner_downstream_session(result, state)
+    _interrupt_result = interrupt_owner_downstream_turn(result, state)
     log_owner_detach_failure(result, state, recovery_result)
   end
 
-  defp interrupt_owner_downstream_session(:ok, state) do
+  defp interrupt_owner_downstream_turn(:ok, state) do
     state
     |> Map.get(:codex_session)
-    |> Gateway.interrupt_codex_session(owner_downstream_interrupt_opts(state))
+    |> Gateway.interrupt_codex_turn(owner_downstream_interrupt_opts(state))
     |> log_interrupt_failure(state)
   end
 
-  defp interrupt_owner_downstream_session(_result, _state), do: :ok
+  defp interrupt_owner_downstream_turn(_result, _state), do: :ok
 
   defp recover_owner_lifecycle_leftovers({:error, reason}, state)
        when reason in [:owner_unavailable, :owner_forward_timeout, :owner_crashed] do

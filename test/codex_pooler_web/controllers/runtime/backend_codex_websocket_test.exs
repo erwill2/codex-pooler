@@ -4650,6 +4650,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                opts: %{}
              })
 
+    assert Process.alive?(task)
+    send(task, :stop)
+
     assert_receive ^unrelated
   end
 
