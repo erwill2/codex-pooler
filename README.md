@@ -48,19 +48,18 @@ tokens, or raw Codex secrets.
 - **Routing strategies:** choose how eligible accounts are ordered, including
   bridge-ring routing, deterministic rotation, least-recent-success preference,
   and quota-first ordering
+- **Advanced control surface:** tune gateway-wide defaults and per-pool options
+  for routing, admission, diagnostics, model metadata, and operational behavior
 - **Session continuity:** keep Codex response sessions and websocket reconnects
   attached to the right Codex account when the client provides stable session
   state
-- **Codex backend compatibility:** serve the Codex backend route family under
-  `/backend-api/*`, including responses, compact, usage, files, transcription,
-  backend image proxy routes at `/backend-api/codex/images/generations` and
-  `/backend-api/codex/images/edits`, selected account-management routes,
-  explicit `/backend-api/codex/v1/models`, `/backend-api/codex/v1/responses`,
-  `/backend-api/codex/v1/responses/compact`, and
-  `/backend-api/codex/v1/chat/completions` aliases, plus canonical and v1
-  websocket response streams
-- **OpenAI SDK compatibility:** serve selected `/v1/*` endpoints and translate
-  supported requests into Codex-compatible calls
+- **Codex backend compatibility:** point Codex-compatible clients at Codex
+  Pooler and keep familiar responses, compacting, usage, files, audio, images,
+  and websocket flows working through pooled accounts
+- **OpenAI SDK compatibility:** serve selected `/v1/*` endpoints so
+  OpenAI-compatible apps can use multiple Codex subscriptions behind one
+  gateway, with supported requests translated and routed through Codex capacity
+  to help contain API spend
 - **Operator UI:** manage pools, Codex accounts, API keys, request logs, audit
   logs, jobs, stats, operators, and settings from authenticated `/admin/*`
   pages
@@ -69,6 +68,15 @@ tokens, or raw Codex secrets.
 - **Metadata-only observability:** record request and routing metadata without
   storing prompts, file bodies, audio, images, bearer tokens, cookies, raw
   Codex account tokens, or raw API keys
+- **Built for the BEAM:** run on Elixir/Erlang's fault-tolerant runtime, a
+  natural fit for long-lived agent sessions, streaming responses, background
+  jobs, and high-concurrency routing
+- **Cloud-native by design:** deploy cleanly on Kubernetes with separate web,
+  worker, scheduler, and migration roles, while keeping the architecture ready
+  for clustered, multinode operation as traffic grows
+- **Native realtime transport:** keep websocket clients on real clustered
+  websocket sessions instead of translating realtime traffic through an HTTP
+  compatibility layer
 
 ## Quick Start With Docker Compose
 
