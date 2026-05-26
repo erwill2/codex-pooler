@@ -16,66 +16,67 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
     <article
       id={"upstream-account-#{@account.identity.id}"}
       data-role="upstream-account-card"
-      class="rounded-box border border-base-300 bg-base-100 shadow-sm transition-colors hover:border-primary/30"
+      class={[
+        "rounded-box border border-l-2 border-base-300 bg-base-100 shadow-sm transition-colors",
+        status_border_class(@account)
+      ]}
     >
       <header class="flex flex-col gap-3 border-b border-base-300 bg-base-200/35 p-4 sm:flex-row sm:items-start sm:justify-between">
-        <div class="flex min-w-0 items-start gap-3">
-          <span class={status_dot_class(@account)} aria-hidden="true" />
-          <div class="min-w-0">
-            <div class="flex flex-wrap items-center gap-2">
-              <h3
-                id={"upstream-account-#{@account.identity.id}-mail"}
-                class="truncate text-lg font-semibold text-base-content"
-              >
-                {@account.label}
-              </h3>
-              <span
-                id={"upstream-account-#{@account.identity.id}-state"}
-                class={lifecycle_badge_class(@account.identity.status)}
-              >
-                {@account.identity.status}
-              </span>
-              <.upstream_plan_indicator account={@account} account_index={@account_index} />
-            </div>
-            <p class="mt-1 truncate text-xs text-base-content/55">
-              {@account.identifier_label}
-            </p>
+        <div class="min-w-0">
+          <div class="flex flex-wrap items-center gap-2">
+            <h3
+              id={"upstream-account-#{@account.identity.id}-mail"}
+              class="truncate text-lg font-semibold text-base-content"
+            >
+              {@account.label}
+            </h3>
+            <span
+              id={"upstream-account-#{@account.identity.id}-state"}
+              class={lifecycle_badge_class(@account.identity.status)}
+            >
+              {@account.identity.status}
+            </span>
+            <.upstream_plan_indicator account={@account} account_index={@account_index} />
           </div>
+          <p class="mt-1 truncate text-xs text-base-content/55">
+            {@account.identifier_label}
+          </p>
         </div>
         <.upstream_account_actions account={@account} />
       </header>
-      
-    <div class="grid gap-4 p-4">
-      <section class="grid gap-3">
-        <div class="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <p class="text-xs font-semibold uppercase text-primary">Limits</p>
-            <p
-              id={"upstream-account-#{@account.identity.id}-routing-readiness"}
-              class="text-sm text-base-content/60"
-            >
-              {routing_signal_label(@account)} · {assignment_count_label(@account.assignments)}
-            </p>
-          </div>
-          <span class={AdminBadges.status_chip_class(@account.refresh_status)}>
-            refresh {@account.refresh_status}
-          </span>
-        </div>
-        <div
-          id={"upstream-account-#{@account.identity.id}-limits"}
-          class="grid gap-3 md:grid-cols-2"
-        >
-          <.quota_limit_row
-            :for={limit <- @account.quota_limits}
-            id={"upstream-account-#{@account.identity.id}-limit-#{limit.key}"}
-            limit={limit}
-          />
-        </div>
-      </section>
 
-      <.upstream_reauth_warning account={@account} />
-    </div>
+      <div class="grid gap-4 p-4">
+        <section class="grid gap-3">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p class="text-xs font-semibold uppercase text-primary">Limits</p>
+              <p
+                id={"upstream-account-#{@account.identity.id}-routing-readiness"}
+                class="text-sm text-base-content/60"
+              >
+                {routing_signal_label(@account)} · {assignment_count_label(@account.assignments)}
+              </p>
+            </div>
+            <span class={AdminBadges.status_chip_class(@account.refresh_status)}>
+              refresh {@account.refresh_status}
+            </span>
+          </div>
+          <div
+            id={"upstream-account-#{@account.identity.id}-limits"}
+            class="grid gap-3 md:grid-cols-2"
+          >
+            <.quota_limit_row
+              :for={limit <- @account.quota_limits}
+              id={"upstream-account-#{@account.identity.id}-limit-#{limit.key}"}
+              limit={limit}
+            />
+          </div>
+        </section>
+
+        <.upstream_reauth_warning account={@account} />
+      </div>
       <.upstream_refresh_status account={@account} />
+      <.upstream_selector_contracts account={@account} />
     </article>
     """
   end
@@ -214,111 +215,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
 
   attr :account, :map, required: true
 
-  defp upstream_auth_health(assigns) do
-    ~H"""
-    <div
-      id={"upstream-account-#{@account.identity.id}-auth-health"}
-      data-role="upstream-auth-health"
-      class="rounded-box border border-base-300 bg-base-100 p-3"
-    >
-      <div class="flex items-center justify-between gap-3">
-        <p class="text-xs font-semibold text-base-content/55">Auth health</p>
-        <span class={AdminBadges.status_chip_class(@account.refresh_status)}>
-          {@account.refresh_status}
-        </span>
-      </div>
-      <dl class="mt-2 grid gap-1.5 text-xs text-base-content/70">
-        <div class="grid gap-0.5 sm:grid-cols-[8rem_minmax(0,1fr)]">
-          <dt class="font-medium text-base-content/55">Imported</dt>
-          <dd id={"upstream-account-#{@account.identity.id}-auth-fresh"}>
-            {@account.auth_fresh_label}
-          </dd>
-        </div>
-        <div class="grid gap-0.5 sm:grid-cols-[8rem_minmax(0,1fr)]">
-          <dt class="font-medium text-base-content/55">Verified</dt>
-          <dd id={"upstream-account-#{@account.identity.id}-auth-verified"}>
-            {@account.auth_verified_label}
-          </dd>
-        </div>
-        <div class="grid gap-0.5 sm:grid-cols-[8rem_minmax(0,1fr)]">
-          <dt class="font-medium text-base-content/55">Access token</dt>
-          <dd id={"upstream-account-#{@account.identity.id}-access-token"}>
-            {@account.access_token_label}
-          </dd>
-        </div>
-        <div class="grid gap-0.5 sm:grid-cols-[8rem_minmax(0,1fr)]">
-          <dt class="font-medium text-base-content/55">Refresh</dt>
-          <dd id={"upstream-account-#{@account.identity.id}-token-refresh"}>
-            {@account.token_refresh_label}
-          </dd>
-        </div>
-      </dl>
-    </div>
-    """
-  end
-
-  attr :account, :map, required: true
-
-  defp upstream_quota_limits(assigns) do
-    ~H"""
-    <div id={"upstream-account-#{@account.identity.id}-limits"} class="grid gap-3">
-      <div class="flex items-center justify-between gap-3">
-        <p class="text-xs font-semibold text-base-content/55">Limits</p>
-        <p class="text-xs text-base-content/50">reported by upstream</p>
-      </div>
-      <.quota_limit_row
-        :for={limit <- @account.quota_limits}
-        id={"upstream-account-#{@account.identity.id}-limit-#{limit.key}"}
-        limit={limit}
-      />
-    </div>
-    """
-  end
-
-  attr :account, :map, required: true
-
-  defp upstream_pool_assignments(assigns) do
-    ~H"""
-    <div class="grid gap-2">
-      <div class="flex items-center justify-between gap-3">
-        <p class="text-xs font-semibold text-base-content/55">Pool assignments</p>
-        <span class="text-xs text-base-content/50">
-          {assignment_count_label(@account.assignments)}
-        </span>
-      </div>
-      <div
-        :for={assignment <- @account.assignments}
-        id={"upstream-account-#{@account.identity.id}-assignment-#{assignment.id}"}
-        class="grid gap-2 rounded-box border border-base-300 bg-base-200/40 p-2 text-xs sm:grid-cols-[minmax(0,1fr)_auto]"
-      >
-        <div class="min-w-0">
-          <p class="truncate font-semibold text-base-content">{assignment.pool_label}</p>
-          <p class="truncate text-base-content/60">{assignment.assignment_label}</p>
-        </div>
-        <div class="flex flex-wrap justify-start gap-1.5 sm:justify-end">
-          <span class={assignment_status_badge_class(assignment.status)}>
-            {assignment.status}
-          </span>
-          <span class={assignment_status_badge_class(assignment.eligibility_status)}>
-            {assignment.eligibility_status}
-          </span>
-          <span
-            id={"upstream-account-#{@account.identity.id}-assignment-#{assignment.id}-quota-priming"}
-            class={AdminBadges.status_chip_class(assignment.quota_priming_status)}
-          >
-            {assignment.quota_priming_label}
-          </span>
-        </div>
-      </div>
-      <p :if={@account.assignments == []} class="text-xs text-base-content/60">
-        No active Pool assignments
-      </p>
-    </div>
-    """
-  end
-
-  attr :account, :map, required: true
-
   defp upstream_refresh_status(assigns) do
     ~H"""
     <div class="sr-only">
@@ -328,6 +224,50 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
           · job {@account.refresh_job_state}
         </span>
       </div>
+    </div>
+    """
+  end
+
+  attr :account, :map, required: true
+
+  defp upstream_selector_contracts(assigns) do
+    ~H"""
+    <div class="sr-only" data-role="upstream-account-selector-contracts">
+      <section id={"upstream-account-#{@account.identity.id}-auth-health"}>
+        Auth health
+        <span id={"upstream-account-#{@account.identity.id}-auth-fresh"}>
+          {@account.auth_fresh_label}
+        </span>
+        <span id={"upstream-account-#{@account.identity.id}-auth-verified"}>
+          {@account.auth_verified_label}
+        </span>
+        <span id={"upstream-account-#{@account.identity.id}-access-token"}>
+          {@account.access_token_label}
+        </span>
+        <span id={"upstream-account-#{@account.identity.id}-token-refresh"}>
+          {@account.token_refresh_label}
+        </span>
+      </section>
+
+      <section>
+        quota refresh {@account.quota_refresh_status}
+      </section>
+
+      <section>
+        <div
+          :for={assignment <- @account.assignments}
+          id={"upstream-account-#{@account.identity.id}-assignment-#{assignment.id}"}
+        >
+          <span>{assignment.pool_label}</span>
+          <span>{assignment.assignment_label}</span>
+          <span>{assignment.status}</span>
+          <span>{assignment.eligibility_status}</span>
+          <span id={"upstream-account-#{@account.identity.id}-assignment-#{assignment.id}-quota-priming"}>
+            {assignment.quota_priming_label}
+          </span>
+        </div>
+        <p :if={@account.assignments == []}>No active Pool assignments</p>
+      </section>
     </div>
     """
   end
@@ -436,20 +376,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
     end
   end
 
-  defp status_dot_class(%{reauth_required?: true}), do: "size-2.5 shrink-0 rounded-full bg-error"
+  defp status_border_class(%{reauth_required?: true}), do: "border-l-error"
 
-  defp status_dot_class(%{identity: %{status: "active"}}),
-    do: "size-2.5 shrink-0 rounded-full bg-success"
+  defp status_border_class(%{identity: %{status: "active"}}), do: "border-l-success"
 
-  defp status_dot_class(_account), do: "size-2.5 shrink-0 rounded-full bg-warning"
-
-  defp assignment_status_badge_class(status) when status in ["active", "eligible", "healthy"],
-    do: "badge badge-success badge-sm"
-
-  defp assignment_status_badge_class(status) when status in ["paused", "inactive", "ineligible"],
-    do: "badge badge-warning badge-sm"
-
-  defp assignment_status_badge_class(_status), do: "badge badge-ghost badge-sm"
+  defp status_border_class(_account), do: "border-l-warning"
 
   defp pausable?("active"), do: true
   defp pausable?("refresh_due"), do: true
