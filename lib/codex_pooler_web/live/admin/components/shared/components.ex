@@ -254,6 +254,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :for, :any, required: true
   attr :advanced_open, :boolean, default: false
   attr :compact, :boolean, default: false
+  attr :mobile_single_column, :boolean, default: false
   attr :rest, :global, include: ~w(phx-change phx-submit phx-target method action autocomplete)
 
   slot :inner_block, required: true
@@ -269,11 +270,12 @@ defmodule CodexPoolerWeb.Admin.Components do
       {@rest}
     >
       <div class={filter_form_layout_class(@compact)}>
-        <div class={filter_fields_class(@compact)}>
+        <div class={filter_fields_class(@compact, @mobile_single_column)}>
           {render_slot(@inner_block)}
         </div>
         <div
           :if={@actions != []}
+          data-role="filter-actions"
           class={[
             "flex flex-wrap items-end gap-2 xl:self-end [&_.btn]:h-8 [&_.btn]:min-h-8",
             !@compact && "xl:pb-1"
@@ -292,7 +294,7 @@ defmodule CodexPoolerWeb.Admin.Components do
         <summary class="cursor-pointer px-1 py-1 text-xs font-semibold uppercase tracking-wide text-base-content/55 transition-colors hover:text-base-content">
           Advanced filters
         </summary>
-        <div class="grid grid-cols-2 gap-2 pt-2 lg:grid-cols-5 [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.label]:mb-0.5 [&_.label]:px-1 [&_.label]:text-[0.65rem] [&_.label]:font-semibold [&_.label]:uppercase [&_.label]:tracking-wide [&_.label]:text-base-content/45 [&_.select]:select-sm">
+        <div class={advanced_filter_fields_class(@mobile_single_column)}>
           {render_slot(@advanced)}
         </div>
       </details>
@@ -500,12 +502,24 @@ defmodule CodexPoolerWeb.Admin.Components do
   defp metric_icon_class(_tone),
     do: "grid size-10 place-items-center rounded-box bg-base-200 text-base-content/60"
 
-  defp filter_fields_class(true) do
+  defp filter_fields_class(true, _mobile_single_column) do
     "grid min-w-0 flex-1 grid-cols-1 items-end gap-2 sm:grid-cols-[minmax(14rem,1fr)_12rem] [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.input]:h-8 [&_.label]:sr-only [&_.select]:h-8 [&_.select]:select-sm"
   end
 
-  defp filter_fields_class(false) do
+  defp filter_fields_class(false, true) do
+    "grid grid-cols-1 items-end gap-2 sm:grid-cols-2 lg:grid-cols-4 [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.label]:mb-0.5 [&_.label]:px-1 [&_.label]:text-[0.65rem] [&_.label]:font-semibold [&_.label]:uppercase [&_.label]:tracking-wide [&_.label]:text-base-content/45 [&_.select]:select-sm"
+  end
+
+  defp filter_fields_class(false, false) do
     "grid grid-cols-2 items-end gap-2 lg:grid-cols-4 [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.label]:mb-0.5 [&_.label]:px-1 [&_.label]:text-[0.65rem] [&_.label]:font-semibold [&_.label]:uppercase [&_.label]:tracking-wide [&_.label]:text-base-content/45 [&_.select]:select-sm"
+  end
+
+  defp advanced_filter_fields_class(true) do
+    "grid grid-cols-1 gap-2 pt-2 sm:grid-cols-2 lg:grid-cols-5 [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.label]:mb-0.5 [&_.label]:px-1 [&_.label]:text-[0.65rem] [&_.label]:font-semibold [&_.label]:uppercase [&_.label]:tracking-wide [&_.label]:text-base-content/45 [&_.select]:select-sm"
+  end
+
+  defp advanced_filter_fields_class(false) do
+    "grid grid-cols-2 gap-2 pt-2 lg:grid-cols-5 [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.label]:mb-0.5 [&_.label]:px-1 [&_.label]:text-[0.65rem] [&_.label]:font-semibold [&_.label]:uppercase [&_.label]:tracking-wide [&_.label]:text-base-content/45 [&_.select]:select-sm"
   end
 
   defp filter_form_layout_class(true), do: "flex flex-wrap items-center gap-2"
