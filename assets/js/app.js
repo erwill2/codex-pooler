@@ -1,5 +1,6 @@
 // Include phoenix_html to handle method=PUT/DELETE in forms and buttons.
 import "phoenix_html"
+import "cally"
 // Establish Phoenix Socket and LiveView configuration.
 import ApexCharts from "apexcharts"
 import {Socket} from "phoenix"
@@ -101,6 +102,65 @@ const TotpSetupTools = {
         textContent: "QR code could not be rendered",
       }))
     }
+  },
+}
+const CallyDatePicker = {
+  mounted() {
+    this.input = this.el.querySelector("input[type='hidden']")
+    this.calendar = this.el.querySelector("calendar-date")
+    this.label = this.el.querySelector("[data-role='cally-date-label']")
+    this.popover = this.el.querySelector("[popover]")
+    this.placeholder = this.el.dataset.placeholder || "dd/mm/yyyy"
+    this.handleChange = event => this.selectDate(event.target.value)
+    this.handleClear = () => this.selectDate("")
+    this.handleCancel = () => this.close()
+
+    this.calendar?.addEventListener("change", this.handleChange)
+    this.el.querySelector("[data-role='cally-clear']")?.addEventListener("click", this.handleClear)
+    this.el.querySelector("[data-role='cally-cancel']")?.addEventListener("click", this.handleCancel)
+    this.sync()
+  },
+  updated() {
+    this.sync()
+  },
+  destroyed() {
+    this.calendar?.removeEventListener("change", this.handleChange)
+    this.el.querySelector("[data-role='cally-clear']")?.removeEventListener("click", this.handleClear)
+    this.el.querySelector("[data-role='cally-cancel']")?.removeEventListener("click", this.handleCancel)
+  },
+  selectDate(value) {
+    if (!this.input) return
+
+    this.input.value = value || ""
+    this.sync()
+    this.input.dispatchEvent(new Event("input", {bubbles: true}))
+    this.input.dispatchEvent(new Event("change", {bubbles: true}))
+    this.close()
+  },
+  sync() {
+    const value = this.input?.value || ""
+
+    if (this.calendar && this.calendar.value !== value) {
+      this.calendar.value = value
+    }
+
+    if (this.label) {
+      this.label.textContent = value ? this.formatDate(value) : this.placeholder
+    }
+  },
+  close() {
+    this.popover?.hidePopover?.()
+  },
+  formatDate(value) {
+    const [year, month, day] = value.split("-").map(Number)
+
+    if (!year || !month || !day) return value
+
+    return new Intl.DateTimeFormat("en-GB", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    }).format(new Date(year, month - 1, day))
   },
 }
 const QuotaPressureChart = {
@@ -555,6 +615,7 @@ const liveSocket = new LiveSocket("/live", Socket, {
     ...colocatedHooks,
     ApexBarChart,
     ApexTimeSeriesChart,
+    CallyDatePicker,
     ClipboardCopy,
     FlashAutoDismiss,
     OtpInput,

@@ -51,6 +51,13 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
      )}
   end
 
+  def handle_event("clear_request_id_filter", _params, socket) do
+    params = Map.put(socket.assigns.filter_values, "request_id", "")
+
+    {:noreply,
+     push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
+  end
+
   def handle_event("select_pool_filter", %{"pool-id" => pool_id}, socket) do
     params = Map.put(socket.assigns.filter_values, "pool_id", pool_id)
 
@@ -106,7 +113,10 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
         <AdminComponents.filter_form
           id="request-log-filter-form"
           for={@filter_form}
+          phx-change="filter"
           phx-submit="filter"
+          advanced_open={advanced_filters_open?(@filter_values)}
+          mobile_single_column
         >
           <.request_log_filter_dropdown
             id="request-log-pool-filter"
@@ -161,29 +171,11 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
             selected={RequestLogsDisplay.selected_model_filter_option(@filter_values["model"])}
             options={@model_filter_options}
           />
-          <.input field={@filter_form[:date_from]} type="date" aria-label="Date from" />
-          <.input field={@filter_form[:date_to]} type="date" aria-label="Date to" />
-          <.input
-            field={@filter_form[:request_id]}
-            type="text"
-            aria-label="Request ID"
-            placeholder="correlation or row id"
-          />
-          <:actions>
-            <AdminComponents.action_button
-              id="request-log-filter-submit"
-              icon="hero-funnel"
-              label="Apply filters"
-              type="submit"
-              variant={:primary}
-            />
-            <AdminComponents.action_button
-              id="request-log-filter-reset"
-              icon="hero-arrow-path"
-              label="Reset"
-              navigate={~p"/admin/request-logs"}
-            />
-          </:actions>
+          <:advanced>
+            <.request_id_filter field={@filter_form[:request_id]} />
+            <.cally_date_filter field={@filter_form[:date_from]} label="Date from" />
+            <.cally_date_filter field={@filter_form[:date_to]} label="Date to" />
+          </:advanced>
         </AdminComponents.filter_form>
 
         <div
@@ -205,6 +197,136 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
     </AdminComponents.admin_shell>
     """
   end
+
+  attr :field, Phoenix.HTML.FormField, required: true
+
+  defp request_id_filter(assigns) do
+    assigns = assign(assigns, :value, form_field_value(assigns.field))
+
+    ~H"""
+    <div id="request-log-request-id-filter" class="fieldset mb-2">
+      <label for={@field.id} class="label mb-1">Correlation or row id</label>
+      <div class="input input-sm flex w-full items-center gap-2">
+        <input
+          id={@field.id}
+          name={@field.name}
+          type="text"
+          value={@value}
+          aria-label="Request ID"
+          class="grow text-sm font-normal"
+        />
+        <button
+          id="request-log-request-id-clear"
+          type="button"
+          class={[
+            "grid size-6 shrink-0 place-items-center rounded-full text-base-content/50 transition-colors hover:bg-base-200 hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+            @value == "" && "hidden"
+          ]}
+          phx-click="clear_request_id_filter"
+          aria-label="Clear request id filter"
+        >
+          <.icon name="hero-x-mark" class="size-4" />
+        </button>
+      </div>
+    </div>
+    """
+  end
+
+  attr :field, Phoenix.HTML.FormField, required: true
+  attr :label, :string, required: true
+
+  defp cally_date_filter(assigns) do
+    assigns =
+      assigns
+      |> assign(:id, assigns.field.id)
+      |> assign(:name, assigns.field.name)
+      |> assign(:value, assigns.field.value || "")
+      |> assign(:anchor_name, "--#{String.replace(assigns.field.id, "_", "-")}-cally")
+
+    ~H"""
+    <div
+      id={"#{@id}-picker"}
+      class="fieldset mb-2"
+      phx-hook="CallyDatePicker"
+      data-placeholder="dd/mm/yyyy"
+    >
+      <input type="hidden" id={@id} name={@name} value={@value} />
+      <label class="label mb-1" for={"#{@id}-button"}>{@label}</label>
+      <button
+        id={"#{@id}-button"}
+        type="button"
+        class="input input-sm w-full justify-between gap-2 text-left"
+        aria-label={@label}
+        popovertarget={"#{@id}-popover"}
+        style={"anchor-name: #{@anchor_name};"}
+      >
+        <span class="min-w-0 truncate" data-role="cally-date-label">
+          {if @value == "", do: "dd/mm/yyyy", else: @value}
+        </span>
+        <.icon name="hero-calendar-days" class="size-4 shrink-0 opacity-65" />
+      </button>
+      <div
+        id={"#{@id}-popover"}
+        popover
+        class="dropdown rounded-box border border-base-300 bg-base-100 p-3 text-base-content shadow-xl"
+        style={"position-anchor: #{@anchor_name};"}
+      >
+        <calendar-date
+          class="cally"
+          value={@value}
+          locale="en-GB"
+          data-role="cally-calendar"
+        >
+          <svg
+            aria-label="Previous"
+            class="size-4 fill-current"
+            slot="previous"
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+          >
+            <path d="M15.75 19.5 8.25 12l7.5-7.5"></path>
+          </svg>
+          <svg
+            aria-label="Next"
+            class="size-4 fill-current"
+            slot="next"
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+          >
+            <path d="m8.25 4.5 7.5 7.5-7.5 7.5"></path>
+          </svg>
+          <calendar-month></calendar-month>
+        </calendar-date>
+        <div class="mt-3 grid grid-cols-2 gap-2 border-t border-base-300 pt-3">
+          <button
+            type="button"
+            class="btn btn-secondary btn-sm"
+            data-role="cally-clear"
+          >
+            Clear
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary btn-sm"
+            data-role="cally-cancel"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  defp advanced_filters_open?(filter_values) do
+    Enum.any?(
+      ~w(request_id date_from date_to),
+      &(filter_values[&1] not in [nil, ""])
+    )
+  end
+
+  defp form_field_value(%{value: value}) when is_binary(value), do: value
+  defp form_field_value(_field), do: ""
 
   defp load_request_logs(socket, params) do
     pools = Pools.list_visible_pools(socket.assigns.current_scope)

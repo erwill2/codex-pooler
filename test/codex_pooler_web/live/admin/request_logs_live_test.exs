@@ -94,7 +94,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
 
     assert has_element?(view, "#admin-request-logs-live")
-    assert has_element?(view, "#request-log-filter-form")
+    assert has_element?(view, "#request-log-filter-form[phx-change='filter']")
+    assert has_element?(view, "#request-log-filter-form[phx-submit='filter']")
     assert has_element?(view, "#filters_pool_id")
     assert has_element?(view, "#filters_status")
     assert has_element?(view, "#filters_status")
@@ -105,11 +106,75 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     assert has_element?(view, "#filters_request_id")
     assert has_element?(view, "#request-log-pool-filter [aria-label='Pool']")
     assert has_element?(view, "#request-log-status-filter [aria-label='Status']")
+
     assert has_element?(view, "#request-log-upstream-filter [aria-label='Upstream account']")
     assert has_element?(view, "#request-log-model-filter [aria-label='Model']")
-    assert has_element?(view, "#filters_date_from[aria-label='Date from']")
-    assert has_element?(view, "#filters_date_to[aria-label='Date to']")
-    assert has_element?(view, "#filters_request_id[aria-label='Request ID']")
+    refute has_element?(view, "#request-log-filter-form-advanced #request-log-upstream-filter")
+    refute has_element?(view, "#request-log-filter-form-advanced #request-log-model-filter")
+
+    assert has_element?(view, "#filters_date_from[type='hidden'][name='filters[date_from]']")
+    assert has_element?(view, "#filters_date_to[type='hidden'][name='filters[date_to]']")
+    refute has_element?(view, "input#filters_date_from[type='date']")
+    refute has_element?(view, "input#filters_date_to[type='date']")
+    assert has_element?(view, "#filters_date_from-picker[phx-hook='CallyDatePicker']")
+    assert has_element?(view, "#filters_date_to-picker[phx-hook='CallyDatePicker']")
+
+    assert has_element?(
+             view,
+             "#request-log-filter-form-advanced #filters_date_from-picker button[popovertarget='filters_date_from-popover'][aria-label='Date from']",
+             "dd/mm/yyyy"
+           )
+
+    assert has_element?(
+             view,
+             "#request-log-filter-form-advanced #filters_date_from-popover calendar-date.cally[data-role='cally-calendar'] calendar-month"
+           )
+
+    assert has_element?(
+             view,
+             "#request-log-filter-form-advanced #filters_date_from-popover [data-role='cally-cancel']",
+             "Cancel"
+           )
+
+    assert has_element?(
+             view,
+             "#request-log-filter-form-advanced #request-log-request-id-filter #filters_request_id"
+           )
+
+    assert has_element?(
+             view,
+             "#request-log-filter-form-advanced #request-log-request-id-filter label[for='filters_request_id']",
+             "Correlation or row id"
+           )
+
+    refute has_element?(view, "#filters_request_id[placeholder]")
+
+    assert has_element?(
+             view,
+             "#request-log-filter-form-advanced #request-log-request-id-clear[aria-label='Clear request id filter']"
+           )
+
+    assert has_element?(view, "#request-log-request-id-clear.hidden")
+
+    {:ok, filtered_view, _html} = live(conn, ~p"/admin/request-logs?request_id=req-live-1")
+
+    assert has_element?(filtered_view, "#request-log-filter-form-advanced[open]")
+    assert has_element?(filtered_view, "#filters_request_id[value='req-live-1']")
+    refute has_element?(filtered_view, "#request-log-request-id-clear.hidden")
+
+    refute has_element?(view, "#request-log-filter-submit")
+    refute has_element?(view, "#request-log-filter-reset")
+
+    assert has_element?(
+             view,
+             ~s(#request-log-filter-form > div > div[class*="grid-cols-1"][class*="sm:grid-cols-2"][class*="lg:grid-cols-4"])
+           )
+
+    assert has_element?(
+             view,
+             ~s(#request-log-filter-form-advanced > div[class*="grid-cols-1"][class*="sm:grid-cols-2"])
+           )
+
     refute has_element?(view, "#request-log-summary")
     refute has_element?(view, "#request-log-page-size")
 
