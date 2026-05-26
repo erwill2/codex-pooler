@@ -3726,9 +3726,107 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert Decimal.equal?(settlement.settled_cost_micros, Decimal.new(100))
   end
 
-  test "POST /backend-api/codex/responses retries only within the bridge ring shortlist", %{
-    conn: conn
-  } do
+  test "POST /backend-api/codex/responses bridge_ring retries only within the default shortlist",
+       %{
+         conn: conn
+       } do
+    retryable_upstream = start_upstream(FakeUpstream.http_500_json_error())
+
+    shortlisted_success_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_bridge_ring_shortlist_success",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    excluded_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_bridge_ring_excluded_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(retryable_upstream)
+
+    shortlisted_success =
+      gateway_upstream(setup.pool, shortlisted_success_upstream, "upstream-token-shortlisted",
+        compact?: false
+      )
+
+    excluded =
+      gateway_upstream(setup.pool, excluded_upstream, "upstream-token-excluded", compact?: false)
+
+    prime_routing_quota!(shortlisted_success.identity)
+    prime_routing_quota!(excluded.identity)
+    use_routing_strategy!(setup.pool, "bridge_ring", 2)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [
+          setup.assignment,
+          shortlisted_success.assignment,
+          excluded.assignment
+        ])
+      )
+
+    request_id =
+      seed_with_assignment_order([
+        setup.assignment.id,
+        shortlisted_success.assignment.id,
+        excluded.assignment.id
+      ])
+
+    conn =
+      conn
+      |> put_req_header("x-request-id", request_id)
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "bridge ring retry metadata sentinel"
+      })
+
+    assert %{"id" => "resp_bridge_ring_shortlist_success"} = json_response(conn, 200)
+    assert FakeUpstream.count(retryable_upstream) == 1
+    assert FakeUpstream.count(shortlisted_success_upstream) == 1
+    assert FakeUpstream.count(excluded_upstream) == 0
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert first_attempt.status == "retryable_failed"
+    assert second_attempt.pool_upstream_assignment_id == shortlisted_success.assignment.id
+    assert second_attempt.status == "succeeded"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.transport == "http_json"
+    assert request.retry_count == 1
+
+    assert_http_json_routing_metadata!(request, "bridge_ring", shortlisted_success.assignment, 2)
+
+    assert_attempt_routing_metadata!(first_attempt, setup.assignment, setup.identity, 1)
+
+    assert_attempt_routing_metadata!(
+      second_attempt,
+      shortlisted_success.assignment,
+      shortlisted_success.identity,
+      2
+    )
+
+    assert_safe_runtime_routing_metadata!(request, [first_attempt, second_attempt], setup)
+  end
+
+  test "POST /backend-api/codex/responses deterministic_rotation retries only within the bridge ring shortlist",
+       %{
+         conn: conn
+       } do
     retryable_upstream = start_upstream(FakeUpstream.http_500_json_error())
 
     shortlisted_success_upstream =
@@ -3761,15 +3859,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     prime_routing_quota!(shortlisted_success.identity)
     prime_routing_quota!(excluded.identity)
-
-    setup.pool
-    |> Pools.ensure_routing_settings()
-    |> Ecto.Changeset.change(%{
-      routing_strategy: "deterministic_rotation",
-      bridge_ring_size: 2,
-      updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    })
-    |> Repo.update!()
+    use_routing_strategy!(setup.pool, "deterministic_rotation", 2)
 
     setup =
       Map.put(
@@ -3805,6 +3895,28 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert first_attempt.status == "retryable_failed"
     assert second_attempt.pool_upstream_assignment_id == shortlisted_success.assignment.id
     assert second_attempt.status == "succeeded"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.retry_count == 1
+
+    assert_http_json_routing_metadata!(
+      request,
+      "deterministic_rotation",
+      shortlisted_success.assignment,
+      2
+    )
+
+    assert_attempt_routing_metadata!(first_attempt, setup.assignment, setup.identity, 1)
+
+    assert_attempt_routing_metadata!(
+      second_attempt,
+      shortlisted_success.assignment,
+      shortlisted_success.identity,
+      2
+    )
+
+    assert_safe_runtime_routing_metadata!(request, [first_attempt, second_attempt], setup)
   end
 
   test "POST /backend-api/codex/responses least_recent_success selects oldest successful assignment",
@@ -3869,7 +3981,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         newer_success.assignment.id
       )
 
-    conn =
+    first_conn =
       conn
       |> put_req_header("x-request-id", request_id)
       |> auth(setup)
@@ -3878,12 +3990,82 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         "input" => "least recent success route"
       })
 
-    assert %{"id" => "resp_oldest_success_assignment"} = json_response(conn, 200)
+    assert %{"id" => "resp_oldest_success_assignment"} = json_response(first_conn, 200)
     assert FakeUpstream.count(older_success_upstream) == 1
     assert FakeUpstream.count(newer_success_upstream) == 0
+
+    second_request_id =
+      seed_preferring_assignment(
+        [setup.assignment.id, newer_success.assignment.id],
+        setup.assignment.id
+      )
+
+    second_conn =
+      build_conn()
+      |> put_req_header("x-request-id", second_request_id)
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "least recent success moves after runtime success"
+      })
+
+    assert %{"id" => "resp_newer_success_assignment"} = json_response(second_conn, 200)
+    assert FakeUpstream.count(older_success_upstream) == 1
+    assert FakeUpstream.count(newer_success_upstream) == 1
+
+    [runtime_first_request, runtime_second_request] =
+      Repo.all(
+        from(r in Request,
+          where: r.pool_id == ^setup.pool.id,
+          order_by: [desc: r.admitted_at],
+          limit: 2
+        )
+      )
+      |> Enum.reverse()
+
+    assert runtime_first_request.status == "succeeded"
+    assert runtime_second_request.status == "succeeded"
+
+    runtime_request_ids = [runtime_first_request.id, runtime_second_request.id]
+
+    [runtime_first_attempt, runtime_second_attempt] =
+      Repo.all(
+        from(a in Attempt,
+          where: a.request_id in ^runtime_request_ids,
+          order_by: [asc: a.started_at, asc: a.attempt_number, asc: a.id]
+        )
+      )
+
+    assert runtime_first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert runtime_second_attempt.pool_upstream_assignment_id == newer_success.assignment.id
+
+    assert_http_json_routing_metadata!(
+      runtime_first_request,
+      "least_recent_success",
+      setup.assignment,
+      2
+    )
+
+    assert_http_json_routing_metadata!(
+      runtime_second_request,
+      "least_recent_success",
+      newer_success.assignment,
+      2
+    )
+
+    assert_attempt_routing_metadata!(runtime_first_attempt, setup.assignment, setup.identity, 1)
+
+    assert_attempt_routing_metadata!(
+      runtime_second_attempt,
+      newer_success.assignment,
+      newer_success.identity,
+      1
+    )
+
+    assert_safe_runtime_routing_metadata!(runtime_second_request, [runtime_second_attempt], setup)
   end
 
-  test "POST /backend-api/codex/responses quota_first selects highest quota headroom assignment",
+  test "POST /backend-api/codex/responses quota_first selects highest usable quota headroom assignment",
        %{conn: conn} do
     low_headroom_upstream =
       start_upstream(
@@ -3903,6 +4085,24 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         })
       )
 
+    exhausted_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_exhausted_quota_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    resetless_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_resetless_quota_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
     setup = gateway_setup(low_headroom_upstream, quota?: false)
 
     high_headroom =
@@ -3910,17 +4110,34 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         compact?: false
       )
 
+    exhausted =
+      gateway_upstream(setup.pool, exhausted_upstream, "upstream-token-exhausted-quota",
+        compact?: false
+      )
+
+    resetless =
+      gateway_upstream(setup.pool, resetless_upstream, "upstream-token-resetless-quota",
+        compact?: false
+      )
+
     prime_routing_quota!(setup.identity, %{used_percent: Decimal.new("90")})
     prime_routing_quota!(high_headroom.identity, %{used_percent: Decimal.new("10")})
+    prime_exhausted_routing_quota!(exhausted.identity)
+    prime_resetless_routing_quota!(resetless.identity)
 
     setup =
       Map.put(
         setup,
         :model,
-        put_model_source_assignments!(setup.model, [setup.assignment, high_headroom.assignment])
+        put_model_source_assignments!(setup.model, [
+          setup.assignment,
+          high_headroom.assignment,
+          exhausted.assignment,
+          resetless.assignment
+        ])
       )
 
-    use_routing_strategy!(setup.pool, "quota_first", 2)
+    use_routing_strategy!(setup.pool, "quota_first", 4)
 
     request_id =
       seed_preferring_assignment(
@@ -3934,16 +4151,161 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       |> auth(setup)
       |> post("/backend-api/codex/responses", %{
         "model" => setup.model.exposed_model_id,
-        "input" => "quota first route"
+        "input" => "quota first route metadata sentinel"
       })
 
     assert %{"id" => "resp_high_headroom_assignment"} = json_response(conn, 200)
     assert FakeUpstream.count(low_headroom_upstream) == 0
     assert FakeUpstream.count(high_headroom_upstream) == 1
+    assert FakeUpstream.count(exhausted_upstream) == 0
+    assert FakeUpstream.count(resetless_upstream) == 0
+
+    assert [attempt] = Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+    assert attempt.pool_upstream_assignment_id == high_headroom.assignment.id
+    assert attempt.status == "succeeded"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert get_in(request.request_metadata, ["quota_decision", "routing_state"]) == "precise"
+    assert get_in(request.request_metadata, ["quota_decision", "eligible_candidate_count"]) == 2
+
+    assert get_in(request.request_metadata, ["quota_decision", "precise_candidate_count"]) == 2
+
+    assert_http_json_routing_metadata!(request, "quota_first", high_headroom.assignment, 4)
+
+    assert_attempt_routing_metadata!(attempt, high_headroom.assignment, high_headroom.identity, 1)
+    assert_safe_runtime_routing_metadata!(request, [attempt], setup)
   end
 
-  @tag :task_8_sse_failure
-  test "SSE upstream read failure after visible output demotes without retrying fallback" do
+  @tag :task_5_sse_strategy_reliability
+  test "SSE bridge_ring first-event retry stays within the strategy shortlist" do
+    retryable_upstream =
+      start_upstream(first_event_terminal_sse("response.failed", "upstream_request_timeout"))
+
+    shortlisted_success_upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_sse_bridge_ring_shortlist_success",
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    excluded_upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_sse_excluded_should_not_run",
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(retryable_upstream)
+
+    shortlisted_success =
+      gateway_upstream(setup.pool, shortlisted_success_upstream, "upstream-token-sse-shortlisted",
+        compact?: false
+      )
+
+    excluded =
+      gateway_upstream(setup.pool, excluded_upstream, "upstream-token-sse-excluded",
+        compact?: false
+      )
+
+    prime_routing_quota!(shortlisted_success.identity)
+    prime_routing_quota!(excluded.identity)
+    use_routing_strategy!(setup.pool, "bridge_ring", 2)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [
+          setup.assignment,
+          shortlisted_success.assignment,
+          excluded.assignment
+        ])
+      )
+
+    request_id =
+      seed_with_assignment_order([
+        setup.assignment.id,
+        shortlisted_success.assignment.id,
+        excluded.assignment.id
+      ])
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert {:ok, %{stream: stream}} =
+             execute_gateway_service(
+               auth,
+               "/backend-api/codex/responses",
+               %{
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "sse bridge ring retry fixture",
+                 "stream" => true
+               },
+               %{
+                 request_id: request_id,
+                 upstream_endpoint: "/backend-api/codex/responses"
+               }
+             )
+
+    stream_conn =
+      Phoenix.ConnTest.build_conn()
+      |> Plug.Conn.put_resp_content_type("text/event-stream")
+      |> Plug.Conn.send_chunked(200)
+
+    assert {:ok, stream_conn} = stream.(stream_conn)
+    assert stream_conn.resp_body =~ "resp_sse_bridge_ring_shortlist_success"
+    assert stream_conn.resp_body =~ "data: [DONE]\n\n"
+
+    assert FakeUpstream.count(retryable_upstream) == 1
+    assert FakeUpstream.count(shortlisted_success_upstream) == 1
+    assert FakeUpstream.count(excluded_upstream) == 0
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert first_attempt.status == "retryable_failed"
+    assert first_attempt.network_error_code == "upstream_request_timeout"
+    assert first_attempt.response_metadata["stream_failure_stage"] == "first_event"
+    assert first_attempt.response_metadata["stream_error_code"] == "upstream_request_timeout"
+
+    assert second_attempt.pool_upstream_assignment_id == shortlisted_success.assignment.id
+    assert second_attempt.status == "succeeded"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.transport == "http_sse"
+    assert request.retry_count == 1
+
+    assert_http_sse_routing_metadata!(request, "bridge_ring", shortlisted_success.assignment, 2)
+    assert_attempt_routing_metadata!(first_attempt, setup.assignment, setup.identity, 1)
+
+    assert_attempt_routing_metadata!(
+      second_attempt,
+      shortlisted_success.assignment,
+      shortlisted_success.identity,
+      2
+    )
+
+    assert_safe_runtime_routing_metadata!(request, [first_attempt, second_attempt], setup)
+  end
+
+  @tag :task_5_sse_strategy_reliability
+  test "SSE deterministic_rotation visible interruption demotes without hidden fallback" do
     release_ref = make_ref()
 
     failing_upstream =
@@ -3969,19 +4331,41 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         ])
       )
 
+    excluded_upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_stream_excluded_should_not_run",
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
     setup = gateway_setup(failing_upstream)
 
     fallback =
       gateway_upstream(setup.pool, fallback_upstream, "upstream-token-fallback", compact?: false)
 
+    excluded =
+      gateway_upstream(setup.pool, excluded_upstream, "upstream-token-excluded", compact?: false)
+
     prime_routing_quota!(fallback.identity)
-    use_deterministic_rotation!(setup.pool, 2)
+    prime_routing_quota!(excluded.identity)
+    use_routing_strategy!(setup.pool, "deterministic_rotation", 2)
 
     setup =
       Map.put(
         setup,
         :model,
-        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+        put_model_source_assignments!(setup.model, [
+          setup.assignment,
+          fallback.assignment,
+          excluded.assignment
+        ])
       )
 
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
@@ -3996,7 +4380,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
                  "stream" => true
                },
                %{
-                 request_id: deterministic_rotation_seed(2, 0),
+                 request_id: deterministic_rotation_seed(3, 0),
                  upstream_endpoint: "/backend-api/codex/responses",
                  receive_timeout: 100
                }
@@ -4018,20 +4402,28 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     assert FakeUpstream.count(failing_upstream) == 1
     assert FakeUpstream.count(fallback_upstream) == 0
+    assert FakeUpstream.count(excluded_upstream) == 0
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "failed"
     assert request.transport == "http_sse"
     assert request.last_error_code == "stream_idle_timeout"
+    assert_http_sse_routing_metadata!(request, "deterministic_rotation", setup.assignment, 2)
+
+    assert get_in(request.request_metadata, ["routing", "demotion_reason"]) ==
+             "stream_idle_timeout"
 
     assert [attempt] = Repo.all(from(a in Attempt))
     assert attempt.status == "failed"
     assert attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert attempt.network_error_code == "stream_idle_timeout"
+    assert_attempt_routing_metadata!(attempt, setup.assignment, setup.identity, 1)
 
     assert [demotion] = Repo.all(from(d in BridgeDemotion))
     assert demotion.pool_upstream_assignment_id == setup.assignment.id
     assert demotion.reason_code == "stream_idle_timeout"
     assert demotion.status == "active"
+    assert demotion.metadata == %{"source" => "gateway_failure"}
 
     assert [circuit] =
              Repo.all(from(c in RoutingCircuitState, where: c.route_class == "proxy_stream"))
@@ -4039,6 +4431,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert circuit.pool_upstream_assignment_id == setup.assignment.id
     assert circuit.reason_code == "stream_idle_timeout"
     assert circuit.failure_count == 1
+
+    assert_safe_runtime_routing_metadata!(request, [attempt], setup)
   end
 
   test "SSE upstream read timeout after downstream keepalives remains upstream idle", %{
@@ -5873,6 +6267,64 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute metadata_text =~ setup.authorization
     refute metadata_text =~ "upstream-token-stale"
     refute metadata_text =~ "upstream-token-resetless"
+  end
+
+  defp seed_with_assignment_order(assignment_ids) do
+    Enum.find_value(1..500, fn index ->
+      seed = "bridge-ring-ordered-seed-#{index}"
+
+      ordered_ids =
+        assignment_ids
+        |> Enum.sort_by(&rendezvous_score(seed, &1), :desc)
+
+      if ordered_ids == assignment_ids, do: seed
+    end) || raise "missing bridge ring ordered seed"
+  end
+
+  defp assert_http_sse_routing_metadata!(request, strategy, assignment, ring_size) do
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "http_sse"
+
+    assert %{"routing" => routing} = request.request_metadata
+    assert routing["strategy"] == strategy
+    assert routing["bridge_ring_size"] == ring_size
+    assert routing["selected_bridge_candidate_id"] == assignment.id
+    assert routing["affinity_enabled"] in [true, false]
+    assert routing["affinity_status"] in ["disabled", "miss", "hit"]
+    assert is_boolean(routing["affinity_hit"])
+  end
+
+  defp assert_http_json_routing_metadata!(request, strategy, assignment, ring_size) do
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "http_json"
+
+    assert %{"routing" => routing} = request.request_metadata
+    assert routing["strategy"] == strategy
+    assert routing["bridge_ring_size"] == ring_size
+    assert routing["selected_bridge_candidate_id"] == assignment.id
+    assert routing["affinity_enabled"] in [true, false]
+    assert routing["affinity_status"] in ["disabled", "miss", "hit"]
+    assert is_boolean(routing["affinity_hit"])
+  end
+
+  defp assert_attempt_routing_metadata!(attempt, assignment, identity, rank) do
+    assert %{"routing" => routing} = attempt.response_metadata
+    assert routing["bridge_candidate_id"] == assignment.id
+    assert routing["bridge_candidate_rank"] == rank
+    assert routing["upstream_identity_id"] == identity.id
+  end
+
+  defp assert_safe_runtime_routing_metadata!(request, attempts, setup) do
+    metadata_text =
+      inspect({request.request_metadata, Enum.map(attempts, & &1.response_metadata)})
+
+    refute metadata_text =~ "metadata sentinel"
+    refute metadata_text =~ "retry within shortlist"
+    refute metadata_text =~ "least recent success"
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ setup.raw_key
+    refute metadata_text =~ "Bearer "
+    refute metadata_text =~ "upstream-token"
   end
 
   defp disable_control_plane_analytics_forwarding!(pool) do

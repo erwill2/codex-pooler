@@ -174,6 +174,142 @@ defmodule CodexPoolerWeb.Runtime.BackendFileRoutingTest do
     refute Enum.any?(create_request.headers, fn {name, _value} -> name == "x-ignore-this" end)
   end
 
+  @tag :upstream_file_assignment_continuity
+  test "multipart create uploads and finalizes through the selected file bridge assignment", %{
+    conn: conn
+  } do
+    setup = active_api_key_fixture()
+    file_id = "file_assignment_continuity_#{System.unique_integer([:positive])}"
+    filename = "assignment-continuity-private.txt"
+    file_contents = "synthetic assignment continuity bytes"
+    file_size = byte_size(file_contents)
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.file_protocol_success(
+          file_id: "file_assignment_continuity_fallback",
+          file_name: "fallback.txt",
+          mime_type: "text/plain"
+        )
+      )
+
+    fallback_assignment =
+      active_upstream_assignment_fixture(setup.pool, %{
+        chatgpt_account_id: "acct_file_continuity_fallback_#{System.unique_integer([:positive])}",
+        metadata: %{"base_url" => FakeUpstream.url(fallback_upstream)},
+        access_token: "file-continuity-fallback-token"
+      })
+
+    selected_upstream = start_upstream(FakeUpstream.file_protocol_success(file_id: file_id))
+
+    FakeUpstream.set_mode(
+      selected_upstream,
+      FakeUpstream.file_protocol_success(
+        file_id: file_id,
+        file_name: filename,
+        mime_type: "text/plain",
+        upload_url: FakeUpstream.url(selected_upstream) <> "/upload/#{file_id}"
+      )
+    )
+
+    selected_assignment =
+      active_upstream_assignment_fixture(setup.pool, %{
+        chatgpt_account_id: "acct_file_continuity_selected_#{System.unique_integer([:positive])}",
+        metadata: %{"base_url" => FakeUpstream.url(selected_upstream)},
+        access_token: "file-continuity-selected-token"
+      })
+
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(fallback_assignment.identity, [
+               %{
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 used_percent: Decimal.new("100"),
+                 reset_at: reset_at,
+                 source: "codex_response_headers",
+                 source_precision: "observed",
+                 freshness_state: "fresh"
+               }
+             ])
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(selected_assignment.identity, [
+               %{
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 used_percent: Decimal.new("1"),
+                 reset_at: reset_at,
+                 source: "codex_response_headers",
+                 source_precision: "observed",
+                 freshness_state: "fresh"
+               }
+             ])
+
+    upload = upload_fixture(filename, "text/plain", file_contents)
+
+    create_conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/files", %{"purpose" => "user_data", "file" => upload})
+
+    assert %{
+             "id" => ^file_id,
+             "object" => "file",
+             "bytes" => ^file_size,
+             "filename" => ^filename,
+             "purpose" => "user_data",
+             "status" => "uploaded"
+           } = create_body = json_response(create_conn, 200)
+
+    refute Map.has_key?(create_body, "upload_url")
+
+    file = Repo.get_by!(FileRecord, file_id: file_id)
+    assert file.pool_upstream_assignment_id == selected_assignment.assignment.id
+    assert file.upstream_identity_id == selected_assignment.identity.id
+    assert file.status == "uploaded"
+    assert file.finalize_status == "succeeded"
+
+    assert [create_request, put_request, finalize_request] =
+             FakeUpstream.requests(selected_upstream)
+
+    assert create_request.path == "/backend-api/files"
+    assert put_request.method == "PUT"
+    assert put_request.path == "/upload/#{file_id}"
+    assert put_request.body == file_contents
+    assert finalize_request.path == "/backend-api/files/#{file_id}/uploaded"
+    assert FakeUpstream.requests(fallback_upstream) == []
+
+    public_create_request =
+      Repo.one!(
+        from request in Request,
+          where:
+            request.pool_id == ^setup.pool.id and request.api_key_id == ^setup.api_key.id and
+              request.endpoint == "/v1/files" and request.status == "succeeded"
+      )
+
+    assert public_create_request.endpoint == "/v1/files"
+    assert public_create_request.transport == "http_multipart"
+    assert public_create_request.request_metadata["operation"] == "uploaded"
+
+    routing_metadata = public_create_request.request_metadata["routing"]
+    assert routing_metadata["route_class"] == "file_upload"
+
+    assert routing_metadata["selected_bridge_candidate_id"] ==
+             selected_assignment.assignment.id
+
+    metadata_text = inspect(public_create_request.request_metadata)
+    refute metadata_text =~ filename
+    refute metadata_text =~ file_contents
+    refute metadata_text =~ "upload_url"
+    refute metadata_text =~ FakeUpstream.url(selected_upstream)
+    refute metadata_text =~ setup.raw_key
+    refute metadata_text =~ "file-continuity-selected-token"
+    refute metadata_text =~ "file-continuity-fallback-token"
+    refute metadata_text =~ "Bearer"
+  end
+
   @tag :upstream_file_create_bridge
   test "prefers a quota-usable file bridge assignment when an earlier assignment is exhausted", %{
     conn: conn
@@ -537,6 +673,18 @@ defmodule CodexPoolerWeb.Runtime.BackendFileRoutingTest do
     assert failed_request.status == "failed"
     assert failed_request.request_metadata["error_code"] == "file_not_found"
     refute inspect(failed_request.request_metadata) =~ missing_file_id
+  end
+
+  defp upload_fixture(filename, content_type, contents) do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "codex-pooler-routing-file-#{System.unique_integer([:positive])}"
+      )
+
+    File.write!(path, contents)
+    on_exit(fn -> File.rm(path) end)
+    %Plug.Upload{path: path, filename: filename, content_type: content_type}
   end
 
   defp header!(headers, name) do

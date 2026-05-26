@@ -2313,8 +2313,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert [request | _rest] =
              Repo.all(from request in Request, order_by: [desc: request.admitted_at])
 
+    assert request.request_metadata["routing"]["strategy"] == "least_recent_success"
     assert request.request_metadata["routing"]["affinity_status"] == "hit"
     assert request.request_metadata["routing"]["affinity_kind"] == "codex_session"
+
+    assert request.request_metadata["routing"]["selected_bridge_candidate_id"] ==
+             first_assignment.id
+
+    metadata_text = inspect(request.request_metadata)
+    refute metadata_text =~ "second ws"
+    refute metadata_text =~ "resp_ws_second"
   end
 
   @tag :websocket_session_assignment_unavailable
@@ -2396,6 +2404,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert denied_request.status == "rejected"
     assert denied_request.last_error_code == "session_assignment_unavailable"
     refute denied_request.last_error_code == "stream_incomplete"
+
+    metadata_text = inspect(denied_request.request_metadata || %{})
+    refute metadata_text =~ "second ws"
+    refute metadata_text =~ "resp_ws_unavailable_first"
   end
 
   @tag :task_6_websocket_resume
@@ -3045,6 +3057,20 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert %{"id" => "resp_sticky_demoted_session"} = Jason.decode!(frame)
     assert FakeUpstream.count(sticky_upstream) == 1
     assert FakeUpstream.count(fallback_upstream) == 0
+
+    assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+    request = Repo.get!(Request, turn.request_id)
+    assert request.transport == "websocket"
+    assert request.endpoint == "/backend-api/codex/responses"
+
+    assert get_in(request.request_metadata, ["routing", "affinity_kind"]) == "codex_session"
+
+    assert get_in(request.request_metadata, ["routing", "selected_bridge_candidate_id"]) ==
+             setup.assignment.id
+
+    metadata_text = inspect(request.request_metadata)
+    refute metadata_text =~ "preserve sticky session assignment"
+    refute metadata_text =~ "resp_sticky_demoted_session"
 
     assert [attempt] = Repo.all(from(a in Attempt))
     assert attempt.pool_upstream_assignment_id == setup.assignment.id
