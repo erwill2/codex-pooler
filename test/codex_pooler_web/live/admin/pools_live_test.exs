@@ -313,7 +313,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert has_element?(
              view,
-             "#pool-row-#{pool.id}-quota-primary-5h [phx-hook='QuotaPressureChart']"
+             "#pool-row-#{pool.id}-quota-primary-5h [phx-hook='QuotaPressureChart'][phx-update='ignore']"
            )
 
     refute has_element?(view, "#pool-row-#{pool.id}-quota-primary-5h", "Total 1.5K")
@@ -530,7 +530,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert has_element?(
              view,
-             "#pool-row-#{pool.id}-traffic-histogram-plot[phx-hook='ApexTimeSeriesChart']"
+             "#pool-row-#{pool.id}-traffic-histogram-plot[phx-hook='ApexTimeSeriesChart'][phx-update='ignore']"
            )
 
     assert has_element?(

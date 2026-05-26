@@ -53,6 +53,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
         id={"#{@id}-plot"}
         class="admin-apex-bar-chart mt-4 w-full"
         phx-hook="ApexTimeSeriesChart"
+        phx-update="ignore"
         role="img"
         aria-labelledby={"#{@id}-title #{@id}-desc"}
         data-chart-categories={@chart.categories}

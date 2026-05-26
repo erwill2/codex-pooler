@@ -377,14 +377,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
   defp quota_limit_percent_class(_limit), do: "tabular-nums font-medium text-base-content/50"
 
   defp quota_limit_progress_class(%{percent: %Decimal{} = percent}) do
-    cond do
-      Decimal.compare(percent, Decimal.new(70)) != :lt -> "progress progress-success h-1.5 w-full"
-      Decimal.compare(percent, Decimal.new(30)) != :lt -> "progress progress-warning h-1.5 w-full"
-      true -> "progress progress-error h-1.5 w-full"
-    end
+    tone_class =
+      cond do
+        Decimal.compare(percent, Decimal.new(70)) != :lt -> "progress-success"
+        Decimal.compare(percent, Decimal.new(30)) != :lt -> "progress-warning"
+        true -> "progress-error"
+      end
+
+    "progress admin-live-progress #{tone_class} h-1.5 w-full"
   end
 
-  defp quota_limit_progress_class(_limit), do: "progress progress-neutral h-1.5 w-full"
+  defp quota_limit_progress_class(_limit),
+    do: "progress admin-live-progress progress-neutral h-1.5 w-full"
 
   defp account_plan_label_id(account, _index),
     do: "upstream-account-#{account.identity.id}-plan-label"

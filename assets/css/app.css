@@ -662,6 +662,25 @@ body {
   line-height: 1.15rem;
 }
 
+.admin-live-progress::-webkit-progress-value {
+  transition:
+    width 260ms ease,
+    background-color 180ms ease;
+}
+
+.admin-live-progress::-moz-progress-bar {
+  transition:
+    width 260ms ease,
+    background-color 180ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .admin-live-progress::-webkit-progress-value,
+  .admin-live-progress::-moz-progress-bar {
+    transition: none;
+  }
+}
+
 .admin-apex-bar-chart {
   min-width: 0;
 }

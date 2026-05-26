@@ -444,6 +444,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           id={"pool-row-#{@pool_row.pool.id}-traffic-histogram-plot"}
           class="pool-token-histogram-plot admin-apex-bar-chart"
           phx-hook="ApexTimeSeriesChart"
+          phx-update="ignore"
           role="img"
           aria-label={@traffic_histogram_card.aria_label}
           data-chart-categories={@traffic_histogram_card.categories}
@@ -483,6 +484,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
                 data-role="pool-quota-donut"
                 class="pool-quota-donut"
                 phx-hook="QuotaPressureChart"
+                phx-update="ignore"
                 data-value={card.chart_value}
                 data-label={card.chart_label}
                 data-color={card.chart_color}

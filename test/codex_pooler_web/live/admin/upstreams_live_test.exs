@@ -307,7 +307,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-account-#{identity.id}-limit-weekly-progress[value='90']"
+             "#upstream-account-#{identity.id}-limit-weekly-progress.admin-live-progress[value='90']"
            )
 
     assert has_element?(
