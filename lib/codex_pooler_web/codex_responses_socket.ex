@@ -96,6 +96,17 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       :stale_owner ->
         {:ok, state}
 
+      :owner_drained ->
+        {:error, :owner_drained}
+        |> recover_owner_lifecycle_leftovers(state)
+        |> log_owner_monitor_recovery(state, reason)
+
+        state
+        |> release_owner_lease("owner_drained")
+        |> log_owner_monitor_lease_release(state, reason)
+
+        {:ok, state}
+
       :owner_crashed ->
         {:error, :owner_crashed}
         |> recover_owner_lifecycle_leftovers(state)
@@ -198,6 +209,9 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
   defp owner_monitor_down_reason(:stale_owner), do: :stale_owner
   defp owner_monitor_down_reason({:shutdown, :stale_owner}), do: :stale_owner
+  defp owner_monitor_down_reason(:normal), do: :owner_drained
+  defp owner_monitor_down_reason(:shutdown), do: :owner_drained
+  defp owner_monitor_down_reason({:shutdown, _details}), do: :owner_drained
   defp owner_monitor_down_reason(_reason), do: :owner_crashed
 
   defp log_owner_monitor_recovery({:ok, _result}, _state, _reason), do: :ok
@@ -439,7 +453,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   defp interrupt_owner_downstream_turn(_result, _state), do: :ok
 
   defp recover_owner_lifecycle_leftovers({:error, reason}, state)
-       when reason in [:owner_unavailable, :owner_forward_timeout, :owner_crashed] do
+       when reason in [:owner_unavailable, :owner_forward_timeout, :owner_crashed, :owner_drained] do
     state
     |> Map.get(:codex_session)
     |> Gateway.recover_owner_lifecycle_leftovers(
@@ -472,7 +486,12 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp owner_lifecycle_interrupt_reason(reason)
-       when reason in ["owner_unavailable", "owner_forward_timeout", "owner_crashed"],
+       when reason in [
+              "owner_unavailable",
+              "owner_forward_timeout",
+              "owner_crashed",
+              "owner_drained"
+            ],
        do: reason
 
   defp owner_lifecycle_interrupt_reason(_reason), do: "owner_unavailable"

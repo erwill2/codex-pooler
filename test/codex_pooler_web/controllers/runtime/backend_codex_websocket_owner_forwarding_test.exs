@@ -946,64 +946,92 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     )
   end
 
-  test "owner monitor normal and shutdown exits remain owner crashed at socket boundary" do
-    Enum.each([{:normal, "normal"}, {:shutdown, "shutdown"}], fn {owner_reason, suffix} ->
-      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_#{suffix}"}))
-      setup = gateway_setup(upstream)
-      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+  test "unexpected owner monitor exit still crashes active turn" do
+    assert_abnormal_owner_monitor_down_crashes_active_turn!(
+      {:unexpected_owner_exit, :boom},
+      "unexpected-exit"
+    )
+  end
 
-      {:ok, state} =
-        CodexResponsesSocket.init(%{
-          auth: auth,
-          opts: %{
-            request_id: "ws-owner-monitor-#{suffix}",
-            accepted_turn_state: "stable-ws-owner-monitor-#{suffix}",
-            client_ip: "127.0.0.1"
-          }
-        })
+  test "owner monitor normal exit drains active turn without closing websocket" do
+    assert_graceful_owner_monitor_down_drains_active_turn!(:normal, "normal")
+  end
 
-      %{request: request, attempt: attempt, turn: turn} =
-        active_turn_fixture(setup, auth, state.codex_session)
+  test "owner monitor shutdown exit drains active turn and finalizes request attempt turn" do
+    assert_graceful_owner_monitor_down_drains_active_turn!(:shutdown, "shutdown")
+  end
 
-      {owner_pid, owner_monitor, owner_down} = owner_monitor_down(owner_reason)
+  test "owner monitor rolling restart exit drains active turn and releases lease" do
+    assert_graceful_owner_monitor_down_drains_active_turn!(
+      {:shutdown, :rolling_restart},
+      "rolling-restart"
+    )
+  end
 
-      monitored_state = %{
-        state
-        | websocket_owner_pid: owner_pid,
-          websocket_owner_monitor: owner_monitor
-      }
+  test "idle owner monitor shutdown exit drains lease without warning or finalization" do
+    upstream =
+      start_upstream(FakeUpstream.json_response(%{"id" => "resp_idle_owner_shutdown"}))
 
-      {handle_result, logs} =
-        with_log(fn -> CodexResponsesSocket.handle_info(owner_down, monitored_state) end)
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
-      assert {:stop, :owner_crashed, {1011, "websocket owner crashed"}, stopped_state} =
-               handle_result
-
-      refute Map.has_key?(stopped_state, :websocket_owner_monitor)
-      refute Map.has_key?(stopped_state, :websocket_owner_pid)
-      refute logs =~ "owner_unavailable_takeover"
-      refute logs =~ "owner_drained"
-      refute logs =~ "client_disconnected"
-      assert_no_leak!("owner #{suffix} monitor logs", logs)
-
-      assert_owner_interruption_state!(%{
-        request: request,
-        attempt: attempt,
-        turn: turn,
-        session: state.codex_session,
-        error_code: "owner_crashed"
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-owner-monitor-idle-shutdown",
+          accepted_turn_state: "stable-ws-owner-monitor-idle-shutdown",
+          client_ip: "127.0.0.1"
+        }
       })
 
-      assert released_owner_lease(
-               state.codex_session.id,
-               state.codex_session.owner_lease_token
-             ).metadata["release_reason"] == "owner_crashed"
+    {owner_pid, owner_monitor, owner_down} = owner_monitor_down(:shutdown)
 
-      CodexResponsesSocket.terminate(
-        :closed,
-        Map.delete(stopped_state, :websocket_owner_downstream)
-      )
-    end)
+    monitored_state = %{
+      state
+      | websocket_owner_pid: owner_pid,
+        websocket_owner_monitor: owner_monitor
+    }
+
+    {handle_result, warning_logs} =
+      with_log([level: :warning], fn ->
+        CodexResponsesSocket.handle_info(owner_down, monitored_state)
+      end)
+
+    assert {:ok, kept_state} = handle_result
+    refute Map.has_key?(kept_state, :websocket_owner_monitor)
+    refute Map.has_key?(kept_state, :websocket_owner_pid)
+    assert warning_logs == ""
+    assert_no_leak!("idle owner shutdown monitor logs", warning_logs)
+
+    assert released_owner_lease(
+             state.codex_session.id,
+             state.codex_session.owner_lease_token
+           ).metadata["release_reason"] == "owner_drained"
+
+    assert Repo.aggregate(
+             from(r in Request, where: r.pool_id == ^setup.pool.id),
+             :count
+           ) == 0
+
+    assert Repo.aggregate(
+             from(a in Attempt,
+               join: r in Request,
+               on: a.request_id == r.id,
+               where: r.pool_id == ^setup.pool.id
+             ),
+             :count
+           ) == 0
+
+    assert Repo.aggregate(
+             from(t in CodexTurn, where: t.codex_session_id == ^state.codex_session.id),
+             :count
+           ) == 0
+
+    CodexResponsesSocket.terminate(
+      :closed,
+      Map.delete(kept_state, :websocket_owner_downstream)
+    )
   end
 
   test "intentional stale owner replacement does not close monitored socket as crashed" do
@@ -1055,6 +1083,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
     assert active_owner_lease(state.codex_session.id).lease_token ==
              state.codex_session.owner_lease_token
+
+    assert kept_state.codex_session.owner_lease_token == state.codex_session.owner_lease_token
 
     CodexResponsesSocket.terminate(
       :closed,
@@ -2598,6 +2628,124 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
         where: r.pool_id == ^pool_id,
         order_by: [asc: r.admitted_at]
       )
+    )
+  end
+
+  defp assert_abnormal_owner_monitor_down_crashes_active_turn!(owner_reason, suffix) do
+    upstream =
+      start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_#{suffix}"}))
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-owner-monitor-#{suffix}",
+          accepted_turn_state: "stable-ws-owner-monitor-#{suffix}",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    %{request: request, attempt: attempt, turn: turn} =
+      active_turn_fixture(setup, auth, state.codex_session)
+
+    {owner_pid, owner_monitor, owner_down} = owner_monitor_down(owner_reason)
+
+    monitored_state = %{
+      state
+      | websocket_owner_pid: owner_pid,
+        websocket_owner_monitor: owner_monitor
+    }
+
+    {handle_result, logs} =
+      with_log(fn -> CodexResponsesSocket.handle_info(owner_down, monitored_state) end)
+
+    assert {:stop, :owner_crashed, {1011, "websocket owner crashed"}, stopped_state} =
+             handle_result
+
+    refute Map.has_key?(stopped_state, :websocket_owner_monitor)
+    refute Map.has_key?(stopped_state, :websocket_owner_pid)
+    refute logs =~ "owner_unavailable_takeover"
+    refute logs =~ "owner_drained"
+    refute logs =~ "client_disconnected"
+    assert_no_leak!("owner #{suffix} abnormal monitor logs", logs)
+
+    assert_owner_interruption_state!(%{
+      request: request,
+      attempt: attempt,
+      turn: turn,
+      session: state.codex_session,
+      error_code: "owner_crashed"
+    })
+
+    assert released_owner_lease(
+             state.codex_session.id,
+             state.codex_session.owner_lease_token
+           ).metadata["release_reason"] == "owner_crashed"
+
+    CodexResponsesSocket.terminate(
+      :closed,
+      Map.delete(stopped_state, :websocket_owner_downstream)
+    )
+  end
+
+  defp assert_graceful_owner_monitor_down_drains_active_turn!(owner_reason, suffix) do
+    upstream =
+      start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_#{suffix}"}))
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-owner-monitor-#{suffix}",
+          accepted_turn_state: "stable-ws-owner-monitor-#{suffix}",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    %{request: request, attempt: attempt, turn: turn} =
+      active_turn_fixture(setup, auth, state.codex_session)
+
+    {owner_pid, owner_monitor, owner_down} = owner_monitor_down(owner_reason)
+
+    monitored_state = %{
+      state
+      | websocket_owner_pid: owner_pid,
+        websocket_owner_monitor: owner_monitor
+    }
+
+    {handle_result, logs} =
+      with_log(fn -> CodexResponsesSocket.handle_info(owner_down, monitored_state) end)
+
+    assert {:ok, kept_state} = handle_result
+    refute Map.has_key?(kept_state, :websocket_owner_monitor)
+    refute Map.has_key?(kept_state, :websocket_owner_pid)
+    refute logs =~ "owner_crashed"
+    refute logs =~ "owner_unavailable_takeover"
+    refute logs =~ "client_disconnected"
+    assert_no_leak!("owner #{suffix} monitor logs", logs)
+
+    assert_owner_interruption_state!(%{
+      request: request,
+      attempt: attempt,
+      turn: turn,
+      session: state.codex_session,
+      error_code: "owner_drained"
+    })
+
+    assert released_owner_lease(
+             state.codex_session.id,
+             state.codex_session.owner_lease_token
+           ).metadata["release_reason"] == "owner_drained"
+
+    CodexResponsesSocket.terminate(
+      :closed,
+      Map.delete(kept_state, :websocket_owner_downstream)
     )
   end
 
