@@ -224,9 +224,9 @@ defmodule CodexPooler.Gateway do
   end
 
   defp log_owner_takeover_attempt(%CodexSession{} = session, %RequestOptions{} = opts) do
-    Logger.warning(
+    Logger.info(
       "websocket owner takeover attempted " <>
-        owner_takeover_log_metadata(session, opts)
+        owner_takeover_log_metadata(session, opts, "attempting", "none")
     )
   end
 
@@ -235,9 +235,9 @@ defmodule CodexPooler.Gateway do
          %CodexSession{} = replacement_session,
          %RequestOptions{} = opts
        ) do
-    Logger.warning(
+    Logger.info(
       "websocket owner takeover succeeded " <>
-        owner_takeover_log_metadata(replacement_session, opts) <>
+        owner_takeover_log_metadata(replacement_session, opts, "succeeded", "none") <>
         " previous_owner_instance_id=#{safe_log_token(previous_session.owner_instance_id)}"
     )
   end
@@ -245,13 +245,21 @@ defmodule CodexPooler.Gateway do
   defp log_owner_takeover_failure(%CodexSession{} = session, %RequestOptions{} = opts, reason) do
     Logger.warning(
       "websocket owner takeover failed " <>
-        owner_takeover_log_metadata(session, opts) <>
+        owner_takeover_log_metadata(session, opts, "failed", "investigate") <>
         " failure_reason=#{owner_takeover_reason(reason)}"
     )
   end
 
-  defp owner_takeover_log_metadata(%CodexSession{} = session, %RequestOptions{} = opts) do
+  defp owner_takeover_log_metadata(
+         %CodexSession{} = session,
+         %RequestOptions{} = opts,
+         outcome,
+         operator_action
+       ) do
     [
+      "recovery_class=owner_unavailable_takeover",
+      "operator_action=#{safe_log_token(operator_action)}",
+      "outcome=#{safe_log_token(outcome)}",
       "codex_session_id=#{safe_log_token(session.id)}",
       "request_id=#{safe_log_token(request_id(opts))}",
       "owner_instance_id=#{safe_log_token(session.owner_instance_id)}",

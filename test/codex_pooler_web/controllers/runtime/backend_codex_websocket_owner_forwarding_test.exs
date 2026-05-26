@@ -56,6 +56,33 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
   @sentinel "SECRET_SENTINEL_DO_NOT_STORE_123"
 
+  defmodule StaleOwnerNodeClient do
+    @moduledoc false
+
+    @behaviour CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder.NodeClient
+
+    alias CodexPooler.Gateway.Persistence.CodexSession
+    alias CodexPooler.Repo
+
+    @impl true
+    def connected_app_nodes, do: state().nodes
+
+    @impl true
+    def app_node?(node), do: node in state().nodes
+
+    @impl true
+    def call_owner(_node, _module, _function, [codex_session_id | _args], _timeout) do
+      CodexSession
+      |> Repo.get!(codex_session_id)
+      |> Ecto.Changeset.change(%{owner_lease_token: Ecto.UUID.generate()})
+      |> Repo.update!()
+
+      {:error, :owner_unavailable}
+    end
+
+    defp state, do: Process.get(__MODULE__, %{nodes: []})
+  end
+
   setup do
     previous = Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
     Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
@@ -828,11 +855,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
     assert released_lease = released_owner_lease(state.codex_session.id, old_token)
     assert released_lease.metadata["release_reason"] == "owner_drained"
+    refute released_lease.metadata["release_reason"] == "owner_crashed"
     assert Repo.get!(CodexTurn, turn.id).status == "interrupted"
     assert Repo.get!(CodexTurn, turn.id).error_code == "owner_drained"
     assert Repo.get!(CodexTurn, turn.id).final_attempt_id == attempt.id
     assert Repo.get!(Request, request.id).status == "failed"
+    assert Repo.get!(Request, request.id).response_status_code == 499
     assert Repo.get!(Request, request.id).last_error_code == "owner_drained"
+    assert Repo.get!(Attempt, attempt.id).network_error_code == "owner_drained"
 
     {:ok, reconnect_state} =
       CodexResponsesSocket.init(%{
@@ -884,8 +914,18 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     owner_monitor = state.websocket_owner_monitor
     assert_receive {:DOWN, ^owner_monitor, :process, ^owner_pid, :killed} = owner_down
 
+    {handle_result, logs} =
+      with_log(fn -> CodexResponsesSocket.handle_info(owner_down, state) end)
+
     assert {:stop, :owner_crashed, {1011, "websocket owner crashed"}, stopped_state} =
-             CodexResponsesSocket.handle_info(owner_down, state)
+             handle_result
+
+    refute Map.has_key?(stopped_state, :websocket_owner_monitor)
+    refute Map.has_key?(stopped_state, :websocket_owner_pid)
+    refute logs =~ "owner_unavailable_takeover"
+    refute logs =~ "owner_drained"
+    refute logs =~ "client_disconnected"
+    assert_no_leak!("local owner crash monitor logs", logs)
 
     assert_owner_interruption_state!(%{
       request: request,
@@ -904,6 +944,66 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
       :closed,
       Map.delete(stopped_state, :websocket_owner_downstream)
     )
+  end
+
+  test "owner monitor normal and shutdown exits remain owner crashed at socket boundary" do
+    Enum.each([{:normal, "normal"}, {:shutdown, "shutdown"}], fn {owner_reason, suffix} ->
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_#{suffix}"}))
+      setup = gateway_setup(upstream)
+      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+      {:ok, state} =
+        CodexResponsesSocket.init(%{
+          auth: auth,
+          opts: %{
+            request_id: "ws-owner-monitor-#{suffix}",
+            accepted_turn_state: "stable-ws-owner-monitor-#{suffix}",
+            client_ip: "127.0.0.1"
+          }
+        })
+
+      %{request: request, attempt: attempt, turn: turn} =
+        active_turn_fixture(setup, auth, state.codex_session)
+
+      {owner_pid, owner_monitor, owner_down} = owner_monitor_down(owner_reason)
+
+      monitored_state = %{
+        state
+        | websocket_owner_pid: owner_pid,
+          websocket_owner_monitor: owner_monitor
+      }
+
+      {handle_result, logs} =
+        with_log(fn -> CodexResponsesSocket.handle_info(owner_down, monitored_state) end)
+
+      assert {:stop, :owner_crashed, {1011, "websocket owner crashed"}, stopped_state} =
+               handle_result
+
+      refute Map.has_key?(stopped_state, :websocket_owner_monitor)
+      refute Map.has_key?(stopped_state, :websocket_owner_pid)
+      refute logs =~ "owner_unavailable_takeover"
+      refute logs =~ "owner_drained"
+      refute logs =~ "client_disconnected"
+      assert_no_leak!("owner #{suffix} monitor logs", logs)
+
+      assert_owner_interruption_state!(%{
+        request: request,
+        attempt: attempt,
+        turn: turn,
+        session: state.codex_session,
+        error_code: "owner_crashed"
+      })
+
+      assert released_owner_lease(
+               state.codex_session.id,
+               state.codex_session.owner_lease_token
+             ).metadata["release_reason"] == "owner_crashed"
+
+      CodexResponsesSocket.terminate(
+        :closed,
+        Map.delete(stopped_state, :websocket_owner_downstream)
+      )
+    end)
   end
 
   test "intentional stale owner replacement does not close monitored socket as crashed" do
@@ -934,9 +1034,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     assert_receive {:DOWN, ^owner_monitor, :process, ^owner_pid, {:shutdown, :stale_owner}} =
                      owner_down
 
-    assert {:ok, kept_state} = CodexResponsesSocket.handle_info(owner_down, state)
+    {handle_result, logs} =
+      with_log(fn -> CodexResponsesSocket.handle_info(owner_down, state) end)
+
+    assert {:ok, kept_state} = handle_result
     refute Map.has_key?(kept_state, :websocket_owner_monitor)
     refute Map.has_key?(kept_state, :websocket_owner_pid)
+    refute logs =~ "owner_crashed"
+    refute logs =~ "owner_drained"
+    assert_no_leak!("stale owner monitor logs", logs)
 
     assert Repo.get!(Request, request.id).status == "in_progress"
     assert Repo.get!(Attempt, attempt.id).status == "in_progress"
@@ -946,6 +1052,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
              state.codex_session.id,
              state.codex_session.owner_lease_token
            )
+
+    assert active_owner_lease(state.codex_session.id).lease_token ==
+             state.codex_session.owner_lease_token
 
     CodexResponsesSocket.terminate(
       :closed,
@@ -1004,7 +1113,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     owner_ref = Process.monitor(owner_pid)
 
     logs =
-      capture_log([level: :info], fn ->
+      capture_info_log(fn ->
         cleanup_local_owner_sessions()
         assert_receive {:DOWN, ^owner_ref, :process, ^owner_pid, :shutdown}
       end)
@@ -1359,7 +1468,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     }
 
     logs =
-      capture_log([level: :info], fn ->
+      capture_info_log(fn ->
         assert {:ok, returned_state} = CodexResponsesSocket.init(state)
         assert returned_state.auth == auth
         assert returned_state.opts.request_id == state.opts.request_id
@@ -1381,17 +1490,62 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
     assert logs =~ "websocket owner takeover attempted"
     assert logs =~ "websocket owner takeover succeeded"
+    assert logs =~ "recovery_class=owner_unavailable_takeover"
+    assert logs =~ "operator_action=none"
+    assert logs =~ "outcome=attempting"
+    assert logs =~ "outcome=succeeded"
     assert logs =~ "codex_session_id=#{session.id}"
     assert logs =~ "request_id=ws-owner-init-nodedown"
     assert logs =~ "owner_instance_id=#{remote_node_string}"
+    assert logs =~ "proxy_instance_id=#{Atom.to_string(node())}"
     assert logs =~ "previous_owner_instance_id=#{remote_node_string}"
     refute logs =~ old_lease.lease_token
+    refute logs =~ "owner_forward_timeout"
+    refute logs =~ "owner_crashed"
+    assert_no_leak!("owner init nodedown takeover logs", logs)
     assert Repo.get!(BridgeOwnerLease, old_lease.id).status == "released"
 
     assert Repo.get!(BridgeOwnerLease, old_lease.id).metadata["release_reason"] ==
              "owner_unavailable_takeover"
 
     assert active_owner_lease(session.id).owner_instance_id == Atom.to_string(node())
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "successful owner socket init takeover stays below warning" do
+    remote_node = :"codex_pooler@init-nodedown-warning-owner.example"
+    upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, _session} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: "stable-ws-owner-init-warning",
+        owner_instance_id: Atom.to_string(remote_node)
+      })
+
+    forwarder_opts =
+      WebsocketOwnerNodeHarness.node_client_opts([remote_node],
+        calls: %{remote_node => :nodedown}
+      )
+
+    warning_logs =
+      capture_log([level: :warning], fn ->
+        assert {:ok, returned_state} =
+                 CodexResponsesSocket.init(%{
+                   auth: auth,
+                   opts: %{
+                     request_id: "ws-owner-init-warning",
+                     accepted_turn_state: "stable-ws-owner-init-warning",
+                     client_ip: "127.0.0.1",
+                     websocket_owner_forwarder_opts: forwarder_opts
+                   }
+                 })
+
+        CodexResponsesSocket.terminate(:closed, returned_state)
+      end)
+
+    assert warning_logs == ""
     assert FakeUpstream.count(upstream) == 0
   end
 
@@ -1450,7 +1604,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
       )
 
     logs =
-      capture_log(fn ->
+      capture_info_log(fn ->
         assert {:ok, runtime} =
                  Gateway.prepare_websocket_session(auth, %{
                    accepted_turn_state: "stable-ws-owner-attach-nodedown",
@@ -1473,16 +1627,64 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
     assert logs =~ "websocket owner takeover attempted"
     assert logs =~ "websocket owner takeover succeeded"
+    assert logs =~ "recovery_class=owner_unavailable_takeover"
+    assert logs =~ "operator_action=none"
+    assert logs =~ "outcome=attempting"
+    assert logs =~ "outcome=succeeded"
     assert logs =~ "codex_session_id=#{session.id}"
     assert logs =~ "owner_instance_id=#{remote_node_string}"
+    assert logs =~ "proxy_instance_id=#{Atom.to_string(node())}"
     assert logs =~ "previous_owner_instance_id=#{remote_node_string}"
     refute logs =~ old_lease.lease_token
+    refute logs =~ "owner_forward_timeout"
+    refute logs =~ "owner_crashed"
+    assert_no_leak!("owner attach nodedown takeover logs", logs)
     assert Repo.get!(BridgeOwnerLease, old_lease.id).status == "released"
 
     assert Repo.get!(BridgeOwnerLease, old_lease.id).metadata["release_reason"] ==
              "owner_unavailable_takeover"
 
     assert active_owner_lease(session.id).owner_instance_id == Atom.to_string(node())
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "owner takeover failure remains warning and actionable without leaking lease token" do
+    remote_node = :"codex_pooler@takeover-failure-owner.example"
+    remote_node_string = Atom.to_string(remote_node)
+    upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: "stable-ws-owner-takeover-failure",
+        owner_instance_id: remote_node_string
+      })
+
+    old_lease = active_owner_lease(session.id)
+    opts = stale_owner_node_client_opts([remote_node])
+
+    logs =
+      capture_log([level: :warning], fn ->
+        assert {:error, :stale_owner} =
+                 Gateway.prepare_websocket_session(auth, %{
+                   accepted_turn_state: "stable-ws-owner-takeover-failure",
+                   client_ip: "127.0.0.1",
+                   websocket_owner_forwarder_opts: opts
+                 })
+      end)
+
+    assert logs =~ "websocket owner takeover failed"
+    assert logs =~ "recovery_class=owner_unavailable_takeover"
+    assert logs =~ "operator_action=investigate"
+    assert logs =~ "outcome=failed"
+    assert logs =~ "codex_session_id=#{session.id}"
+    assert logs =~ "owner_instance_id=#{remote_node_string}"
+    assert logs =~ "proxy_instance_id=#{Atom.to_string(node())}"
+    assert logs =~ "failure_reason=stale_owner"
+    refute logs =~ old_lease.lease_token
+    refute logs =~ "operator_action=none"
+    assert_no_leak!("owner takeover failure logs", logs)
     assert FakeUpstream.count(upstream) == 0
   end
 
@@ -1606,13 +1808,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     assert_receive {:DOWN, ^owner_ref, :process, ^owner_pid, :killed}
 
     try do
-      payload = websocket_payload(setup, "dispatch takeover")
+      {{:ok, _handled_state, frame}, warning_logs} =
+        with_log([level: :warning], fn ->
+          payload = websocket_payload(setup, "dispatch takeover")
 
-      assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
-      assert {:push, {:text, frame}, state} = receive_owner_socket_push(state)
+          assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+          assert {:push, {:text, frame}, state} = receive_owner_socket_push(state)
+          assert {:ok, state} = receive_socket_done(state)
+
+          {:ok, state, frame}
+        end)
+
+      assert warning_logs == ""
       assert %{"id" => "resp_owner_dispatch_takeover"} = Jason.decode!(frame)
-      assert {:ok, _state} = receive_socket_done(state)
-
       assert active_owner_lease(session.id).lease_token == old_lease.lease_token
       assert active_owner_lease(session.id).owner_instance_id == Atom.to_string(node())
       assert [request] = await_upstream_requests(upstream, 1)
@@ -1649,7 +1857,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     assert_receive {:DOWN, ^owner_ref, :process, ^owner_pid, :normal}
 
     logs =
-      capture_log(fn ->
+      capture_info_log(fn ->
         try do
           payload = websocket_payload(setup, "dispatch drain takeover")
 
@@ -1678,9 +1886,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
     assert logs =~ "websocket owner takeover attempted"
     assert logs =~ "websocket owner takeover succeeded"
+    assert logs =~ "recovery_class=owner_unavailable_takeover"
+    assert logs =~ "operator_action=none"
+    assert logs =~ "outcome=attempting"
+    assert logs =~ "outcome=succeeded"
     assert logs =~ "codex_session_id=#{session.id}"
     assert logs =~ "request_id=ws-owner-dispatch-drain-takeover"
+    assert logs =~ "previous_owner_instance_id=#{Atom.to_string(node())}"
     refute logs =~ old_lease.lease_token
+    refute logs =~ "owner_crashed"
+
+    assert Repo.get!(BridgeOwnerLease, old_lease.id).metadata["release_reason"] == "owner_drained"
+
+    assert_no_leak!("local drain dispatch takeover logs", logs)
   end
 
   test "owner-forwarded socket replaces a local owner with a dead upstream before first dispatch" do
@@ -2009,6 +2227,177 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     assert turn.error_code == "client_disconnected"
   end
 
+  test "owner rollout timeline preserves interrupted and recovered websocket rows" do
+    release_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        {:sequence,
+         [
+           FakeUpstream.barrier_sse_stream(
+             [%{"id" => "resp_owner_timeline_interrupted", "object" => "response"}],
+             notify: self(),
+             release_ref: release_ref
+           ),
+           FakeUpstream.json_response(%{
+             "id" => "resp_owner_timeline_recovered",
+             "object" => "response"
+           })
+         ]}
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    turn_state = "stable-ws-owner-rollout-timeline"
+    interrupted_request_id = "ws-owner-timeline-interrupted"
+    recovered_request_id = "ws-owner-timeline-recovered"
+
+    {:ok, state} = owner_socket(auth, interrupted_request_id, turn_state)
+
+    payload =
+      websocket_payload(setup, "owner timeline interrupted", %{
+        "request_id" => interrupted_request_id
+      })
+
+    assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+    assert_receive {:fake_upstream_chunk_barrier, 1, upstream_pid, ^release_ref}
+
+    assert [interrupted_upstream_request] = await_upstream_requests(upstream, 1)
+
+    assert interrupted_upstream_request.json["input"] |> List.first() |> Map.get("content") ==
+             "owner timeline interrupted"
+
+    assert :ok = CodexResponsesSocket.terminate(:closed, state)
+    send(upstream_pid, {:fake_upstream_release_chunk, release_ref})
+
+    interrupted_request =
+      Repo.one!(
+        from r in Request,
+          where: r.pool_id == ^setup.pool.id and r.correlation_id == ^interrupted_request_id
+      )
+
+    interrupted_attempt =
+      Repo.one!(from a in Attempt, where: a.request_id == ^interrupted_request.id)
+
+    interrupted_turn =
+      Repo.one!(from t in CodexTurn, where: t.request_id == ^interrupted_request.id)
+
+    session = Repo.get_by!(CodexSession, session_key: turn_state)
+
+    assert_owner_interruption_state!(%{
+      request: interrupted_request,
+      attempt: interrupted_attempt,
+      turn: interrupted_turn,
+      session: session,
+      error_code: "client_disconnected"
+    })
+
+    remote_node = :"codex_pooler@timeline-unavailable-owner.example"
+    remote_node_string = Atom.to_string(remote_node)
+    old_lease = active_owner_lease(session.id)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    session
+    |> Ecto.Changeset.change(%{owner_instance_id: remote_node_string, updated_at: now})
+    |> Repo.update!()
+
+    old_lease
+    |> Ecto.Changeset.change(%{owner_instance_id: remote_node_string, updated_at: now})
+    |> Repo.update!()
+
+    forwarder_opts =
+      WebsocketOwnerNodeHarness.node_client_opts([remote_node],
+        calls: %{remote_node => :nodedown}
+      )
+
+    logs =
+      capture_info_log(fn ->
+        {:ok, recovered_state} =
+          owner_socket(auth, recovered_request_id, turn_state,
+            websocket_owner_forwarder_opts: forwarder_opts
+          )
+
+        try do
+          recovered_payload =
+            websocket_payload(setup, "owner timeline recovered", %{
+              "request_id" => recovered_request_id
+            })
+
+          assert {:ok, recovered_state} =
+                   CodexResponsesSocket.handle_in(
+                     {recovered_payload, [opcode: :text]},
+                     recovered_state
+                   )
+
+          assert {:push, {:text, recovered_frame}, recovered_state} =
+                   receive_owner_socket_push(recovered_state)
+
+          assert %{"id" => "resp_owner_timeline_recovered"} = Jason.decode!(recovered_frame)
+          assert {:ok, _recovered_state} = receive_socket_done(recovered_state)
+        after
+          CodexResponsesSocket.terminate(:closed, recovered_state)
+        end
+      end)
+
+    assert logs =~ "websocket owner takeover attempted"
+    assert logs =~ "websocket owner takeover succeeded"
+    assert logs =~ "recovery_class=owner_unavailable_takeover"
+    assert logs =~ "operator_action=none"
+    assert logs =~ "outcome=attempting"
+    assert logs =~ "outcome=succeeded"
+    assert logs =~ "codex_session_id=#{session.id}"
+    assert logs =~ "request_id=#{recovered_request_id}"
+    assert logs =~ "owner_instance_id=#{remote_node_string}"
+    assert logs =~ "proxy_instance_id=#{Atom.to_string(node())}"
+    assert logs =~ "previous_owner_instance_id=#{remote_node_string}"
+    refute logs =~ old_lease.lease_token
+    assert_no_leak!("owner rollout timeline takeover logs", logs)
+
+    released_lease = Repo.get!(BridgeOwnerLease, old_lease.id)
+    assert released_lease.status == "released"
+    assert released_lease.metadata["release_reason"] == "owner_unavailable_takeover"
+
+    active_lease = active_owner_lease(session.id)
+    assert active_lease.owner_instance_id == Atom.to_string(node())
+    assert active_lease.metadata["source"] == "owner_unavailable_takeover"
+
+    recovered_request =
+      Repo.one!(
+        from r in Request,
+          where: r.pool_id == ^setup.pool.id and r.correlation_id == ^recovered_request_id
+      )
+
+    recovered_attempt = Repo.one!(from a in Attempt, where: a.request_id == ^recovered_request.id)
+    recovered_turn = Repo.one!(from t in CodexTurn, where: t.request_id == ^recovered_request.id)
+
+    assert Repo.get!(Request, interrupted_request.id).status == "failed"
+    assert Repo.get!(Request, interrupted_request.id).response_status_code == 499
+    assert Repo.get!(Request, interrupted_request.id).last_error_code == "client_disconnected"
+    assert Repo.get!(Attempt, interrupted_attempt.id).status == "failed"
+    assert Repo.get!(Attempt, interrupted_attempt.id).network_error_code == "client_disconnected"
+    assert Repo.get!(CodexTurn, interrupted_turn.id).status == "interrupted"
+    assert Repo.get!(CodexTurn, interrupted_turn.id).error_code == "client_disconnected"
+
+    assert recovered_request.status == "succeeded"
+    assert recovered_request.response_status_code == 200
+    assert is_nil(recovered_request.last_error_code)
+    assert recovered_attempt.status == "succeeded"
+    assert recovered_attempt.upstream_status_code == 200
+    assert is_nil(recovered_attempt.network_error_code)
+    assert recovered_turn.status == "succeeded"
+    assert is_nil(recovered_turn.error_code)
+    assert recovered_turn.final_attempt_id == recovered_attempt.id
+
+    assert [first_upstream_request, second_upstream_request] =
+             await_upstream_requests(upstream, 2)
+
+    assert Enum.map([first_upstream_request, second_upstream_request], fn request ->
+             request.json["input"] |> List.first() |> Map.get("content")
+           end) == ["owner timeline interrupted", "owner timeline recovered"]
+
+    assert FakeUpstream.count(upstream) == 2
+  end
+
   @tag :leakage
   test "owner remote wrapper and process crash paths sanitize sentinel-bearing frames" do
     upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
@@ -2139,6 +2528,31 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     |> Jason.encode!()
   end
 
+  defp capture_info_log(fun) when is_function(fun, 0) do
+    previous_level = Logger.level()
+    Logger.configure(level: :info)
+
+    try do
+      capture_log([level: :info], fun)
+    after
+      Logger.configure(level: previous_level)
+    end
+  end
+
+  defp stale_owner_node_client_opts(nodes) when is_list(nodes) do
+    previous = Process.get(StaleOwnerNodeClient)
+    Process.put(StaleOwnerNodeClient, %{nodes: nodes})
+
+    ExUnit.Callbacks.on_exit(fn ->
+      case previous do
+        nil -> Process.delete(StaleOwnerNodeClient)
+        value -> Process.put(StaleOwnerNodeClient, value)
+      end
+    end)
+
+    [node_client: StaleOwnerNodeClient]
+  end
+
   defp owner_socket(auth, request_id, turn_state, extra_opts \\ []) do
     CodexResponsesSocket.init(%{
       auth: auth,
@@ -2185,6 +2599,21 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
         order_by: [asc: r.admitted_at]
       )
     )
+  end
+
+  defp owner_monitor_down(owner_reason) do
+    owner_pid =
+      spawn(fn ->
+        receive do
+          {:finish_owner, :normal} -> :ok
+          {:finish_owner, reason} -> exit(reason)
+        end
+      end)
+
+    owner_monitor = Process.monitor(owner_pid)
+    send(owner_pid, {:finish_owner, owner_reason})
+    assert_receive {:DOWN, ^owner_monitor, :process, ^owner_pid, ^owner_reason} = owner_down
+    {owner_pid, owner_monitor, owner_down}
   end
 
   defp active_turn_fixture(setup, auth, session) do
