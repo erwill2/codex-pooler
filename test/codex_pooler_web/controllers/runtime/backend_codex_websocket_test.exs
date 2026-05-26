@@ -4560,6 +4560,77 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert Repo.get!(CodexSession, session.id).status == "interrupted"
   end
 
+  test "websocket terminate waits for in-flight response task finalization after interrupting" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "task-finalization-drain"})
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               auth,
+               setup.model,
+               %{"model" => setup.model.exposed_model_id, "input" => "complete after close"},
+               %{
+                 endpoint: "/backend-api/codex/responses",
+                 transport: "websocket",
+                 correlation_id:
+                   "ws-task-finalization-drain-#{System.unique_integer([:positive])}",
+                 request_metadata: %{"codex_session_id" => session.id}
+               }
+             )
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+    assert {:ok, turn} = Gateway.start_codex_turn(session, reserved.request)
+
+    parent = self()
+
+    {:ok, pid} =
+      Task.start(fn ->
+        send(parent, {:task_finalization_waiting, self()})
+
+        receive do
+          :finish_task_finalization -> :ok
+        end
+
+        AttemptSettlement.finalize_success(
+          reserved.request,
+          attempt,
+          %{status: "usage_known", input_tokens: 1, output_tokens: 1, total_tokens: 2},
+          %{response_status_code: 200}
+        )
+
+        send(parent, {:task_finalization_finished, self()})
+        send(parent, {:codex_response_done, self(), :ok})
+      end)
+
+    assert_receive {:task_finalization_waiting, ^pid}, 1_000
+
+    terminator =
+      Task.async(fn ->
+        CodexResponsesSocket.terminate(:closed, %{
+          tasks: MapSet.new([pid]),
+          codex_session: session,
+          opts: %{reason: "client_disconnected", reconnect_window_seconds: 300}
+        })
+      end)
+
+    refute_receive {:task_finalization_finished, ^pid}, 350
+    refute Task.yield(terminator, 0)
+
+    send(pid, :finish_task_finalization)
+
+    assert_receive {:task_finalization_finished, ^pid}, 1_000
+    assert :ok = Task.await(terminator, 1_000)
+
+    assert Repo.get!(CodexTurn, turn.id).status == "succeeded"
+    assert Repo.get!(CodexTurn, turn.id).error_code == nil
+    assert Repo.get!(Request, reserved.request.id).status == "succeeded"
+    assert Repo.get!(Request, reserved.request.id).last_error_code == nil
+    assert Repo.get!(CodexSession, session.id).status == "interrupted"
+  end
+
   test "websocket terminate wait preserves unrelated mailbox messages" do
     unrelated = {:unrelated_websocket_mailbox_message, make_ref()}
 

@@ -10,6 +10,9 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
   require Logger
 
+  @pre_cleanup_response_task_drain_ms 250
+  @post_cleanup_response_task_drain_ms 5_000
+
   @impl WebSock
   def init(state) do
     case Gateway.prepare_websocket_session(state.auth, state.opts) do
@@ -121,15 +124,25 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     remaining_tasks =
       state
       |> Map.get(:tasks, MapSet.new())
-      |> await_response_tasks()
+      |> await_response_tasks(@pre_cleanup_response_task_drain_ms)
 
     cleanup_websocket_session(state)
 
     close_upstream_websocket_session(state)
 
-    Enum.each(remaining_tasks, &Process.exit(&1, :shutdown))
+    state
+    |> remaining_response_tasks_after_cleanup(remaining_tasks)
+    |> Enum.each(&Process.exit(&1, :shutdown))
 
     :ok
+  end
+
+  defp remaining_response_tasks_after_cleanup(state, remaining_tasks) do
+    if owner_forwarded_socket?(state) do
+      remaining_tasks
+    else
+      await_response_tasks(remaining_tasks, @post_cleanup_response_task_drain_ms)
+    end
   end
 
   defp log_interrupt_failure({:ok, _result}, _state), do: :ok
@@ -645,22 +658,26 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   defp payload_input_count(nil), do: nil
   defp payload_input_count(_input), do: 1
 
-  defp await_response_tasks(tasks) do
+  defp await_response_tasks(tasks, timeout_ms) do
     if MapSet.size(tasks) == 0 do
       tasks
     else
       monitors = Map.new(tasks, &{&1, Process.monitor(&1)})
-      deadline = System.monotonic_time(:millisecond) + 250
+      deadline = response_task_deadline(timeout_ms)
 
       do_await_response_tasks(tasks, monitors, deadline)
     end
+  end
+
+  defp response_task_deadline(timeout_ms) when is_integer(timeout_ms) do
+    System.monotonic_time(:millisecond) + timeout_ms
   end
 
   defp do_await_response_tasks(tasks, monitors, deadline) do
     if MapSet.size(tasks) == 0 do
       tasks
     else
-      timeout = max(deadline - System.monotonic_time(:millisecond), 0)
+      timeout = response_task_wait_timeout(deadline)
 
       receive do
         {:codex_response_done, pid, _result} ->
@@ -673,6 +690,10 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
           tasks
       end
     end
+  end
+
+  defp response_task_wait_timeout(deadline) when is_integer(deadline) do
+    max(deadline - System.monotonic_time(:millisecond), 0)
   end
 
   defp remove_response_task(tasks, monitors, pid) do
