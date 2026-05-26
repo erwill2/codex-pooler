@@ -69,7 +69,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
             class="grid gap-3 md:grid-cols-2"
           >
             <.quota_limit_row
-              :for={limit <- @account.quota_limits}
+              :for={limit <- reported_quota_limits(@account.quota_limits)}
               id={"upstream-account-#{@account.identity.id}-limit-#{limit.key}"}
               limit={limit}
             />
@@ -364,6 +364,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
   end
 
   defp remaining_limits_summary(_account), do: "Remaining quota · no reported evidence"
+
+  defp reported_quota_limits(quota_limits) when is_list(quota_limits) do
+    Enum.filter(quota_limits, &match?(%{percent: %Decimal{}}, &1))
+  end
+
+  defp reported_quota_limits(_quota_limits), do: []
 
   defp tightest_remaining_limit([limit | limits]) do
     Enum.reduce(limits, limit, fn candidate, current ->

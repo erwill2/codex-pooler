@@ -369,8 +369,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(view, "#upstream-account-#{browser_identity.id}-limit-weekly", "75%")
 
-    refute has_element?(view, "#upstream-account-#{browser_identity.id}-limit-primary_5h-count")
-    refute has_element?(view, "#upstream-account-#{browser_identity.id}-limit-primary_5h-reset")
+    refute has_element?(view, "#upstream-account-#{browser_identity.id}-limit-primary_5h")
     refute has_element?(view, "#upstream-account-#{browser_identity.id}-limit-weekly-count")
     assert has_element?(view, "#upstream-account-#{browser_identity.id}-limit-weekly-reset")
 
