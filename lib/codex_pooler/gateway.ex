@@ -523,6 +523,11 @@ defmodule CodexPooler.Gateway do
     Interruption.interrupt_codex_session(session, websocket_request_options(opts))
   end
 
+  @spec interrupt_codex_turn(session_ref(), opts()) :: {:ok, term()} | {:error, term()}
+  def interrupt_codex_turn(session, opts \\ %{}) do
+    Interruption.interrupt_codex_turn(session, websocket_request_options(opts))
+  end
+
   @spec recover_owner_lifecycle_leftovers(session_ref(), atom() | String.t(), opts()) ::
           {:ok, term()} | {:error, term()}
   def recover_owner_lifecycle_leftovers(session, owner_reason, opts \\ %{}) do

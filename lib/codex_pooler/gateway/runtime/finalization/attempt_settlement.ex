@@ -38,9 +38,10 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement do
           settlement_result()
   def finalize_partial_stream_failure(request, attempt, usage, attrs) do
     attrs = Map.new(attrs)
+    error_code = Map.get(attrs, :last_error_code)
 
     Accounting.finalize_partial_stream_failure(request, attempt, usage, attrs)
-    |> SessionContinuity.complete_codex_turn("failed", Map.get(attrs, :last_error_code))
+    |> SessionContinuity.complete_codex_turn(partial_stream_turn_status(error_code), error_code)
     |> accounting_result(:finalize_partial_stream_failure, request, attempt)
   end
 
@@ -67,4 +68,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement do
   defp accounting_result({:error, reason}, operation, request, attempt) do
     FailureResponse.accounting_failure(operation, request, attempt, reason)
   end
+
+  defp partial_stream_turn_status("client_disconnected"), do: "interrupted"
+  defp partial_stream_turn_status(:client_disconnected), do: "interrupted"
+  defp partial_stream_turn_status(_error_code), do: "failed"
 end

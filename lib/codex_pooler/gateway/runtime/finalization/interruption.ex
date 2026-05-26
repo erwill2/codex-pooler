@@ -26,6 +26,18 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
 
   def interrupt_codex_session(_session_id, _opts), do: {:ok, :ok}
 
+  @spec interrupt_codex_turn(session_ref(), opts()) :: {:ok, term()} | {:error, term()}
+  def interrupt_codex_turn(%CodexSession{id: id}, opts), do: interrupt_codex_turn(id, opts)
+
+  def interrupt_codex_turn(session_id, %RequestOptions{} = opts) when is_binary(session_id) do
+    case request_id(opts) do
+      nil -> {:ok, %{interrupted_turn_count: 0}}
+      request_id -> interrupt_session_turn(session_id, request_id, opts, interrupt_reason(opts))
+    end
+  end
+
+  def interrupt_codex_turn(_session_id, _opts), do: {:ok, %{interrupted_turn_count: 0}}
+
   @spec recover_owner_lifecycle_leftovers(session_ref(), atom() | String.t(), opts()) ::
           {:ok, term()} | {:error, term()}
   def recover_owner_lifecycle_leftovers(%CodexSession{id: id}, owner_reason, opts),
@@ -77,6 +89,74 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
       end
     end)
     |> unwrap_transaction()
+  end
+
+  defp interrupt_session_turn(session_id, request_id, %RequestOptions{} = opts, reason) do
+    now = now()
+    reconnect_window = reconnect_window_seconds(opts)
+    next_status = if reconnect_window > 0, do: "interrupted", else: "closed"
+    lease_expires_at = if reconnect_window > 0, do: DateTime.add(now, reconnect_window, :second)
+
+    Repo.transaction(fn ->
+      CodexSession
+      |> Repo.get(session_id, lock: "FOR UPDATE")
+      |> interrupt_session_turn_for_request(
+        session_id,
+        request_id,
+        reason,
+        now,
+        next_status,
+        lease_expires_at
+      )
+    end)
+    |> unwrap_transaction()
+  end
+
+  defp interrupt_session_turn_for_request(
+         nil,
+         _session_id,
+         _request_id,
+         _reason,
+         _now,
+         _status,
+         _expires_at
+       ),
+       do: %{interrupted_turn_count: 0}
+
+  defp interrupt_session_turn_for_request(
+         %CodexSession{} = session,
+         session_id,
+         request_id,
+         reason,
+         now,
+         next_status,
+         lease_expires_at
+       ) do
+    interrupted_count = interrupt_turn_for_request(session_id, request_id, reason, now)
+
+    session
+    |> Ecto.Changeset.change(%{
+      status: next_status,
+      disconnected_at: now,
+      closed_at: if(next_status == "closed", do: now, else: nil),
+      owner_lease_expires_at: lease_expires_at,
+      last_heartbeat_at: now,
+      updated_at: now
+    })
+    |> Repo.update!()
+
+    %{interrupted_turn_count: interrupted_count}
+  end
+
+  defp interrupt_turn_for_request(session_id, request_id, reason, now) do
+    case in_progress_turn_for_request(session_id, request_id) do
+      %CodexTurn{} = turn ->
+        interrupt_turn!(turn, reason, now)
+        1
+
+      nil ->
+        0
+    end
   end
 
   defp interrupt_turn!(%CodexTurn{} = turn, reason, now) do
@@ -140,6 +220,19 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
     )
   end
 
+  defp in_progress_turn_for_request(session_id, request_id) do
+    Repo.one(
+      from turn in CodexTurn,
+        join: request in Request,
+        on: request.id == turn.request_id,
+        where:
+          turn.codex_session_id == ^session_id and turn.status == "in_progress" and
+            request.correlation_id == ^request_id,
+        order_by: [desc: turn.started_at],
+        limit: 1
+    )
+  end
+
   defp latest_attempt_for_update(request_id) do
     Repo.one(
       from attempt in Attempt,
@@ -193,6 +286,14 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
        do: reason
 
   defp interrupt_reason(%RequestOptions{}), do: "client_disconnected"
+
+  defp request_id(%RequestOptions{request_metadata: %{request_id: request_id}})
+       when is_binary(request_id) do
+    request_id = String.trim(request_id)
+    if request_id == "", do: nil, else: request_id
+  end
+
+  defp request_id(%RequestOptions{}), do: nil
 
   defp owner_recovery_reason(:owner_drained), do: "owner_drained"
   defp owner_recovery_reason("owner_drained"), do: "owner_drained"

@@ -108,6 +108,40 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.WebSocket do
   end
 
   @spec finalize_failed(DispatchContext.t(), map()) :: {:error, map()}
+  def finalize_failed(context, %{reason: :client_disconnected} = finalization) do
+    %{headers: headers, started: started} = finalization
+
+    %{reserved: reserved, attempt: attempt, request_options: request_options, endpoint: endpoint} =
+      context
+
+    code = "client_disconnected"
+
+    case AttemptSettlement.finalize_partial_stream_failure(
+           reserved.request,
+           attempt,
+           ResponseUsage.from_websocket_body(""),
+           SettlementAttrs.partial_stream_failure(
+             context,
+             499,
+             code,
+             code,
+             Metadata.websocket_response_metadata(
+               headers,
+               code,
+               request_options,
+               Map.get(finalization, :websocket_frame_headers, %{})
+             ),
+             started: started
+           )
+         ) do
+      {:ok, _finalized} ->
+        {:error, error(499, code, Metadata.upstream_failure_message(endpoint))}
+
+      {:error, gateway_error} ->
+        {:error, gateway_error}
+    end
+  end
+
   def finalize_failed(context, %{reason: reason} = finalization)
       when reason in [
              :owner_unavailable,
