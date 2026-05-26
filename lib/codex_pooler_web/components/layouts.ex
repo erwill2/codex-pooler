@@ -23,7 +23,7 @@ defmodule CodexPoolerWeb.Layouts do
     ~H"""
     <%= cond do %>
       <% @chrome == :admin -> %>
-        <main class="min-h-svh bg-base-200 text-base-content">
+        <main class="h-svh overflow-hidden bg-base-200 text-base-content">
           {render_slot(@inner_block)}
         </main>
       <% @chrome == :invite -> %>

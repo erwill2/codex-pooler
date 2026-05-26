@@ -70,6 +70,8 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
       for {path, selector} <- @admin_routes do
         assert {:ok, view, _html} = live(conn, path)
         assert has_element?(view, selector)
+        assert has_element?(view, "#admin-shell-root.overflow-hidden")
+        assert has_element?(view, "#admin-shell-scroll-region.relative")
 
         assert has_element?(
                  view,

@@ -115,7 +115,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
 
     ~H"""
     <Layouts.app flash={@flash} current_scope={@current_scope} auth_surface chrome={:admin}>
-      <div class="min-h-svh overflow-hidden bg-base-200 text-base-content">
+      <div id="admin-shell-root" class="h-svh overflow-hidden bg-base-200 text-base-content">
         <header class="fixed inset-x-0 top-0 z-50 border-b border-base-300/70 bg-base-100">
           <div class="flex h-12 items-center justify-between gap-4 px-4">
             <.link
@@ -273,7 +273,10 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
           </div>
         </aside>
 
-        <main class="ml-16 h-svh overflow-y-auto bg-base-200 pt-12 md:ml-64">
+        <main
+          id="admin-shell-scroll-region"
+          class="relative ml-16 h-full min-h-0 overflow-x-hidden overflow-y-auto bg-base-200 pt-12 md:ml-64"
+        >
           <div class="flex min-w-0 flex-col gap-6 p-4 sm:p-6 xl:p-8">
             {render_slot(@inner_block)}
           </div>
