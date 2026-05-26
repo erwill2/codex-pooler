@@ -1051,6 +1051,52 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
            )
   end
 
+  test "route metadata identifies OpenAI-compatible translated origins on desktop and mobile",
+       %{conn: conn, scope: scope} do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "translated-origin", name: "Translated Origin"})
+
+    sensitive_marker = "translated-origin-secret-prompt"
+
+    %{request: translated_request} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-translated-origin",
+        endpoint: "/backend-api/codex/responses",
+        transport: "http_sse",
+        request_metadata: %{
+          "openai_compatibility" => %{
+            "surface" => "openai_v1",
+            "source_endpoint" => "/v1/chat/completions",
+            "translated_endpoint" => "/backend-api/codex/responses"
+          },
+          "body" => %{"messages" => [%{"content" => sensitive_marker}]}
+        }
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+
+    assert has_element?(
+             view,
+             "#request-log-row-#{translated_request.id} [data-role='route']",
+             "/backend-api/codex/responses"
+           )
+
+    assert has_element?(
+             view,
+             "#request-log-row-#{translated_request.id} [data-role='route-metadata']",
+             "translated from /v1/chat/completions"
+           )
+
+    assert has_element?(
+             view,
+             "#mobile-request-log-row-#{translated_request.id} [data-role='route-metadata']",
+             "translated from /v1/chat/completions"
+           )
+
+    html = render(view)
+    refute html =~ sensitive_marker
+  end
+
   test "normalized table headers put transport, route, and usage in separate columns",
        %{conn: conn, scope: scope} do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "header-order", name: "Header Order"})

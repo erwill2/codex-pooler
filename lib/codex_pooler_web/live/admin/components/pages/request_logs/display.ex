@@ -268,7 +268,12 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
   end
 
   def format_route_metadata(log) do
-    [route_class(log), request_content_type(log), request_body_size(log)]
+    [
+      openai_compatibility_origin(log),
+      route_class(log),
+      request_content_type(log),
+      request_body_size(log)
+    ]
     |> Enum.reject(&blank?/1)
     |> case do
       [] -> nil
@@ -358,6 +363,15 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
     do: get_in(metadata, ["routing", "route_class"])
 
   defp route_class(_log), do: nil
+
+  defp openai_compatibility_origin(%{metadata: metadata}) when is_map(metadata) do
+    case get_in(metadata, ["openai_compatibility", "source_endpoint"]) do
+      endpoint when is_binary(endpoint) -> "translated from #{endpoint}"
+      _endpoint -> nil
+    end
+  end
+
+  defp openai_compatibility_origin(_log), do: nil
 
   defp request_content_type(%{metadata: metadata}) when is_map(metadata),
     do: get_in(metadata, ["request", "content_type"])
