@@ -155,7 +155,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
             send_upstream(reservation, upstream_payload)
           end)
 
-        :ok = activate_reserved_frame(owner, reservation.ref, task.ref)
+        :ok = activate_reserved_frame(owner, reservation.ref, task)
 
         result =
           case Task.yield(task, :infinity) || Task.shutdown(task, :brutal_kill) do
@@ -164,8 +164,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
             nil -> {:error, :owner_crashed}
           end
 
-        finish_reserved_frame(owner, reservation.ref, result)
-        result
+        case finish_reserved_frame(owner, reservation.ref, result) do
+          {:ok, effective_result} -> effective_result
+          {:error, reason} -> {:error, reason}
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -268,6 +270,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
           state
           |> demonitor_downstream()
           |> schedule_idle_shutdown()
+          |> cancel_active_turn_downstream(%{
+            pid: pid,
+            epoch: epoch,
+            correlation_id: correlation_id
+          })
 
         {:reply, :ok, %{state | downstream: nil}}
 
@@ -306,11 +313,15 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   end
 
   def handle_call(
-        {:activate_reserved_frame, ref, task_ref},
+        {:activate_reserved_frame, ref, %Task{pid: task_pid, ref: task_ref}},
         _from,
         %{active_turn: %{ref: ref}} = state
       ) do
-    active_turn = %{state.active_turn | task_ref: task_ref}
+    active_turn =
+      state.active_turn
+      |> Map.put(:task_pid, task_pid)
+      |> Map.put(:task_ref, task_ref)
+
     {:reply, :ok, %{state | active_turn: active_turn}}
   end
 
@@ -330,7 +341,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
         _from,
         %{active_turn: %{ref: ref}} = state
       ) do
-    {:reply, :ok, finish_active_turn(state, result)}
+    result = effective_active_turn_result(state.active_turn, result)
+    {:reply, {:ok, result}, finish_active_turn(state, result)}
   end
 
   def handle_call({:finish_reserved_frame, _ref, _result}, _from, state) do
@@ -484,6 +496,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   defp active_turn_downstream(state), do: state.downstream
 
+  defp effective_active_turn_result(%{canceled_result: canceled_result}, _result),
+    do: canceled_result
+
+  defp effective_active_turn_result(_active_turn, result), do: result
+
   defp finish_active_turn(state, result) do
     downstream = active_turn_downstream(state)
 
@@ -501,10 +518,45 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   defp put_active_turn_downstream(%{active_turn: active_turn} = state, downstream)
        when is_map(active_turn) and is_map(downstream) do
-    %{state | active_turn: %{active_turn | downstream: downstream}}
+    if Map.has_key?(active_turn, :canceled_result) do
+      state
+    else
+      %{state | active_turn: %{active_turn | downstream: downstream}}
+    end
   end
 
   defp put_active_turn_downstream(state, _downstream), do: state
+
+  defp cancel_active_turn_downstream(%{active_turn: active_turn} = state, downstream)
+       when is_map(active_turn) and is_map(downstream) do
+    case downstream_status(Map.get(active_turn, :downstream), downstream) do
+      :active ->
+        cancel_active_turn_task(active_turn)
+
+        %{
+          state
+          | active_turn:
+              active_turn
+              |> Map.put(:canceled_result, {:error, :client_disconnected})
+              |> Map.put(:downstream, nil)
+        }
+
+      {:error, _reason} ->
+        state
+    end
+  end
+
+  defp cancel_active_turn_downstream(state, _downstream), do: state
+
+  defp cancel_active_turn_task(%{task_pid: task_pid}) when is_pid(task_pid) do
+    if Process.alive?(task_pid) do
+      Process.exit(task_pid, :shutdown)
+    end
+
+    :ok
+  end
+
+  defp cancel_active_turn_task(_active_turn), do: :ok
 
   defp stale_or_busy(current_downstream, downstream) do
     case downstream_status(current_downstream, downstream) do
@@ -846,7 +898,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   defp owner_exit_reason(_reason, _state), do: :owner_crashed
 
   defp owner_error(error)
-       when error in [:owner_unavailable, :stale_owner, :owner_busy, :owner_drained],
+       when error in [
+              :owner_unavailable,
+              :stale_owner,
+              :owner_busy,
+              :owner_drained,
+              :client_disconnected
+            ],
        do: error
 
   defp owner_error({:error, error}), do: owner_error(error)

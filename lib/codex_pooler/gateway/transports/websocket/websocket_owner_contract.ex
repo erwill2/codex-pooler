@@ -22,6 +22,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
           | :stale_downstream
           | :owner_forwarding_disabled
           | :owner_busy
+          | :client_disconnected
 
   @type request_status :: binary()
   @type attempt_status :: binary()
@@ -63,7 +64,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
     :duplicate_downstream,
     :stale_downstream,
     :owner_forwarding_disabled,
-    :owner_busy
+    :owner_busy,
+    :client_disconnected
   ]
 
   @default_forward_timeout_ms 5_000
@@ -133,6 +135,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
        code: "owner_drained",
        message: "websocket owner is draining",
        reason: "owner_drained"
+     )}
+  end
+
+  def safe_error_payload(:client_disconnected, _unsafe_context) do
+    {:ok,
+     payload(
+       status: 499,
+       code: "client_disconnected",
+       message: "websocket client disconnected",
+       reason: "client_disconnected"
      )}
   end
 
