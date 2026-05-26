@@ -1,3 +1,10 @@
+> [!NOTE]
+> **Work in Progress**
+>
+> Codex Pooler is under active development. No published release exists yet, so
+> expect the application, docs, and deployment shape to change before the first
+> release.
+
 <h1 align="center">Codex Pooler</h1>
 
 <p align="center">
