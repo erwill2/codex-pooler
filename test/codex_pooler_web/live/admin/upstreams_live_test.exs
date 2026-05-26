@@ -261,6 +261,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
+             "#upstream-account-#{identity.id} header[data-role='upstream-account-card-header'].flex-row.items-start.justify-between"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{identity.id} [data-role='upstream-account-actions'].shrink-0.self-start #upstream-account-actions-menu-#{identity.id}"
+           )
+
+    assert has_element?(
+             view,
              "#upstream-account-#{identity.id} header #upstream-account-#{identity.id}-routing-readiness",
              "Routing candidate · 1 Pool"
            )

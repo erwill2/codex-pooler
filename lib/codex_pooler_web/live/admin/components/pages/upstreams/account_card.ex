@@ -21,8 +21,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
         status_border_class(@account)
       ]}
     >
-      <header class="flex flex-col gap-3 border-b border-base-300 bg-base-200/35 p-4 sm:flex-row sm:items-start sm:justify-between">
-        <div class="min-w-0">
+      <header
+        data-role="upstream-account-card-header"
+        class="flex flex-row items-start justify-between gap-3 border-b border-base-300 bg-base-200/35 p-4"
+      >
+        <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
             <h3
               id={"upstream-account-#{@account.identity.id}-mail"}
@@ -88,7 +91,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
 
   defp upstream_account_actions(assigns) do
     ~H"""
-    <div class="dropdown dropdown-end inline-block">
+    <div
+      class="dropdown dropdown-end inline-block shrink-0 self-start"
+      data-role="upstream-account-actions"
+    >
       <button
         id={"upstream-account-actions-menu-#{@account.identity.id}"}
         type="button"
