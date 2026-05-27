@@ -70,7 +70,7 @@ defmodule CodexPoolerWeb.Endpoint do
     if codex_desktop_browser?(conn) do
       conn
     else
-      apply(Module.concat(Phoenix, LiveReloader), :call, [conn, opts])
+      Module.concat(Phoenix, LiveReloader).call(conn, opts)
     end
   end
 

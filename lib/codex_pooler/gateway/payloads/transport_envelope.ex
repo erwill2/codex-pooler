@@ -3,9 +3,9 @@ defmodule CodexPooler.Gateway.Payloads.TransportEnvelope do
   Shared upstream HTTP transport envelope helpers.
   """
 
+  alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.RequestOptions.TimeoutConfig
-  alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @type timeout_settings :: %{
