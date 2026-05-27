@@ -106,7 +106,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
 
     assert has_element?(
              view,
-             "#audit-log-pool-filter button[data-pool-id='#{pool.id}'] [data-role='pool-filter-icon'].text-primary"
+             "#audit-log-pool-filter button[data-pool-id='#{pool.id}'] [data-role='pool-filter-icon'].text-success"
            )
 
     html = render(view)

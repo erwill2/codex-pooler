@@ -176,7 +176,7 @@ defmodule CodexPoolerWeb.Admin.PoolFilterComponents do
   defp pool_status(%{"status" => status}), do: status
   defp pool_status(_pool), do: nil
 
-  defp pool_status_icon_class("active"), do: "text-primary"
+  defp pool_status_icon_class("active"), do: "text-success"
   defp pool_status_icon_class("disabled"), do: "text-warning"
   defp pool_status_icon_class("archived"), do: "text-error"
   defp pool_status_icon_class(_status), do: "text-base-content/60"

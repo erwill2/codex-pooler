@@ -427,7 +427,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
 
     assert has_element?(
              view,
-             "#invite-pool-filter button[data-pool-id='#{pool.id}'] [data-role='pool-filter-icon'].text-primary"
+             "#invite-pool-filter button[data-pool-id='#{pool.id}'] [data-role='pool-filter-icon'].text-success"
            )
 
     open_invite_dialog(view)

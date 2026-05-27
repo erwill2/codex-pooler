@@ -89,7 +89,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
 
       assert has_element?(
                view,
-               "#stats-pool-filter-control [data-role='pool-filter-trigger'] [data-role='pool-filter-icon'].text-primary"
+               "#stats-pool-filter-control [data-role='pool-filter-trigger'] [data-role='pool-filter-icon'].text-success"
              )
 
       assert has_element?(
