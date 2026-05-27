@@ -83,6 +83,17 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
 
       assert has_element?(
                view,
+               "#stats-pool-filter-control [data-role='pool-filter-trigger']",
+               "Quota first"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-pool-filter-control [data-role='pool-filter-trigger'] [data-role='pool-filter-icon'].text-primary"
+             )
+
+      assert has_element?(
+               view,
                "#stats-pool-filter-control [data-role='pool-filter-menu'] button[data-pool-id='']",
                "All Pools"
              )

@@ -9,6 +9,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLive do
   alias CodexPoolerWeb.Admin.InviteCreationDialog
   alias CodexPoolerWeb.Admin.InvitesPageComponents
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
+  alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.Admin.PoolInviteForm
 
   @page_size 50
@@ -215,14 +216,10 @@ defmodule CodexPoolerWeb.Admin.InvitesLive do
           phx-submit="filter"
           compact
         >
-          <InvitesPageComponents.invite_filter_dropdown
+          <PoolFilterComponents.pool_filter_dropdown
             id="invite-pool-filter"
             label="Pool"
-            field_name="pool_id"
             hidden_id="filters_pool_id"
-            role="pool-filter"
-            event="select_pool_filter"
-            value_attr={:pool_id}
             selected_value={@filter_values["pool_id"] || ""}
             options={@pool_filter_options}
           />
@@ -264,7 +261,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLive do
       invites: invites,
       filter_form: to_form(form_values, as: :filters),
       filter_values: form_values,
-      pool_filter_options: pool_filter_options(pools)
+      pool_filter_options: PoolFilterComponents.pool_filter_options(pools)
     )
   end
 
@@ -414,13 +411,6 @@ defmodule CodexPoolerWeb.Admin.InvitesLive do
 
   defp maybe_put_filter(filters, _key, value) when value in [nil, ""], do: filters
   defp maybe_put_filter(filters, key, value), do: Keyword.put(filters, key, value)
-
-  defp pool_filter_options(pools) do
-    [%{label: "All Pools", value: "", icon: "hero-server-stack", tone: :neutral}] ++
-      Enum.map(pools, fn pool ->
-        %{label: pool.name, value: pool.id, icon: "hero-server-stack", tone: :primary}
-      end)
-  end
 
   defp dialog_pool_options(pools) do
     pools

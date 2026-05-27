@@ -411,13 +411,24 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     Application.put_env(:codex_pooler, Mailer, adapter: Swoosh.Adapters.Local)
     Application.put_env(:swoosh, :local, false)
 
-    _pool =
+    pool =
       pool_fixture(%{
         slug: "invite-email-unavailable",
         name: "Invite Email Unavailable"
       })
 
     {:ok, view, _html} = live(conn, ~p"/admin/invites")
+
+    assert has_element?(
+             view,
+             "#invite-pool-filter button[data-pool-id='#{pool.id}']",
+             "Bridge ring"
+           )
+
+    assert has_element?(
+             view,
+             "#invite-pool-filter button[data-pool-id='#{pool.id}'] [data-role='pool-filter-icon'].text-primary"
+           )
 
     open_invite_dialog(view)
 

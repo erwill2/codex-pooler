@@ -5,9 +5,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   alias CodexPooler.Events
   alias CodexPooler.Pools
   alias CodexPooler.Upstreams
-  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
+  alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.Admin.RequestLogFilterForm
   alias CodexPoolerWeb.Admin.RequestLogsDisplay
 
@@ -118,16 +118,11 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
           advanced_open={advanced_filters_open?(@filter_values)}
           mobile_single_column
         >
-          <.request_log_filter_dropdown
+          <PoolFilterComponents.pool_filter_dropdown
             id="request-log-pool-filter"
             label="Pool"
-            field_name="pool_id"
             hidden_id="filters_pool_id"
-            role="pool-filter"
-            event="select_pool_filter"
-            value_attr={:pool_id}
             selected_value={@filter_values["pool_id"] || ""}
-            selected={selected_pool_filter_option(@pool_filter_options, @filter_values["pool_id"])}
             options={@pool_filter_options}
           />
           <.request_log_filter_dropdown
@@ -292,7 +287,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
         ),
       filter_values: form_values,
       filter_errors: filter_errors,
-      pool_filter_options: pool_filter_options(pools),
+      pool_filter_options: PoolFilterComponents.pool_filter_options(pools),
       model_filter_options: model_filter_options(model_filter_models, form_values["model"]),
       upstream_account_options: upstream_account_options(visible_upstream_identities)
     )
@@ -321,34 +316,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       nil -> Enum.any?(socket.assigns.pools, &(&1.id == pool_id))
       selected_pool_id -> selected_pool_id == pool_id
     end
-  end
-
-  defp pool_filter_options(pools) do
-    settings_by_pool_id = pools |> Enum.map(& &1.id) |> Pools.routing_settings_by_pool_ids()
-
-    pool_options =
-      pools
-      |> Enum.sort_by(&String.downcase(&1.name))
-      |> Enum.map(fn pool ->
-        strategy = Map.fetch!(settings_by_pool_id, pool.id).routing_strategy
-
-        %{
-          label: pool.name,
-          value: pool.id,
-          icon: AdminBadges.routing_strategy_icon(strategy),
-          strategy_label: AdminBadges.routing_strategy_label(strategy)
-        }
-      end)
-
-    [all_pool_filter_option() | pool_options]
-  end
-
-  defp all_pool_filter_option do
-    %{label: "All Pools", value: "", icon: "hero-server-stack", strategy_label: nil}
-  end
-
-  defp selected_pool_filter_option(options, pool_id) do
-    Enum.find(options, &(&1.value == pool_id)) || all_pool_filter_option()
   end
 
   defp model_filter_options(models, selected_model) do

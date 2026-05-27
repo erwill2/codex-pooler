@@ -3,10 +3,9 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
 
   alias CodexPooler.Admin.Stats
   alias CodexPooler.Events
-  alias CodexPooler.Pools
-  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
+  alias CodexPoolerWeb.Admin.PoolFilterComponents
   alias CodexPoolerWeb.Admin.StatsPresentation
   alias CodexPoolerWeb.Admin.StatsPresentation.Charts, as: StatsCharts
 
@@ -28,7 +27,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
        dashboard: nil,
        filter_form: to_form(%{"pool_id" => "", "window" => "24h"}, as: :filters),
        filter_error: nil,
-       pool_filter_options: all_pool_filter_options(),
+       pool_filter_options: PoolFilterComponents.all_pool_filter_options(),
        subscribed_pool_ids: MapSet.new()
      )}
   end
@@ -85,64 +84,13 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
         />
 
         <AdminComponents.filter_form id="stats-filter-form" for={@filter_form} phx-submit="filter">
-          <div class="grid gap-2">
-            <input
-              type="hidden"
-              id="stats-pool-filter"
-              name="filters[pool_id]"
-              value={@filter_form.params["pool_id"] || ""}
-            />
-            <details
-              id="stats-pool-filter-control"
-              class="dropdown w-full"
-              phx-click-away={JS.remove_attribute("open", to: "#stats-pool-filter-control")}
-            >
-              <summary
-                data-role="pool-filter-trigger"
-                aria-label="Scope"
-                class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
-              >
-                <% selected_pool =
-                  selected_pool_filter_option(
-                    @pool_filter_options,
-                    @filter_form.params["pool_id"]
-                  ) %>
-                <.icon
-                  name={selected_pool.icon}
-                  class="size-4 shrink-0 text-base-content/60"
-                />
-                <span class="truncate">{selected_pool.label}</span>
-              </summary>
-              <ul
-                data-role="pool-filter-menu"
-                class="menu dropdown-content z-[60] mt-1 max-h-80 w-full flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-1 !transition-none ![scale:100%] shadow-xl"
-              >
-                <li :for={option <- @pool_filter_options}>
-                  <button
-                    type="button"
-                    phx-click="select_pool_filter"
-                    phx-value-pool-id={option.value}
-                    data-role="pool-filter-option"
-                    data-pool-id={option.value}
-                    class={[
-                      "flex items-center gap-2 text-sm",
-                      option.value == (@filter_form.params["pool_id"] || "") && "active"
-                    ]}
-                    aria-current={option.value == (@filter_form.params["pool_id"] || "") && "true"}
-                  >
-                    <.icon name={option.icon} class="size-4 shrink-0" />
-                    <span class="truncate">{option.label}</span>
-                    <span
-                      :if={option.strategy_label}
-                      class="ml-auto shrink-0 text-[0.68rem] text-base-content/50"
-                    >
-                      {option.strategy_label}
-                    </span>
-                  </button>
-                </li>
-              </ul>
-            </details>
-          </div>
+          <PoolFilterComponents.pool_filter_dropdown
+            id="stats-pool-filter-control"
+            label="Scope"
+            hidden_id="stats-pool-filter"
+            selected_value={@filter_form.params["pool_id"] || ""}
+            options={@pool_filter_options}
+          />
           <div class="grid gap-2">
             <input
               type="hidden"
@@ -244,7 +192,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
           dashboard: nil,
           filter_form: stats_filter_form(filters),
           filter_error: error,
-          pool_filter_options: all_pool_filter_options(),
+          pool_filter_options: PoolFilterComponents.all_pool_filter_options(),
           current_params: params
         )
     end
@@ -345,33 +293,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
   defp query_param_order(_key), do: 2
 
   defp pool_filter_options(%{filters: %{pool_options: pool_options}}) do
-    settings_by_pool_id =
-      pool_options
-      |> Enum.map(& &1.id)
-      |> Pools.routing_settings_by_pool_ids()
-
-    pool_options =
-      pool_options
-      |> Enum.map(fn pool ->
-        strategy = Map.fetch!(settings_by_pool_id, pool.id).routing_strategy
-
-        %{
-          label: pool.name,
-          value: pool.id,
-          icon: AdminBadges.routing_strategy_icon(strategy),
-          strategy_label: AdminBadges.routing_strategy_label(strategy)
-        }
-      end)
-
-    all_pool_filter_options() ++ pool_options
-  end
-
-  defp all_pool_filter_options do
-    [%{label: "All Pools", value: "", icon: "hero-server-stack", strategy_label: nil}]
-  end
-
-  defp selected_pool_filter_option(options, pool_id) do
-    Enum.find(options, &(&1.value == (pool_id || ""))) || hd(all_pool_filter_options())
+    PoolFilterComponents.pool_filter_options(pool_options)
   end
 
   defp window_options, do: @window_options

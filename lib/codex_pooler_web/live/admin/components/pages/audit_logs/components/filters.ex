@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Filters do
 
   alias CodexPoolerWeb.Admin.AuditLogsComponents.Presentation
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.PoolFilterComponents
 
   attr :filter_form, :any, required: true
   attr :filter_values, :map, required: true
@@ -19,64 +20,13 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Filters do
       advanced_open
       phx-submit="filter"
     >
-      <div class="grid gap-2">
-        <input
-          type="hidden"
-          id="filters_pool_id"
-          name="filters[pool_id]"
-          value={@filter_values["pool_id"] || ""}
-        />
-        <details
-          id="audit-log-pool-filter"
-          class="dropdown w-full"
-          phx-click-away={JS.remove_attribute("open", to: "#audit-log-pool-filter")}
-        >
-          <summary
-            data-role="pool-filter-trigger"
-            aria-label="Pool"
-            class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
-          >
-            <% selected_pool =
-              Presentation.selected_pool_filter_option(
-                @pool_filter_options,
-                @filter_values["pool_id"]
-              ) %>
-            <.icon
-              name={selected_pool.icon}
-              class="size-4 shrink-0 text-base-content/60"
-            />
-            <span class="truncate">{selected_pool.label}</span>
-          </summary>
-          <ul
-            data-role="pool-filter-menu"
-            class="menu dropdown-content z-[60] mt-1 max-h-80 w-full flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-1 !transition-none ![scale:100%] shadow-xl"
-          >
-            <li :for={option <- @pool_filter_options}>
-              <button
-                type="button"
-                phx-click="select_pool_filter"
-                phx-value-pool-id={option.value}
-                data-role="pool-filter-option"
-                data-pool-id={option.value}
-                class={[
-                  "flex items-center gap-2 text-sm",
-                  option.value == (@filter_values["pool_id"] || "") && "active"
-                ]}
-                aria-current={option.value == (@filter_values["pool_id"] || "") && "true"}
-              >
-                <.icon name={option.icon} class="size-4 shrink-0" />
-                <span class="truncate">{option.label}</span>
-                <span
-                  :if={option.strategy_label}
-                  class="ml-auto shrink-0 text-[0.68rem] text-base-content/50"
-                >
-                  {option.strategy_label}
-                </span>
-              </button>
-            </li>
-          </ul>
-        </details>
-      </div>
+      <PoolFilterComponents.pool_filter_dropdown
+        id="audit-log-pool-filter"
+        label="Pool"
+        hidden_id="filters_pool_id"
+        selected_value={@filter_values["pool_id"] || ""}
+        options={@pool_filter_options}
+      />
       <div class="grid gap-2">
         <input
           type="hidden"
@@ -274,7 +224,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Filters do
     ~H"""
     <div id={"#{@id}-filter"} class="fieldset mb-2">
       <div class="input input-sm flex w-full items-center gap-2">
-        <span class="label !mb-0 min-w-0 shrink truncate !px-2 !normal-case !tracking-normal leading-none text-base-content/60">
+        <span class="label !mb-0 w-12 min-w-12 shrink-0 truncate !px-2 !normal-case !tracking-normal leading-none text-base-content/60">
           {@label}
         </span>
         <input

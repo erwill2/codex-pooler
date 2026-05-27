@@ -89,6 +89,11 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
 
     assert has_element?(
              view,
+             "#audit-log-pool-filter [data-role='pool-filter-trigger'] [data-role='pool-filter-icon'].text-base-content\\/60"
+           )
+
+    assert has_element?(
+             view,
              "#audit-log-pool-filter button[data-pool-id='#{pool.id}']",
              "Audit Page"
            )
@@ -97,6 +102,11 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
              view,
              "#audit-log-pool-filter button[data-pool-id='#{pool.id}']",
              "Quota first"
+           )
+
+    assert has_element?(
+             view,
+             "#audit-log-pool-filter button[data-pool-id='#{pool.id}'] [data-role='pool-filter-icon'].text-primary"
            )
 
     html = render(view)
@@ -125,6 +135,11 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
              view,
              "#audit-log-outcome-filter [data-role='outcome-filter-trigger']",
              "Any outcome"
+           )
+
+    assert has_element?(
+             view,
+             "#audit-log-outcome-filter [data-role='outcome-filter-trigger-icon'] .hero-adjustments-horizontal"
            )
 
     assert has_element?(
@@ -166,6 +181,11 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
              view,
              "#audit-log-action-filter [data-role='action-filter-trigger']",
              "Any event"
+           )
+
+    assert has_element?(
+             view,
+             "#audit-log-action-filter [data-role='action-filter-trigger-icon'] .hero-squares-2x2"
            )
 
     assert has_element?(

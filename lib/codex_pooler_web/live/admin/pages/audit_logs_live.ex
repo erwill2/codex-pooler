@@ -3,8 +3,8 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
 
   alias CodexPooler.Audit
   alias CodexPooler.Pools
-  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.PoolFilterComponents
 
   import CodexPoolerWeb.Admin.AuditLogsComponents,
     only: [audit_event_drawer: 1, audit_log_filters: 1, audit_logs_table: 1]
@@ -135,7 +135,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
       filter_form: to_form(form_values, as: :filters, errors: form_errors(filter_errors)),
       filter_values: form_values,
       filter_errors: filter_errors,
-      pool_filter_options: pool_filter_options(pools)
+      pool_filter_options: PoolFilterComponents.pool_filter_options(pools)
     )
   end
 
@@ -245,30 +245,6 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
   defp date_boundary(date, _field), do: DateTime.new!(date, ~T[00:00:00], "Etc/UTC")
 
   defp form_errors(errors), do: Enum.map(errors, &{&1.field, {&1.message, []}})
-
-  defp pool_filter_options(pools) do
-    settings_by_pool_id = pools |> Enum.map(& &1.id) |> Pools.routing_settings_by_pool_ids()
-
-    pool_options =
-      pools
-      |> Enum.sort_by(&String.downcase(&1.name))
-      |> Enum.map(fn pool ->
-        strategy = Map.fetch!(settings_by_pool_id, pool.id).routing_strategy
-
-        %{
-          label: pool.name,
-          value: pool.id,
-          icon: AdminBadges.routing_strategy_icon(strategy),
-          strategy_label: AdminBadges.routing_strategy_label(strategy)
-        }
-      end)
-
-    [all_pool_filter_option() | pool_options]
-  end
-
-  defp all_pool_filter_option do
-    %{label: "All Pools", value: "", icon: "hero-server-stack", strategy_label: nil}
-  end
 
   defp empty_audit_logs, do: %{items: [], total: 0, limit: @page_size, offset: 0}
 

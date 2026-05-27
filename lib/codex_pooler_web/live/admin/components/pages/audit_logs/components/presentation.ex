@@ -8,14 +8,6 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Presentation do
   @outcome_options ~w(success failure)
   @actor_type_options ~w(user system)
 
-  def selected_pool_filter_option(options, pool_id) do
-    Enum.find(options, &(&1.value == pool_id)) || all_pool_filter_option()
-  end
-
-  def all_pool_filter_option do
-    %{label: "All Pools", value: "", icon: "hero-server-stack", strategy_label: nil}
-  end
-
   def outcome_options,
     do: [{"Any outcome", ""} | Enum.map(@outcome_options, &{String.capitalize(&1), &1})]
 
@@ -30,7 +22,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Presentation do
 
   def outcome_filter_icon("success"), do: "hero-check-circle"
   def outcome_filter_icon("failure"), do: "hero-x-circle"
-  def outcome_filter_icon(_outcome), do: "hero-clipboard-document-check"
+  def outcome_filter_icon(_outcome), do: "hero-adjustments-horizontal"
 
   def outcome_filter_icon_class("success"), do: "text-success"
   def outcome_filter_icon_class("failure"), do: "text-error"
@@ -63,6 +55,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents.Presentation do
   def audit_action_icon("upstream_account." <> _suffix), do: "hero-cloud-arrow-up"
   def audit_action_icon("api_key." <> _suffix), do: "hero-key"
   def audit_action_icon("mcp." <> _suffix), do: "hero-command-line"
+  def audit_action_icon(action) when action in [nil, ""], do: "hero-squares-2x2"
   def audit_action_icon(_action), do: "hero-clipboard-document-list"
 
   def audit_action_icon_class("auth." <> _suffix), do: "text-success"

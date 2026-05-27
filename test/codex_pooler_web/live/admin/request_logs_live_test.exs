@@ -107,6 +107,17 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     assert has_element?(view, "#request-log-pool-filter [aria-label='Pool']")
     assert has_element?(view, "#request-log-status-filter [aria-label='Status']")
 
+    assert has_element?(
+             view,
+             "#request-log-pool-filter [data-role='pool-filter-trigger']",
+             "Bridge ring"
+           )
+
+    assert has_element?(
+             view,
+             "#request-log-pool-filter [data-role='pool-filter-trigger'] [data-role='pool-filter-icon'].text-primary"
+           )
+
     assert has_element?(view, "#request-log-upstream-filter [aria-label='Upstream account']")
     assert has_element?(view, "#request-log-model-filter [aria-label='Model']")
     refute has_element?(view, "#request-log-filter-form-advanced #request-log-upstream-filter")
