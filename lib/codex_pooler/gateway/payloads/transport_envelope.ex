@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Payloads.TransportEnvelope do
 
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.RequestOptions.TimeoutConfig
+  alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @type timeout_settings :: %{
@@ -47,7 +48,10 @@ defmodule CodexPooler.Gateway.Payloads.TransportEnvelope do
 
   defp user_agent_headers(opts) do
     if Keyword.get(opts, :include_user_agent?, false) do
-      [{"user-agent", "codex_cli_rs/0.0.0"}]
+      user_agent =
+        Keyword.get(opts, :upstream_user_agent, OperationalSettings.current().upstream_user_agent)
+
+      [{"user-agent", user_agent}]
     else
       []
     end
@@ -73,8 +77,7 @@ defmodule CodexPooler.Gateway.Payloads.TransportEnvelope do
       {name, value} when is_binary(name) and is_binary(value) ->
         name = String.downcase(name)
 
-        if name == "user-agent" or String.starts_with?(name, "x-openai-") or
-             String.starts_with?(name, "x-codex-") do
+        if String.starts_with?(name, "x-openai-") or String.starts_with?(name, "x-codex-") do
           [{name, value}]
         else
           []
