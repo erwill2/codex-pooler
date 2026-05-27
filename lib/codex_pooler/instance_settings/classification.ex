@@ -299,6 +299,17 @@ defmodule CodexPooler.InstanceSettings.Classification do
       notes: "Timeout options are attached to each new upstream request."
     },
     %{
+      key: :upstream_user_agent,
+      bucket: :db_runtime_cached,
+      group: :gateway,
+      label: "Upstream Codex user-agent",
+      env_names: [],
+      storage: :database,
+      reloadability: :cached,
+      notes:
+        "New upstream Codex transport envelopes synthesize this user-agent instead of forwarding downstream client identity."
+    },
+    %{
       key: :model_context_window_overrides,
       bucket: :db_runtime_live,
       group: :gateway,
