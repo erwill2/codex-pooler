@@ -134,13 +134,13 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                   type="button"
                   tabindex="0"
                   class="btn btn-ghost btn-sm btn-square text-base-content/60"
-                  aria-label="Admin page live updates: connecting"
+                  aria-label="Live updates: syncing"
                   data-ws-button
                 >
                   <span data-ws-icon>
                     <.icon name="hero-wifi" class="size-5 text-base-content/45" />
                   </span>
-                  <span class="sr-only" data-ws-label>Admin page live updates: connecting</span>
+                  <span class="sr-only" data-ws-label>Live updates: syncing</span>
                 </button>
                 <div
                   id="admin-websocket-state-popover"
@@ -157,7 +157,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                         live updates
                       </p>
                       <p class="mt-1 text-xs leading-5 text-base-content/60">
-                        Browser admin UI only. Codex API websocket health is separate.
+                        Changes appear automatically while this page is open. No manual refresh needed.
                       </p>
                     </div>
                     <dl class="grid gap-2 text-xs">
@@ -167,12 +167,12 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                           class="max-w-40 text-right font-mono font-semibold text-base-content/70"
                           data-ws-state
                         >
-                          connecting
+                          Syncing
                         </dd>
                       </div>
                       <div class="flex items-center justify-between gap-3">
                         <dt class="text-base-content/50">Transport</dt>
-                        <dd class="font-mono text-base-content/80" data-ws-transport>pending</dd>
+                        <dd class="font-mono text-base-content/80" data-ws-transport>Pending</dd>
                       </div>
                     </dl>
                   </div>
@@ -186,18 +186,21 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
           class="fixed left-0 top-12 z-40 flex h-[calc(100svh-3rem)] w-16 flex-col border-r border-base-300/70 bg-base-100 py-4 md:w-64"
           aria-label="Admin navigation"
         >
-          <div class="mb-6 flex justify-center px-3 text-center md:flex-col md:items-start md:gap-1 md:px-4 md:text-left">
+          <div class="mb-6 flex min-w-0 justify-center px-3 text-center md:flex-col md:items-start md:gap-1 md:px-4 md:text-left">
             <OperatorComponents.operator_avatar
               id="admin-sidebar-operator-avatar"
               operator={@current_scope.user}
               status={@current_scope.user.status}
               class="md:hidden"
             />
-            <div id="admin-sidebar-operator-label" class="hidden min-w-0 md:block">
+            <div id="admin-sidebar-operator-label" class="hidden min-w-0 md:block md:w-full">
               <p class="text-sm font-semibold uppercase tracking-wide text-primary">
                 operator
               </p>
-              <p class="mt-1 max-w-full truncate text-xs font-medium uppercase tracking-wide text-base-content/50">
+              <p
+                class="mt-1 block w-full min-w-0 truncate text-xs font-medium uppercase tracking-wide text-base-content/50"
+                title={@admin_identity}
+              >
                 {@admin_identity}
               </p>
             </div>

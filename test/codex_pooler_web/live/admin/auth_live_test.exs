@@ -80,7 +80,7 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
 
         assert has_element?(
                  view,
-                 "#admin-websocket-state-button[aria-label='Admin page live updates: connecting']"
+                 "#admin-websocket-state-button[aria-label='Live updates: syncing']"
                )
 
         assert has_element?(view, "#topbar-connection-indicator [data-ws-icon]")
@@ -88,7 +88,7 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
         assert has_element?(
                  view,
                  "#topbar-connection-indicator [data-ws-label]",
-                 "Admin page live updates: connecting"
+                 "Live updates: syncing"
                )
 
         assert has_element?(
@@ -96,19 +96,21 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
                  "#admin-websocket-state-popover[data-state='connecting'][data-transport='pending'][phx-hook='WebSocketState']"
                )
 
-        assert has_element?(view, "#admin-websocket-state-popover [data-ws-state]", "connecting")
-        assert has_element?(view, "#admin-websocket-state-popover [data-ws-transport]", "pending")
+        assert has_element?(view, "#admin-websocket-state-popover [data-ws-state]", "Syncing")
+        assert has_element?(view, "#admin-websocket-state-popover [data-ws-transport]", "Pending")
 
         assert has_element?(
                  view,
                  "#admin-websocket-state-popover",
-                 "Browser admin UI only. Codex API websocket health is separate."
+                 "Changes appear automatically while this page is open. No manual refresh needed."
                )
 
         for forbidden_copy <- [
               "web" <> "socket degraded",
               "Browser connection" <> " degraded",
-              "Long" <> "Poll fallback"
+              "Long" <> "Poll fallback",
+              "Browser admin UI only",
+              "connected via WebSocket"
             ] do
           refute has_element?(view, "#admin-websocket-state-popover", forbidden_copy)
         end
@@ -116,7 +118,7 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
         refute has_element?(view, "#admin-websocket-state-popover [data-ws-endpoint]")
         refute has_element?(view, "#admin-websocket-state-popover [data-ws-heartbeat]")
         assert has_element?(view, "#admin-sidebar-operator-avatar")
-        assert has_element?(view, "#admin-sidebar-operator-label")
+        assert has_element?(view, "#admin-sidebar-operator-label.min-w-0.md\\:w-full")
 
         assert has_element?(
                  view,
@@ -126,7 +128,7 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
 
         assert has_element?(
                  view,
-                 "#admin-sidebar-operator-label",
+                 "#admin-sidebar-operator-label p.block.w-full.min-w-0.truncate[title='#{expected_operator_identity}']",
                  expected_operator_identity
                )
 

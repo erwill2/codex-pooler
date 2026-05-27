@@ -11,7 +11,7 @@ test("normalizes Phoenix longpoll transport through transportName instead of min
 
   assert.deepEqual(normalizeLiveSocketTransport(socket), {
     transportKey: "longpoll",
-    transportLabel: "long polling",
+    transportLabel: "Long polling",
   })
 })
 
@@ -32,7 +32,7 @@ test("never exposes minified unknown transport names to operators", () => {
 
   assert.deepEqual(normalizeLiveSocketTransport(socket), {
     transportKey: "unknown",
-    transportLabel: "unknown",
+    transportLabel: "Unknown",
   })
 })
 
@@ -61,7 +61,7 @@ test("classifies connected longpoll as browser admin fallback", () => {
 
   assert.deepEqual(classifyLiveSocketConnection(liveSocket, socket), {
     transportKey: "longpoll",
-    transportLabel: "long polling",
+    transportLabel: "Long polling",
     visualState: "longPollFallback",
   })
 })

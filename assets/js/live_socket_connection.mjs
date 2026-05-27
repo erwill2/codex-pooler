@@ -1,6 +1,6 @@
 export const classifyLiveSocketConnection = (liveSocket, socket) => {
   if (!liveSocket || !socket) {
-    return {transportKey: "pending", transportLabel: "pending", visualState: "connecting"}
+    return {transportKey: "pending", transportLabel: "Pending", visualState: "connecting"}
   }
 
   const state = socket?.connectionState?.() || readyStateLabel(socket?.conn?.readyState)
@@ -26,20 +26,20 @@ export const normalizeLiveSocketTransport = (socket) => {
   const transportName = phoenixTransportName(socket) || connectionTransportName(socket)
 
   if (!transportName) {
-    return {transportKey: "unknown", transportLabel: "unknown"}
+    return {transportKey: "unknown", transportLabel: "Unknown"}
   }
 
   const normalized = transportName.toString().replace(/[_\s-]+/g, "").toLowerCase()
 
   if (normalized.includes("longpoll")) {
-    return {transportKey: "longpoll", transportLabel: "long polling"}
+    return {transportKey: "longpoll", transportLabel: "Long polling"}
   }
 
   if (normalized.includes("websocket")) {
     return {transportKey: "websocket", transportLabel: "WebSocket"}
   }
 
-  return {transportKey: "unknown", transportLabel: "unknown"}
+  return {transportKey: "unknown", transportLabel: "Unknown"}
 }
 
 const phoenixTransportName = (socket) => {
