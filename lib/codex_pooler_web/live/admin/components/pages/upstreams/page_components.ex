@@ -24,7 +24,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
       <AdminComponents.page_header
         id="upstream-account-page-header"
         title="Upstreams"
-        description="Import upstream auth.json, check readiness, and keep account access current."
+        description="Import Codex auth.json, check readiness, and keep account access current."
       >
         <:actions>
           <AdminComponents.action_button
@@ -36,15 +36,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
             size={:md}
             variant={:primary}
           />
-          <AdminComponents.action_button
-            :if={@pools != []}
-            id="upstream-page-import-auth-json-action"
-            icon="hero-document-arrow-up"
-            label="Import auth.json"
-            phx-click="open_import_auth_json"
-            size={:md}
-            variant={:primary}
-          />
+          <.upstream_page_actions :if={@pools != []} />
         </:actions>
       </AdminComponents.page_header>
 
@@ -84,6 +76,45 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
         <.upstream_account_grid accounts={@upstream_accounts} />
       </section>
     </section>
+    """
+  end
+
+  defp upstream_page_actions(assigns) do
+    ~H"""
+    <div id="upstream-page-actions" class="join w-full sm:w-auto">
+      <button
+        id="upstream-page-import-auth-json-action"
+        type="button"
+        class="btn btn-primary join-item min-w-0 flex-1 gap-2 px-5 sm:flex-none"
+        phx-click="open_import_auth_json"
+      >
+        <.icon name="hero-document-arrow-up" class="size-4 shrink-0" />
+        <span class="truncate">Import auth.json</span>
+      </button>
+      <details class="dropdown dropdown-end join-item">
+        <summary
+          id="upstream-page-actions-menu"
+          class="btn btn-primary btn-square join-item list-none"
+          aria-label="More upstream actions"
+        >
+          <.icon name="hero-chevron-down" class="size-4" />
+        </summary>
+        <ul
+          id="upstream-page-actions-menu-items"
+          tabindex="0"
+          class="menu dropdown-content z-20 mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-2 text-left shadow-xl"
+        >
+          <li>
+            <AdminComponents.dropdown_action_item
+              id="upstream-page-create-invite-action"
+              icon="hero-user-plus"
+              label="Invite account"
+              navigate={~p"/admin/invites?create=1"}
+            />
+          </li>
+        </ul>
+      </details>
+    </div>
     """
   end
 

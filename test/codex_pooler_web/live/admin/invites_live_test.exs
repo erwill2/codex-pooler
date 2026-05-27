@@ -91,15 +91,24 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
 
     assert has_element?(view, "#pool-invite-dialog[open]")
     assert has_element?(view, "#pool-invite-form")
+
+    assert has_element?(
+             view,
+             "#pool-invite-dialog",
+             "Create a one-time invite link for a Codex account and assign it to a Pool."
+           )
+
     assert has_element?(view, "#pool-invite-submit")
     assert has_element?(view, "#invite_pool_id")
 
     assert has_element?(
              view,
              "#invite_pool_id option[value='#{pool.id}']",
-             "Admin Invites (admin-invites)"
+             "Admin Invites"
            )
 
+    invite_pool_select_html = view |> element("#invite_pool_id") |> render()
+    refute invite_pool_select_html =~ "admin-invites"
     assert has_element?(view, "#invite_invited_email")
     assert has_element?(view, "label[for='invite_invited_email']", "Codex Account Email")
     assert has_element?(view, "#invite_send_email")
@@ -116,6 +125,20 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     })
 
     assert has_element?(view, "#pool-invite-submit:not([disabled])")
+  end
+
+  test "bare create query opens the invite dialog without immediate validation errors", %{
+    conn: conn
+  } do
+    pool_fixture(%{slug: "bare-create-target", name: "Bare Create Target"})
+
+    {:ok, view, _html} = live(conn, ~p"/admin/invites?create=1")
+
+    assert has_element?(view, "#pool-invite-dialog[open]")
+    assert has_element?(view, "#pool-invite-form")
+    assert has_element?(view, "#pool-invite-submit[disabled]")
+    refute has_element?(view, "#pool-invite-form", "can't be blank")
+    refute has_element?(view, "#pool-invite-form", "must be an active Pool")
   end
 
   @tag :invite_prefill_valid
@@ -145,7 +168,7 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     assert has_element?(
              view,
              "#invite_pool_id option[value='#{pool.id}'][selected]",
-             "Prefill Target (prefill-target)"
+             "Prefill Target"
            )
 
     assert has_element?(view, "#invite_invited_email[value='user@example.com']")
@@ -211,12 +234,13 @@ defmodule CodexPoolerWeb.Admin.InvitesLiveTest do
     assert has_element?(
              view,
              "#invite_pool_id option[value='#{pool.id}'][selected]",
-             "Blank Prefill Target (blank-prefill-target)"
+             "Blank Prefill Target"
            )
 
     assert has_element?(view, "#invite_invited_email[value='']")
     assert has_element?(view, "#invite_send_email")
     assert has_element?(view, "#pool-invite-submit[disabled]")
+    refute has_element?(view, "#pool-invite-form", "can't be blank")
     refute has_element?(view, "#invite-url")
     assert Repo.aggregate(Invite, :count) == 0
     assert_no_email_sent()

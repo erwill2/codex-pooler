@@ -1229,7 +1229,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   defp dialog_pool_options(scope) do
     scope
     |> Pools.list_visible_pools()
-    |> Enum.map(&{"#{&1.name} (#{&1.slug})", &1.id})
+    |> Enum.map(&{&1.name, &1.id})
     |> case do
       [] -> [{"No active Pools available", ""}]
       options -> options

@@ -103,16 +103,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysReadModel do
   def pool_options([]), do: [{"No active Pools available", ""}]
 
   def pool_options(pools) do
-    pool_lookup = Map.new(pools, &{&1.id, &1})
-    Enum.map(pools, &{pool_label(pool_lookup, &1.id), &1.id})
-  end
-
-  @spec pool_label(pool_lookup(), Ecto.UUID.t()) :: String.t()
-  def pool_label(pool_lookup, pool_id) do
-    case Map.get(pool_lookup, pool_id) do
-      nil -> "Unknown Pool"
-      pool -> "#{pool.name} (#{pool.slug})"
-    end
+    Enum.map(pools, &{&1.name, &1.id})
   end
 
   @spec pool_groups([Pool.t()], pool_lookup(), [APIKey.t()]) :: [pool_group()]

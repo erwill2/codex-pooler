@@ -114,6 +114,15 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
     assert has_element?(view, "#api-key-step-review-panel")
     assert has_element?(view, "#api_key_display_name")
     assert has_element?(view, "#api_key_pool_id")
+
+    assert has_element?(
+             view,
+             "#api_key_pool_id option[value='#{primary_pool.id}']",
+             "Primary Pool"
+           )
+
+    pool_select_html = view |> element("#api_key_pool_id") |> render()
+    refute pool_select_html =~ "primary-pool"
     assert has_element?(view, "#api_key_status")
     assert has_element?(view, "#api_key_expires_at")
     assert has_element?(view, "#api_key_operator_notes")

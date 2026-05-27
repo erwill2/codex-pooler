@@ -127,8 +127,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     refute has_element?(view, "#upstream-account-form")
     refute has_element?(view, "#upstream-account-submit")
+    assert has_element?(view, "#upstream-page-actions.join")
     assert has_element?(view, "#upstream-page-import-auth-json-action", "Import auth.json")
-    refute has_element?(view, "#upstream-page-create-invite-action")
+    assert has_element?(view, "#upstream-page-actions-menu[aria-label='More upstream actions']")
+
+    assert has_element?(
+             view,
+             "#upstream-page-create-invite-action[href='/admin/invites?create=1']",
+             "Invite account"
+           )
+
     refute has_element?(view, "#auth-json-import-dialog")
     refute has_element?(view, "#pool-invite-dialog")
     refute has_element?(view, "#pool-invite-form")
@@ -290,7 +298,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#upstream-account-page-header",
-             "Import upstream auth.json, check readiness, and keep account access current."
+             "Import Codex auth.json, check readiness, and keep account access current."
            )
 
     refute has_element?(view, "#upstream-account-form")
@@ -299,7 +307,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     refute has_element?(view, "#upstream-account-submit")
     assert has_element?(view, "#upstream-page-import-auth-json-action")
     refute has_element?(view, "#auth-json-import-refresh-token-warning")
-    refute has_element?(view, "#upstream-page-create-invite-action")
+    assert has_element?(view, "#upstream-page-create-invite-action")
     refute has_element?(view, "#pool-invite-submit")
     refute has_element?(view, "#upstream-account-table")
     assert has_element?(view, "#upstream-account-grid")
@@ -1573,8 +1581,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#auth_json_pool_id option[value='#{pool.id}'][selected]",
-             "Recovery Actions (recovery-actions)"
+             "Recovery Actions"
            )
+
+    pool_select_html = view |> element("#auth_json_pool_id") |> render()
+    refute pool_select_html =~ "recovery-actions"
 
     reauth_identity =
       identities

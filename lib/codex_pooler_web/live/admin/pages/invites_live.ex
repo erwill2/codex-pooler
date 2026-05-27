@@ -282,19 +282,41 @@ defmodule CodexPoolerWeb.Admin.InvitesLive do
       "send_email" => send_email_param(params)
     }
 
-    changeset =
-      PoolInviteForm.changeset(invite_params, selected_pool(socket.assigns.pools, pool_id))
-
-    assign(socket,
+    socket
+    |> assign(
       creating_invite: true,
-      invite_form: PoolInviteForm.form_for_changeset(changeset),
-      invite_form_valid?: changeset.valid?,
       last_invite: nil,
       revoking_invite: nil
     )
+    |> prefill_invite_form(params, invite_params, pool_id)
   end
 
   defp maybe_prefill_invite_dialog(socket, _params), do: socket
+
+  defp prefill_invite_form(socket, params, invite_params, pool_id) do
+    if validate_invite_prefill?(params) do
+      changeset =
+        PoolInviteForm.changeset(invite_params, selected_pool(socket.assigns.pools, pool_id))
+
+      assign(socket,
+        invite_form: PoolInviteForm.form_for_changeset(changeset),
+        invite_form_valid?: changeset.valid?
+      )
+    else
+      assign(socket,
+        invite_form: PoolInviteForm.form_for_params(invite_params),
+        invite_form_valid?: false
+      )
+    end
+  end
+
+  defp validate_invite_prefill?(params) do
+    explicit_param?(params, "invited_email") or explicit_param?(params, "send_email")
+  end
+
+  defp explicit_param?(params, key) do
+    match?(value when is_binary(value) and value != "", Map.get(params, key))
+  end
 
   defp string_param(params, key) do
     case Map.get(params, key, "") do
@@ -402,15 +424,15 @@ defmodule CodexPoolerWeb.Admin.InvitesLive do
 
   defp dialog_pool_options(pools) do
     pools
-    |> Enum.map(&{dialog_pool_label(&1), &1.id})
+    |> Enum.map(&{pool_name(&1), &1.id})
     |> case do
       [] -> [{"No active Pools available", ""}]
       options -> options
     end
   end
 
-  defp dialog_pool_label(nil), do: "Unknown Pool"
-  defp dialog_pool_label(pool), do: "#{pool.name} (#{pool.slug})"
+  defp pool_name(nil), do: "Unknown Pool"
+  defp pool_name(pool), do: pool.name
 
   defp selected_pool(pools, pool_id) when is_binary(pool_id),
     do: Enum.find(pools, &(&1.id == pool_id))

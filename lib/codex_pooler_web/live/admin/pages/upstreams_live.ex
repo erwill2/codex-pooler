@@ -328,19 +328,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
 
   defp pool_options(pools) do
     pools
-    |> Enum.map(&{pool_label(&1), &1.id})
+    |> Enum.map(&{pool_name(&1), &1.id})
     |> case do
       [] -> [{"No active Pools available", ""}]
       options -> options
     end
   end
 
-  defp pool_label(nil), do: "Unknown Pool"
-  defp pool_label(pool), do: "#{pool.name} (#{pool.slug})"
+  defp pool_name(nil), do: "Unknown Pool"
+  defp pool_name(pool), do: pool.name
 
   defp dialog_pool_options(pools) do
     pools
-    |> Enum.map(&{pool_label(&1), &1.id})
+    |> Enum.map(&{pool_name(&1), &1.id})
     |> case do
       [] -> [{"No active Pools available", ""}]
       options -> options

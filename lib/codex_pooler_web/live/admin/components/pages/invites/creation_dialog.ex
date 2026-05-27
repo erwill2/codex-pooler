@@ -22,7 +22,7 @@ defmodule CodexPoolerWeb.Admin.InviteCreationDialog do
           </p>
           <h2 class="mt-1 text-2xl font-bold text-base-content">Create Pool invite</h2>
           <p class="mt-2 max-w-prose text-sm leading-6 text-base-content/70">
-            Generate a one-time invite URL for a browser-linked upstream account.
+            Create a one-time invite link for a Codex account and assign it to a Pool.
           </p>
         </div>
 
