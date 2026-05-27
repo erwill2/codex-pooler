@@ -16,6 +16,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Quota.PrimingState
   alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.UpstreamAccountCard
 
   setup :register_and_log_in_user
 
@@ -42,7 +44,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       )
 
     button_html =
-      render_component(&CodexPoolerWeb.Admin.Components.dropdown_action_item/1, button_attrs)
+      render_component(&AdminComponents.dropdown_action_item/1, button_attrs)
 
     assert button_html =~ ~s(<button)
     assert button_html =~ ~s(id="test-dropdown-button")
@@ -51,7 +53,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert button_html =~ ~s(phx-value-pool-id="pool-1")
 
     link_html =
-      render_component(&CodexPoolerWeb.Admin.Components.dropdown_action_item/1,
+      render_component(&AdminComponents.dropdown_action_item/1,
         id: "test-dropdown-link",
         icon: "hero-link",
         label: "Link action",
@@ -250,6 +252,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, "#upstream-account-grid")
     assert has_element?(view, "[data-role='upstream-account-card']")
     assert has_element?(view, "#upstream-account-#{identity.id}-plan-label", "Team")
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{identity.id}-cockpit-link[href='/admin/upstreams/#{identity.id}']"
+           )
 
     open_auth_json_import_dialog(view)
 
@@ -1498,7 +1505,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     no_assignment_id = Ecto.UUID.generate()
 
     no_assignment_html =
-      render_component(&CodexPoolerWeb.Admin.UpstreamAccountCard.account_card/1,
+      render_component(&UpstreamAccountCard.account_card/1,
         account: recovery_component_account(no_assignment_id, "paused", []),
         account_index: 0
       )
@@ -1514,7 +1521,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     deleted_id = Ecto.UUID.generate()
 
     deleted_html =
-      render_component(&CodexPoolerWeb.Admin.UpstreamAccountCard.account_card/1,
+      render_component(&UpstreamAccountCard.account_card/1,
         account: recovery_component_account(deleted_id, "deleted", []),
         account_index: 0
       )
@@ -1525,7 +1532,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     usable_id = Ecto.UUID.generate()
 
     usable_html =
-      render_component(&CodexPoolerWeb.Admin.UpstreamAccountCard.account_card/1,
+      render_component(&UpstreamAccountCard.account_card/1,
         account:
           recovery_component_account(
             usable_id,

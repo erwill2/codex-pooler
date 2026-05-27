@@ -153,6 +153,7 @@ defmodule CodexPoolerWeb.Router do
       live "/admin/jobs", Admin.JobsLive, :index
       live "/admin/system", Admin.SystemLive, :index
       live "/admin/upstreams", Admin.UpstreamsLive, :index
+      live "/admin/upstreams/:id", Admin.UpstreamCockpitLive, :show
       live "/admin/api-keys", Admin.ApiKeysLive, :index
       live "/admin/invites", Admin.InvitesLive, :index
       live "/admin/audit-logs", Admin.AuditLogsLive, :index

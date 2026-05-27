@@ -43,6 +43,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
               {@account.identity.status}
             </span>
             <.upstream_plan_indicator account={@account} account_index={@account_index} />
+            <.link
+              id={"upstream-account-#{@account.identity.id}-cockpit-link"}
+              navigate={~p"/admin/upstreams/#{@account.identity.id}"}
+              class="btn btn-ghost btn-xs gap-1"
+            >
+              <.icon name="hero-arrow-top-right-on-square" class="size-3.5" />
+              <span>Cockpit</span>
+            </.link>
           </div>
           <p
             id={"upstream-account-#{@account.identity.id}-routing-readiness"}

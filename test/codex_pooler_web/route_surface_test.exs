@@ -34,6 +34,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:get, "/admin/stats"},
                {:get, "/admin/system"},
                {:get, "/admin/upstreams"},
+               {:get, "/admin/upstreams/:id"},
                {:get, "/api/codex/usage"},
                {:get, "/backend-api/codex/agent-identities/jwks"},
                {:get, "/backend-api/codex/models"},
