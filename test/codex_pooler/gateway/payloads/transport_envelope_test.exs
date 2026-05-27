@@ -4,6 +4,7 @@ defmodule CodexPooler.Gateway.Payloads.TransportEnvelopeTest do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.RequestOptions.TimeoutConfig
   alias CodexPooler.Gateway.Payloads.TransportEnvelope
+  alias CodexPooler.Gateway.Transports.UpstreamDispatch
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   describe "timeout_config/2" do
@@ -65,6 +66,68 @@ defmodule CodexPooler.Gateway.Payloads.TransportEnvelopeTest do
     end
   end
 
+  describe "UpstreamDispatch regular runtime headers" do
+    test "keeps forwarded metadata broad at construction and narrows only at runtime output" do
+      options = runtime_options("/backend-api/codex/responses")
+
+      assert options.transport.forwarded_metadata_headers == forwarded_metadata_headers()
+
+      assert UpstreamDispatch.regular_runtime_forwarded_metadata_headers(options) ==
+               approved_forwarded_metadata_headers()
+    end
+
+    test "builds regular runtime headers with only approved forwarded metadata" do
+      options = runtime_options("/backend-api/codex/responses")
+
+      headers =
+        UpstreamDispatch.regular_runtime_headers(
+          identity(),
+          " upstream-token ",
+          options,
+          [{"content-type", "application/json"}, {"accept", "text/event-stream"}],
+          upstream_user_agent: "codex_cli_rs/9.9.9"
+        )
+
+      assert headers == [
+               {"authorization", "Bearer upstream-token"},
+               {"user-agent", "codex_cli_rs/9.9.9"},
+               {"chatgpt-account-id", "acct_test"},
+               {"content-type", "application/json"},
+               {"accept", "text/event-stream"},
+               {"x-codex-turn-metadata", "metadata-redacted"},
+               {"x-codex-window-id", "window-redacted"},
+               {"x-codex-parent-thread-id", "thread-redacted"},
+               {"x-openai-subagent", "subagent-redacted"}
+             ]
+    end
+
+    test "gates forwarded metadata to backend responses and compact transport only" do
+      assert UpstreamDispatch.regular_runtime_forwarded_metadata_headers(
+               runtime_options("/backend-api/codex/responses")
+             ) == approved_forwarded_metadata_headers()
+
+      assert UpstreamDispatch.regular_runtime_forwarded_metadata_headers(
+               runtime_options("/backend-api/codex/responses/compact")
+             ) == approved_forwarded_metadata_headers()
+
+      assert UpstreamDispatch.regular_runtime_forwarded_metadata_headers(
+               runtime_options("/v1/responses")
+             ) == []
+
+      assert UpstreamDispatch.regular_runtime_forwarded_metadata_headers(
+               runtime_options("/backend-api/codex/responses",
+                 openai_source_endpoint: "/v1/responses"
+               )
+             ) == []
+
+      assert UpstreamDispatch.regular_runtime_forwarded_metadata_headers(
+               runtime_options("/backend-api/codex/responses",
+                 openai_chat_payload: %{"model" => "example-model", "messages" => []}
+               )
+             ) == []
+    end
+  end
+
   defp request_options(%TimeoutConfig{} = timeout_config) do
     %RequestOptions{
       request_metadata: nil,
@@ -78,6 +141,37 @@ defmodule CodexPooler.Gateway.Payloads.TransportEnvelopeTest do
       usage_authentication: nil,
       file_bridge: nil
     }
+  end
+
+  defp runtime_options(endpoint, opts \\ []) do
+    opts
+    |> Keyword.put(:forwarded_headers, forwarded_metadata_headers())
+    |> Map.new()
+    |> RequestOptions.build(endpoint, %{"model" => "example-model"})
+  end
+
+  defp forwarded_metadata_headers do
+    approved_forwarded_metadata_headers() ++
+      [
+        {"User-Agent", "downstream-harness/1.0"},
+        {"authorization", "Bearer downstream"},
+        {"cookie", "downstream-cookie"},
+        {"idempotency-key", "downstream-idempotency"},
+        {"accept", "application/json"},
+        {"content-type", "application/json"},
+        {"x-codex-turn-state", "turn-state-redacted"},
+        {"x-codex-extra", "extra-redacted"},
+        {"x-openai-extra", "extra-redacted"}
+      ]
+  end
+
+  defp approved_forwarded_metadata_headers do
+    [
+      {"x-codex-turn-metadata", "metadata-redacted"},
+      {"x-codex-window-id", "window-redacted"},
+      {"x-codex-parent-thread-id", "thread-redacted"},
+      {"x-openai-subagent", "subagent-redacted"}
+    ]
   end
 
   defp identity do

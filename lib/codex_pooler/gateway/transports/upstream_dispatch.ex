@@ -12,6 +12,20 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
   alias CodexPooler.RouteClass
+  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+
+  @regular_runtime_metadata_endpoints [
+    "/backend-api/codex/responses",
+    "/backend-api/codex/responses/compact"
+  ]
+  @regular_runtime_metadata_header_names [
+    "x-codex-turn-metadata",
+    "x-codex-window-id",
+    "x-codex-parent-thread-id",
+    "x-openai-subagent"
+  ]
+
+  @type header :: {String.t(), String.t()}
 
   defmodule Request do
     @moduledoc false
@@ -45,6 +59,64 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   end
 
   alias __MODULE__.Request, as: DispatchRequest
+
+  @doc false
+  @spec regular_runtime_headers(
+          UpstreamIdentity.t(),
+          String.t(),
+          RequestOptions.t(),
+          [header()],
+          keyword()
+        ) :: [header()]
+  def regular_runtime_headers(
+        identity,
+        token,
+        %RequestOptions{} = request_options,
+        headers,
+        opts \\ []
+      )
+      when is_list(headers) and is_list(opts) do
+    envelope_opts =
+      opts
+      |> Keyword.put(:include_user_agent?, true)
+      |> Keyword.put(
+        :forwarded_headers,
+        regular_runtime_forwarded_metadata_headers(request_options)
+      )
+
+    TransportEnvelope.headers(identity, token, headers, envelope_opts)
+  end
+
+  @doc false
+  @spec regular_runtime_forwarded_metadata_headers(RequestOptions.t()) :: [header()]
+  def regular_runtime_forwarded_metadata_headers(%RequestOptions{
+        transport: %{
+          upstream_endpoint: endpoint,
+          forwarded_metadata_headers: forwarded_headers
+        },
+        openai_compatibility: %{source_endpoint: nil, openai_chat_payload: nil}
+      })
+      when endpoint in @regular_runtime_metadata_endpoints and is_list(forwarded_headers) do
+    filter_regular_runtime_forwarded_metadata_headers(forwarded_headers)
+  end
+
+  def regular_runtime_forwarded_metadata_headers(%RequestOptions{}), do: []
+
+  defp filter_regular_runtime_forwarded_metadata_headers(headers) do
+    Enum.flat_map(headers, fn
+      {name, value} when is_binary(name) and is_binary(value) ->
+        name = String.downcase(name)
+
+        if name in @regular_runtime_metadata_header_names do
+          [{name, value}]
+        else
+          []
+        end
+
+      _other ->
+        []
+    end)
+  end
 
   @spec http_request(DispatchRequest.t()) :: {:ok, Req.Response.t()} | {:error, map()}
   def http_request(%DispatchRequest{
@@ -93,7 +165,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         decode_body: false,
         retry: false,
         headers:
-          upstream_headers(identity, token, [
+          regular_runtime_headers(identity, token, opts, [
             {"content-type", "application/json"},
             {"accept",
              if(RouteClass.streaming?(payload), do: "text/event-stream", else: "application/json")}
