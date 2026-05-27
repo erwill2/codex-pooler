@@ -34,6 +34,36 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     :ok
   end
 
+  test "shared dropdown action item renders button and link modes" do
+    button_attrs =
+      Map.merge(
+        %{id: "test-dropdown-button", icon: "hero-check", label: "Button action"},
+        %{"phx-click" => "select", "phx-value-pool-id" => "pool-1"}
+      )
+
+    button_html =
+      render_component(&CodexPoolerWeb.Admin.Components.dropdown_action_item/1, button_attrs)
+
+    assert button_html =~ ~s(<button)
+    assert button_html =~ ~s(id="test-dropdown-button")
+    assert button_html =~ ~s(type="button")
+    assert button_html =~ ~s(phx-click="select")
+    assert button_html =~ ~s(phx-value-pool-id="pool-1")
+
+    link_html =
+      render_component(&CodexPoolerWeb.Admin.Components.dropdown_action_item/1,
+        id: "test-dropdown-link",
+        icon: "hero-link",
+        label: "Link action",
+        navigate: ~p"/admin/invites?create=1"
+      )
+
+    assert link_html =~ ~s(<a)
+    assert link_html =~ ~s(id="test-dropdown-link")
+    assert link_html =~ ~s(href="/admin/invites?create=1")
+    assert link_html =~ ~s(data-phx-link="redirect")
+  end
+
   test "guides operators to create a Pool before upstream accounts", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 

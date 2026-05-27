@@ -24,6 +24,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   @type assignment_snapshot :: %{
           required(:id) => Ecto.UUID.t(),
           required(:upstream_identity_id) => Ecto.UUID.t(),
+          required(:pool_id) => Ecto.UUID.t(),
           required(:assignment_label) => String.t(),
           required(:status) => String.t(),
           required(:health_status) => String.t(),
@@ -87,6 +88,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     %{
       id: assignment.id,
       upstream_identity_id: assignment.upstream_identity_id,
+      pool_id: assignment.pool_id,
       assignment_label: assignment.assignment_label || "Pool assignment",
       status: assignment.status,
       health_status: assignment.health_status,

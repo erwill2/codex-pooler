@@ -427,17 +427,29 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :icon, :string, required: true
   attr :label, :string, required: true
   attr :variant, :atom, default: :secondary, values: [:secondary, :danger, :positive, :warning]
-  attr :rest, :global, include: ~w(disabled phx-click phx-value-id title aria-label)
+
+  attr :rest, :global,
+    include:
+      ~w(href navigate patch disabled phx-click phx-value-id phx-value-pool-id title aria-label)
 
   def dropdown_action_item(assigns) do
     assigns = assign(assigns, :class, dropdown_action_item_class(assigns.variant))
 
-    ~H"""
-    <button id={@id} type="button" class={@class} {@rest}>
-      <.icon name={@icon} class="size-4" />
-      <span>{@label}</span>
-    </button>
-    """
+    if assigns.rest[:href] || assigns.rest[:navigate] || assigns.rest[:patch] do
+      ~H"""
+      <.link id={@id} class={@class} {@rest}>
+        <.icon name={@icon} class="size-4" />
+        <span>{@label}</span>
+      </.link>
+      """
+    else
+      ~H"""
+      <button id={@id} type="button" class={@class} {@rest}>
+        <.icon name={@icon} class="size-4" />
+        <span>{@label}</span>
+      </button>
+      """
+    end
   end
 
   defp dropdown_action_item_class(:danger) do

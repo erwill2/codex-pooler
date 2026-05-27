@@ -1300,7 +1300,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [target_pool, source_pool])
 
     assert account.identity.id == identity.id
-    assert [%{pool_label: source_pool_label}] = account.assignments
+    assert [%{pool_id: source_pool_id, pool_label: source_pool_label}] = account.assignments
+    assert source_pool_id == source_pool.id
     assert source_pool_label =~ source_pool.name
   end
 
