@@ -2,6 +2,8 @@ defmodule CodexPooler.EventsTest do
   use CodexPooler.DataCase, async: false
 
   alias CodexPooler.Events
+  alias CodexPooler.Events.Event
+  alias CodexPooler.Events.PostgresBridge
 
   import CodexPooler.PoolerFixtures
 
@@ -64,6 +66,26 @@ defmodule CodexPooler.EventsTest do
 
     assert {:error, :invalid_topics} =
              Events.broadcast_pool_event(pool.id, ["unknown"], "invalid", %{})
+  end
+
+  test "relays postgres notification payloads back into local pool PubSub" do
+    pool = pool_fixture()
+    assert :ok = Events.subscribe_pool(pool.id)
+
+    event = %Event{
+      version: 1,
+      id: Ecto.UUID.generate(),
+      pool_id: pool.id,
+      topics: ["upstreams"],
+      reason: "upstream_quota_windows_updated",
+      emitted_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
+      payload: %{"upstream_identity_id" => Ecto.UUID.generate()}
+    }
+
+    assert {:ok, payload} = Events.event_to_postgres_payload(event)
+    assert :ok = PostgresBridge.relay_payload(payload)
+
+    assert_receive {Events, ^event}
   end
 
   defp assert_event_shape(event, pool_id, topics, reason) do

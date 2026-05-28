@@ -16,6 +16,8 @@ defmodule CodexPooler.Application do
        name: CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession.TaskSupervisor},
       {Task.Supervisor, name: CodexPooler.RateLimitEventSupervisor, max_children: 4},
       {Phoenix.PubSub, name: CodexPooler.PubSub},
+      {Postgrex.Notifications, postgres_notifications_config()},
+      CodexPooler.Events.PostgresBridge,
       CodexPooler.InstanceSettings.Cache,
       {Oban, Application.fetch_env!(:codex_pooler, Oban)},
       {DNSCluster,
@@ -32,5 +34,27 @@ defmodule CodexPooler.Application do
   def config_change(changed, _new, removed) do
     CodexPoolerWeb.Endpoint.config_change(changed, removed)
     :ok
+  end
+
+  defp postgres_notifications_config do
+    CodexPooler.Repo.config()
+    |> Keyword.take([
+      :after_connect,
+      :connect_timeout,
+      :database,
+      :hostname,
+      :password,
+      :parameters,
+      :port,
+      :socket_dir,
+      :socket_options,
+      :ssl,
+      :ssl_opts,
+      :timeout,
+      :types,
+      :url,
+      :username
+    ])
+    |> Keyword.merge(name: CodexPooler.Events.PostgresNotifications, auto_reconnect: true)
   end
 end

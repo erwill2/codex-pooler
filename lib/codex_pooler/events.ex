@@ -9,12 +9,16 @@ defmodule CodexPooler.Events do
 
   alias CodexPooler.Events.Event
   alias CodexPooler.Pools.Pool
+  alias CodexPooler.Repo
   alias Phoenix.PubSub
+
+  require Logger
 
   @pubsub CodexPooler.PubSub
   @message_tag __MODULE__
   @topic_prefix "pool_events"
   @all_topic @topic_prefix <> ":all"
+  @postgres_channel "codex_pooler_events"
 
   @request_logs "request_logs"
   @usage "usage"
@@ -94,10 +98,8 @@ defmodule CodexPooler.Events do
         payload: normalize_payload(payload)
       }
 
-      message = {@message_tag, event}
-
-      with :ok <- PubSub.broadcast(@pubsub, pubsub_topic(pool_id), message),
-           :ok <- PubSub.broadcast(@pubsub, @all_topic, message) do
+      with :ok <- broadcast_local_event(event),
+           :ok <- broadcast_postgres_event(event) do
         {:ok, event}
       end
     else
@@ -109,6 +111,22 @@ defmodule CodexPooler.Events do
   @spec all_pubsub_topic() :: String.t()
   def all_pubsub_topic, do: @all_topic
 
+  @spec postgres_channel() :: String.t()
+  def postgres_channel, do: @postgres_channel
+
+  @spec origin_id() :: String.t()
+  def origin_id do
+    case :persistent_term.get({__MODULE__, :origin_id}, nil) do
+      origin_id when is_binary(origin_id) ->
+        origin_id
+
+      nil ->
+        origin_id = System.get_env("POD_NAME") || Ecto.UUID.generate()
+        :persistent_term.put({__MODULE__, :origin_id}, origin_id)
+        origin_id
+    end
+  end
+
   @spec message_tag() :: module()
   def message_tag, do: @message_tag
 
@@ -118,6 +136,25 @@ defmodule CodexPooler.Events do
       nil -> nil
       pool_id -> @topic_prefix <> ":" <> pool_id
     end
+  end
+
+  @spec broadcast_local_event(Event.t()) :: :ok | {:error, term()}
+  def broadcast_local_event(%Event{} = event) do
+    message = {@message_tag, event}
+
+    with :ok <- PubSub.broadcast(@pubsub, pubsub_topic(event.pool_id), message),
+         :ok <- PubSub.broadcast(@pubsub, @all_topic, message) do
+      :ok
+    end
+  end
+
+  @spec event_to_postgres_payload(Event.t()) :: {:ok, String.t()} | {:error, term()}
+  def event_to_postgres_payload(%Event{} = event) do
+    event
+    |> Map.from_struct()
+    |> Map.update!(:emitted_at, &DateTime.to_iso8601/1)
+    |> Map.put(:origin_id, origin_id())
+    |> Jason.encode()
   end
 
   defp normalize_topics(topic) when is_binary(topic), do: normalize_topics([topic])
@@ -150,4 +187,16 @@ defmodule CodexPooler.Events do
   defp pool_id(%{id: id}) when is_binary(id), do: id
   defp pool_id(id) when is_binary(id), do: String.trim(id)
   defp pool_id(_pool_or_id), do: nil
+
+  defp broadcast_postgres_event(%Event{} = event) do
+    with {:ok, payload} <- event_to_postgres_payload(event),
+         {:ok, _result} <-
+           Ecto.Adapters.SQL.query(Repo, "SELECT pg_notify($1, $2)", [@postgres_channel, payload]) do
+      :ok
+    else
+      {:error, reason} ->
+        Logger.warning("pool event postgres relay failed: #{inspect(reason)}")
+        :ok
+    end
+  end
 end
