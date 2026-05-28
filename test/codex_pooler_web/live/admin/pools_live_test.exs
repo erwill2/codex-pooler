@@ -139,11 +139,11 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert has_element?(view, "#pool-row-#{pool.id} > footer [data-role='pool-tps-cell']")
     assert has_element?(view, "#pool-metric-requests", "0")
-    assert has_element?(view, "#pool-metric-requests", "Last 5h requests")
+    refute has_element?(view, "#pool-metric-requests", "Last 5h requests")
     assert has_element?(view, "#pool-metric-tokens-per-sec", "0")
     assert has_element?(view, "#pool-metric-tokens-per-sec", "Token throughput")
 
-    assert has_element?(
+    refute has_element?(
              view,
              "#pool-metric-tokens-per-sec",
              "5h settled tokens / upstream latency"
@@ -245,11 +245,11 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
 
     assert has_element?(view, "#pool-metric-requests", "1")
-    assert has_element?(view, "#pool-metric-requests", "Last 5h requests")
+    refute has_element?(view, "#pool-metric-requests", "Last 5h requests")
     assert has_element?(view, "#pool-metric-tokens-per-sec", "50.0")
     assert has_element?(view, "#pool-metric-tokens-per-sec", "Token throughput")
 
-    assert has_element?(
+    refute has_element?(
              view,
              "#pool-metric-tokens-per-sec",
              "5h settled tokens / upstream latency"

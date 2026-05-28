@@ -324,7 +324,6 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
             icon="hero-arrow-path"
             label="Requests 5h"
             value={PoolsReadModel.format_metric_integer(@pool_metrics.request_count_5h)}
-            description="Last 5h requests"
             compact_mobile
           />
           <AdminComponents.metric_card
@@ -332,7 +331,6 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
             icon="hero-bolt"
             label="Token throughput"
             value={PoolsReadModel.format_metric_float(@pool_metrics.tokens_per_second)}
-            description="5h settled tokens / upstream latency"
             tone={:primary}
             compact_mobile
           />
