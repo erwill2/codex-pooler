@@ -151,6 +151,109 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     end
   end
 
+  test "GET /backend-api/codex/responses ignores prompt-cache routing input from websocket frames" do
+    primary_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_public_ws_prompt_cache_primary",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+        })
+      )
+
+    alternate_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_public_ws_prompt_cache_alternate",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+        })
+      )
+
+    setup = gateway_setup(primary_upstream)
+
+    alternate =
+      gateway_upstream(setup.pool, alternate_upstream, "upstream-token-ws-prompt-cache-alternate",
+        compact?: false
+      )
+
+    prime_routing_quota!(alternate.identity)
+    use_routing_strategy!(setup.pool, "bridge_ring", 2)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, alternate.assignment])
+      )
+
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    turn_state = "public-ws-prompt-cache-#{System.unique_integer([:positive])}"
+    raw_prompt_cache_key = "raw-ws-prompt-cache-routing-key-do-not-log"
+
+    {conn, websocket, ref} = public_websocket_connect!(port, setup, turn_state)
+
+    try do
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{"type" => "message", "role" => "user", "content" => "websocket prompt cache"}
+          ],
+          "prompt_cache_key" => raw_prompt_cache_key,
+          "stream" => true,
+          "generate" => true
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+      assert Jason.decode!(frame)["id"] in [
+               "resp_public_ws_prompt_cache_primary",
+               "resp_public_ws_prompt_cache_alternate"
+             ]
+
+      assert_receive {Events,
+                      %{
+                        reason: "request_finalized",
+                        payload: %{"request_id" => request_id, "status" => "succeeded"}
+                      }},
+                     @websocket_frame_timeout
+
+      request = Repo.get!(Request, request_id)
+      assert request.endpoint == "/backend-api/codex/responses"
+      assert request.transport == "websocket"
+      assert request.status == "succeeded"
+
+      routing = request.request_metadata["routing"]
+      assert routing["strategy"] == "bridge_ring"
+      assert routing["routing_locality_status"] == "unavailable"
+      assert routing["routing_locality_applied"] == false
+      assert routing["routing_locality_unhonored_reason"] == "prompt_cache_key_absent"
+      refute Map.has_key?(routing, "routing_locality_seed_fingerprint")
+      refute Map.has_key?(routing, "routing_locality_assignment_fingerprint")
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.transport == "websocket"
+      assert attempt.status == "succeeded"
+
+      metadata_text = inspect({request.request_metadata, attempt.response_metadata})
+      refute metadata_text =~ raw_prompt_cache_key
+      refute metadata_text =~ setup.authorization
+      refute metadata_text =~ setup.raw_key
+      refute metadata_text =~ "Bearer "
+      refute metadata_text =~ "upstream-token"
+      refute metadata_text =~ "cache_hit"
+      refute metadata_text =~ "provider_cache"
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
   test "GET /backend-api/codex/v1/responses upgrades through the websocket alias route" do
     upstream =
       start_upstream(

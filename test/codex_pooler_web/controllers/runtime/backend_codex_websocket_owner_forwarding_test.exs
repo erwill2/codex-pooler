@@ -53,8 +53,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
-  alias CodexPoolerWeb.WebsocketConnectionLogger
   alias CodexPoolerWeb.CodexResponsesSocket
+  alias CodexPoolerWeb.WebsocketConnectionLogger
 
   @sentinel "SECRET_SENTINEL_DO_NOT_STORE_123"
 
