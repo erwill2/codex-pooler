@@ -35,7 +35,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
         unique: [
           fields: [:args, :queue, :worker],
           keys: [:pool_id, :pool_upstream_assignment_id, :trigger_kind],
-          states: [:scheduled, :available, :executing, :retryable, :completed],
+          states: :successful,
           period: 60
         ]
       )

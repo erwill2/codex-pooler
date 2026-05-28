@@ -10,7 +10,7 @@ defmodule CodexPooler.Jobs.AccountReconciliationWorker do
     unique: [
       fields: [:args, :queue, :worker],
       keys: [:pool_id, :pool_upstream_assignment_id],
-      states: [:scheduled, :available, :executing, :retryable],
+      states: :incomplete,
       period: {7, :days}
     ]
 

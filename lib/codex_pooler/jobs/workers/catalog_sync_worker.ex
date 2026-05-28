@@ -10,7 +10,7 @@ defmodule CodexPooler.Jobs.CatalogSyncWorker do
     unique: [
       fields: [:args, :queue, :worker],
       keys: [:pool_id],
-      states: [:scheduled, :available, :executing, :retryable],
+      states: :incomplete,
       period: {7, :days}
     ]
 

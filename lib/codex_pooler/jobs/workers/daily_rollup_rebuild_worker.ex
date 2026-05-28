@@ -10,7 +10,7 @@ defmodule CodexPooler.Jobs.DailyRollupRebuildWorker do
     unique: [
       fields: [:args, :queue, :worker],
       keys: [:rollup_date],
-      states: [:scheduled, :available, :executing, :retryable],
+      states: :incomplete,
       period: {7, :days}
     ]
 

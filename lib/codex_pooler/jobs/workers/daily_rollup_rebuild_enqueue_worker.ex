@@ -9,7 +9,7 @@ defmodule CodexPooler.Jobs.DailyRollupRebuildEnqueueWorker do
     tags: ["daily_rollup_rebuild_enqueue"],
     unique: [
       fields: [:worker, :queue],
-      states: [:scheduled, :available, :executing, :retryable],
+      states: :incomplete,
       period: {1, :day}
     ]
 

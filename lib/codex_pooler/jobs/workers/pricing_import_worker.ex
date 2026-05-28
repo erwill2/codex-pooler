@@ -9,7 +9,7 @@ defmodule CodexPooler.Jobs.PricingImportWorker do
     tags: ["pricing_import"],
     unique: [
       fields: [:worker, :queue],
-      states: [:scheduled, :available, :executing, :retryable],
+      states: :incomplete,
       period: {1, :hour}
     ]
 

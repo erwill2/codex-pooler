@@ -9,7 +9,7 @@ defmodule CodexPooler.Jobs.CatalogSyncEnqueueWorker do
     tags: ["catalog_sync_enqueue"],
     unique: [
       fields: [:worker, :queue],
-      states: [:scheduled, :available, :executing, :retryable],
+      states: :incomplete,
       period: {30, :minutes}
     ]
 

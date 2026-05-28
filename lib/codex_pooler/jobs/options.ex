@@ -10,7 +10,7 @@ defmodule CodexPooler.Jobs.Options do
       Keyword.get(opts, :unique,
         fields: [:args, :queue, :worker],
         keys: keys,
-        states: [:scheduled, :available, :executing, :retryable],
+        states: :incomplete,
         period: {7, :days}
       )
     )

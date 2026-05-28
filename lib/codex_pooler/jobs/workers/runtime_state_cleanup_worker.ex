@@ -6,7 +6,7 @@ defmodule CodexPooler.Jobs.RuntimeStateCleanupWorker do
     tags: ["runtime_state_cleanup"],
     unique: [
       fields: [:worker, :queue],
-      states: [:scheduled, :available, :executing, :retryable],
+      states: :incomplete,
       period: {15, :minutes}
     ]
 

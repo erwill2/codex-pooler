@@ -9,7 +9,7 @@ defmodule CodexPooler.Jobs.AccountReconciliationEnqueueWorker do
     tags: ["account_reconciliation_enqueue"],
     unique: [
       fields: [:worker, :queue],
-      states: [:scheduled, :available, :executing, :retryable],
+      states: :incomplete,
       period: {5, :minutes}
     ]
 
