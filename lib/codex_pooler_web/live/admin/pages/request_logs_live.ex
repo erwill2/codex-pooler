@@ -238,7 +238,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   defp form_field_value(_field), do: ""
 
   defp load_request_logs(socket, params) do
-    pools = Pools.list_visible_pools(socket.assigns.current_scope)
+    pools = Pools.list_log_filter_pools(socket.assigns.current_scope)
 
     visible_upstream_identities =
       Upstreams.list_visible_upstream_identities(socket.assigns.current_scope)

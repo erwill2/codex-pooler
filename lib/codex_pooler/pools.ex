@@ -56,6 +56,21 @@ defmodule CodexPooler.Pools do
     end
   end
 
+  @spec list_log_filter_pools(term()) :: [Pool.t()]
+  def list_log_filter_pools(%Scope{} = scope) do
+    with {:ok, _decision} <- require_capability(scope, capability(:pool_operate)) do
+      Repo.all(
+        from p in Pool,
+          where: p.status in [^@status_active, ^@status_disabled],
+          order_by: [asc: p.created_at]
+      )
+    else
+      {:error, _reason} -> []
+    end
+  end
+
+  def list_log_filter_pools(_scope), do: []
+
   @spec list_pools_for_management(Scope.t()) :: {:ok, [Pool.t()]} | {:error, access_error()}
   def list_pools_for_management(%Scope{} = scope) do
     with {:ok, _decision} <- require_capability(scope, capability(:pool_manage)) do

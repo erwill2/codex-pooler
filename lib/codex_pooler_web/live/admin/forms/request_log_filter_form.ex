@@ -55,7 +55,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogFilterForm do
     if blank?(pool_id) do
       {nil, nil}
     else
-      {nil, %{field: :pool_id, message: "Pool filter did not match an active Pool"}}
+      {nil, %{field: :pool_id, message: "Pool filter did not match an available Pool"}}
     end
   end
 
@@ -68,7 +68,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogFilterForm do
         {pool, nil}
 
       true ->
-        {nil, %{field: :pool_id, message: "Pool filter did not match an active Pool"}}
+        {nil, %{field: :pool_id, message: "Pool filter did not match an available Pool"}}
     end
   end
 

@@ -23,6 +23,7 @@ defmodule CodexPooler.PoolsTest do
       assert pool.created_by_user_id == owner.id
       assert {:ok, [^pool]} = Pools.list_pools(scope)
       assert Pools.list_visible_pools(scope) == [pool]
+      assert Pools.list_log_filter_pools(scope) == [pool]
 
       assert audit = Repo.get_by(AuditEvent, action: "pool.create", target_id: pool.id)
       assert audit.actor_user_id == owner.id
@@ -232,6 +233,7 @@ defmodule CodexPooler.PoolsTest do
       assert {:error, %{code: :invalid_request}} = Pools.list_pools_for_management(%{})
       assert {:error, %{code: :invalid_request}} = Pools.list_pools(nil)
       assert Pools.list_visible_pools(nil) == []
+      assert Pools.list_log_filter_pools(nil) == []
       refute Pools.can_manage_pools?(%{})
 
       assert {:error, %{code: :invalid_request}} = Pools.update_pool(nil, pool, %{name: "Denied"})

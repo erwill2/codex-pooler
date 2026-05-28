@@ -109,14 +109,27 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
              "#audit-log-pool-filter button[data-pool-id='#{pool.id}'] [data-role='pool-filter-icon'].text-success"
            )
 
+    assert has_element?(
+             view,
+             "#audit-log-pool-filter button[data-pool-id='#{hidden_pool.id}']",
+             "Hidden Audit"
+           )
+
+    assert has_element?(
+             view,
+             "#audit-log-pool-filter button[data-pool-id='#{hidden_pool.id}'] [data-role='pool-filter-icon'].text-warning"
+           )
+
     html = render(view)
     all_pools_position = html =~ "All Pools"
     alpha_position = html =~ "Alpha Audit"
     audit_position = html =~ "Audit Page"
+    hidden_position = html =~ "Hidden Audit"
 
     assert all_pools_position
     assert alpha_position
     assert audit_position
+    assert hidden_position
     assert :binary.match(html, "All Pools") < :binary.match(html, "Alpha Audit")
     assert :binary.match(html, "Alpha Audit") < :binary.match(html, "Audit Page")
 
@@ -252,10 +265,10 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
     assert has_element?(view, "#mobile-audit-logs-table thead", "Actor")
     refute has_element?(view, "#mobile-audit-logs-table thead", "Context")
     assert has_element?(view, "#audit-log-row-#{operator_event.id}")
-    refute has_element?(view, "#audit-log-row-#{hidden_event.id}")
     assert has_element?(view, "#audit-log-row-#{pool_routing_event.id}", "Pool routing updated")
 
     assert has_element?(view, "#mobile-audit-log-row-#{operator_event.id}")
+    assert has_element?(view, "#audit-log-row-#{hidden_event.id}", "Pool updated")
     assert has_element?(view, "a[href='/admin/operators']", user.email)
 
     html = render(view)
@@ -296,6 +309,27 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
              "#audit-log-pool-filter [data-role='pool-filter-trigger']",
              "All Pools"
            )
+
+    view
+    |> element("#audit-log-pool-filter button[data-pool-id='#{hidden_pool.id}']")
+    |> render_click()
+
+    assert_patch(view, ~p"/admin/audit-logs?pool_id=#{hidden_pool.id}")
+    assert has_element?(view, "#filters_pool_id[value='#{hidden_pool.id}']")
+
+    assert has_element?(
+             view,
+             "#audit-log-pool-filter [data-role='pool-filter-trigger']",
+             "Hidden Audit"
+           )
+
+    assert has_element?(view, "#audit-log-row-#{hidden_event.id}", "Pool updated")
+
+    view
+    |> element("#audit-log-pool-filter button[data-pool-id='']")
+    |> render_click()
+
+    assert_patch(view, ~p"/admin/audit-logs")
 
     view
     |> element("#audit-log-outcome-filter button[data-outcome='success']")

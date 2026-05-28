@@ -403,7 +403,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
   test "filters by Pool and status without mixing Pool rows", %{conn: conn, scope: scope} do
     {:ok, first_pool} = Pools.create_pool(scope, %{slug: "logs-first", name: "Logs First"})
     {:ok, second_pool} = Pools.create_pool(scope, %{slug: "logs-second", name: "Logs Second"})
-    hidden_pool = pool_fixture(%{slug: "logs-hidden"})
+    hidden_pool = pool_fixture(%{slug: "logs-hidden", name: "Logs Hidden"})
 
     %{request: first_request} =
       request_log_fixture(first_pool, %{
@@ -439,13 +439,33 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(view, "#request-log-row-#{first_request.id}", "gpt-first-pool")
     assert has_element?(view, "#request-log-row-#{second_request.id}", "gpt-second-pool")
-    refute has_element?(view, "#request-log-row-#{hidden_request.id}", "gpt-hidden-pool")
+    assert has_element?(view, "#request-log-row-#{hidden_request.id}", "gpt-hidden-pool")
+
+    assert has_element?(
+             view,
+             "#request-log-pool-filter button[data-pool-id='#{hidden_pool.id}']",
+             "Logs Hidden"
+           )
+
+    assert has_element?(
+             view,
+             "#request-log-pool-filter button[data-pool-id='#{hidden_pool.id}'] [data-role='pool-filter-icon'].text-warning"
+           )
 
     view
     |> element("#request-log-filter-form")
     |> render_submit(%{"filters" => %{"pool_id" => second_pool.id, "status" => "failed"}})
 
     assert has_element?(view, "#request-log-row-#{second_request.id}", "gpt-second-pool")
+    refute has_element?(view, "#request-log-row-#{first_request.id}")
+
+    view
+    |> element("#request-log-pool-filter button[data-pool-id='#{hidden_pool.id}']")
+    |> render_click()
+
+    assert_patch(view, ~p"/admin/request-logs?pool_id=#{hidden_pool.id}&status=failed")
+    assert has_element?(view, "#filters_pool_id[type='hidden'][value='#{hidden_pool.id}']")
+    assert has_element?(view, "#request-log-row-#{hidden_request.id}", "gpt-hidden-pool")
     refute has_element?(view, "#request-log-row-#{first_request.id}")
   end
 

@@ -148,7 +148,7 @@ defmodule CodexPooler.Audit do
 
   @spec list_events_for_scope(Scope.t(), list_opts()) :: audit_page()
   def list_events_for_scope(%Scope{} = scope, opts \\ []) do
-    visible_pool_ids = scope |> Pools.list_visible_pools() |> Enum.map(& &1.id)
+    visible_pool_ids = scope |> Pools.list_log_filter_pools() |> Enum.map(& &1.id)
     list_events_for_pool_filter(nil, Keyword.put(opts, :visible_pool_ids, visible_pool_ids))
   end
 

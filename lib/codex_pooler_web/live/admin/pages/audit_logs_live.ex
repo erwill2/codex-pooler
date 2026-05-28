@@ -111,7 +111,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
   end
 
   defp load_audit_logs(socket, params) do
-    pools = Pools.list_visible_pools(socket.assigns.current_scope)
+    pools = Pools.list_log_filter_pools(socket.assigns.current_scope)
     {selected_pool, pool_error} = select_pool(pools, params["pool_id"])
     {filters, form_values, filter_errors} = parse_filters(params, selected_pool)
     filter_errors = Enum.reject([pool_error | filter_errors], &is_nil/1)
@@ -215,7 +215,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
         {pool, nil}
 
       true ->
-        {nil, %{field: :pool_id, message: "Pool filter did not match an active Pool"}}
+        {nil, %{field: :pool_id, message: "Pool filter did not match an available Pool"}}
     end
   end
 

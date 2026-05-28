@@ -28,14 +28,14 @@ defmodule CodexPooler.Accounting.RequestLogs do
 
   @spec list_for_scope(CodexPooler.Accounts.Scope.t(), keyword()) :: map()
   def list_for_scope(%CodexPooler.Accounts.Scope{} = scope, opts \\ []) do
-    visible_pool_ids = scope |> Pools.list_visible_pools() |> Enum.map(& &1.id)
+    visible_pool_ids = scope |> Pools.list_log_filter_pools() |> Enum.map(& &1.id)
     list_for_pool_filter(nil, Keyword.put(opts, :visible_pool_ids, visible_pool_ids))
   end
 
   @spec get_for_scope(CodexPooler.Accounts.Scope.t(), Ecto.UUID.t()) :: map() | nil
   def get_for_scope(%CodexPooler.Accounts.Scope{} = scope, request_id)
       when is_binary(request_id) do
-    visible_pool_ids = scope |> Pools.list_visible_pools() |> Enum.map(& &1.id)
+    visible_pool_ids = scope |> Pools.list_log_filter_pools() |> Enum.map(& &1.id)
 
     request_log_query()
     |> maybe_filter_request_log_visible_pools(visible_pool_ids)
@@ -63,7 +63,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
 
   @spec list_models_for_scope(CodexPooler.Accounts.Scope.t()) :: [String.t()]
   def list_models_for_scope(%CodexPooler.Accounts.Scope{} = scope) do
-    visible_pool_ids = scope |> Pools.list_visible_pools() |> Enum.map(& &1.id)
+    visible_pool_ids = scope |> Pools.list_log_filter_pools() |> Enum.map(& &1.id)
     list_models(nil, visible_pool_ids: visible_pool_ids)
   end
 
