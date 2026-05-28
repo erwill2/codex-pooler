@@ -475,6 +475,64 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefreshTest do
       refute inspect(result) =~ refresh_token
     end
 
+    test "reused refresh tokens mark the account reauth_required without retrying or storing provider payloads" do
+      for {label, provider_body} <- [
+            {"flat",
+             %{
+               "error" => "refresh_token_reused",
+               "provider_body" => "raw-provider-body-do-not-leak"
+             }},
+            {"nested",
+             %{
+               "error" => %{
+                 "code" => "refresh_token_reused",
+                 "body" => "nested-provider-body-do-not-leak"
+               }
+             }}
+          ] do
+        refresh_token = secret("refresh", "reused-#{label}")
+
+        upstream =
+          start_path_upstream(%{
+            "/oauth/token" => {400, provider_body}
+          })
+
+        identity =
+          refreshable_identity_fixture("active", %{"base_url" => FakeUpstream.url(upstream)})
+
+        assignment = active_assignment_for_identity!(identity)
+        store_secret!(identity, "refresh_token", refresh_token)
+
+        assert {:ok, %{status: :reauth_required, retryable?: false} = result} =
+                 TokenRefresh.refresh_access_token(identity,
+                   trigger_kind: "unit_test"
+                 )
+
+        persisted = Repo.get!(UpstreamIdentity, identity.id)
+        token_refresh = persisted.metadata["token_refresh"]
+        metadata_text = inspect(persisted.metadata)
+
+        assert persisted.status == "reauth_required"
+        assert token_refresh["status"] == "reauth_required"
+
+        assert token_refresh["reason"] == %{
+                 "code" => "refresh_token_revoked",
+                 "message" => "refresh token was revoked"
+               }
+
+        cascaded = Repo.get!(PoolUpstreamAssignment, assignment.id)
+        assert cascaded.health_status == "disabled"
+        assert cascaded.eligibility_status == "ineligible"
+        assert FakeUpstream.count(upstream) == 1
+
+        refute inspect(result) =~ refresh_token
+        refute metadata_text =~ refresh_token
+        refute metadata_text =~ "refresh_token_reused"
+        refute metadata_text =~ "raw-provider-body-do-not-leak"
+        refute metadata_text =~ "nested-provider-body-do-not-leak"
+      end
+    end
+
     test "refresh token error descriptions mark the account reauth_required without retrying" do
       refresh_token = secret("refresh", "revoked-description")
 

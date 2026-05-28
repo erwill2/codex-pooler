@@ -274,11 +274,23 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
       do: auth_error(:codex_oauth_refresh_failed, "Codex token refresh failed", 502)
 
     defp refresh_token_reauth_error?(%{"error" => error})
-         when error in ["invalid_grant", "revoked", "invalid_refresh_token", "token_expired"],
+         when error in [
+                "invalid_grant",
+                "revoked",
+                "invalid_refresh_token",
+                "token_expired",
+                "refresh_token_reused"
+              ],
          do: true
 
     defp refresh_token_reauth_error?(%{"error" => %{"code" => code}})
-         when code in ["invalid_grant", "revoked", "invalid_refresh_token", "token_expired"],
+         when code in [
+                "invalid_grant",
+                "revoked",
+                "invalid_refresh_token",
+                "token_expired",
+                "refresh_token_reused"
+              ],
          do: true
 
     defp refresh_token_reauth_error?(%{} = body) do
