@@ -317,7 +317,7 @@ const ApexTimeSeriesChart = {
       stroke: {
         curve: "smooth",
         lineCap: "round",
-        width: seriesTypes.map(type => type === "line" ? 2.4 : 0),
+        width: seriesTypes.map(type => type === "line" ? (compact ? 1.4 : 2) : 0),
       },
       tooltip: {
         shared: true,

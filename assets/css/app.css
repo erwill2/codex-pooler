@@ -408,8 +408,6 @@ body {
 
 .pool-token-histogram-header span {
   flex-shrink: 0;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
   font-size: 0.72rem;
   font-weight: 800;
   color: color-mix(in oklab, var(--color-base-content) 84%, transparent);
