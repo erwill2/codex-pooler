@@ -29,7 +29,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
     >
       <header
         data-role="upstream-account-card-header"
-        class="flex flex-row items-start justify-between gap-3 border-b border-base-300 bg-base-200/35 p-4"
+        class="flex flex-row items-start justify-between gap-3 border-b border-base-300 bg-base-200/35 px-4 py-3"
       >
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
@@ -103,7 +103,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
       >
         <dl
           id={"upstream-account-#{@account.identity.id}-routing-readiness"}
-          class="grid min-w-0 grid-cols-2 divide-x divide-base-300/70 text-xs leading-5"
+          class="grid min-w-0 grid-cols-3 divide-x divide-base-300/70 text-xs leading-5"
         >
           <div class="min-w-0 pr-3" data-role="upstream-routing-cell">
             <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
@@ -117,6 +117,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
             </dt>
             <dd class="truncate text-base-content/60">
               {assignment_count_label(@account.assignments)}
+            </dd>
+          </div>
+          <div class="min-w-0 pl-3" data-role="upstream-token-status-cell">
+            <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
+              Token
+            </dt>
+            <dd class="truncate text-base-content/60">
+              {footer_status_label(@account.refresh_status)}
             </dd>
           </div>
         </dl>
@@ -487,6 +495,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
   end
 
   defp account_status_label(_account), do: "Unknown"
+
+  defp footer_status_label(status) when is_binary(status) do
+    status
+    |> String.replace("_", " ")
+    |> String.capitalize()
+  end
+
+  defp footer_status_label(_status), do: "Unknown"
 
   defp reported_quota_limits(quota_limits) when is_list(quota_limits) do
     Enum.filter(quota_limits, &match?(%{percent: %Decimal{}}, &1))

@@ -369,7 +369,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-account-#{identity.id} header[data-role='upstream-account-card-header'].flex-row.items-start.justify-between"
+             "#upstream-account-#{identity.id} header[data-role='upstream-account-card-header'].flex-row.items-start.justify-between.py-3"
            )
 
     assert has_element?(
@@ -399,6 +399,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              view,
              "#upstream-account-#{identity.id}-routing-readiness [data-role='upstream-pool-count-cell']",
              "1 Pool"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{identity.id}-routing-readiness [data-role='upstream-token-status-cell']",
+             "Not run"
            )
 
     refute has_element?(
