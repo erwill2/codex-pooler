@@ -121,10 +121,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
           </div>
           <div class="min-w-0 pl-3" data-role="upstream-token-status-cell">
             <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
-              Token
+              5m tokens
             </dt>
             <dd class="truncate text-base-content/60">
-              {footer_status_label(@account.refresh_status)}
+              {recent_token_count_label(@account)}
             </dd>
           </div>
         </dl>
@@ -496,14 +496,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
 
   defp account_status_label(_account), do: "Unknown"
 
-  defp footer_status_label(status) when is_binary(status) do
-    status
-    |> String.replace("_", " ")
-    |> String.capitalize()
-  end
-
-  defp footer_status_label(_status), do: "Unknown"
-
   defp reported_quota_limits(quota_limits) when is_list(quota_limits) do
     Enum.filter(quota_limits, &match?(%{percent: %Decimal{}}, &1))
   end
@@ -519,6 +511,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
   defp assignment_count_label([]), do: "No Pools"
   defp assignment_count_label([_assignment]), do: "1 Pool"
   defp assignment_count_label(assignments), do: "#{length(assignments)} Pools"
+
+  defp recent_token_count_label(%{token_burn: %{recent_tokens: tokens}})
+       when is_integer(tokens) and tokens >= 0 do
+    "#{format_token_count(tokens)} tokens"
+  end
+
+  defp recent_token_count_label(_account), do: "0 tokens"
+
+  defp format_token_count(tokens) when tokens >= 1_000_000 do
+    "#{Float.round(tokens / 1_000_000, 1)}m"
+  end
+
+  defp format_token_count(tokens) when tokens >= 1_000 do
+    "#{Float.round(tokens / 1_000, 1)}k"
+  end
+
+  defp format_token_count(tokens), do: Integer.to_string(tokens)
 
   defp routing_signal_label(%{reauth_required?: true}), do: "Needs reauth"
   defp routing_signal_label(%{assignments: []}), do: "Not assigned"

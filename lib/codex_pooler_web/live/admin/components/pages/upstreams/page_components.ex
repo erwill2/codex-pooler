@@ -182,14 +182,52 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
     <div
       :if={@accounts != []}
       id="upstream-account-grid"
-      class="grid min-w-0 items-start gap-3 lg:grid-cols-2 2xl:grid-cols-3"
+      class="grid min-w-0 items-start gap-3 lg:grid-cols-2 2xl:grid-cols-3 [@media(width>=112rem)]:grid-cols-4"
     >
       <UpstreamAccountCard.account_card
         :for={{account, account_index} <- Enum.with_index(@accounts)}
         account={account}
         account_index={account_index}
       />
+      <.add_capacity_card />
     </div>
+    """
+  end
+
+  defp add_capacity_card(assigns) do
+    ~H"""
+    <article
+      id="upstream-add-capacity-card"
+      data-role="upstream-add-capacity-card"
+      class="group grid min-h-64 min-w-0 place-items-center rounded-box border border-dashed border-base-content/10 bg-transparent p-6 text-center transition-colors hover:border-primary/35 hover:bg-base-100/20"
+    >
+      <div class="grid max-w-sm justify-items-center gap-4 opacity-100 transition-opacity duration-200 ease-out [@media(hover:hover)]:opacity-40 [@media(hover:hover)]:group-hover:opacity-100">
+        <span class="grid size-11 place-items-center rounded-full border border-base-content/15 text-base-content/30 transition-colors duration-200 group-hover:border-primary/40 group-hover:bg-primary/10 group-hover:text-primary">
+          <.icon name="hero-bolt" class="size-5" />
+        </span>
+        <div class="grid gap-1">
+          <h3 class="text-lg font-semibold leading-6 text-base-content/80">Add Capacity</h3>
+          <p class="text-sm leading-5 text-base-content/50">
+            Import another Codex auth.json or create an invite link for account onboarding.
+          </p>
+        </div>
+        <div class="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
+          <AdminComponents.action_button
+            id="upstream-add-capacity-import-auth-json"
+            icon="hero-document-arrow-up"
+            label="Import auth.json"
+            phx-click="open_import_auth_json"
+            variant={:primary}
+          />
+          <AdminComponents.action_button
+            id="upstream-add-capacity-create-invite"
+            icon="hero-user-plus"
+            label="Invite to Pool"
+            navigate={~p"/admin/invites?create=1"}
+          />
+        </div>
+      </div>
+    </article>
     """
   end
 end

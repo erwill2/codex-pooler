@@ -150,6 +150,52 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              "#upstream-account-empty-state",
              "Import upstream auth.json to connect an account to a Pool."
            )
+
+    refute has_element?(view, "#upstream-add-capacity-card")
+  end
+
+  test "renders an add capacity card beside existing upstream accounts", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "capacity-upstreams", name: "Capacity"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Capacity Codex",
+        account_identifier: "capacity@example.com"
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    assert has_element?(view, "#upstream-account-#{identity.id}", "Capacity Codex")
+    assert has_element?(view, "#upstream-add-capacity-card", "Add Capacity")
+    assert has_element?(view, "#upstream-add-capacity-card.group")
+
+    assert has_element?(
+             view,
+             "#upstream-add-capacity-card .\\[\\@media\\(hover\\:hover\\)\\]\\:opacity-40.\\[\\@media\\(hover\\:hover\\)\\]\\:group-hover\\:opacity-100"
+           )
+
+    assert has_element?(view, "#upstream-add-capacity-card .hero-bolt")
+
+    assert has_element?(
+             view,
+             "#upstream-add-capacity-card",
+             "Import another Codex auth.json or create an invite link for account onboarding."
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-add-capacity-import-auth-json[phx-click='open_import_auth_json']",
+             "Import auth.json"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-add-capacity-create-invite[href='/admin/invites?create=1']",
+             "Invite to Pool"
+           )
   end
 
   test "renders required forms, account cards, limits, badges, and action selectors", %{
@@ -313,6 +359,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, "#upstream-account-grid")
     assert has_element?(view, "#admin-upstreams-live.min-w-0")
     assert has_element?(view, "#upstream-account-grid.min-w-0.items-start")
+
+    assert has_element?(
+             view,
+             "#upstream-account-grid.\\[\\@media\\(width\\>\\=112rem\\)\\]\\:grid-cols-4"
+           )
+
     assert has_element?(view, "#upstream-account-#{identity.id}.min-w-0")
     assert has_element?(view, "[data-role='upstream-account-card']")
     assert has_element?(view, "#upstream-account-#{identity.id}-plan-label", "Team")
@@ -410,7 +462,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#upstream-account-#{identity.id}-routing-readiness [data-role='upstream-token-status-cell']",
-             "Not run"
+             "5m tokens"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{identity.id}-routing-readiness [data-role='upstream-token-status-cell']",
+             "700 tokens"
            )
 
     refute has_element?(
