@@ -1,18 +1,68 @@
 defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
   use CodexPoolerWeb.ConnCase, async: false
 
+  import Ecto.Query
   import ExUnit.CaptureLog
 
+  import CodexPoolerWeb.Runtime.BackendCodexTestSupport,
+    only: [gateway_setup: 1, start_upstream: 1]
+
+  alias CodexPooler.Access
+  alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.Request
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway
+  alias CodexPooler.Repo
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPoolerWeb.WebsocketConnectionLogger
 
   require Logger
 
+  @websocket_lifecycle_metadata_keys ~w(
+    codex_session_id
+    downstream_epoch
+    elapsed_ms
+    endpoint
+    owner_instance_id
+    phase
+    proxy_instance_id
+    reason_class
+    request_id
+    route_class
+    transport
+  )
+
+  @websocket_lifecycle_forbidden_terms ~w(
+    auth.json
+    authorization
+    bearer
+    cookie
+    headers
+    idempotency
+    payload
+    prompt
+    upstream_body
+    websocket_frame
+  )
+
   setup do
     previous_level = Logger.level()
+
+    previous_owner_forwarding =
+      Application.get_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+
     Logger.configure(level: :info)
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
     CodexPoolerWeb.RequestLogger.attach()
 
-    on_exit(fn -> Logger.configure(level: previous_level) end)
+    on_exit(fn ->
+      Logger.configure(level: previous_level)
+
+      case previous_owner_forwarding do
+        nil -> Application.delete_env(:codex_pooler, :websocket_owner_forwarding_enabled)
+        value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
+      end
+    end)
 
     :ok
   end
@@ -96,6 +146,67 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
     refute line =~ "10.42.0.50"
   end
 
+  test "websocket init timeout emits one bounded lifecycle line and no request row" do
+    remote_instance_id = "codex_pooler@request-log-init-timeout.example"
+    upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{
+        accepted_turn_state: "stable-ws-request-log-init-timeout",
+        owner_instance_id: remote_instance_id
+      })
+
+    request_id = "ws-request-log-init-timeout"
+
+    logs =
+      capture_websocket_lifecycle_log(fn ->
+        assert :ok =
+                 WebsocketConnectionLogger.log_init_failed_before_request_reservation(
+                   %{
+                     request_id: request_id,
+                     endpoint: "/backend-api/codex/responses",
+                     transport: "websocket",
+                     route_class: "proxy_websocket",
+                     phase: "init",
+                     elapsed_ms: 17,
+                     codex_session_id: session.id,
+                     owner_instance_id: remote_instance_id,
+                     proxy_instance_id: Atom.to_string(node())
+                   },
+                   :timeout
+                 )
+      end)
+
+    line =
+      assert_websocket_lifecycle_line!(
+        logs,
+        "websocket init failed before request reservation",
+        ~w(codex_session_id elapsed_ms endpoint phase reason_class request_id route_class transport),
+        ~w(owner_instance_id proxy_instance_id)
+      )
+
+    expected_endpoint = String.replace("/backend-api/codex/responses", ~r/[^a-zA-Z0-9_.:-]+/, "_")
+    expected_owner_instance_id = String.replace(remote_instance_id, ~r/[^a-zA-Z0-9_.:-]+/, "_")
+
+    expected_proxy_instance_id =
+      String.replace(Atom.to_string(node()), ~r/[^a-zA-Z0-9_.:-]+/, "_")
+
+    assert line =~ "request_id=#{request_id}"
+    assert line =~ "endpoint=#{expected_endpoint}"
+    assert line =~ "transport=websocket"
+    assert line =~ "route_class=proxy_websocket"
+    assert line =~ "codex_session_id=#{session.id}"
+    assert line =~ "owner_instance_id=#{expected_owner_instance_id}"
+    assert line =~ "proxy_instance_id=#{expected_proxy_instance_id}"
+
+    assert [] = Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id))
+    assert %{items: [], total: 0} = Accounting.list_request_logs(setup.pool)
+
+    assert FakeUpstream.count(upstream) == 0
+  end
+
   defp setup_trusted_proxies(trusted_proxies) do
     previous = Application.get_env(:codex_pooler, OperationalSettings, [])
 
@@ -108,5 +219,51 @@ defmodule CodexPoolerWeb.Runtime.RequestLoggingTest do
     )
 
     on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous) end)
+  end
+
+  defp capture_websocket_lifecycle_log(fun) when is_function(fun, 0) do
+    capture_log(
+      [
+        level: :info,
+        format: "$metadata$message\n",
+        metadata: @websocket_lifecycle_metadata_keys,
+        colors: [enabled: false]
+      ],
+      fun
+    )
+  end
+
+  defp assert_websocket_lifecycle_line!(logs, message, required_keys, optional_keys) do
+    lifecycle_lines =
+      logs
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&String.contains?(&1, message))
+
+    assert [line] = lifecycle_lines
+
+    metadata_text =
+      line
+      |> String.replace_prefix(message, "")
+      |> String.trim_leading()
+
+    metadata_keys =
+      metadata_text
+      |> String.split(" ", trim: true)
+      |> Enum.map(fn token -> token |> String.split("=", parts: 2) |> hd() end)
+
+    assert Enum.all?(metadata_keys, &(&1 in @websocket_lifecycle_metadata_keys))
+    assert Enum.all?(required_keys, &(&1 in metadata_keys))
+    assert Enum.all?(metadata_keys, &(&1 in (required_keys ++ optional_keys)))
+    assert_no_websocket_lifecycle_leaks!(logs)
+
+    line
+  end
+
+  defp assert_no_websocket_lifecycle_leaks!(logs) do
+    downcased_logs = String.downcase(logs)
+
+    for forbidden_term <- @websocket_lifecycle_forbidden_terms do
+      refute downcased_logs =~ forbidden_term
+    end
   end
 end
