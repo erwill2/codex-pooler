@@ -209,7 +209,7 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     hidden_pool = pool_fixture(%{slug: "request-log-exact-hidden", name: "Exact Hidden"})
     %{api_key: visible_key} = active_api_key_fixture(visible_pool)
     %{api_key: hidden_key} = active_api_key_fixture(hidden_pool)
-    hidden_pool = hidden_pool |> Ecto.Changeset.change(status: "disabled") |> Repo.update!()
+    hidden_pool = hidden_pool |> Ecto.Changeset.change(status: "archived") |> Repo.update!()
     older_time = ~U[2026-05-26 00:00:00.000000Z]
     newer_time = DateTime.add(older_time, 60, :second)
 
