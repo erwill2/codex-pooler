@@ -18,6 +18,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
   setup do
     codex_session_id = "codex-session-#{System.unique_integer([:positive])}"
 
+    on_exit(fn -> cleanup_owner_session(codex_session_id) end)
+
     {:ok,
      codex_session_id: codex_session_id,
      owner_lease_token: "owner-token-#{System.unique_integer([:positive])}",
@@ -138,6 +140,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
   test "renews persisted owner lease while owner remains alive" do
     context = db_owner_context()
+    on_exit(fn -> cleanup_owner_session(context.codex_session_id) end)
+
     upstream = WebsocketOwnerNodeHarness.fake_upstream_boundary(self())
 
     stale_soon = DateTime.utc_now() |> DateTime.add(1, :second) |> DateTime.truncate(:microsecond)
@@ -513,6 +517,25 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
   defp await_fresh_owner(context, upstream, _old_owner, 0),
     do: start_owner(context, upstream: upstream)
+
+  defp cleanup_owner_session(codex_session_id) do
+    case WebsocketOwnerSession.lookup(codex_session_id) do
+      {:ok, owner} ->
+        owner_ref = Process.monitor(owner)
+        _result = GenServer.stop(owner, :normal, 1_000)
+
+        receive do
+          {:DOWN, ^owner_ref, :process, ^owner, _reason} -> :ok
+        after
+          1_000 -> :ok
+        end
+
+      {:error, :owner_unavailable} ->
+        :ok
+    end
+  catch
+    :exit, _reason -> :ok
+  end
 
   defp yield_once(message) do
     send(self(), message)
