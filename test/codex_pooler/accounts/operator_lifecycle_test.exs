@@ -407,6 +407,7 @@ defmodule CodexPooler.Accounts.OperatorLifecycleTest do
 
     @tag :last_active_admin
     test "protects the last active admin from deactivation" do
+      reset_bootstrap_state_fixture!()
       %{user: owner, token: token} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
 
       assert {:error, :last_active_admin} =
