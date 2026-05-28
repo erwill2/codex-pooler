@@ -185,6 +185,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert result.payload["metadata"] == %{"fixture" => "true"}
     assert result.payload["prompt_cache_key"] == "fixture-cache-key"
     assert result.payload["prompt_cache_retention"] == "24h"
+    assert result.request_options.routing.prompt_cache_key == "fixture-cache-key"
+    refute Map.has_key?(result.request_options.extra, "prompt_cache_key")
     assert result.payload["reasoning"] == %{"effort" => "low"}
     assert result.payload["safety_identifier"] == "fixture-safety-id"
     assert result.payload["service_tier"] == "priority"
@@ -379,6 +381,51 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
     assert Map.take(result.payload, Map.keys(payload) -- ["input"]) ==
              Map.delete(payload, "input")
+
+    assert result.request_options.routing.prompt_cache_key == "fixture-cache-key"
+    refute Map.has_key?(result.request_options.extra, "prompt_cache_key")
+  end
+
+  @tag :responses_coercion
+  test "OpenAI source endpoints keep prompt cache forwarding and typed routing input aligned" do
+    response_payload = %{
+      "model" => "gpt-fixture-text",
+      "input" => "synthetic input",
+      "prompt_cache_key" => "fixture-response-cache-key",
+      "prompt_cache_retention" => "24h"
+    }
+
+    assert {:ok, response_result} =
+             Responses.coerce(response_payload,
+               collect_openai_response_stream: true,
+               openai_source_endpoint: "/v1/responses"
+             )
+
+    assert response_result.payload["prompt_cache_key"] == "fixture-response-cache-key"
+    assert response_result.payload["prompt_cache_retention"] == "24h"
+
+    assert response_result.request_options.routing.prompt_cache_key ==
+             "fixture-response-cache-key"
+
+    refute Map.has_key?(response_result.request_options.extra, "prompt_cache_key")
+
+    chat_payload = %{
+      "model" => "gpt-fixture-text",
+      "messages" => [%{"role" => "user", "content" => "synthetic input"}],
+      "prompt_cache_key" => "fixture-chat-cache-key",
+      "prompt_cache_retention" => "24h"
+    }
+
+    assert {:ok, chat_result} =
+             Chat.coerce(chat_payload,
+               collect_openai_response_stream: true,
+               openai_source_endpoint: "/v1/chat/completions"
+             )
+
+    assert chat_result.payload["prompt_cache_key"] == "fixture-chat-cache-key"
+    assert chat_result.payload["prompt_cache_retention"] == "24h"
+    assert chat_result.request_options.routing.prompt_cache_key == "fixture-chat-cache-key"
+    refute Map.has_key?(chat_result.request_options.extra, "prompt_cache_key")
   end
 
   @tag :unsupported_fields

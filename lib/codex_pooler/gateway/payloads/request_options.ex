@@ -56,6 +56,14 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   @websocket_responses_endpoint "/backend-api/codex/responses"
 
+  @prompt_cache_key_routes [
+    "/v1/responses",
+    "/v1/chat/completions",
+    "/backend-api/codex/responses",
+    "/backend-api/codex/v1/responses",
+    "/backend-api/codex/v1/chat/completions"
+  ]
+
   @known_opt_keys [
     :accepted_turn_state,
     :authenticated_owner_attach,
@@ -95,6 +103,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :pool_timeout_ms,
     :pool_upstream_assignment_id,
     :previous_response_id,
+    :prompt_cache_key,
     :public_openai_chat_stream,
     :public_openai_responses_stream,
     :quota_decision,
@@ -106,6 +115,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :client_request_id,
     :request_content_type,
     :request_id,
+    :request_method,
     :requested_model,
     :response_id,
     :routing_attempt_metadata,
@@ -130,6 +140,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :websocket_writer,
     "authorization_header",
     "chatgpt_account_id",
+    "prompt_cache_key",
+    "request_method",
     "transport"
   ]
 
@@ -145,7 +157,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       request_metadata: request_metadata(opts, endpoint, payload),
       transport: transport(opts, endpoint, payload),
       continuity: continuity(opts),
-      routing: routing(opts),
+      routing: routing(opts, endpoint, payload),
       timeout_config: timeout_config(opts),
       payload_context: payload_context(opts),
       runtime: runtime_context(opts),
@@ -168,6 +180,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     options
     |> put_transport(transport: "websocket")
     |> retarget(@websocket_responses_endpoint, payload)
+    |> put_routing(prompt_cache_key: nil)
   end
 
   def for_websocket(opts, payload) when is_map(payload) do
@@ -204,7 +217,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     %{
       options
       | request_metadata: request_metadata(options, endpoint, payload),
-        transport: retargeted_transport(options.transport, endpoint, payload)
+        transport: retargeted_transport(options.transport, endpoint, payload),
+        routing: struct!(options.routing, prompt_cache_key: nil)
     }
   end
 
@@ -447,12 +461,13 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     }
   end
 
-  defp routing(opts) do
+  defp routing(opts, endpoint, payload) do
     %Routing{
       requested_model: Map.get(opts, :requested_model),
       effective_model: Map.get(opts, :effective_model),
       api_key_policy: Map.get(opts, :api_key_policy),
       file_affinity_assignment_id: Map.get(opts, :file_affinity_assignment_id),
+      prompt_cache_key: prompt_cache_key(opts, endpoint, payload),
       quota_decision: Map.get(opts, :quota_decision),
       routing_attempt_metadata: Map.get(opts, :routing_attempt_metadata),
       routing_circuit_state: Map.get(opts, :routing_circuit_state)
@@ -584,6 +599,36 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   end
 
   defp safe_endpoint(_value), do: nil
+
+  defp prompt_cache_key(opts, endpoint, payload) do
+    if prompt_cache_key_route?(opts, endpoint, payload) do
+      payload
+      |> Map.get("prompt_cache_key")
+      |> normalized_prompt_cache_key()
+    end
+  end
+
+  defp prompt_cache_key_route?(opts, endpoint, payload) do
+    route_endpoint = safe_endpoint(Map.get(opts, :openai_source_endpoint)) || endpoint
+
+    route_endpoint in @prompt_cache_key_routes and
+      post_request?(Map.get(opts, :request_method) || Map.get(opts, "request_method")) and
+      classify_route_class(opts, endpoint, payload) != "proxy_websocket"
+  end
+
+  defp post_request?(nil), do: true
+
+  defp post_request?(method) when is_atom(method),
+    do: method |> Atom.to_string() |> post_request?()
+
+  defp post_request?(method) when is_binary(method), do: String.upcase(method) == "POST"
+  defp post_request?(_method), do: false
+
+  defp normalized_prompt_cache_key(value) when is_binary(value) do
+    if String.trim(value) == "", do: nil, else: value
+  end
+
+  defp normalized_prompt_cache_key(_value), do: nil
 
   defp openai_surface(%OpenAICompatibility{source_endpoint: endpoint}) when is_binary(endpoint),
     do: "openai_v1"

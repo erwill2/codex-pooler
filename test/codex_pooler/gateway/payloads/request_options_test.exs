@@ -187,6 +187,104 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.extra == %{}
     end
 
+    test "keeps prompt cache keys typed only for the exact routing allowlist" do
+      allowed_routes = [
+        "/v1/responses",
+        "/v1/chat/completions",
+        "/backend-api/codex/responses",
+        "/backend-api/codex/v1/responses",
+        "/backend-api/codex/v1/chat/completions"
+      ]
+
+      for endpoint <- allowed_routes do
+        options =
+          RequestOptions.build(
+            %{request_method: "POST"},
+            endpoint,
+            %{"model" => "example-model", "prompt_cache_key" => "fixture-cache-key"}
+          )
+
+        assert options.routing.prompt_cache_key == "fixture-cache-key"
+        assert options.extra == %{}
+      end
+    end
+
+    test "treats blank and non-string prompt cache keys as absent" do
+      for value <- ["", "   ", 123, true, nil, %{"unsafe" => "shape"}] do
+        options =
+          RequestOptions.build(
+            %{request_method: "POST"},
+            "/backend-api/codex/responses",
+            %{"model" => "example-model", "prompt_cache_key" => value}
+          )
+
+        assert options.routing.prompt_cache_key == nil
+        assert options.extra == %{}
+      end
+    end
+
+    test "consumes raw prompt cache option keys without using them as routing input" do
+      options =
+        RequestOptions.build(
+          %{
+            "prompt_cache_key" => "string-opt-cache-key",
+            prompt_cache_key: "atom-opt-cache-key"
+          },
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      assert options.routing.prompt_cache_key == nil
+      assert options.extra == %{}
+    end
+
+    test "excludes prompt cache routing input from negative route surfaces" do
+      negative_routes = [
+        {"GET", "/backend-api/codex/responses", %{transport: "websocket"}},
+        {"POST", "/backend-api/codex/responses/compact", %{}},
+        {"POST", "/backend-api/codex/v1/responses/compact", %{}},
+        {"POST", "/v1/responses/compact", %{}},
+        {"POST", "/backend-api/files", %{}},
+        {"POST", "/backend-api/files/file_fixture/uploaded", %{}},
+        {"POST", "/backend-api/transcribe", %{}},
+        {"POST", "/v1/audio/transcriptions", %{}},
+        {"POST", "/v1/images/generations", %{}},
+        {"POST", "/v1/images/edits", %{}},
+        {"POST", "/backend-api/codex/images/generations", %{}},
+        {"POST", "/backend-api/codex/images/edits", %{}}
+      ]
+
+      for {method, endpoint, opts} <- negative_routes do
+        options =
+          opts
+          |> Map.put(:request_method, method)
+          |> RequestOptions.build(endpoint, %{
+            "model" => "example-model",
+            "prompt_cache_key" => "fixture-cache-key"
+          })
+
+        assert options.routing.prompt_cache_key == nil
+        assert options.extra == %{}
+      end
+    end
+
+    test "websocket retargeting clears prompt cache routing input" do
+      options =
+        %{request_method: "POST"}
+        |> RequestOptions.build("/backend-api/codex/responses", %{
+          "model" => "example-model",
+          "prompt_cache_key" => "fixture-cache-key"
+        })
+        |> RequestOptions.for_websocket(%{
+          "model" => "example-model",
+          "prompt_cache_key" => "fixture-cache-key"
+        })
+
+      assert options.transport.transport == "websocket"
+      assert options.transport.route_class == "proxy_websocket"
+      assert options.routing.prompt_cache_key == nil
+    end
+
     test "keeps every consumed option key out of extra opts" do
       writer = fn _frame -> :ok end
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
@@ -198,6 +296,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
           %{
             "authorization_header" => "Bearer string-token",
             "chatgpt_account_id" => "acct_string",
+            "prompt_cache_key" => "string-opt-cache-key",
             "transport" => "http_json",
             accepted_turn_state: "turn-state",
             authenticated_owner_attach: true,
@@ -234,6 +333,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
             pool_timeout_ms: 13,
             pool_upstream_assignment_id: Ecto.UUID.generate(),
             previous_response_id: "resp_prev",
+            prompt_cache_key: "atom-opt-cache-key",
             public_openai_chat_stream: true,
             public_openai_responses_stream: true,
             quota_decision: %{"summary" => "allowed"},
