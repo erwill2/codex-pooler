@@ -4140,6 +4140,138 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert_safe_runtime_routing_metadata!(request, [first_attempt, second_attempt], setup)
   end
 
+  test "POST /backend-api/codex/responses records prompt-cache routing-locality metadata safely",
+       %{
+         conn: conn
+       } do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_prompt_cache_locality_primary",
+          "object" => "response",
+          "usage" => %{
+            "input_tokens" => 9,
+            "input_tokens_details" => %{"cached_tokens" => 3},
+            "output_tokens" => 2,
+            "total_tokens" => 11
+          }
+        })
+      )
+
+    alternate_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_prompt_cache_locality_alternate",
+          "object" => "response",
+          "usage" => %{
+            "input_tokens" => 9,
+            "input_tokens_details" => %{"cached_tokens" => 3},
+            "output_tokens" => 2,
+            "total_tokens" => 11
+          }
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    alternate =
+      gateway_upstream(setup.pool, alternate_upstream, "upstream-token-prompt-cache-alternate",
+        compact?: false
+      )
+
+    prime_routing_quota!(alternate.identity)
+    use_routing_strategy!(setup.pool, "bridge_ring", 2)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, alternate.assignment])
+      )
+
+    raw_prompt_cache_key = "raw-prompt-cache-routing-key-do-not-log"
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "prompt-cache locality metadata prompt must not persist",
+        "prompt_cache_key" => raw_prompt_cache_key
+      })
+
+    assert %{"id" => response_id} = json_response(conn, 200)
+
+    assert response_id in [
+             "resp_prompt_cache_locality_primary",
+             "resp_prompt_cache_locality_alternate"
+           ]
+
+    assert [attempt] = Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+
+    selected_assignment_id = request.request_metadata["routing"]["selected_bridge_candidate_id"]
+
+    selected_assignment =
+      if selected_assignment_id == setup.assignment.id,
+        do: setup.assignment,
+        else: alternate.assignment
+
+    selected_identity =
+      if selected_assignment_id == setup.assignment.id,
+        do: setup.identity,
+        else: alternate.identity
+
+    assert_http_json_routing_metadata!(request, "bridge_ring", selected_assignment, 2)
+    assert_attempt_routing_metadata!(attempt, selected_assignment, selected_identity, 1)
+
+    assert_prompt_cache_locality_metadata_safe!(
+      request.request_metadata["routing"],
+      raw_prompt_cache_key,
+      selected_assignment.id,
+      2
+    )
+
+    assert_prompt_cache_locality_metadata_safe!(
+      attempt.response_metadata["routing"],
+      raw_prompt_cache_key,
+      selected_assignment.id,
+      2
+    )
+
+    settlement =
+      Repo.get_by!(LedgerEntry,
+        request_id: request.id,
+        entry_kind: "settlement",
+        amount_status: "recorded"
+      )
+
+    assert settlement.cached_input_tokens == 3
+
+    assert %{items: [log], total: 1} = RequestLogs.list(setup.pool)
+
+    assert_prompt_cache_locality_metadata_safe!(
+      log.metadata["routing"],
+      raw_prompt_cache_key,
+      selected_assignment.id,
+      2
+    )
+
+    metadata_text = inspect({request, attempt, log})
+    refute metadata_text =~ raw_prompt_cache_key
+    refute metadata_text =~ "prompt-cache locality metadata prompt must not persist"
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ setup.raw_key
+    refute metadata_text =~ "Bearer "
+    refute metadata_text =~ "upstream-token"
+    refute metadata_text =~ "cache_hit"
+    refute metadata_text =~ "cache hit"
+    refute metadata_text =~ "provider_cache"
+    refute metadata_text =~ "provider cache"
+    refute metadata_text =~ "prompt cache hit"
+  end
+
   test "POST /backend-api/codex/responses deterministic_rotation retries only within the bridge ring shortlist",
        %{
          conn: conn
@@ -5886,6 +6018,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     setup = gateway_setup(upstream, compact?: true)
 
+    raw_prompt_cache_key = "raw-compact-prompt-cache-routing-key-do-not-log"
+
     conn =
       conn
       |> put_req_header("x-codex-turn-state", "compact-turn-state")
@@ -5893,6 +6027,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       |> post("/backend-api/codex/responses/compact", %{
         "model" => setup.model.exposed_model_id,
         "input" => "compact",
+        "prompt_cache_key" => raw_prompt_cache_key,
         "max_output_tokens" => 128,
         "temperature" => 0.2,
         "top_p" => 0.9
@@ -5908,6 +6043,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert request.endpoint == "/backend-api/codex/responses/compact"
     assert request.transport == "http_compact_json"
     assert request.status == "succeeded"
+
+    routing = request.request_metadata["routing"]
+    assert routing["routing_locality_status"] == "unavailable"
+    assert routing["routing_locality_applied"] == false
+    assert routing["routing_locality_unhonored_reason"] == "prompt_cache_key_absent"
+    refute Map.has_key?(routing, "routing_locality_seed_fingerprint")
+    refute Map.has_key?(routing, "routing_locality_assignment_fingerprint")
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    metadata_text = inspect({request.request_metadata, attempt.response_metadata})
+    refute metadata_text =~ raw_prompt_cache_key
+    refute metadata_text =~ "cache_hit"
+    refute metadata_text =~ "provider_cache"
 
     assert [turn] = Repo.all(from(t in CodexTurn, where: t.request_id == ^request.id))
     assert turn.transport_kind == "http_json"
@@ -6733,6 +6881,26 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert routing["bridge_candidate_id"] == assignment.id
     assert routing["bridge_candidate_rank"] == rank
     assert routing["upstream_identity_id"] == identity.id
+  end
+
+  defp assert_prompt_cache_locality_metadata_safe!(
+         routing,
+         raw_prompt_cache_key,
+         assignment_id,
+         count
+       ) do
+    assert routing["routing_locality_strategy"] == "prompt_cache_routing_locality"
+    assert routing["routing_locality_status"] == "applied"
+    assert routing["routing_locality_applied"] == true
+    assert routing["routing_locality_eligible_candidate_count"] == count
+    assert routing["routing_locality_seed_basis_class"] == "pool_api_key_model_prompt_cache"
+    assert routing["routing_locality_seed_fingerprint"] =~ ~r/\A[0-9a-f]{16}\z/
+    assert routing["routing_locality_assignment_fingerprint"] =~ ~r/\A[0-9a-f]{16}\z/
+    refute routing["routing_locality_seed_fingerprint"] == raw_prompt_cache_key
+    refute routing["routing_locality_assignment_fingerprint"] == assignment_id
+    refute inspect(routing) =~ raw_prompt_cache_key
+    refute inspect(routing) =~ "cache_hit"
+    refute inspect(routing) =~ "provider_cache"
   end
 
   defp assert_safe_runtime_routing_metadata!(request, attempts, setup) do
