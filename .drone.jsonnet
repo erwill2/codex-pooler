@@ -1,6 +1,6 @@
 local releaseBranch = 'release-please--branches--main--components--codex-pooler';
-local registry = 'ghcr.io';
-local image = 'ghcr.io/icoretech/codex-pooler';
+local registry = 'registry.icorete.ch';
+local image = 'registry.icorete.ch/icoretech/codex-pooler';
 local helmVersion = 'v4.2.0';
 local nodeImage = 'node:26.2.0-slim';
 
@@ -17,7 +17,7 @@ local nodeImage = 'node:26.2.0-slim';
         exclude: [releaseBranch],
       },
       event: {
-        include: ['push', 'pull_request', 'tag'],
+        include: ['push'],
       },
       action: {
         exclude: ['synchronized'],
@@ -81,20 +81,19 @@ local nodeImage = 'node:26.2.0-slim';
       },
       {
         name: 'tag',
-        image: 'alpine/git',
+        image: 'registry.icorete.ch/proxy-dockerhub/alpine/git',
         depends_on: ['quality'],
         commands: [
-          'if [ -n "${DRONE_TAG:-}" ]; then echo -n "$DRONE_TAG" > .tags; else export CUSTOM_BRANCH_NAME=$(basename "${DRONE_SOURCE_BRANCH:-$DRONE_BRANCH}" | tr "[:upper:]" "[:lower:]" | sed "s/_/-/g"); echo -n "$CUSTOM_BRANCH_NAME-$SHORT_SHA-$(date +%s)" > .tags; fi',
+          'CUSTOM_BRANCH_NAME=$(basename "${DRONE_SOURCE_BRANCH:-$DRONE_BRANCH}" | tr "[:upper:]" "[:lower:]" | sed "s/_/-/g")',
+          'printf "%s" "$CUSTOM_BRANCH_NAME-$SHORT_SHA-$(date +%s)" > .tags',
+          'cat .tags',
         ],
         environment: {
           SHORT_SHA: '${DRONE_COMMIT_SHA:0:8}',
         },
-        when: {
-          event: ['push', 'tag'],
-        },
       },
       {
-        name: 'build-tag-and-push',
+        name: 'build-and-push-main',
         image: 'thegeeklab/drone-docker-buildx',
         privileged: true,
         depends_on: ['tag'],
@@ -104,19 +103,20 @@ local nodeImage = 'node:26.2.0-slim';
           platforms: ['linux/amd64'],
           repo: image,
           registry: registry,
+          tags_file: '.tags',
           username: {
-            from_secret: 'github_packages_username',
+            from_secret: 'icoretech_registry_user',
           },
           password: {
-            from_secret: 'github_packages_pat',
+            from_secret: 'icoretech_registry_secret_key',
           },
         },
         when: {
-          event: ['tag'],
+          branch: ['main'],
         },
       },
       {
-        name: 'build-push-no-push',
+        name: 'build-no-push',
         image: 'thegeeklab/drone-docker-buildx',
         privileged: true,
         depends_on: ['tag'],
@@ -127,26 +127,12 @@ local nodeImage = 'node:26.2.0-slim';
           platforms: ['linux/amd64'],
           repo: image,
           registry: registry,
+          tags_file: '.tags',
         },
         when: {
-          event: ['push'],
-        },
-      },
-      {
-        name: 'build-pr-no-push',
-        image: 'thegeeklab/drone-docker-buildx',
-        privileged: true,
-        depends_on: ['quality'],
-        settings: {
-          dry_run: true,
-          purge: true,
-          no_cache: true,
-          platforms: ['linux/amd64'],
-          repo: image,
-          registry: registry,
-        },
-        when: {
-          event: ['pull_request'],
+          branch: {
+            exclude: ['main'],
+          },
         },
       },
     ],
