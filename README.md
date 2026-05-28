@@ -55,6 +55,9 @@ tokens, or raw Codex secrets.
 - **Session-aware realtime:** keep resumable Codex sessions and websocket
   reconnects attached to the right upstream account without translating
   realtime traffic through an HTTP compatibility layer
+- **Prompt-cache locality:** use a transient `prompt_cache_key` to prefer the
+  same eligible upstream account for repeat stateless requests, improving
+  provider-side cache locality without storing prompts or responses locally
 - **Operator dashboard:** manage Pools, Codex accounts, API keys, invites,
   request logs, audit logs, jobs, operators, MCP access, and global settings
 - **Privacy-minded observability:** store request, routing, and audit metadata
@@ -833,9 +836,15 @@ make dev
 pricing feed, and starts the Phoenix server on `http://localhost:4000`. Logs
 are written to `tmp/dev-server.log`.
 
-`mix ecto.setup` also loads a compact idempotent development operator baseline:
-one owner on an empty database plus four example operators. All seeded operators
-use `dev-password-123`.
+Development seeds are optional and only run through the explicit seed task. To
+create a compact idempotent operator baseline with one owner plus four example
+operators, run:
+
+```bash
+mix dev.seed compact
+```
+
+All seeded operators use `dev-password-123`.
 
 To recreate a fuller fake dataset for exercising admin UI states without real
 accounts or real request data, run:

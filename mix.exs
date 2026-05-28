@@ -95,7 +95,6 @@ defmodule CodexPooler.MixProject do
       "ecto.setup": [
         "ecto.create",
         "ecto.migrate",
-        "run priv/repo/seeds.exs",
         "pricing.import_openai"
       ],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
