@@ -252,6 +252,10 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
 
   defp terminal_turn_status(%Request{status: "succeeded"}), do: "succeeded"
 
+  defp terminal_turn_status(%Request{status: "failed", last_error_code: error_code})
+       when error_code in ["client_disconnected", "owner_drained", "owner_unavailable"],
+       do: "interrupted"
+
   defp terminal_turn_status(%Request{status: status})
        when status in ["failed", "rejected", "cancelled"],
        do: "failed"

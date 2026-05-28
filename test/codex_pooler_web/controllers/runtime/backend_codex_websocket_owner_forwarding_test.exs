@@ -38,6 +38,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Runtime.Finalization.Interruption
 
   alias CodexPooler.Gateway.Persistence.{
     BridgeOwnerLease,
@@ -1560,6 +1561,62 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     assert_no_leak!("late owner drain detach logs", logs)
 
     assert_owner_success_preserved!(%{request: request, attempt: attempt, turn: turn})
+  end
+
+  @tag :owner_interruption_terminal_state
+  test "owner interruption preserves a turn after disconnect accounting wins the race" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_owner_disconnect_race"}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-owner-disconnect-accounting-race",
+          accepted_turn_state: "stable-ws-owner-disconnect-accounting-race",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      %{request: request, attempt: attempt, turn: turn} =
+        active_turn_fixture(setup, auth, state.codex_session)
+
+      assert {:ok, %{request: failed_request, attempt: failed_attempt}} =
+               Accounting.finalize_request(request, attempt, %{
+                 request_status: "failed",
+                 attempt_status: "failed",
+                 response_status_code: 499,
+                 last_error_code: "client_disconnected",
+                 error_message: "websocket client disconnected before the turn completed",
+                 usage: %{status: "usage_unknown", source: "client_disconnected"}
+               })
+
+      assert failed_request.status == "failed"
+      assert failed_attempt.status == "failed"
+      assert Repo.get!(CodexTurn, turn.id).status == "in_progress"
+
+      interrupt_opts =
+        %{
+          interrupt_reason: "client_disconnected",
+          reconnect_window_seconds: 300
+        }
+        |> RequestOptions.for_websocket()
+
+      assert {:ok, %{interrupted_turn_count: 1}} =
+               Interruption.interrupt_codex_session(state.codex_session, interrupt_opts)
+
+      assert_owner_interruption_state!(%{
+        request: request,
+        attempt: attempt,
+        turn: turn,
+        session: state.codex_session,
+        error_code: "client_disconnected"
+      })
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
   end
 
   @tag :owner_recovery_preserves_success
