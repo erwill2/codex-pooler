@@ -29,11 +29,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
     >
       <header
         data-role="upstream-account-card-header"
-        class="flex flex-row items-start justify-between gap-3 border-b border-base-300 bg-base-200/35 px-4 py-3"
+        class="flex flex-row items-center justify-between gap-3 border-b border-base-300 bg-base-200/35 px-4 py-3"
       >
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
-            <h3 class="min-w-0 text-base font-semibold text-base-content">
+            <h3 class="min-w-0 text-base font-semibold leading-5 text-base-content">
               <.link
                 id={"upstream-account-#{@account.identity.id}-mail"}
                 navigate={~p"/admin/upstreams/#{@account.identity.id}"}
@@ -46,7 +46,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
         </div>
         <div
           id={"upstream-account-#{@account.identity.id}-header-actions"}
-          class="flex shrink-0 items-center gap-2 self-start"
+          class="flex shrink-0 items-center gap-2 self-center"
         >
           <.upstream_plan_indicator account={@account} account_index={@account_index} />
           <.upstream_account_actions account={@account} />

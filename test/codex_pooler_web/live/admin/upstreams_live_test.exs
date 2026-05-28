@@ -325,7 +325,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-account-#{identity.id} h3.text-base #upstream-account-#{identity.id}-mail",
+             "#upstream-account-#{identity.id} h3.text-base.leading-5 #upstream-account-#{identity.id}-mail",
              "Primary Codex"
            )
 
@@ -375,7 +375,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-account-#{identity.id} header[data-role='upstream-account-card-header'].flex-row.items-start.justify-between.py-3"
+             "#upstream-account-#{identity.id} header[data-role='upstream-account-card-header'].flex-row.items-center.justify-between.py-3"
            )
 
     assert has_element?(
@@ -385,7 +385,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-account-#{identity.id}-header-actions.items-center #upstream-account-#{identity.id}-plan-label.self-center",
+             "#upstream-account-#{identity.id}-header-actions.items-center.self-center #upstream-account-#{identity.id}-plan-label.self-center",
              "Team"
            )
 
