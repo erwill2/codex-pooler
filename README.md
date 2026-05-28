@@ -48,13 +48,13 @@ tokens, or raw Codex secrets.
   policy
 - **Codex backend compatibility:** point Codex-compatible clients at Codex
   Pooler and keep responses, compacting, usage, files, audio, images, and
-  realtime flows working through pooled accounts
+  backend websocket flows working through pooled accounts
 - **OpenAI-compatible SDK surface:** let `/v1`-only apps and agent tools use
   multiple Codex subscriptions behind one gateway, with supported requests
   translated and routed through Codex capacity to help contain API spend
-- **Session-aware realtime:** keep resumable Codex sessions and websocket
-  reconnects attached to the right upstream account without translating
-  realtime traffic through an HTTP compatibility layer
+- **Session-aware websockets:** keep resumable Codex sessions and websocket
+  reconnects attached to the right upstream account without translating backend
+  websocket traffic through an HTTP compatibility layer
 - **Prompt-cache locality:** use a transient `prompt_cache_key` to prefer the
   same eligible upstream account for repeat stateless requests, improving
   provider-side cache locality without storing prompts or responses locally
@@ -153,7 +153,8 @@ for example `https://pooler.example.com`.
 
 opencode talks to Codex Pooler through the OpenAI-compatible `/v1` surface. The
 provider uses the Pool API key, and the optional remote MCP entry uses an
-operator-owned MCP token.
+operator-owned MCP token. Its websocket support is the narrow Responses
+websocket route at `GET /v1/responses`, not OpenAI Realtime SDK compatibility.
 
 ```jsonc
 {
@@ -742,14 +743,25 @@ For deployed instances, change `baseURL` to `https://pooler.example.com/v1`.
 Codex Pooler supports two client-facing shapes:
 
 - **Codex backend clients:** `/backend-api/codex/*`, `/backend-api/files`,
-  `/backend-api/transcribe`, usage routes, and websocket response streams
+  `/backend-api/transcribe`, usage routes, and backend websocket response
+  streams
 - **OpenAI-style SDK clients:** `/v1/models`, `/v1/responses`,
-  `/v1/chat/completions`, `/v1/files`, `/v1/audio/transcriptions`, and
-  selected image endpoints
+  `/v1/chat/completions`, `/v1/files`, `/v1/audio/transcriptions`, selected
+  image endpoints, and narrow Responses websocket compatibility on
+  `GET /v1/responses`
 
 The `/v1` surface is compatibility, not a second engine. Supported requests are
 translated into Codex-compatible calls, then routed through the same Pool rules,
-limit checks, accounting, and account selection path.
+limit checks, accounting, and account selection path. `/v1/realtime` and OpenAI
+Realtime SDK websocket or session routes are not supported.
+
+Continuity headers are local routing inputs. Codex Pooler chooses them in this
+order: `x-codex-session-id` > `session-id` > `x-session-affinity` >
+`session_id` > `x-codex-conversation-id`. `session-id` and
+`x-session-affinity` are not forwarded upstream. Local timing regressions showed
+`/v1/responses` HTTP streaming and Responses websocket paths stay inside the
+observed client budgets with the existing stream timeout settings, so no new
+route-specific timeout defaults are required.
 
 ## Operator MCP Service
 
