@@ -261,6 +261,12 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
           status={:unknown}
         />
 
+        <AdminComponents.extended_notice
+          id="admin-test-extended-notice"
+          title="Notice title"
+          description="Notice body copy wraps with compact rhythm."
+        />
+
         <AdminComponents.action_button
           id="admin-test-link-action"
           icon="hero-arrow-right"
@@ -286,6 +292,13 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
       assert_html_selector(html, "#admin-test-inspector-links", "Links")
       assert_html_selector(html, "#admin-test-empty-state", "No rows yet")
       assert_html_selector(html, "#admin-test-status-badge", "redacted")
+
+      assert html =~
+               ~s(<p class="text-sm leading-5">Notice body copy wraps with compact rhythm.</p>)
+
+      refute html =~
+               ~s(<p class="text-sm leading-6">Notice body copy wraps with compact rhythm.</p>)
+
       assert_html_selector(html, "#admin-test-link-action", "Open")
     end
 

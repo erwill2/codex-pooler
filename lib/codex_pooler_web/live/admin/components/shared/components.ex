@@ -486,7 +486,7 @@ defmodule CodexPoolerWeb.Admin.Components do
       <.icon name={@icon} class="size-5" />
       <div class="grid gap-1">
         <p class="font-semibold">{@title}</p>
-        <p class="text-sm leading-6">{@description}</p>
+        <p class="text-sm leading-5">{@description}</p>
       </div>
     </div>
     """
