@@ -58,6 +58,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:get, "/v1/files/:file_id"},
                {:get, "/v1/files/:file_id/content"},
                {:get, "/v1/models"},
+               {:get, "/v1/responses"},
                {:get, "/v1/responses/:response_id"},
                {:get, "/v1/usage"},
                {:get, "/wham/usage"},
@@ -164,6 +165,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
       {:get, "/v1/files/:file_id"},
       {:get, "/v1/files/:file_id/content"},
       {:delete, "/v1/files/:file_id"},
+      {:get, "/v1/responses"},
       {:post, "/v1/audio/transcriptions"},
       {:post, "/v1/images/generations"},
       {:post, "/v1/images/edits"}
@@ -190,6 +192,9 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
       assert MapSet.member?(route_set, route),
              "expected routed /v1 contract for #{inspect(route)}"
     end
+
+    refute MapSet.member?(route_set, {:get, "/v1/realtime"})
+    refute MapSet.member?(route_set, {:post, "/v1/realtime"})
   end
 
   test "GET /status falls through to the standard 404 response for authenticated users" do

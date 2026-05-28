@@ -111,6 +111,7 @@ defmodule CodexPoolerWeb.Router do
     pipe_through :api
 
     get "/models", V1.ModelsController, :index
+    get "/responses", V1.ResponsesController, :websocket
     post "/responses", V1.ResponsesController, :create
     post "/responses/compact", V1.ResponsesController, :compact
     post "/chat/completions", V1.ChatCompletionsController, :create

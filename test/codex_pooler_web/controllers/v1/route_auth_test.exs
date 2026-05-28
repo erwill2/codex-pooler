@@ -10,6 +10,7 @@ defmodule CodexPoolerWeb.V1.RouteAuthTest do
 
   @supported_routes [
     {:get, "/v1/models", nil},
+    {:get, "/v1/responses", nil},
     {:post, "/v1/responses", %{"model" => "gpt-fixture-text", "input" => "synthetic text"}},
     {:post, "/v1/responses/compact",
      %{"model" => "gpt-fixture-text", "input" => "synthetic text"}},
@@ -44,16 +45,47 @@ defmodule CodexPoolerWeb.V1.RouteAuthTest do
     end
 
     test "invalid bearer keys return OpenAI-shaped 401", %{conn: conn} do
-      conn =
-        conn
-        |> put_req_header("authorization", "Bearer sk-cxp-invalid-fixture")
-        |> get("/v1/models")
+      for path <- ["/v1/models", "/v1/responses"] do
+        conn =
+          conn
+          |> recycle()
+          |> put_req_header("authorization", "Bearer sk-cxp-invalid-fixture")
+          |> get(path)
 
-      assert_openai_error(conn, 401,
+        assert_openai_error(conn, 401,
+          code: "api_key_missing",
+          message: "api key is required"
+        )
+      end
+
+      assert_no_gateway_side_effects()
+    end
+
+    test "websocket upgrade-shaped GET /v1/responses denies missing and invalid bearer before upgrade",
+         %{conn: conn} do
+      missing_bearer =
+        conn
+        |> websocket_upgrade_headers()
+        |> get("/v1/responses")
+
+      assert_openai_error(missing_bearer, 401,
         code: "api_key_missing",
         message: "api key is required"
       )
 
+      invalid_bearer =
+        build_conn()
+        |> websocket_upgrade_headers()
+        |> put_req_header("authorization", "Bearer sk-cxp-invalid-fixture")
+        |> get("/v1/responses")
+
+      assert_openai_error(invalid_bearer, 401,
+        code: "api_key_missing",
+        message: "api key is required"
+      )
+
+      assert get_resp_header(missing_bearer, "sec-websocket-accept") == []
+      assert get_resp_header(invalid_bearer, "sec-websocket-accept") == []
       assert_no_gateway_side_effects()
     end
 
@@ -149,6 +181,19 @@ defmodule CodexPoolerWeb.V1.RouteAuthTest do
                {:post, "/v1/responses/resp_fixture/cancel"},
                {:delete, "/v1/responses/resp_fixture"}
              ]
+    end
+
+    test "/v1/realtime remains outside the public route surface", %{conn: conn} do
+      setup = active_api_key_fixture()
+
+      for path <- ["/v1/realtime", "/v1/realtime/sessions"] do
+        conn = conn |> recycle() |> auth(setup) |> get(path)
+
+        assert html_response(conn, 404) =~ "Not Found"
+        refute get_resp_header(conn, "content-type") |> Enum.join(" ") |> String.contains?("json")
+      end
+
+      assert_no_gateway_side_effects()
     end
 
     test "legacy public OpenAI endpoints return deterministic OpenAI-shaped 404", %{conn: conn} do
@@ -274,6 +319,14 @@ defmodule CodexPoolerWeb.V1.RouteAuthTest do
   defp dispatch_v1(conn, :delete, path, _body), do: delete(conn, path)
 
   defp auth(conn, setup), do: put_req_header(conn, "authorization", setup.authorization)
+
+  defp websocket_upgrade_headers(conn) do
+    conn
+    |> put_req_header("connection", "upgrade")
+    |> put_req_header("upgrade", "websocket")
+    |> put_req_header("sec-websocket-version", "13")
+    |> put_req_header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+  end
 
   defp assert_openai_error(conn, status, opts) do
     assert %{"error" => error} = json_response(conn, status)

@@ -31,6 +31,18 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
     end
   end
 
+  @spec websocket(conn(), String.t(), (auth() -> conn())) :: conn()
+  def websocket(conn, endpoint, upgrade_fun)
+      when is_binary(endpoint) and is_function(upgrade_fun, 1) do
+    case GatewayHelpers.authenticate_v1(conn) do
+      {:ok, auth} ->
+        upgrade_fun.(auth)
+
+      {:error, reason} ->
+        GatewayHelpers.send_error(conn, reason)
+    end
+  end
+
   @spec coerced(conn(), coercer(), success_normalizer()) :: conn()
   def coerced(conn, coercer, normalize_success)
       when is_function(coercer, 0) and is_function(normalize_success, 2) do

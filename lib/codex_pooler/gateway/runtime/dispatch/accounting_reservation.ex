@@ -16,17 +16,32 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
       transport: transport
     } = request_options
 
+    accounting_endpoint = accounting_endpoint(endpoint, request_options)
+
     %{
-      endpoint: endpoint,
+      endpoint: accounting_endpoint,
       transport: transport.transport,
       correlation_id: RequestOptions.server_correlation_id(request_options),
       idempotency_key: request_metadata.idempotency_key,
       client_ip: request_metadata.client_ip,
       user_agent: request_metadata.user_agent,
       api_key_policy: request_options.routing.api_key_policy,
-      request_metadata: request_metadata_attrs(auth, payload, endpoint, request_options)
+      request_metadata:
+        request_metadata_attrs(auth, payload, accounting_endpoint, request_options)
     }
   end
+
+  defp accounting_endpoint(
+         _endpoint,
+         %RequestOptions{
+           transport: %{transport: "websocket"},
+           openai_compatibility: %{source_endpoint: source_endpoint}
+         }
+       )
+       when is_binary(source_endpoint),
+       do: source_endpoint
+
+  defp accounting_endpoint(endpoint, _request_options), do: endpoint
 
   defp request_metadata_attrs(auth, payload, endpoint, request_options) do
     %RequestOptions{
