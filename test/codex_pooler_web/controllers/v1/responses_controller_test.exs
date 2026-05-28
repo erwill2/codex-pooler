@@ -2,13 +2,32 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   use CodexPoolerWeb.ConnCase, async: false
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport,
-    only: [auth: 2, gateway_setup: 1, gateway_setup: 2, start_upstream: 1]
+    only: [
+      auth: 2,
+      await_public_websocket_upgrade: 2,
+      gateway_setup: 1,
+      gateway_setup: 2,
+      mint_websocket_new!: 4,
+      public_websocket_receive_text!: 3,
+      public_websocket_send_text!: 4,
+      start_public_endpoint!: 0,
+      start_upstream: 1
+    ]
 
   alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Events
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Persistence.CodexSession
   alias CodexPooler.Repo
+
+  @websocket_frame_timeout 1_000
+  @ttfh_threshold_ms 9_500
+  @timing_observation_timeout_ms 1_000
+  @failure_observation_timeout_ms 2_000
 
   defp with_public_metadata_headers(conn) do
     conn
@@ -20,6 +39,245 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     |> put_req_header("x-openai-extra", "extra-redacted")
     |> put_req_header("cookie", "public-client-cookie")
     |> put_req_header("idempotency-key", "public-client-idempotency")
+  end
+
+  defp public_v1_websocket_connect!(port, setup, turn_state, extra_headers) do
+    {:ok, conn} = Mint.HTTP.connect(:http, "127.0.0.1", port, protocols: [:http1])
+
+    headers = [
+      {"authorization", setup.authorization},
+      {"x-codex-turn-state", turn_state}
+      | extra_headers
+    ]
+
+    {:ok, conn, ref} = Mint.WebSocket.upgrade(:ws, conn, "/v1/responses", headers)
+    {:ok, conn, status, response_headers} = await_public_websocket_upgrade(conn, ref)
+    {conn, websocket} = mint_websocket_new!(conn, ref, status, response_headers)
+    {conn, websocket, ref, response_headers}
+  end
+
+  defp assert_receive_finalized_request! do
+    assert_receive {Events,
+                    %{
+                      reason: "request_finalized",
+                      payload: %{"status" => "succeeded"}
+                    }},
+                   @websocket_frame_timeout
+  end
+
+  defp perform_public_continuity_websocket_request!(port, setup, extra_headers) do
+    turn_state = "v1-public-continuity-ws-#{System.unique_integer([:positive])}"
+
+    {conn, websocket, ref, _response_headers} =
+      public_v1_websocket_connect!(port, setup, turn_state, extra_headers)
+
+    try do
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+      assert %{"id" => "resp_v1_websocket_continuity"} = Jason.decode!(frame)
+      assert_receive_finalized_request!()
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  defp assert_no_continuity_headers_forwarded!(captured) do
+    captured_headers = Map.new(captured.headers)
+
+    refute Map.has_key?(captured_headers, "session-id")
+    refute Map.has_key?(captured_headers, "x-session-affinity")
+  end
+
+  @tag :v1_websocket
+  test "GET /v1/responses upgrades and dispatches through the public websocket route" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_websocket_public",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    turn_state = "v1-public-ws-#{System.unique_integer([:positive])}"
+    local_session_id = "v1-local-session-#{System.unique_integer([:positive])}"
+
+    {conn, websocket, ref, response_headers} =
+      public_v1_websocket_connect!(port, setup, turn_state, [
+        {"openai-beta", "responses_websockets=2026-02-06"},
+        {"session-id", local_session_id},
+        {"x-session-affinity", local_session_id}
+      ])
+
+    try do
+      assert {"x-codex-turn-state", ^turn_state} =
+               List.keyfind(response_headers, "x-codex-turn-state", 0)
+
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+      assert %{"id" => "resp_v1_websocket_public"} = Jason.decode!(frame)
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.method == "WEBSOCKET"
+      assert captured.path == "/backend-api/codex/responses"
+      assert captured.json["type"] == "response.create"
+      assert captured.json["generate"] == true
+
+      assert_no_continuity_headers_forwarded!(captured)
+
+      assert_receive_finalized_request!()
+
+      assert %CodexSession{} = session = Repo.get_by(CodexSession, session_key: local_session_id)
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.endpoint == "/v1/responses"
+      assert request.transport == "websocket"
+      assert request.status == "succeeded"
+      assert get_in(request.request_metadata, ["openai_compatibility", "surface"]) == "openai_v1"
+
+      assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+               "/v1/responses"
+
+      assert get_in(request.request_metadata, ["openai_compatibility", "translated_endpoint"]) ==
+               "/backend-api/codex/responses"
+
+      assert request.request_metadata["codex_session_id"] == session.id
+      assert request.request_metadata["codex_session_key"] == local_session_id
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.transport == "websocket"
+      assert attempt.status == "succeeded"
+
+      persistence_text = inspect({request.request_metadata, attempt.response_metadata})
+      refute persistence_text =~ setup.authorization
+      refute persistence_text =~ setup.raw_key
+      refute persistence_text =~ "Bearer "
+      refute persistence_text =~ "upstream-token"
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  @tag :v1_websocket
+  test "GET /v1/responses keeps opencode continuity headers local without forwarding" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_websocket_continuity",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    session_id_header = "v1-ws-session-id-#{System.unique_integer([:positive])}"
+    affinity_header = "v1-ws-session-affinity-#{System.unique_integer([:positive])}"
+
+    perform_public_continuity_websocket_request!(port, setup, [
+      {"session-id", session_id_header}
+    ])
+
+    perform_public_continuity_websocket_request!(port, setup, [
+      {"x-session-affinity", affinity_header}
+    ])
+
+    assert %CodexSession{} =
+             session_id_session = Repo.get_by(CodexSession, session_key: session_id_header)
+
+    assert %CodexSession{} =
+             affinity_session = Repo.get_by(CodexSession, session_key: affinity_header)
+
+    requests =
+      Repo.all(
+        from r in Request,
+          where: r.pool_id == ^setup.pool.id,
+          order_by: [asc: r.admitted_at]
+      )
+
+    assert Enum.map(requests, & &1.endpoint) == ["/v1/responses", "/v1/responses"]
+
+    assert Enum.map(requests, & &1.request_metadata["codex_session_id"]) == [
+             session_id_session.id,
+             affinity_session.id
+           ]
+
+    assert Enum.map(requests, & &1.request_metadata["codex_session_key"]) == [
+             session_id_header,
+             affinity_header
+           ]
+
+    captured_requests = FakeUpstream.requests(upstream)
+    assert length(captured_requests) == 2
+
+    for captured <- captured_requests do
+      assert captured.method == "WEBSOCKET"
+      assert captured.path == "/backend-api/codex/responses"
+      assert_no_continuity_headers_forwarded!(captured)
+    end
+  end
+
+  test "GET /v1/responses with valid auth but no websocket upgrade fails without side effects", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    conn = conn |> auth(setup) |> get("/v1/responses")
+
+    assert %{"error" => %{"code" => "websocket_upgrade_required"}} = json_response(conn, 400)
+    assert get_resp_header(conn, "sec-websocket-accept") == []
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  test "GET /v1/responses blocked by runtime ingress fails before websocket upgrade", %{
+    conn: conn
+  } do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"id" => "blocked"})))
+    setup_runtime_ingress_override(%OperationalSettings{firewall_allowlist: ["203.0.113.10"]})
+
+    conn =
+      conn
+      |> Map.put(:remote_ip, {198, 51, 100, 20})
+      |> auth(setup)
+      |> websocket_upgrade_headers()
+      |> get("/v1/responses")
+
+    assert %{"error" => error} = json_response(conn, 403)
+    assert error["code"] == "access_denied"
+    assert error["message"] == "client IP is not allowed"
+    assert get_resp_header(conn, "sec-websocket-accept") == []
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
   end
 
   test "POST /v1/responses non-streaming dispatches through the gateway", %{conn: conn} do
@@ -75,6 +333,148 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.status == "succeeded"
+  end
+
+  test "POST /v1/responses non-streaming preserves web search action queries", %{conn: conn} do
+    web_search_item = web_search_call_item("ws_call_non_stream")
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_web_search_queries",
+               "status" => "completed",
+               "output" => [
+                 web_search_item,
+                 %{
+                   "type" => "message",
+                   "content" => [%{"type" => "output_text", "text" => "search complete"}]
+                 }
+               ],
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic web search response"
+      })
+
+    response = json_response(conn, 200)
+    assert %{"id" => "resp_v1_web_search_queries", "object" => "response"} = response
+    assert [public_web_search | _rest] = response["output"]
+    assert public_web_search["type"] == "web_search_call"
+
+    assert public_web_search["action"] == %{
+             "type" => "search",
+             "query" => "synthetic release notes",
+             "queries" => ["synthetic release notes", "synthetic changelog"]
+           }
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["stream"] == true
+    assert captured.json["store"] == false
+  end
+
+  test "POST /v1/responses keeps opencode continuity headers local without forwarding", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_continuity_headers",
+               "status" => "completed",
+               "output" => [
+                 %{
+                   "type" => "message",
+                   "content" => [%{"type" => "output_text", "text" => "synthetic answer"}]
+                 }
+               ],
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    session_id_header = "v1-session-id-#{System.unique_integer([:positive])}"
+    affinity_header = "v1-session-affinity-#{System.unique_integer([:positive])}"
+
+    first_conn =
+      conn
+      |> auth(setup)
+      |> put_req_header("x-codex-session-id", " ")
+      |> put_req_header("session-id", session_id_header)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic v1 session-id continuity"
+      })
+
+    second_conn =
+      build_conn()
+      |> auth(setup)
+      |> put_req_header("session-id", " ")
+      |> put_req_header("x-session-affinity", affinity_header)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic v1 affinity continuity"
+      })
+
+    assert %{"id" => "resp_v1_continuity_headers", "object" => "response"} =
+             json_response(first_conn, 200)
+
+    assert %{"id" => "resp_v1_continuity_headers", "object" => "response"} =
+             json_response(second_conn, 200)
+
+    assert %CodexSession{} =
+             session_id_session = Repo.get_by(CodexSession, session_key: session_id_header)
+
+    assert %CodexSession{} =
+             affinity_session = Repo.get_by(CodexSession, session_key: affinity_header)
+
+    requests =
+      Repo.all(
+        from r in Request,
+          where: r.pool_id == ^setup.pool.id,
+          order_by: [asc: r.admitted_at]
+      )
+
+    assert Enum.map(requests, & &1.endpoint) == [
+             "/backend-api/codex/responses",
+             "/backend-api/codex/responses"
+           ]
+
+    assert Enum.map(requests, & &1.request_metadata["codex_session_id"]) == [
+             session_id_session.id,
+             affinity_session.id
+           ]
+
+    assert Enum.map(requests, & &1.request_metadata["codex_session_key"]) == [
+             session_id_header,
+             affinity_header
+           ]
+
+    assert [first_upstream_request, second_upstream_request] = FakeUpstream.requests(upstream)
+
+    for captured <- [first_upstream_request, second_upstream_request] do
+      assert captured.path == "/backend-api/codex/responses"
+      assert_no_continuity_headers_forwarded!(captured)
+    end
   end
 
   test "POST /v1/responses does not forward public metadata headers upstream", %{conn: conn} do
@@ -217,6 +617,541 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.transport == "http_sse"
     assert request.status == "succeeded"
+  end
+
+  @tag :streaming_timing
+  test "POST /v1/responses streaming sends HTTP headers before delayed upstream body" do
+    release_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.barrier_sse_stream(
+          [
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "id" => "resp_v1_ttfh_stream",
+                 "status" => "completed",
+                 "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+               }
+             }}
+          ],
+          barrier_after: 0,
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+
+    {:ok, http_conn, ref, started} =
+      start_public_v1_responses_request(port, setup, %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic timing stream request",
+        "stream" => true
+      })
+
+    assert_receive {:fake_upstream_chunk_barrier, 0, upstream_pid, ^release_ref},
+                   @timing_observation_timeout_ms
+
+    try do
+      {http_conn, status, response_headers, elapsed_ms, chunks, done?} =
+        await_public_response_headers!(
+          http_conn,
+          ref,
+          started,
+          @timing_observation_timeout_ms
+        )
+
+      assert status == 200
+      assert elapsed_ms < @ttfh_threshold_ms
+      assert elapsed_ms < @timing_observation_timeout_ms
+      assert header_value(response_headers, "content-type") =~ "text/event-stream"
+      assert header_value(response_headers, "cache-control") == "no-cache"
+
+      send(upstream_pid, {:fake_upstream_release_chunk, release_ref})
+
+      body =
+        await_public_response_done!(http_conn, ref, chunks, done?, @timing_observation_timeout_ms)
+
+      assert body =~ "event: response.created\n"
+      assert body =~ "event: response.completed\n"
+    after
+      send(upstream_pid, {:fake_upstream_release_chunk, release_ref})
+      Mint.HTTP.close(http_conn)
+    end
+  end
+
+  @tag :streaming_timing
+  test "POST /v1/responses streaming upstream header timeout fails within client header budget" do
+    release_ref = make_ref()
+    setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 200})
+
+    upstream =
+      start_upstream(
+        FakeUpstream.timeout_before_headers(notify: self(), release_ref: release_ref)
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+
+    {:ok, http_conn, ref, started} =
+      start_public_v1_responses_request(port, setup, %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic timeout stream request",
+        "stream" => true
+      })
+
+    assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                   @timing_observation_timeout_ms
+
+    logs =
+      capture_log([level: :warning], fn ->
+        try do
+          {http_conn, status, _response_headers, header_elapsed_ms, chunks, done?} =
+            await_public_response_headers!(
+              http_conn,
+              ref,
+              started,
+              @failure_observation_timeout_ms
+            )
+
+          body =
+            await_public_response_done!(
+              http_conn,
+              ref,
+              chunks,
+              done?,
+              @failure_observation_timeout_ms
+            )
+
+          total_elapsed_ms = elapsed_ms(started)
+
+          assert status == 502
+          assert header_elapsed_ms < @ttfh_threshold_ms
+          assert total_elapsed_ms < @ttfh_threshold_ms
+          assert %{"error" => %{"code" => "upstream_request_failed"}} = Jason.decode!(body)
+        after
+          send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+          Mint.HTTP.close(http_conn)
+        end
+      end)
+
+    warnings =
+      logs
+      |> String.split("\n", trim: true)
+      |> Enum.filter(&String.contains?(&1, "gateway upstream transport failed"))
+
+    assert [warning] = warnings
+    assert warning =~ "transport=http_sse"
+    assert warning =~ "endpoint=/backend-api/codex/responses"
+    assert warning =~ "exception=Req.TransportError"
+    assert warning =~ "reason=timeout"
+    refute logs =~ "synthetic timeout stream request"
+    refute logs =~ setup.authorization
+    refute logs =~ setup.raw_key
+  end
+
+  @tag :streaming_timing
+  test "POST /v1/responses streaming stays alive while upstream sends steady progress" do
+    setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 250})
+
+    upstream =
+      start_upstream(
+        FakeUpstream.delayed_sse_stream(
+          long_turn_progress_events("resp_v1_long_turn_progress"),
+          interval_ms: 100,
+          notify: self()
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+
+    {:ok, http_conn, ref, started} =
+      start_public_v1_responses_request(port, setup, %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic long progress stream request",
+        "stream" => true
+      })
+
+    try do
+      {http_conn, status, response_headers, header_elapsed_ms, chunks, done?} =
+        await_public_response_headers!(
+          http_conn,
+          ref,
+          started,
+          @timing_observation_timeout_ms
+        )
+
+      assert status == 200
+      assert header_elapsed_ms < @ttfh_threshold_ms
+      assert header_elapsed_ms < 250
+      assert header_value(response_headers, "content-type") =~ "text/event-stream"
+
+      body =
+        await_public_response_done!(
+          http_conn,
+          ref,
+          chunks,
+          done?,
+          @failure_observation_timeout_ms
+        )
+
+      total_elapsed_ms = elapsed_ms(started)
+
+      assert total_elapsed_ms >= 600
+      assert body =~ "event: response.output_text.delta\n"
+      assert body =~ "progress-6"
+      assert body =~ "event: response.completed\n"
+      refute body =~ "stream_idle_timeout"
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.transport == "http_sse"
+      assert request.status == "succeeded"
+
+      assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+               "/v1/responses"
+    after
+      Mint.HTTP.close(http_conn)
+    end
+  end
+
+  @tag :streaming_timing
+  test "POST /v1/responses streaming reports idle timeout after visible output" do
+    release_ref = make_ref()
+    setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 150})
+
+    upstream =
+      start_upstream(
+        FakeUpstream.timeout_mid_stream(
+          ~s(event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"visible-before-idle"}\n\n),
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+
+    {:ok, http_conn, ref, started} =
+      start_public_v1_responses_request(port, setup, %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic idle timeout stream request",
+        "stream" => true
+      })
+
+    assert_receive {:fake_upstream_timeout_barrier, :mid_stream, upstream_pid, ^release_ref},
+                   @timing_observation_timeout_ms
+
+    try do
+      {http_conn, status, response_headers, header_elapsed_ms, chunks, done?} =
+        await_public_response_headers!(
+          http_conn,
+          ref,
+          started,
+          @timing_observation_timeout_ms
+        )
+
+      assert status == 200
+      assert header_elapsed_ms < @ttfh_threshold_ms
+      assert header_value(response_headers, "content-type") =~ "text/event-stream"
+
+      body =
+        await_public_response_done!(
+          http_conn,
+          ref,
+          chunks,
+          done?,
+          @failure_observation_timeout_ms
+        )
+
+      total_elapsed_ms = elapsed_ms(started)
+      silent_gap_elapsed_ms = await_silent_gap!(started, 250)
+
+      assert total_elapsed_ms >= 150
+      assert silent_gap_elapsed_ms >= 250
+      assert body =~ "visible-before-idle"
+      refute body =~ "late"
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.transport == "http_sse"
+      assert request.status == "failed"
+      assert request.last_error_code == "stream_idle_timeout"
+
+      assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+               "/v1/responses"
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.status == "failed"
+      assert attempt.network_error_code == "stream_idle_timeout"
+    after
+      Process.send_after(upstream_pid, {:fake_upstream_release_timeout, release_ref}, 250)
+      Mint.HTTP.close(http_conn)
+    end
+  end
+
+  @tag :v1_websocket
+  test "GET /v1/responses websocket stays alive while upstream sends steady progress" do
+    setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 250})
+
+    upstream =
+      start_upstream(
+        FakeUpstream.delayed_sse_stream(
+          long_turn_progress_events("resp_v1_ws_long_turn_progress"),
+          interval_ms: 100
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    turn_state = "v1-ws-long-progress-#{System.unique_integer([:positive])}"
+
+    {conn, websocket, ref, _response_headers} =
+      public_v1_websocket_connect!(port, setup, turn_state, [
+        {"openai-beta", "responses_websockets=2026-02-06"}
+      ])
+
+    started = System.monotonic_time(:millisecond)
+
+    try do
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, websocket, first_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      first_elapsed_ms = elapsed_ms(started)
+      {conn, websocket, second_frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+      {conn, _websocket, terminal_frame} =
+        receive_public_websocket_until_completed!(conn, websocket, ref)
+
+      total_elapsed_ms = elapsed_ms(started)
+
+      assert first_elapsed_ms < @ttfh_threshold_ms
+      assert first_elapsed_ms < 250
+      assert Jason.decode!(first_frame)["type"] == "response.output_text.delta"
+      assert Jason.decode!(second_frame)["delta"] == "progress-2"
+      assert %{"type" => "response.completed"} = Jason.decode!(terminal_frame)
+      assert total_elapsed_ms >= 600
+
+      assert_receive_finalized_request!()
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.endpoint == "/v1/responses"
+      assert request.transport == "websocket"
+      assert request.status == "succeeded"
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  @tag :v1_websocket
+  test "GET /v1/responses websocket reports idle timeout after visible output" do
+    release_ref = make_ref()
+    setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 150})
+
+    upstream =
+      start_upstream(
+        FakeUpstream.timeout_mid_stream(
+          ~s(event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"visible-before-ws-idle"}\n\n),
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    turn_state = "v1-ws-idle-timeout-#{System.unique_integer([:positive])}"
+
+    {conn, websocket, ref, _response_headers} =
+      public_v1_websocket_connect!(port, setup, turn_state, [
+        {"openai-beta", "responses_websockets=2026-02-06"}
+      ])
+
+    started = System.monotonic_time(:millisecond)
+
+    try do
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, websocket, visible_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      visible_elapsed_ms = elapsed_ms(started)
+      silent_gap_elapsed_ms = await_silent_gap!(started, 250)
+
+      {conn, _websocket, terminal_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      total_elapsed_ms = elapsed_ms(started)
+
+      assert visible_elapsed_ms < @ttfh_threshold_ms
+      assert silent_gap_elapsed_ms >= 250
+      assert visible_elapsed_ms < 250
+      assert Jason.decode!(visible_frame)["delta"] == "visible-before-ws-idle"
+
+      assert %{
+               "type" => "error",
+               "status" => 502,
+               "error" => %{"code" => "stream_idle_timeout"}
+             } = Jason.decode!(terminal_frame)
+
+      assert total_elapsed_ms >= 150
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.endpoint == "/v1/responses"
+      assert request.transport == "websocket"
+      assert request.status == "failed"
+      assert request.last_error_code == "stream_idle_timeout"
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.status == "failed"
+      assert attempt.network_error_code == "stream_idle_timeout"
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  test "POST /v1/responses streaming preserves web search action queries", %{conn: conn} do
+    web_search_item = web_search_call_item("ws_call_stream")
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.output_item.added",
+           %{
+             "type" => "response.output_item.added",
+             "output_index" => 0,
+             "item" => web_search_item
+           }},
+          {"response.output_item.done",
+           %{
+             "type" => "response.output_item.done",
+             "output_index" => 0,
+             "item" => web_search_item
+           }},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_stream_web_search_queries",
+               "status" => "completed",
+               "output" => [web_search_item],
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic streaming web search request",
+        "stream" => true
+      })
+
+    events = public_sse_events(conn.resp_body)
+
+    assert %{
+             "type" => "web_search_call",
+             "action" => %{
+               "type" => "search",
+               "query" => "synthetic release notes",
+               "queries" => ["synthetic release notes", "synthetic changelog"]
+             }
+           } = event_item(events, "response.output_item.added")
+
+    assert %{
+             "type" => "web_search_call",
+             "action" => %{
+               "type" => "search",
+               "query" => "synthetic release notes",
+               "queries" => ["synthetic release notes", "synthetic changelog"]
+             }
+           } = event_item(events, "response.output_item.done")
+  end
+
+  test "POST /v1/responses streaming keeps non-text-first output ordering", %{conn: conn} do
+    web_search_item = web_search_call_item("ws_call_first_visible")
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.output_item.added",
+           %{
+             "type" => "response.output_item.added",
+             "output_index" => 0,
+             "item" => web_search_item
+           }},
+          {"response.output_item.done",
+           %{
+             "type" => "response.output_item.done",
+             "output_index" => 0,
+             "item" => web_search_item
+           }},
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => "final text"}},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_non_text_first_stream",
+               "status" => "completed",
+               "output" => [
+                 web_search_item,
+                 %{
+                   "type" => "message",
+                   "content" => [%{"type" => "output_text", "text" => "final text"}]
+                 }
+               ],
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic non text first stream request",
+        "stream" => true
+      })
+
+    events = public_sse_events(conn.resp_body)
+    event_types = Enum.map(events, & &1["event"])
+    output_item_index = Enum.find_index(event_types, &(&1 == "response.output_item.added"))
+    text_delta_index = Enum.find_index(event_types, &(&1 == "response.output_text.delta"))
+
+    assert output_item_index != nil
+    assert text_delta_index != nil
+    assert output_item_index < text_delta_index
+    assert event_item(events, "response.output_item.added")["type"] == "web_search_call"
   end
 
   test "POST /v1/responses streaming synthesizes missing delta from terminal output", %{
@@ -440,5 +1375,242 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert FakeUpstream.count(upstream) == 0
     assert Repo.aggregate(Request, :count) == 0
     assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  defp long_turn_progress_events(response_id) do
+    progress_events =
+      for index <- 1..6 do
+        {"response.output_text.delta",
+         %{"type" => "response.output_text.delta", "delta" => "progress-#{index}"}}
+      end
+
+    progress_events ++
+      [
+        {"response.completed",
+         %{
+           "type" => "response.completed",
+           "response" => %{
+             "id" => response_id,
+             "status" => "completed",
+             "usage" => %{"input_tokens" => 2, "output_tokens" => 6, "total_tokens" => 8}
+           }
+         }}
+      ]
+  end
+
+  defp receive_public_websocket_until_completed!(conn, websocket, ref) do
+    {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+    case Jason.decode!(frame) do
+      %{"type" => "response.completed"} -> {conn, websocket, frame}
+      _other -> receive_public_websocket_until_completed!(conn, websocket, ref)
+    end
+  end
+
+  defp start_public_v1_responses_request(port, setup, payload) do
+    {:ok, conn} = Mint.HTTP.connect(:http, "127.0.0.1", port, protocols: [:http1])
+
+    headers = [
+      {"authorization", setup.authorization},
+      {"content-type", "application/json"},
+      {"accept", "text/event-stream"}
+    ]
+
+    started = System.monotonic_time(:millisecond)
+
+    {:ok, conn, ref} =
+      Mint.HTTP.request(conn, "POST", "/v1/responses", headers, Jason.encode!(payload))
+
+    {:ok, conn, ref, started}
+  end
+
+  defp await_public_response_headers!(conn, ref, started, timeout_ms) do
+    await_public_response_headers!(conn, ref, started, timeout_ms, nil, nil, [], false)
+  end
+
+  defp await_public_response_headers!(
+         conn,
+         ref,
+         started,
+         timeout_ms,
+         status,
+         headers,
+         chunks,
+         done?
+       ) do
+    if is_integer(status) and is_list(headers) do
+      {conn, status, headers, elapsed_ms(started), chunks, done?}
+    else
+      receive do
+        message ->
+          case Mint.HTTP.stream(conn, message) do
+            {:ok, conn, responses} ->
+              {status, headers, chunks, done?} =
+                merge_public_response_parts(responses, ref, status, headers, chunks, done?)
+
+              await_public_response_headers!(
+                conn,
+                ref,
+                started,
+                timeout_ms,
+                status,
+                headers,
+                chunks,
+                done?
+              )
+
+            {:error, conn, reason, _responses} ->
+              Mint.HTTP.close(conn)
+              flunk("public /v1 response stream failed before headers: #{inspect(reason)}")
+
+            :unknown ->
+              await_public_response_headers!(
+                conn,
+                ref,
+                started,
+                timeout_ms,
+                status,
+                headers,
+                chunks,
+                done?
+              )
+          end
+      after
+        timeout_ms -> flunk("timed out waiting for public /v1 response headers")
+      end
+    end
+  end
+
+  defp await_public_response_done!(_conn, _ref, chunks, true, _timeout_ms) do
+    chunks
+    |> Enum.reverse()
+    |> IO.iodata_to_binary()
+  end
+
+  defp await_public_response_done!(conn, ref, chunks, false, timeout_ms) do
+    receive do
+      message ->
+        case Mint.HTTP.stream(conn, message) do
+          {:ok, conn, responses} ->
+            {_status, _headers, chunks, done?} =
+              merge_public_response_parts(responses, ref, nil, nil, chunks, false)
+
+            await_public_response_done!(conn, ref, chunks, done?, timeout_ms)
+
+          {:error, conn, reason, _responses} ->
+            Mint.HTTP.close(conn)
+            flunk("public /v1 response stream failed before completion: #{inspect(reason)}")
+
+          :unknown ->
+            await_public_response_done!(conn, ref, chunks, false, timeout_ms)
+        end
+    after
+      timeout_ms -> flunk("timed out waiting for public /v1 response completion")
+    end
+  end
+
+  defp merge_public_response_parts(responses, ref, status, headers, chunks, done?) do
+    Enum.reduce(responses, {status, headers, chunks, done?}, fn
+      {:status, ^ref, status}, {_status, headers, chunks, done?} ->
+        {status, headers, chunks, done?}
+
+      {:headers, ^ref, headers}, {status, _headers, chunks, done?} ->
+        {status, headers, chunks, done?}
+
+      {:data, ^ref, data}, {status, headers, chunks, done?} ->
+        {status, headers, [data | chunks], done?}
+
+      {:done, ^ref}, {status, headers, chunks, _done?} ->
+        {status, headers, chunks, true}
+
+      _part, acc ->
+        acc
+    end)
+  end
+
+  defp header_value(headers, name) do
+    headers
+    |> Enum.find_value(fn {header_name, value} ->
+      if String.downcase(to_string(header_name)) == name, do: value
+    end)
+  end
+
+  defp await_silent_gap!(started, gap_ms) do
+    Process.send_after(self(), {:task_11_silent_gap_elapsed, make_ref()}, gap_ms)
+
+    receive do
+      {:task_11_silent_gap_elapsed, _ref} -> elapsed_ms(started)
+    after
+      gap_ms + @timing_observation_timeout_ms -> flunk("timed out waiting for silent gap")
+    end
+  end
+
+  defp elapsed_ms(started), do: max(System.monotonic_time(:millisecond) - started, 0)
+
+  defp web_search_call_item(id) do
+    %{
+      "id" => id,
+      "type" => "web_search_call",
+      "status" => "completed",
+      "action" => %{
+        "type" => "search",
+        "query" => "synthetic release notes",
+        "queries" => ["synthetic release notes", "synthetic changelog"]
+      }
+    }
+  end
+
+  defp public_sse_events(body) do
+    body
+    |> String.split("\n\n", trim: true)
+    |> Enum.flat_map(fn block ->
+      case public_sse_event(block) do
+        nil -> []
+        event -> [event]
+      end
+    end)
+  end
+
+  defp public_sse_event(block) do
+    lines = String.split(block, "\n")
+    event = lines |> Enum.find(&String.starts_with?(&1, "event: ")) |> strip_sse_prefix("event: ")
+    data = lines |> Enum.find(&String.starts_with?(&1, "data: ")) |> strip_sse_prefix("data: ")
+
+    if is_binary(event) and is_binary(data) and data != "[DONE]" do
+      %{"event" => event, "data" => Jason.decode!(data)}
+    end
+  end
+
+  defp event_item(events, event_type) do
+    events
+    |> Enum.find_value(fn
+      %{"event" => ^event_type, "data" => %{"item" => item}} -> item
+      _event -> nil
+    end)
+  end
+
+  defp strip_sse_prefix(nil, _prefix), do: nil
+  defp strip_sse_prefix(line, prefix), do: String.replace_prefix(line, prefix, "")
+
+  defp websocket_upgrade_headers(conn) do
+    conn
+    |> put_req_header("connection", "upgrade")
+    |> put_req_header("upgrade", "websocket")
+    |> put_req_header("sec-websocket-version", "13")
+    |> put_req_header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+  end
+
+  defp setup_runtime_ingress_override(%OperationalSettings{} = settings) do
+    previous = Application.get_env(:codex_pooler, OperationalSettings, [])
+
+    Application.put_env(
+      :codex_pooler,
+      OperationalSettings,
+      previous
+      |> Keyword.put(:settings, settings)
+      |> Keyword.put(:use_instance_settings?, false)
+    )
+
+    on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous) end)
   end
 end
