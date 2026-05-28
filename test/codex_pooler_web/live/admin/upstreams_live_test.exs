@@ -8,12 +8,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   import Phoenix.LiveViewTest
   import CodexPooler.PoolerFixtures
 
+  alias CodexPooler.Events
+  alias CodexPooler.Events.Event
+  alias CodexPooler.Events.PostgresBridge
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.Jobs.TokenRefreshWorker
   alias CodexPooler.Mailer
   alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.PrimingState
   alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
@@ -836,6 +840,78 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
                }
              ])
 
+    _ = :sys.get_state(view.pid)
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300",
+             "80%"
+           )
+  end
+
+  test "refreshes quota limits when worker quota notifications arrive through postgres relay", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "postgres-relay-quota", name: "Postgres Relay Quota"})
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Postgres Relay Codex",
+        assignment_label: "Postgres relay assignment"
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:ok, [window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 quota_key: "gpt_5_3_codex_spark",
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 used_percent: Decimal.new("0"),
+                 display_label: "GPT-5.3-Codex-Spark",
+                 quota_scope: "model",
+                 model: "gpt-5.3-codex-spark",
+                 reset_at: DateTime.add(now, 5, :hour),
+                 source: "codex_usage",
+                 freshness_state: "fresh",
+                 observed_at: now
+               }
+             ])
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300",
+             "100%"
+           )
+
+    later_reset = DateTime.add(now, 7, :hour)
+
+    window
+    |> AccountQuotaWindow.changeset(%{used_percent: Decimal.new("20"), reset_at: later_reset})
+    |> Repo.update!()
+
+    event = %Event{
+      version: 1,
+      id: Ecto.UUID.generate(),
+      pool_id: pool.id,
+      topics: ["upstreams"],
+      reason: "upstream_quota_windows_updated",
+      emitted_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
+      payload: %{
+        "assignment_id" => assignment.id,
+        "upstream_identity_id" => identity.id,
+        "upstream_status" => identity.status,
+        "assignment_status" => assignment.status
+      }
+    }
+
+    assert {:ok, payload} = Events.event_to_postgres_payload(event)
+    assert :ok = PostgresBridge.relay_payload(payload)
     _ = :sys.get_state(view.pid)
 
     assert has_element?(
