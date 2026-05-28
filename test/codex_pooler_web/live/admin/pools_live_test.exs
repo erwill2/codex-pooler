@@ -120,6 +120,24 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy", "Deterministic rotation")
     assert has_element?(view, "#pool-row-#{pool.id}-id", pool.id)
     assert has_element?(view, "#pool-row-#{pool.id}-activity[data-role='pool-activity-panel']")
+    assert has_element?(view, "#pool-row-#{pool.id} > footer.pool-card-metrics.border-t")
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id} > footer [data-role='pool-upstream-count-cell']"
+           )
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id} > footer [data-role='pool-api-key-count-cell']"
+           )
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id} > footer [data-role='pool-request-count-cell']"
+           )
+
+    assert has_element?(view, "#pool-row-#{pool.id} > footer [data-role='pool-tps-cell']")
     assert has_element?(view, "#pool-metric-requests", "0")
     assert has_element?(view, "#pool-metric-requests", "Last 5h requests")
     assert has_element?(view, "#pool-metric-tokens-per-sec", "0")

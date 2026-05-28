@@ -372,35 +372,58 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           <.pool_action_menu pool_row={@pool_row} can_manage_pools?={@can_manage_pools?} />
         </div>
       </div>
-      <footer class="pool-card-metrics" data-role="pool-card-metrics">
-        <dl class="audit-metrics">
-          <div class="audit-metric">
-            <dt>Upstreams</dt>
-            <dd id={"pool-row-#{@pool_row.pool.id}-upstream-account-count"}>
+      <.pool_activity_panel pool_row={@pool_row} />
+      <footer
+        class="pool-card-metrics border-t border-base-300 bg-base-200/20 px-4 py-2.5"
+        data-role="pool-card-metrics"
+      >
+        <dl class="grid min-w-0 grid-cols-4 divide-x divide-base-300/70 text-xs leading-5">
+          <div class="min-w-0 pr-3" data-role="pool-upstream-count-cell">
+            <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
+              Upstreams
+            </dt>
+            <dd
+              id={"pool-row-#{@pool_row.pool.id}-upstream-account-count"}
+              class="truncate text-base-content/60"
+            >
               {@pool_row.upstream_count}
             </dd>
           </div>
-          <div class="audit-metric">
-            <dt>Keys</dt>
-            <dd id={"pool-row-#{@pool_row.pool.id}-api-key-count"}>
+          <div class="min-w-0 px-3" data-role="pool-api-key-count-cell">
+            <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
+              Keys
+            </dt>
+            <dd
+              id={"pool-row-#{@pool_row.pool.id}-api-key-count"}
+              class="truncate text-base-content/60"
+            >
               {@pool_row.api_key_count}
             </dd>
           </div>
-          <div class="audit-metric">
-            <dt>Requests</dt>
-            <dd id={"pool-row-#{@pool_row.pool.id}-request-count-5h"}>
+          <div class="min-w-0 px-3" data-role="pool-request-count-cell">
+            <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
+              Requests
+            </dt>
+            <dd
+              id={"pool-row-#{@pool_row.pool.id}-request-count-5h"}
+              class="truncate text-base-content/60"
+            >
               {PoolsReadModel.format_metric_integer(@pool_row.request_count_5h)}
             </dd>
           </div>
-          <div class="audit-metric">
-            <dt>TPS</dt>
-            <dd id={"pool-row-#{@pool_row.pool.id}-tokens-per-sec"}>
+          <div class="min-w-0 pl-3" data-role="pool-tps-cell">
+            <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
+              TPS
+            </dt>
+            <dd
+              id={"pool-row-#{@pool_row.pool.id}-tokens-per-sec"}
+              class="truncate text-base-content/60"
+            >
               {PoolsReadModel.format_metric_float(@pool_row.tokens_per_second)}
             </dd>
           </div>
         </dl>
       </footer>
-      <.pool_activity_panel pool_row={@pool_row} />
     </article>
     """
   end

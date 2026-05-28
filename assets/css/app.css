@@ -304,6 +304,7 @@ body {
   display: grid;
   min-width: 0;
   gap: 0;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   overflow: hidden;
   border: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent);
   border-radius: var(--radius-box);
@@ -370,59 +371,6 @@ body {
 
 .pool-redesign-audit .audit-row-v2 .audit-command-line > .dropdown {
   justify-self: end;
-}
-
-.pool-card-metrics {
-  border-top: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent);
-  background: color-mix(in oklab, var(--color-base-200) 20%, transparent);
-  padding: 0.65rem 1rem;
-}
-
-.pool-redesign-audit .audit-metrics {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  margin: 0;
-}
-
-.pool-redesign-audit .audit-metric {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 0.15rem;
-  min-width: 0;
-  padding: 0 0.75rem;
-}
-
-.pool-redesign-audit .audit-metric:first-child {
-  padding-left: 0;
-}
-
-.pool-redesign-audit .audit-metric:not(:first-child) {
-  border-left: 1px solid color-mix(in oklab, var(--color-base-content) 12%, transparent);
-}
-
-.pool-redesign-audit .audit-metric dt {
-  overflow: hidden;
-  color: color-mix(in oklab, var(--color-base-content) 42%, transparent);
-  font-size: 0.62rem;
-  font-weight: 700;
-  line-height: 1;
-  text-overflow: ellipsis;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
-.pool-redesign-audit .audit-metric dd {
-  margin: 0;
-  overflow: hidden;
-  color: color-mix(in oklab, var(--color-base-content) 74%, transparent);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-    "Courier New", monospace;
-  font-size: 0.7rem;
-  font-weight: 700;
-  line-height: 1.15rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .pool-activity-panel {
@@ -532,18 +480,6 @@ body {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .pool-redesign-audit .audit-metrics {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .pool-redesign-audit .audit-metric:nth-child(odd) {
-    border-left: 0;
-    padding-left: 0;
-  }
-
-  .pool-redesign-audit .audit-metric:nth-child(even) {
-    padding-right: 0;
-  }
 }
 
 .admin-log-table.table-sm :where(th, td) {
