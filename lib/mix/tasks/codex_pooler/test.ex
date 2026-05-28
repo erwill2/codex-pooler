@@ -6,6 +6,7 @@ defmodule Mix.Tasks.CodexPooler.Test do
   use Mix.Task
 
   alias CodexPooler.MixTasks.TestDatabaseLock
+  alias Mix.Tasks.Test
 
   @shortdoc "Runs ecto setup and tests under the shared test database lock"
 
@@ -14,7 +15,7 @@ defmodule Mix.Tasks.CodexPooler.Test do
     TestDatabaseLock.with_lock!(CodexPooler.Repo.config(), fn ->
       Mix.Task.run("ecto.create", ["--quiet"])
       Mix.Task.run("ecto.migrate", ["--quiet"])
-      Mix.Tasks.Test.run(args)
+      Test.run(args)
     end)
   end
 end

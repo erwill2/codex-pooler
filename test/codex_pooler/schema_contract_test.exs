@@ -156,6 +156,7 @@ defmodule CodexPooler.SchemaContractTest do
     assert constraints["requests_endpoint_check"] =~ "'/backend-api/files/uploaded'"
     assert constraints["requests_endpoint_check"] =~ "'/api/codex/usage'"
     assert constraints["requests_endpoint_check"] =~ "'/v1/models'"
+    assert constraints["requests_endpoint_check"] =~ "'/v1/responses'"
     assert constraints["requests_endpoint_check"] =~ "'/v1/usage'"
     assert constraints["requests_endpoint_check"] =~ "'/v1/files'"
     assert constraints["requests_endpoint_check"] =~ "'/v1/files/content'"

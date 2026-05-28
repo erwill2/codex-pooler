@@ -241,6 +241,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       categories: [:route, :auth, :error, :multipart, :streaming, :ownership],
       routes: [
         %{method: :get, path: "/v1/models"},
+        %{method: :get, path: "/v1/responses"},
         %{method: :post, path: "/v1/responses"},
         %{method: :post, path: "/v1/responses/compact"},
         %{method: :post, path: "/v1/chat/completions"},
@@ -257,7 +258,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :v1_supported_surface,
       contract:
-        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, and allow prompt-cache routing locality only on POST responses and chat completions"
+        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, include narrow GET /v1/responses Responses websocket compatibility only, exclude broad /v1/realtime routes, consume continuity headers using the documented local precedence without forwarding session-id or x-session-affinity upstream, and allow prompt-cache routing locality only on POST responses and chat completions"
     },
     %{
       slug: :v1_unsupported_public_surface,
@@ -444,6 +445,28 @@ defmodule CodexPooler.CompatibilityMatrix do
         "/v1/audio/transcriptions",
         "/v1/images/generations",
         "/v1/images/edits"
+      ],
+      websocket_route: %{method: :get, path: "/v1/responses"},
+      websocket_contract: "narrow_responses_websocket_only",
+      continuity_precedence: [
+        "x-codex-session-id",
+        "session-id",
+        "x-session-affinity",
+        "session_id",
+        "x-codex-conversation-id"
+      ],
+      local_continuity_headers_not_forwarded: ["session-id", "x-session-affinity"],
+      timeout_contract: %{
+        route_specific_defaults_added: false,
+        progress_receive_timeout_ms: 250,
+        progress_interval_ms: 100,
+        idle_receive_timeout_ms: 150,
+        idle_silent_gap_min_ms: 250,
+        idle_error_code: "stream_idle_timeout"
+      },
+      unsupported_realtime_routes: [
+        %{method: :get, path: "/v1/realtime"},
+        %{method: :post, path: "/v1/realtime"}
       ],
       error_shape: %{
         "error" => %{

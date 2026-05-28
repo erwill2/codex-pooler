@@ -157,11 +157,47 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert :ownership in feature.categories
 
       assert Enum.any?(feature.routes, &(&1.method == :get and &1.path == "/v1/models"))
+      assert Enum.any?(feature.routes, &(&1.method == :get and &1.path == "/v1/responses"))
+      assert Enum.any?(feature.routes, &(&1.method == :post and &1.path == "/v1/responses"))
       assert feature.contract =~ "OpenAI-compatible /v1 routes"
+      assert feature.contract =~ "narrow GET /v1/responses Responses websocket compatibility only"
+      assert feature.contract =~ "exclude broad /v1/realtime routes"
+      assert feature.contract =~ "documented local precedence"
+      assert feature.contract =~ "without forwarding session-id or x-session-affinity upstream"
       refute feature.contract =~ "metadata"
 
       assert fixture.auth == "required_bearer_api_key"
       assert fixture.default_enabled == true
+      assert fixture.websocket_route == %{method: :get, path: "/v1/responses"}
+      assert fixture.websocket_contract == "narrow_responses_websocket_only"
+
+      assert fixture.continuity_precedence == [
+               "x-codex-session-id",
+               "session-id",
+               "x-session-affinity",
+               "session_id",
+               "x-codex-conversation-id"
+             ]
+
+      assert fixture.local_continuity_headers_not_forwarded == [
+               "session-id",
+               "x-session-affinity"
+             ]
+
+      assert fixture.timeout_contract == %{
+               route_specific_defaults_added: false,
+               progress_receive_timeout_ms: 250,
+               progress_interval_ms: 100,
+               idle_receive_timeout_ms: 150,
+               idle_silent_gap_min_ms: 250,
+               idle_error_code: "stream_idle_timeout"
+             }
+
+      assert fixture.unsupported_realtime_routes == [
+               %{method: :get, path: "/v1/realtime"},
+               %{method: :post, path: "/v1/realtime"}
+             ]
+
       refute Map.has_key?(fixture, :metadata)
 
       assert fixture.routes |> Enum.sort() == [
@@ -175,6 +211,23 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                "/v1/responses/compact",
                "/v1/usage"
              ]
+    end
+
+    test "keeps broad public realtime routes outside the router surface" do
+      route_set =
+        CodexPoolerWeb.Router
+        |> Phoenix.Router.routes()
+        |> Enum.map(&{&1.verb, &1.path})
+        |> MapSet.new()
+
+      feature = CompatibilityMatrix.by_slug!(:v1_supported_surface)
+      fixture = CompatibilityMatrix.fixture!(:v1_supported_surface)
+
+      assert feature.contract =~ "exclude broad /v1/realtime routes"
+
+      for route <- fixture.unsupported_realtime_routes do
+        refute MapSet.member?(route_set, {route.method, route.path})
+      end
     end
 
     test "documents unsupported v1 public surface with exact OpenAI-shaped error contract" do
