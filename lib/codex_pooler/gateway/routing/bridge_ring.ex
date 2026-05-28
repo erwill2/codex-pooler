@@ -25,6 +25,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   @default_strategy "bridge_ring"
   @default_ring_size 3
   @demotion_seconds 60
+  @prompt_cache_affinity_kind "prompt_cache"
   @affinity_conflict_target {:unsafe_fragment,
                              "(pool_id, api_key_id, model_identifier, affinity_kind, affinity_key_hash) WHERE status = 'active'"}
   @demotion_conflict_target {:unsafe_fragment,
@@ -51,6 +52,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
           candidates: [candidate()],
           affinity: affinity_context(),
           demotions: demotion_map(),
+          locality: map(),
           request_metadata: map(),
           selected_assignment_id: Ecto.UUID.t() | nil
         }
@@ -77,15 +79,20 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     affinity = affinity_context(auth, model, input, opts, settings)
     demotions = active_demotions(auth, model, candidates)
 
+    prompt_cache_locality =
+      prompt_cache_locality_context(auth, model, opts, settings, affinity, candidates)
+
     ordered =
       settings.routing_strategy
       |> strategy_order(candidates, model, affinity.seed || input.correlation_id)
+      |> apply_prompt_cache_locality(prompt_cache_locality)
       |> apply_affinity(affinity)
       |> apply_demotions(demotions)
 
     ring_size = max(settings.bridge_ring_size || @default_ring_size, 1)
     candidates = Enum.take(ordered, ring_size)
     selected = List.first(candidates)
+    prompt_cache_locality = finalize_prompt_cache_locality(prompt_cache_locality, selected)
 
     %{
       strategy: settings.routing_strategy,
@@ -93,7 +100,9 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       candidates: candidates,
       affinity: affinity,
       demotions: demotions,
-      request_metadata: Metadata.request_metadata(settings, affinity, demotions, selected),
+      locality: prompt_cache_locality,
+      request_metadata:
+        Metadata.request_metadata(settings, affinity, demotions, selected, prompt_cache_locality),
       selected_assignment_id: selected && elem(selected, 0).id
     }
   end
@@ -265,6 +274,140 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       end)
 
     matched ++ rest
+  end
+
+  defp apply_prompt_cache_locality(candidates, %{status: "applied", seed: seed}) do
+    Enum.sort_by(candidates, fn {assignment, _identity} ->
+      {-rendezvous_score(seed, assignment.id), assignment.id}
+    end)
+  end
+
+  defp apply_prompt_cache_locality(candidates, _locality), do: candidates
+
+  defp prompt_cache_locality_context(
+         auth,
+         model,
+         %RequestOptions{} = opts,
+         %RoutingSettings{} = settings,
+         affinity,
+         candidates
+       ) do
+    prompt_cache_key = opts.routing.prompt_cache_key
+    candidate_count = length(candidates)
+
+    seed =
+      if valid_prompt_cache_key?(prompt_cache_key),
+        do: prompt_cache_seed(auth, model, prompt_cache_key)
+
+    %{}
+    |> Map.put(:strategy, "prompt_cache_routing_locality")
+    |> Map.put(:eligible_candidate_count, candidate_count)
+    |> Map.put(:seed, seed)
+    |> Map.put(:seed_basis_class, seed_basis_class(seed))
+    |> Map.put(:seed_fingerprint, fingerprint(seed))
+    |> Map.merge(
+      prompt_cache_locality_status(settings, affinity, prompt_cache_key, candidate_count)
+    )
+  end
+
+  defp prompt_cache_locality_status(_settings, _affinity, prompt_cache_key, _candidate_count)
+       when not (is_binary(prompt_cache_key) and prompt_cache_key != "") do
+    %{status: "unavailable", applied?: false, unhonored_reason: "prompt_cache_key_absent"}
+  end
+
+  defp prompt_cache_locality_status(
+         %RoutingSettings{prompt_cache_affinity_enabled: false},
+         _affinity,
+         _prompt_cache_key,
+         _candidate_count
+       ) do
+    %{status: "disabled", applied?: false, unhonored_reason: "pool_toggle_disabled"}
+  end
+
+  defp prompt_cache_locality_status(_settings, _affinity, _prompt_cache_key, 0) do
+    %{status: "unavailable", applied?: false, unhonored_reason: "no_eligible_candidates"}
+  end
+
+  defp prompt_cache_locality_status(_settings, _affinity, _prompt_cache_key, 1) do
+    %{status: "unavailable", applied?: false, unhonored_reason: "single_eligible_candidate"}
+  end
+
+  defp prompt_cache_locality_status(
+         _settings,
+         %{row: %BridgeAffinity{}},
+         _prompt_cache_key,
+         _count
+       ) do
+    %{
+      status: "blocked_by_stronger_continuity",
+      applied?: false,
+      unhonored_reason: "durable_affinity_hit"
+    }
+  end
+
+  defp prompt_cache_locality_status(
+         _settings,
+         %{kind: "codex_session"},
+         _prompt_cache_key,
+         _count
+       ) do
+    %{
+      status: "blocked_by_stronger_continuity",
+      applied?: false,
+      unhonored_reason: "codex_session_continuity"
+    }
+  end
+
+  defp prompt_cache_locality_status(
+         _settings,
+         %{kind: "idempotency_key"},
+         _prompt_cache_key,
+         _count
+       ) do
+    %{
+      status: "blocked_by_stronger_continuity",
+      applied?: false,
+      unhonored_reason: "idempotency_key_continuity"
+    }
+  end
+
+  defp prompt_cache_locality_status(_settings, _affinity, _prompt_cache_key, _candidate_count) do
+    %{status: "applied", applied?: true, unhonored_reason: nil}
+  end
+
+  defp finalize_prompt_cache_locality(%{status: "applied"} = locality, {assignment, _identity}) do
+    Map.put(
+      locality,
+      :assignment_fingerprint,
+      fingerprint("prompt_cache_assignment:" <> assignment.id)
+    )
+  end
+
+  defp finalize_prompt_cache_locality(locality, _selected), do: locality
+
+  defp valid_prompt_cache_key?(prompt_cache_key),
+    do: is_binary(prompt_cache_key) and prompt_cache_key != ""
+
+  defp seed_basis_class(nil), do: nil
+  defp seed_basis_class(_seed), do: "pool_api_key_model_prompt_cache"
+
+  defp fingerprint(nil), do: nil
+
+  defp fingerprint(value) do
+    :crypto.hash(:sha256, to_string(value))
+    |> Base.encode16(case: :lower)
+    |> String.slice(0, 16)
+  end
+
+  defp prompt_cache_seed(auth, model, prompt_cache_key) do
+    [
+      auth.pool.id,
+      auth.api_key.id,
+      model.exposed_model_id,
+      @prompt_cache_affinity_kind,
+      prompt_cache_key
+    ]
+    |> Enum.join(":")
   end
 
   defp active_demotions(auth, model, candidates) do
@@ -474,6 +617,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
       bridge_ring_size: @default_ring_size,
       sticky_websocket_sessions: true,
       sticky_http_sessions: false,
+      prompt_cache_affinity_enabled: true,
       metadata: %{}
     }
   end

@@ -200,6 +200,182 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     end
   end
 
+  describe "plan_route/5 prompt-cache locality" do
+    test "prompt-cache locality keeps the same selection for the same eligible set and seed" do
+      setup = routing_setup(4)
+      prompt_cache_key = "synthetic-cache-key-stable"
+      expected_ids = prompt_cache_order_ids(setup, setup.candidates, prompt_cache_key)
+
+      first_plan = plan_for_prompt_cache(setup, "bridge_ring", "request-a", prompt_cache_key)
+      second_plan = plan_for_prompt_cache(setup, "bridge_ring", "request-b", prompt_cache_key)
+
+      assert candidate_ids(first_plan.candidates) == expected_ids
+      assert candidate_ids(second_plan.candidates) == expected_ids
+      assert first_plan.selected_assignment_id == hd(expected_ids)
+      assert second_plan.selected_assignment_id == hd(expected_ids)
+      assert_prompt_cache_locality_applied!(first_plan, prompt_cache_key, hd(expected_ids), 4)
+    end
+
+    test "prompt-cache locality metadata reports unavailable absent typed routing seed" do
+      setup = routing_setup(3)
+      plan = plan_for(setup, "bridge_ring", "request-without-prompt-cache")
+
+      assert plan.request_metadata["routing_locality_strategy"] == "prompt_cache_routing_locality"
+      assert plan.request_metadata["routing_locality_status"] == "unavailable"
+      assert plan.request_metadata["routing_locality_applied"] == false
+      assert plan.request_metadata["routing_locality_eligible_candidate_count"] == 3
+
+      assert plan.request_metadata["routing_locality_unhonored_reason"] ==
+               "prompt_cache_key_absent"
+
+      refute Map.has_key?(plan.request_metadata, "routing_locality_seed_fingerprint")
+      refute Map.has_key?(plan.request_metadata, "routing_locality_assignment_fingerprint")
+    end
+
+    test "eligible-set changes deterministically reselect among remaining candidates" do
+      setup = routing_setup(4)
+      prompt_cache_key = "synthetic-cache-key-reselect"
+      full_expected_ids = prompt_cache_order_ids(setup, setup.candidates, prompt_cache_key)
+      dropped_id = hd(full_expected_ids)
+
+      remaining_candidates =
+        Enum.reject(setup.candidates, fn {assignment, _identity} ->
+          assignment.id == dropped_id
+        end)
+
+      remaining_expected_ids =
+        prompt_cache_order_ids(setup, remaining_candidates, prompt_cache_key)
+
+      plan =
+        plan_for_prompt_cache(setup, "bridge_ring", "remaining-request", prompt_cache_key,
+          candidates: remaining_candidates
+        )
+
+      refute dropped_id in candidate_ids(plan.candidates)
+      assert candidate_ids(plan.candidates) == remaining_expected_ids
+      assert plan.selected_assignment_id == hd(remaining_expected_ids)
+    end
+
+    test "prompt-cache locality cannot resurrect candidates absent after eligibility filtering" do
+      setup = routing_setup(4)
+      [filtered_assignment | remaining_assignments] = setup.assignments
+
+      prompt_cache_key =
+        prompt_cache_key_preferring_assignment(
+          setup,
+          candidate_ids(setup.candidates),
+          filtered_assignment.id
+        )
+
+      remaining_ids = Enum.map(remaining_assignments, & &1.id)
+
+      remaining_candidates =
+        Enum.filter(setup.candidates, fn {assignment, _identity} ->
+          assignment.id in remaining_ids
+        end)
+
+      expected_ids = prompt_cache_order_ids(setup, remaining_candidates, prompt_cache_key)
+
+      plan =
+        plan_for_prompt_cache(setup, "bridge_ring", "filtered-request", prompt_cache_key,
+          candidates: remaining_candidates
+        )
+
+      refute filtered_assignment.id in candidate_ids(plan.candidates)
+      assert candidate_ids(plan.candidates) == expected_ids
+      assert plan.selected_assignment_id == hd(expected_ids)
+    end
+
+    test "durable continuity affinity wins over prompt-cache locality" do
+      setup = routing_setup(4)
+      request_id = "continuity-request-id"
+      base_ids = rendezvous_order_ids(setup.candidates, request_id)
+      sticky_id = List.last(base_ids)
+      {sticky_assignment, sticky_identity} = candidate_by_id!(setup.candidates, sticky_id)
+
+      prompt_cache_key =
+        setup.candidates
+        |> candidate_ids()
+        |> Enum.reject(&(&1 == sticky_id))
+        |> then(fn non_sticky_ids ->
+          prompt_cache_key_preferring_assignment(
+            setup,
+            candidate_ids(setup.candidates),
+            hd(non_sticky_ids)
+          )
+        end)
+
+      refute hd(prompt_cache_order_ids(setup, setup.candidates, prompt_cache_key)) == sticky_id
+
+      insert_affinity!(setup, sticky_assignment, sticky_identity, request_id)
+
+      plan =
+        plan_for_prompt_cache(setup, "bridge_ring", "continuity-request", prompt_cache_key,
+          request_id: request_id
+        )
+
+      assert plan.affinity.status == "hit"
+      assert plan.selected_assignment_id == sticky_id
+      assert hd(candidate_ids(plan.candidates)) == sticky_id
+      assert plan.request_metadata["routing_locality_status"] == "blocked_by_stronger_continuity"
+      assert plan.request_metadata["routing_locality_applied"] == false
+      assert plan.request_metadata["routing_locality_unhonored_reason"] == "durable_affinity_hit"
+      refute plan.request_metadata["routing_locality_assignment_fingerprint"] == sticky_id
+    end
+
+    test "disabled prompt-cache locality toggle preserves current non-prompt ordering" do
+      setup = routing_setup(4)
+      routing_seed = "toggle-disabled-seed"
+      base_ids = rendezvous_order_ids(setup.candidates, routing_seed)
+      prompt_preferred_id = List.last(base_ids)
+
+      prompt_cache_key =
+        prompt_cache_key_preferring_assignment(
+          setup,
+          candidate_ids(setup.candidates),
+          prompt_preferred_id
+        )
+
+      assert hd(prompt_cache_order_ids(setup, setup.candidates, prompt_cache_key)) ==
+               prompt_preferred_id
+
+      refute prompt_preferred_id == hd(base_ids)
+
+      plan =
+        plan_for_prompt_cache(setup, "bridge_ring", routing_seed, prompt_cache_key,
+          prompt_cache_affinity_enabled: false
+        )
+
+      assert candidate_ids(plan.candidates) == base_ids
+      assert plan.selected_assignment_id == hd(base_ids)
+      assert plan.request_metadata["routing_locality_status"] == "disabled"
+      assert plan.request_metadata["routing_locality_applied"] == false
+      assert plan.request_metadata["routing_locality_unhonored_reason"] == "pool_toggle_disabled"
+      refute plan.request_metadata["routing_locality_seed_fingerprint"] == prompt_cache_key
+    end
+
+    test "prompt-cache seed excludes route class" do
+      setup = routing_setup(4)
+      prompt_cache_key = "synthetic-cache-key-route-class"
+      expected_ids = prompt_cache_order_ids(setup, setup.candidates, prompt_cache_key)
+
+      http_plan =
+        plan_for_prompt_cache(setup, "bridge_ring", "http-request", prompt_cache_key,
+          payload: %{"stream" => false}
+        )
+
+      stream_plan =
+        plan_for_prompt_cache(setup, "bridge_ring", "stream-request", prompt_cache_key,
+          payload: %{"stream" => true}
+        )
+
+      assert http_plan.selected_assignment_id == hd(expected_ids)
+      assert stream_plan.selected_assignment_id == hd(expected_ids)
+      assert candidate_ids(http_plan.candidates) == expected_ids
+      assert candidate_ids(stream_plan.candidates) == expected_ids
+    end
+  end
+
   describe "plan_route/5 quota-first edge cases" do
     test "quota_first orders by quota headroom before rendezvous tie-breaking" do
       setup = routing_setup(3)
@@ -436,6 +612,17 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       refute is_nil(affinity.last_hit_at)
       assert DateTime.compare(affinity.created_at, affinity.updated_at) in [:lt, :eq]
     end
+
+    test "prompt-cache locality is not persisted as durable affinity" do
+      setup = routing_setup(3)
+      prompt_cache_key = "synthetic-cache-key-stateless"
+      plan = plan_for_prompt_cache(setup, "bridge_ring", "stateless-request", prompt_cache_key)
+      {assignment, identity} = hd(plan.candidates)
+
+      assert plan.affinity.status == "disabled"
+      assert :ok = BridgeRing.record_success(plan, assignment, identity)
+      assert [] = all_affinities(setup)
+    end
   end
 
   describe "record_failure/5 concurrency" do
@@ -461,6 +648,27 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert DateTime.compare(demotion.created_at, demotion.updated_at) in [:lt, :eq]
       assert DateTime.compare(demotion.updated_at, demotion.demoted_until) == :lt
     end
+  end
+
+  defp assert_prompt_cache_locality_applied!(plan, raw_prompt_cache_key, assignment_id, count) do
+    assert plan.request_metadata["routing_locality_strategy"] == "prompt_cache_routing_locality"
+    assert plan.request_metadata["routing_locality_status"] == "applied"
+    assert plan.request_metadata["routing_locality_applied"] == true
+    assert plan.request_metadata["routing_locality_eligible_candidate_count"] == count
+
+    assert plan.request_metadata["routing_locality_seed_basis_class"] ==
+             "pool_api_key_model_prompt_cache"
+
+    assert plan.request_metadata["routing_locality_seed_fingerprint"] =~ ~r/\A[0-9a-f]{16}\z/
+
+    assert plan.request_metadata["routing_locality_assignment_fingerprint"] =~
+             ~r/\A[0-9a-f]{16}\z/
+
+    refute plan.request_metadata["routing_locality_seed_fingerprint"] == raw_prompt_cache_key
+    refute plan.request_metadata["routing_locality_assignment_fingerprint"] == assignment_id
+    refute inspect(plan.request_metadata) =~ raw_prompt_cache_key
+    refute inspect(plan.request_metadata) =~ "cache_hit"
+    refute inspect(plan.request_metadata) =~ "provider_cache"
   end
 
   defp routing_setup(candidate_count) do
@@ -526,14 +734,57 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     )
   end
 
-  defp update_routing_settings!(pool, strategy, ring_size) do
-    pool
-    |> Pools.ensure_routing_settings()
-    |> Ecto.Changeset.change(%{
+  defp plan_for_prompt_cache(setup, strategy, seed, prompt_cache_key, opts \\ []) do
+    candidates = Keyword.get(opts, :candidates, setup.candidates)
+    ring_size = Keyword.get(opts, :ring_size, length(candidates))
+    update_routing_settings!(setup.pool, strategy, ring_size, opts)
+
+    request =
+      request_fixture(setup.auth, %{
+        model_id: setup.model.id,
+        requested_model: setup.model.exposed_model_id,
+        correlation_id: seed
+      })
+
+    payload =
+      %{"prompt_cache_key" => prompt_cache_key}
+      |> Map.merge(Keyword.get(opts, :payload, %{}))
+
+    request_options =
+      %{
+        request_method: Keyword.get(opts, :request_method, "POST"),
+        request_id: Keyword.get(opts, :request_id)
+      }
+      |> RequestOptions.build(
+        Keyword.get(opts, :endpoint, "/backend-api/codex/responses"),
+        payload
+      )
+
+    BridgeRing.plan_route(
+      setup.auth,
+      setup.model,
+      candidates,
+      RoutePlanInput.from_reserved(%{request: request}),
+      request_options
+    )
+  end
+
+  defp update_routing_settings!(pool, strategy, ring_size, opts \\ []) do
+    attrs = %{
       routing_strategy: strategy,
       bridge_ring_size: ring_size,
       updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
-    })
+    }
+
+    attrs =
+      case Keyword.fetch(opts, :prompt_cache_affinity_enabled) do
+        {:ok, value} -> Map.put(attrs, :prompt_cache_affinity_enabled, value)
+        :error -> attrs
+      end
+
+    pool
+    |> Pools.ensure_routing_settings()
+    |> Ecto.Changeset.change(attrs)
     |> Repo.update!()
   end
 
@@ -661,6 +912,15 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     )
   end
 
+  defp all_affinities(setup) do
+    Repo.all(
+      from affinity in BridgeAffinity,
+        where:
+          affinity.pool_id == ^setup.pool.id and affinity.api_key_id == ^setup.auth.api_key.id and
+            affinity.model_identifier == ^setup.model.exposed_model_id
+    )
+  end
+
   defp active_demotions(setup, assignment) do
     Repo.all(
       from demotion in BridgeDemotion,
@@ -728,6 +988,16 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     |> candidate_ids()
   end
 
+  defp prompt_cache_order_ids(setup, candidates, prompt_cache_key) do
+    seed = prompt_cache_seed(setup, prompt_cache_key)
+
+    candidates
+    |> Enum.sort_by(fn {assignment, _identity} ->
+      {-rendezvous_score(seed, assignment.id), assignment.id}
+    end)
+    |> candidate_ids()
+  end
+
   defp seed_rotating_to_index(rotation_index, candidate_count) do
     Enum.find(1..500, fn index ->
       :erlang.phash2("rotation-distribution-#{index}", candidate_count) == rotation_index
@@ -757,6 +1027,29 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       |> Kernel.==(desired_assignment_id)
     end)
     |> then(&"bridge-ring-seed-#{&1}")
+  end
+
+  defp prompt_cache_key_preferring_assignment(setup, assignment_ids, desired_assignment_id) do
+    Enum.find(1..1_000, fn index ->
+      prompt_cache_key = "synthetic-cache-key-#{index}"
+      seed = prompt_cache_seed(setup, prompt_cache_key)
+
+      assignment_ids
+      |> Enum.max_by(&rendezvous_score(seed, &1))
+      |> Kernel.==(desired_assignment_id)
+    end)
+    |> then(&"synthetic-cache-key-#{&1}")
+  end
+
+  defp prompt_cache_seed(setup, prompt_cache_key) do
+    [
+      setup.pool.id,
+      setup.auth.api_key.id,
+      setup.model.exposed_model_id,
+      "prompt_cache",
+      prompt_cache_key
+    ]
+    |> Enum.join(":")
   end
 
   defp rendezvous_score(seed, assignment_id) do

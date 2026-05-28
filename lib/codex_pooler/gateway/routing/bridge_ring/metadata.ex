@@ -45,14 +45,16 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Metadata do
           RoutingSettings.t(),
           BridgeRing.affinity_context(),
           BridgeRing.demotion_map(),
-          BridgeRing.candidate() | nil
+          BridgeRing.candidate() | nil,
+          map()
         ) :: map()
-  def request_metadata(settings, affinity, demotions, selected) do
+  def request_metadata(settings, affinity, demotions, selected, locality \\ %{}) do
     base_metadata(%{
       strategy: settings.routing_strategy,
       bridge_ring_size: max(settings.bridge_ring_size || @default_ring_size, 1),
       affinity: affinity,
       demotions: demotions,
+      locality: locality,
       selected_assignment_id: selected && elem(selected, 0).id
     })
   end
@@ -60,6 +62,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Metadata do
   defp base_metadata(plan) do
     affinity = Map.get(plan, :affinity, %{})
     demotions = Map.get(plan, :demotions, %{})
+
+    locality = Map.get(plan, :locality, %{})
 
     %{
       "strategy" => plan.strategy,
@@ -72,9 +76,25 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Metadata do
       "fallback_reason" => fallback_reason(affinity),
       "demotion_reason" => first_demotion_reason(demotions)
     }
+    |> Map.merge(locality_metadata(locality))
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
   end
+
+  defp locality_metadata(%{} = locality) when map_size(locality) > 0 do
+    %{
+      "routing_locality_strategy" => locality[:strategy],
+      "routing_locality_status" => locality[:status],
+      "routing_locality_applied" => locality[:applied?],
+      "routing_locality_eligible_candidate_count" => locality[:eligible_candidate_count],
+      "routing_locality_seed_basis_class" => locality[:seed_basis_class],
+      "routing_locality_seed_fingerprint" => locality[:seed_fingerprint],
+      "routing_locality_assignment_fingerprint" => locality[:assignment_fingerprint],
+      "routing_locality_unhonored_reason" => locality[:unhonored_reason]
+    }
+  end
+
+  defp locality_metadata(_locality), do: %{}
 
   defp fallback_reason(%{enabled?: true, status: "miss", row: nil}), do: "affinity_not_found"
   defp fallback_reason(%{enabled?: true, status: "hit"}), do: nil
