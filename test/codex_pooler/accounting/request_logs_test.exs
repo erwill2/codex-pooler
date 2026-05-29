@@ -7,8 +7,13 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Gateway.Denials
+  alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
+  alias CodexPooler.MCP.Redaction
   alias CodexPooler.Repo
+
+  @pinned_continuation_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
 
   test "request logs present latest settlement token counts and persisted costs" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
@@ -302,6 +307,213 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     assert log.metadata["body"] == "[REDACTED]"
     refute inspect(log) =~ "raw denied prompt"
     refute inspect(log) =~ synthetic_token
+  end
+
+  test "gateway denial request logs expose pinned reauth metadata-only summaries" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Pinned upstream",
+        assignment_label: "Pinned assignment"
+      })
+
+    model =
+      model_fixture(pool, %{
+        exposed_model_id: "gpt-pinned-denial-log",
+        upstream_model_id: "provider-gpt-pinned-denial-log",
+        pricing_ref: "provider-gpt-pinned-denial-log"
+      })
+
+    raw_anchor = "resp_raw_anchor_#{System.unique_integer([:positive])}"
+    raw_nested_map_anchor = "resp_nested_map_anchor_#{System.unique_integer([:positive])}"
+    raw_nested_list_anchor = "resp_nested_list_anchor_#{System.unique_integer([:positive])}"
+    raw_prompt = Redaction.forbidden_sentinel!(:prompt)
+    raw_idempotency_key = Redaction.forbidden_sentinel!(:raw_idempotency_key)
+    request_body = Redaction.forbidden_sentinel!(:request_body)
+    response_body = Redaction.forbidden_sentinel!(:response_body)
+    access_token = Redaction.forbidden_sentinel!(:access_token)
+    refresh_token = Redaction.forbidden_sentinel!(:refresh_token)
+    cookie = Redaction.forbidden_sentinel!(:cookies)
+    auth_json = Redaction.forbidden_sentinel!(:upstream_auth_json)
+    provider_payload = Redaction.forbidden_sentinel!(:provider_payload)
+    websocket_frame = Redaction.forbidden_sentinel!(:websocket_frame)
+
+    opts =
+      RequestOptions.build(
+        [
+          transport: "http_json",
+          requested_model: "gpt-pinned-denial-log",
+          previous_response_id: raw_anchor,
+          idempotency_key: raw_idempotency_key,
+          request_id: "safe-server-correlation"
+        ],
+        "/backend-api/codex/responses",
+        %{
+          "model" => "gpt-pinned-denial-log",
+          "previous_response_id" => raw_anchor,
+          "input" => raw_prompt
+        }
+      )
+
+    reason = %{
+      code: "pinned_continuation_reauth_required",
+      status: 503,
+      message: "restart with full visible context",
+      param: "model",
+      continuity_denial:
+        continuity_denial_metadata(assignment, identity)
+        |> Map.merge(%{
+          "previous_response_id" => raw_anchor,
+          "previous-response-id" => %{
+            "id" => raw_nested_map_anchor,
+            "preview" => raw_nested_map_anchor
+          },
+          "previous response id" => [%{"id" => raw_nested_list_anchor}],
+          "request_body" => request_body,
+          "response_body" => response_body,
+          "access_token" => access_token,
+          "refresh_token" => refresh_token,
+          "cookie" => cookie,
+          "auth_json" => auth_json,
+          "provider_payload" => provider_payload,
+          "websocket_frame" => websocket_frame
+        })
+    }
+
+    assert {:error, ^reason} =
+             Denials.log_gateway(%Denials.Context{
+               auth: %{pool: pool, api_key: api_key, key_prefix: api_key.key_prefix},
+               model: model,
+               reason: reason,
+               endpoint: "/backend-api/codex/responses",
+               payload: %{
+                 "model" => "gpt-pinned-denial-log",
+                 "previous_response_id" => raw_anchor,
+                 "input" => raw_prompt
+               },
+               opts: opts
+             })
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+    assert log.status == "rejected"
+    assert log.denial_reason == "pinned_continuation_reauth_required"
+    assert log.pool_upstream_assignment_id == nil
+    assert log.upstream_identity_id == nil
+
+    assert log.metadata["gateway_denial"] == %{
+             "code" => "pinned_continuation_reauth_required",
+             "message" => "restart with full visible context",
+             "param" => "model"
+           }
+
+    assert log.metadata["continuity_denial"] == %{
+             "denial_family" => "pinned_continuation_reauth",
+             "continuity_family" => "pinned_codex_session",
+             "upstream_lifecycle_family" => "reauth_required",
+             "token_refresh_reason_code_preview" => "refresh_token_revoked",
+             "pool_upstream_assignment_id" => assignment.id,
+             "upstream_identity_id" => identity.id,
+             "operator_action" => @pinned_continuation_operator_action,
+             "previous_response_id" => "[REDACTED]",
+             "previous-response-id" => "[REDACTED]",
+             "previous response id" => "[REDACTED]",
+             "request_body" => "[REDACTED]",
+             "response_body" => "[REDACTED]",
+             "access_token" => "[REDACTED]",
+             "refresh_token" => "[REDACTED]",
+             "cookie" => "[REDACTED]",
+             "auth_json" => "[REDACTED]",
+             "provider_payload" => "[REDACTED]",
+             "websocket_frame" => "[REDACTED]"
+           }
+
+    assert Enum.any?(log.errors, fn error ->
+             error.source == "metadata" and
+               error.kind == "continuity_denial" and
+               error.code == "pinned_continuation_reauth" and
+               error.denial_family == "pinned_continuation_reauth" and
+               error.continuity_family == "pinned_codex_session" and
+               error.upstream_lifecycle_family == "reauth_required" and
+               error.token_refresh_reason_code_preview == "refresh_token_revoked" and
+               error.pool_upstream_assignment_id == assignment.id and
+               error.upstream_identity_id == identity.id and
+               error.operator_action == @pinned_continuation_operator_action
+           end)
+
+    inspected = inspect(log)
+    refute inspected =~ raw_anchor
+    refute inspected =~ raw_nested_map_anchor
+    refute inspected =~ raw_nested_list_anchor
+    refute inspected =~ raw_prompt
+    refute inspected =~ raw_idempotency_key
+    refute inspected =~ request_body
+    refute inspected =~ response_body
+    refute inspected =~ access_token
+    refute inspected =~ refresh_token
+    refute inspected =~ cookie
+    refute inspected =~ auth_json
+    refute inspected =~ provider_payload
+    refute inspected =~ websocket_frame
+  end
+
+  test "scoped request-log visibility keeps pinned denial rows inside assigned pools" do
+    reset_bootstrap_state_fixture!()
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    owner_scope = Scope.for_user(owner, [])
+
+    visible_pool = pool_fixture(%{slug: "request-log-pinned-visible", name: "Pinned Visible"})
+    hidden_pool = pool_fixture(%{slug: "request-log-pinned-hidden", name: "Pinned Hidden"})
+    %{api_key: visible_key} = active_api_key_fixture(visible_pool)
+    %{api_key: hidden_key} = active_api_key_fixture(hidden_pool)
+
+    %{identity: visible_identity, assignment: visible_assignment} =
+      upstream_assignment_fixture(visible_pool)
+
+    %{identity: hidden_identity, assignment: hidden_assignment} =
+      upstream_assignment_fixture(hidden_pool)
+
+    %{user: admin} =
+      operator_fixture(owner_scope, %{
+        "email" => unique_user_email(),
+        "role" => "instance_admin",
+        "pool_ids" => [visible_pool.id]
+      })
+
+    admin_scope = Scope.for_user(admin)
+
+    visible_request =
+      pinned_denial_request_fixture(
+        visible_pool,
+        visible_key,
+        visible_assignment,
+        visible_identity
+      )
+
+    hidden_request =
+      pinned_denial_request_fixture(hidden_pool, hidden_key, hidden_assignment, hidden_identity)
+
+    assert %{items: owner_logs, total: 2} = Accounting.list_request_logs_for_scope(owner_scope)
+
+    assert MapSet.new(Enum.map(owner_logs, & &1.id)) ==
+             MapSet.new([visible_request.id, hidden_request.id])
+
+    assert %{items: [admin_log], total: 1} = Accounting.list_request_logs_for_scope(admin_scope)
+    assert admin_log.id == visible_request.id
+
+    assert admin_log.metadata["continuity_denial"]["pool_upstream_assignment_id"] ==
+             visible_assignment.id
+
+    assert admin_log.metadata["continuity_denial"]["upstream_identity_id"] == visible_identity.id
+    assert is_nil(Accounting.get_request_log_for_scope(admin_scope, hidden_request.id))
+
+    assert hidden_owner_log = Accounting.get_request_log_for_scope(owner_scope, hidden_request.id)
+
+    assert hidden_owner_log.metadata["continuity_denial"]["pool_upstream_assignment_id"] ==
+             hidden_assignment.id
+
+    assert hidden_owner_log.metadata["continuity_denial"]["upstream_identity_id"] ==
+             hidden_identity.id
   end
 
   test "websocket request logs expose session metadata without payload capture" do
@@ -1079,6 +1291,39 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
 
     assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
     refute inspect(log) =~ raw_idempotency_key
+  end
+
+  defp pinned_denial_request_fixture(pool, api_key, assignment, identity) do
+    assert {:ok, %{request: request}} =
+             Accounting.record_denied_request(%{pool: pool, api_key: api_key}, nil, %{
+               endpoint: "/backend-api/codex/responses",
+               transport: "http_json",
+               correlation_id: "pinned-denial-#{System.unique_integer([:positive])}",
+               requested_model: "gpt-pinned-denial-scope",
+               response_status_code: 503,
+               last_error_code: "pinned_continuation_reauth_required",
+               request_metadata: %{
+                 "gateway_denial" => %{
+                   "code" => "pinned_continuation_reauth_required",
+                   "message" => "restart with full visible context"
+                 },
+                 "continuity_denial" => continuity_denial_metadata(assignment, identity)
+               }
+             })
+
+    request
+  end
+
+  defp continuity_denial_metadata(assignment, identity) do
+    %{
+      "denial_family" => "pinned_continuation_reauth",
+      "continuity_family" => "pinned_codex_session",
+      "upstream_lifecycle_family" => "reauth_required",
+      "token_refresh_reason_code_preview" => "refresh_token_revoked",
+      "pool_upstream_assignment_id" => assignment.id,
+      "upstream_identity_id" => identity.id,
+      "operator_action" => @pinned_continuation_operator_action
+    }
   end
 
   defp debug_turn_fixture(pool, api_key, assignment, request, attrs) do

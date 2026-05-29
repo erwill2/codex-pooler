@@ -18,8 +18,8 @@ defmodule CodexPooler.Gateway.Payloads.DebugPayloadSummary do
           "request_id=#{summary["request_id"] || "unknown"}",
           "transport=#{summary["transport"] || "unknown"}",
           "endpoint=#{summary["endpoint"] || "unknown"}",
-          "previous_response_id_action=#{summary["previous_response_id"]["action"]}",
-          "previous_response_id_preview=#{summary["previous_response_id"]["preview"] || "none"}",
+          "previous_response_id_action=#{summary["previous_response_id_summary"]["action"]}",
+          "previous_response_id_preview=#{summary["previous_response_id_summary"]["preview"] || "none"}",
           "client_json_bytes=#{summary["shape"]["client"]["json"]["bytes"]}",
           "client_approx_tokens=#{summary["shape"]["client"]["json"]["approx_tokens"]}",
           "upstream_json_bytes=#{summary["shape"]["upstream"]["json"]["bytes"]}",
@@ -63,7 +63,7 @@ defmodule CodexPooler.Gateway.Payloads.DebugPayloadSummary do
       "transport" => transport,
       "request_id" => clean_string(Map.get(opts, :request_id)),
       "codex_session_id" => session_id(opts),
-      "previous_response_id" => %{
+      "previous_response_id_summary" => %{
         "present" => not is_nil(previous_response_id),
         "action" => previous_response_action(previous_response_id, upstream_previous_response_id),
         "preview" => secret_preview(previous_response_id)

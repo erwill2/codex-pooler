@@ -3,6 +3,8 @@ defmodule CodexPooler.Accounting.RequestLogs.ErrorSummaries do
 
   alias CodexPooler.Accounting
 
+  @pinned_continuation_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
+
   @spec build(map(), map(), [map()]) :: [map()]
   def build(request, metadata, attempts) do
     []
@@ -29,6 +31,7 @@ defmodule CodexPooler.Accounting.RequestLogs.ErrorSummaries do
     []
     |> Kernel.++(metadata_named_error(metadata, "policy_denial"))
     |> Kernel.++(metadata_named_error(metadata, "gateway_denial"))
+    |> Kernel.++(metadata_named_error(metadata, "continuity_denial"))
     |> Kernel.++(metadata_named_error(metadata, "retryable_summary"))
     |> Kernel.++(metadata_named_error(metadata, "degraded_summary"))
     |> Kernel.++(candidate_exclusion_error_summaries(metadata))
@@ -41,6 +44,21 @@ defmodule CodexPooler.Accounting.RequestLogs.ErrorSummaries do
       summary when is_map(summary) -> [metadata_error_from_summary(key, summary)]
       _summary -> []
     end
+  end
+
+  defp metadata_error_from_summary("continuity_denial" = key, summary) do
+    clean_error_summary(%{
+      source: "metadata",
+      kind: key,
+      code: Map.get(summary, "code") || Map.get(summary, "denial_family"),
+      denial_family: Map.get(summary, "denial_family"),
+      continuity_family: Map.get(summary, "continuity_family"),
+      upstream_lifecycle_family: Map.get(summary, "upstream_lifecycle_family"),
+      token_refresh_reason_code_preview: Map.get(summary, "token_refresh_reason_code_preview"),
+      pool_upstream_assignment_id: Map.get(summary, "pool_upstream_assignment_id"),
+      upstream_identity_id: Map.get(summary, "upstream_identity_id"),
+      operator_action: Map.get(summary, "operator_action") || @pinned_continuation_operator_action
+    })
   end
 
   defp metadata_error_from_summary(key, summary) do

@@ -12,8 +12,17 @@ defmodule CodexPooler.Accounting.Metadata do
   @assignment_eligible PoolUpstreamAssignment.eligible_status()
   @usage_not_applicable "not_applicable"
   @redacted "[REDACTED]"
-  @sensitive_key_fragments ~w(api_key apikey authorization bearer token access_token refresh_token upstream_token upstream_secret cookie set-cookie secret password prompt messages input output completion content raw_request raw_response body payload file filename audio image transcript transcription upload_url download_url sas_url signed_url chatgpt_account_id)
-  @sensitive_exact_keys MapSet.new(["analytics", "arc", "idempotency_key", "sdp", "trace"])
+  @sensitive_key_fragments ~w(api_key apikey authorization bearer token access_token refresh_token upstream_token upstream_secret cookie set-cookie secret password prompt messages input output completion content raw_request raw_response body payload file filename audio image transcript transcription upload_url download_url sas_url signed_url auth_json chatgpt_account_id)
+  @sensitive_exact_keys MapSet.new([
+                          "analytics",
+                          "arc",
+                          "idempotency_key",
+                          "previous_response_id",
+                          "sdp",
+                          "trace",
+                          "websocket_frame"
+                        ])
+  @safe_sensitive_exact_keys MapSet.new(["token_refresh_reason_code_preview"])
   @safe_control_plane_keys MapSet.new(["analytics_forwarding"])
 
   @type accounting_error :: %{required(:code) => atom(), required(:message) => String.t()}
@@ -242,7 +251,11 @@ defmodule CodexPooler.Accounting.Metadata do
   end
 
   defp sanitize_value(value, key) when is_list(value) do
-    if sensitive_key?(key), do: @redacted, else: Enum.map(value, &sanitize_value(&1, key))
+    if sensitive_key?(key) do
+      @redacted
+    else
+      Enum.map(value, &sanitize_value(&1, key))
+    end
   end
 
   defp sanitize_value(value, key) when is_binary(value) do
@@ -277,6 +290,7 @@ defmodule CodexPooler.Accounting.Metadata do
     normalized = normalize_key(key)
 
     normalized not in ["content_type", "request_content_type", "response_content_type"] and
+      not MapSet.member?(@safe_sensitive_exact_keys, normalized) and
       (MapSet.member?(@sensitive_exact_keys, normalized) or
          Enum.any?(@sensitive_key_fragments, &String.contains?(normalized, &1)))
   end
