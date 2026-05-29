@@ -437,6 +437,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.path == "/backend-api/codex/responses"
       assert captured.json["type"] == "response.create"
+      assert captured.json["generate"] == true
       assert captured.json["store"] == false
       assert captured.json["previous_response_id"] == "resp_v1_ws_opencode_previous"
 

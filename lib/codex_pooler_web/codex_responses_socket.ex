@@ -661,7 +661,8 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       |> Responses.coerce(opts)
       |> case do
         {:ok, %{payload: coerced_payload, request_options: request_options}} ->
-          {:ok, Jason.encode!(coerced_payload), request_options}
+          websocket_payload = Map.put_new(coerced_payload, "generate", true)
+          {:ok, Jason.encode!(websocket_payload), request_options}
 
         {:error, reason} ->
           {:error, reason}
