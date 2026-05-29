@@ -14,6 +14,7 @@ defmodule CodexPooler.SchemaContractTest do
   alias CodexPooler.Pools.{OperatorPoolAssignment, RoutingSettings}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @expected_tables ~w(
     account_quota_windows api_key_policy_bindings api_keys attempts audit_events bridge_owner_leases
@@ -57,7 +58,7 @@ defmodule CodexPooler.SchemaContractTest do
     Quota.AccountQuotaWindow,
     CodexPooler.Upstreams.Schemas.EncryptedSecret,
     CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment,
-    CodexPooler.Upstreams.Schemas.UpstreamIdentity
+    UpstreamIdentity
   ]
 
   test "creates the final source table inventory with pgcrypto enabled" do
@@ -232,6 +233,7 @@ defmodule CodexPooler.SchemaContractTest do
     assert column_type("codex_files", "finalize_status") == "text"
     assert column_type("codex_files", "pool_upstream_assignment_id") == "uuid"
     assert column_type("codex_files", "upstream_identity_id") == "uuid"
+    assert column_type("upstream_identities", "account_email") == "text"
 
     assert column_type("pricing_snapshots", "input_token_micros") == "numeric(30,9)"
     assert column_type("pricing_snapshots", "request_base_micros") == "numeric(30,9)"
@@ -440,6 +442,8 @@ defmodule CodexPooler.SchemaContractTest do
     assert APIKey.__schema__(:type, :enforced_model_identifier) == :string
     assert APIKey.__schema__(:type, :enforced_reasoning_effort) == :string
     assert APIKey.__schema__(:type, :enforced_service_tier) == :string
+
+    assert UpstreamIdentity.__schema__(:type, :account_email) == :string
 
     assert RoutingSettings.__schema__(:type, :prompt_cache_affinity_enabled) ==
              :boolean

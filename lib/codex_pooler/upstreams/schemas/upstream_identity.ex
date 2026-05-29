@@ -21,6 +21,7 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
 
   schema "upstream_identities" do
     field :chatgpt_account_id, :string
+    field :account_email, :string
     field :account_label, :string
     field :onboarding_method, :string
     field :status, :string
@@ -43,6 +44,7 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
     identity
     |> cast(attrs, [
       :chatgpt_account_id,
+      :account_email,
       :account_label,
       :onboarding_method,
       :status,
@@ -60,6 +62,7 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
       :metadata
     ])
     |> update_change(:chatgpt_account_id, &trim_string/1)
+    |> update_change(:account_email, &normalize_optional_email/1)
     |> update_change(:account_label, &trim_string/1)
     |> update_change(:plan_family, &normalize_optional_token/1)
     |> update_change(:plan_label, &trim_string/1)
@@ -131,6 +134,15 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
   end
 
   defp normalize_optional_token(value), do: value
+
+  defp normalize_optional_email(value) when is_binary(value) do
+    case value |> String.trim() |> String.downcase() do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_optional_email(value), do: value
 
   defp trim_string(value) when is_binary(value), do: String.trim(value)
   defp trim_string(value), do: value
