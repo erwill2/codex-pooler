@@ -2,6 +2,7 @@ defmodule CodexPooler.MCP.OperatorsToolsTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.AccountsFixtures
+  import CodexPooler.PoolerFixtures, only: [operator_pool_assignment_fixture: 3, pool_fixture: 1]
 
   alias CodexPooler.InstanceSettings
   alias CodexPooler.MCP
@@ -194,5 +195,66 @@ defmodule CodexPooler.MCP.OperatorsToolsTest do
     assert result["isError"] == true
     assert get_in(result, ["structuredContent", "error", "code"]) == "invalid_arguments"
     assert :ok = Redaction.assert_mcp_output_safe!(result)
+  end
+
+  test "operator metadata is owner-only for scoped admins", %{owner: owner} do
+    target = operator_fixture(owner, %{"display_name" => "Hidden Operator Alpha"}).user
+    _second = operator_fixture(owner, %{"display_name" => "Hidden Operator Beta"}).user
+
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    admin = admin |> Ecto.Changeset.change(password_change_required: false) |> Repo.update!()
+    pool = pool_fixture(%{name: "Operator visibility Pool"})
+    operator_pool_assignment_fixture(admin, pool, created_by_user_id: owner.id)
+
+    assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(admin, true)
+
+    assert {:ok, %{raw_token: raw_token}} =
+             MCP.create_operator_token(admin, %{label: "Admin MCP"})
+
+    assert {:ok, admin_auth} = MCP.authenticate_token(raw_token)
+
+    assert {:ok, list_result} =
+             ToolDispatch.call(
+               "codex_pooler_list_operators",
+               %{"query" => "Hidden Operator", "limit" => 10},
+               %{auth: admin_auth}
+             )
+
+    assert list_result["isError"] == false
+    assert [%{"type" => "text", "text" => list_text}] = list_result["content"]
+    assert list_text == "No operator metadata records matched the visible scope"
+    assert list_result["structuredContent"]["operators"] == []
+    assert list_result["structuredContent"]["total"] == 0
+    refute inspect(list_result) =~ target.id
+    refute inspect(list_result) =~ "Hidden Operator"
+
+    assert {:ok, get_result} =
+             ToolDispatch.call("codex_pooler_get_operator", %{"selector" => target.id}, %{
+               auth: admin_auth
+             })
+
+    assert get_result["isError"] == false
+
+    assert get_result["structuredContent"] == %{
+             "status" => "not_found",
+             "kind" => "operator",
+             "item" => nil,
+             "candidates" => [],
+             "message" => "Operator selector did not match"
+           }
+
+    assert {:ok, ambiguous_result} =
+             ToolDispatch.call(
+               "codex_pooler_get_operator",
+               %{"selector" => "Hidden Operator"},
+               %{auth: admin_auth}
+             )
+
+    assert ambiguous_result["structuredContent"]["status"] == "not_found"
+    assert ambiguous_result["structuredContent"]["candidates"] == []
+    refute inspect(ambiguous_result) =~ "Hidden Operator"
+    assert :ok = Redaction.assert_mcp_output_safe!(list_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(get_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(ambiguous_result)
   end
 end

@@ -12,6 +12,7 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
   alias CodexPooler.MCP.{OperatorMCPKey, PrivacyMatrix}
   alias CodexPooler.MCP.Tools.DetailEnvelope
   alias CodexPooler.MCP.Tools.ReadableText
+  alias CodexPooler.Pools
   alias CodexPooler.Repo
 
   @default_limit 50
@@ -64,54 +65,47 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
   end
 
   @spec list_operators(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def list_operators(arguments, _context) do
-    limit = bounded_limit(arguments)
-    status = blank_to_nil(Map.get(arguments, "status"))
-    query = blank_to_nil(Map.get(arguments, "query"))
+  def list_operators(arguments, context) do
+    with {:ok, scope} <- scope_from_context(context) do
+      limit = bounded_limit(arguments)
+      status = blank_to_nil(Map.get(arguments, "status"))
+      query = blank_to_nil(Map.get(arguments, "query"))
 
-    operators =
-      Accounts.list_operators()
-      |> filter_operator_status(status)
-      |> filter_operator_query(query)
+      operators =
+        if Pools.owner?(scope) do
+          Accounts.list_operators()
+          |> filter_operator_status(status)
+          |> filter_operator_query(query)
+        else
+          []
+        end
 
-    items =
-      operators
-      |> Enum.take(limit)
-      |> Enum.map(&present_operator/1)
+      items =
+        operators
+        |> Enum.take(limit)
+        |> Enum.map(&present_operator/1)
 
-    structured = %{
-      "operators" => items,
-      "total" => length(operators),
-      "limit" => limit,
-      "filters" => filter_summary(%{status: status, query: query})
-    }
+      structured = %{
+        "operators" => items,
+        "total" => length(operators),
+        "limit" => limit,
+        "filters" => filter_summary(%{status: status, query: query})
+      }
 
-    {:ok, structured, operator_list_text(structured)}
+      {:ok, structured, operator_list_text(structured)}
+    end
   end
 
   @spec get_operator(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_operator(%{"selector" => selector}, _context) do
-    selector = String.trim(selector)
-
-    case operator_matches(selector) do
-      [] ->
-        {:ok, DetailEnvelope.not_found("operator", "Operator selector did not match"),
-         ReadableText.not_found("operator metadata record")}
-
-      [operator] ->
-        presented = present_operator(operator)
-
-        {:ok, DetailEnvelope.ok("operator", presented), operator_text(presented)}
-
-      matches ->
-        candidates = Enum.map(matches, &operator_candidate/1)
-
-        {:ok, DetailEnvelope.ambiguous("operator", candidates, "Operator selector is ambiguous"),
-         ReadableText.ambiguous(
-           "operator metadata record",
-           candidates,
-           operator_candidate_fields()
-         )}
+  def get_operator(%{"selector" => selector}, context) do
+    with {:ok, scope} <- scope_from_context(context),
+         true <- Pools.owner?(scope) do
+      selector
+      |> String.trim()
+      |> operator_match_result()
+    else
+      false -> operator_not_found()
+      error -> error
     end
   end
 
@@ -158,15 +152,37 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
     end
   end
 
+  defp operator_match_result(selector) do
+    case operator_matches(selector) do
+      [] ->
+        operator_not_found()
+
+      [operator] ->
+        presented = present_operator(operator)
+
+        {:ok, DetailEnvelope.ok("operator", presented), operator_text(presented)}
+
+      matches ->
+        candidates = Enum.map(matches, &operator_candidate/1)
+
+        {:ok, DetailEnvelope.ambiguous("operator", candidates, "Operator selector is ambiguous"),
+         ReadableText.ambiguous(
+           "operator metadata record",
+           candidates,
+           operator_candidate_fields()
+         )}
+    end
+  end
+
   defp list_operators_tool do
     %{
       name: "codex_pooler_list_operators",
       title: "List operators",
       description: """
-      Use when an MCP client needs bounded discovery of Codex Pooler operator accounts before selecting one for detail lookup.
+      Use when an MCP client needs bounded owner-only discovery of Codex Pooler operator accounts before selecting one for detail lookup.
       Returns masked operator metadata, account status, password-change requirement, TOTP status, MCP gate summary, MCP key count, and timestamps.
       Never returns raw emails, password hashes, temporary passwords, session tokens, TOTP secrets, recovery secrets, MCP tokens, MCP token hashes, cookies, headers, prompts, or raw domain structs.
-      Filters/limits: optional status and query filters are applied in memory to active operator rows; limit is clamped to 1..100 and defaults to 50.
+      Filters/limits: owner-only; optional status and query filters are applied in memory to active operator rows; limit is clamped to 1..100 and defaults to 50.
       """,
       input_schema: @list_input_schema,
       output_schema: list_output_schema("operators"),
@@ -180,10 +196,10 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
       name: "codex_pooler_get_operator",
       title: "Get operator",
       description: """
-      Use when an MCP client needs one operator metadata record by id, masked email, or display-name/email selector.
+      Use when an MCP client needs one owner-only operator metadata record by id, masked email, or display-name/email selector.
       Returns one masked operator metadata record, a not-found marker, or structured ambiguity candidates when the selector matches multiple operators.
       Never returns raw emails, password hashes, temporary passwords, session tokens, TOTP secrets, recovery secrets, MCP tokens, MCP token hashes, cookies, headers, prompts, or raw domain structs.
-      Filters/limits: selector is required; ambiguity candidates are bounded to 10 and no arbitrary first match is chosen.
+      Filters/limits: owner-only; selector is required; ambiguity candidates are bounded to 10 and no arbitrary first match is chosen.
       """,
       input_schema: @get_input_schema,
       output_schema: get_output_schema(),
@@ -296,6 +312,11 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
     end
   end
 
+  defp operator_not_found do
+    {:ok, DetailEnvelope.not_found("operator", "Operator selector did not match"),
+     ReadableText.not_found("operator metadata record")}
+  end
+
   defp invite_matches(scope, selector) do
     page = Access.list_invites(scope, limit: @max_limit, filters: [])
 
@@ -352,9 +373,9 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
     |> Map.take(["id", "pool_name", "pool_slug", "invited_email", "status"])
   end
 
-  defp scope_from_context(%{auth: %{operator: operator}}) do
-    {:ok, Scope.for_user(operator, Accounts.roles_for_user(operator))}
-  end
+  defp scope_from_context(%{auth: %{scope: %Scope{} = scope}}), do: {:ok, scope}
+
+  defp scope_from_context(%{auth: %{operator: operator}}), do: {:ok, Scope.for_user(operator)}
 
   defp scope_from_context(_context) do
     {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
