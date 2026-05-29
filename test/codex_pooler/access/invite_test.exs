@@ -270,6 +270,91 @@ defmodule CodexPooler.Access.InviteTest do
            )
   end
 
+  test "assigned admins list and create invites only for assigned pools" do
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    owner_scope = Scope.for_user(owner)
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    pool_a = pool_fixture(%{name: "Pool A"})
+    pool_b = pool_fixture(%{name: "Pool B"})
+    pool_c = pool_fixture(%{name: "Pool C"})
+
+    operator_pool_assignment_fixture(admin, pool_a, created_by_user_id: owner.id)
+    operator_pool_assignment_fixture(admin, pool_b, created_by_user_id: owner.id)
+    admin_scope = Scope.for_user(admin)
+
+    {:ok, %{invite: invite_a}} =
+      Access.create_invite(owner_scope, pool_a, %{invited_email: "a@example.com"})
+
+    {:ok, %{invite: invite_b}} =
+      Access.create_invite(owner_scope, pool_b, %{invited_email: "b@example.com"})
+
+    {:ok, %{invite: _invite_c}} =
+      Access.create_invite(owner_scope, pool_c, %{invited_email: "c@example.com"})
+
+    assert {:ok, %{invite: created}} =
+             Access.create_invite(admin_scope, pool_a, %{invited_email: "admin-a@example.com"})
+
+    assert {:error, %{code: :capability_denied}} =
+             Access.create_invite(admin_scope, pool_c, %{invited_email: "admin-c@example.com"})
+
+    assert %{items: rows, total: 3} = Access.list_invites(admin_scope)
+
+    assert Enum.map(rows, & &1.id) |> Enum.sort() ==
+             Enum.sort([created.id, invite_a.id, invite_b.id])
+
+    assert %{items: [], total: 0} =
+             Access.list_invites(admin_scope, filters: [pool_id: pool_c.id])
+  end
+
+  test "unassigned admins cannot list create reissue or revoke pool invites" do
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    owner_scope = Scope.for_user(owner)
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    pool = pool_fixture(%{name: "Hidden Invite Pool"})
+
+    {:ok, %{invite: invite}} =
+      Access.create_invite(owner_scope, pool, %{invited_email: "hidden-invite@example.com"})
+
+    admin_scope = Scope.for_user(admin)
+
+    assert %{items: [], total: 0} = Access.list_invites(admin_scope)
+
+    assert {:error, %{code: :capability_denied}} =
+             Access.create_invite(admin_scope, pool, %{invited_email: "denied@example.com"})
+
+    assert {:error, %{code: :capability_denied}} = Access.reissue_invite(admin_scope, invite.id)
+    assert {:error, %{code: :capability_denied}} = Access.revoke_invite(admin_scope, invite.id)
+    assert Repo.get!(Invite, invite.id).status == "active"
+  end
+
+  test "assigned admins cannot reissue or revoke unassigned pool invites" do
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    owner_scope = Scope.for_user(owner)
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    pool_a = pool_fixture(%{name: "Pool A"})
+    pool_c = pool_fixture(%{name: "Pool C"})
+
+    operator_pool_assignment_fixture(admin, pool_a, created_by_user_id: owner.id)
+    admin_scope = Scope.for_user(admin)
+
+    {:ok, %{invite: assigned_invite}} =
+      Access.create_invite(owner_scope, pool_a, %{invited_email: "assigned@example.com"})
+
+    {:ok, %{invite: hidden_invite}} =
+      Access.create_invite(owner_scope, pool_c, %{invited_email: "hidden@example.com"})
+
+    assert {:ok, %{revoked: revoked}} = Access.reissue_invite(admin_scope, assigned_invite.id)
+    assert revoked.id == assigned_invite.id
+
+    assert {:error, %{code: :capability_denied}} =
+             Access.reissue_invite(admin_scope, hidden_invite.id)
+
+    assert {:error, %{code: :capability_denied}} =
+             Access.revoke_invite(admin_scope, hidden_invite.id)
+
+    assert Repo.get!(Invite, hidden_invite.id).status == "active"
+  end
+
   defp fixture_owner_scope do
     %{user: user} = bootstrap_owner_fixture()
     Scope.for_user(user, ["instance_owner"])

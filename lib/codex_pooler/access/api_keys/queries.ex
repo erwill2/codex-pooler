@@ -20,7 +20,12 @@ defmodule CodexPooler.Access.APIKeys.Queries do
 
   @spec list_api_keys(Scope.t()) :: {:ok, [APIKey.t()]} | {:error, access_error()}
   def list_api_keys(%Scope{} = scope) do
-    with {:ok, pools} <- Pools.list_pools(scope) do
+    with {:ok, pools} <-
+           PoolAuthorization.list_pools_for_capability(
+             scope,
+             PoolAuthorization.capability(:pool_api_key_manage),
+             ["active"]
+           ) do
       list_api_keys_for_pools(scope, pools)
     end
   end
@@ -118,8 +123,14 @@ defmodule CodexPooler.Access.APIKeys.Queries do
            ) do
       {:ok, api_key}
     else
-      nil -> {:error, Errors.access_error(:api_key_not_found, "api key was not found")}
-      {:error, _reason} = error -> error
+      nil ->
+        {:error, Errors.access_error(:api_key_not_found, "api key was not found")}
+
+      {:error, %{code: :capability_denied}} ->
+        {:error, Errors.access_error(:api_key_not_found, "api key was not found")}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

@@ -9,6 +9,7 @@ defmodule CodexPooler.AccessTest do
 
   import Ecto.Query
   import CodexPooler.AccountsFixtures
+  import CodexPooler.PoolerFixtures
 
   describe "server-authoritative API key policy APIs" do
     test "selected model mode persists normalized catalog-backed and custom manual identifiers" do
@@ -219,6 +220,85 @@ defmodule CodexPooler.AccessTest do
 
       assert {:error, %{code: :api_key_missing}} = Access.authenticate_api_key(raw_key)
       assert {:error, %{code: :api_key_missing}} = Access.authenticate_v1_api_key(raw_key)
+    end
+  end
+
+  describe "assigned-admin API key scoping" do
+    test "assigned admins list and read only API keys from assigned pools" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      owner_scope = Scope.for_user(owner)
+      %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+
+      pool_a = pool_fixture(%{name: "Pool A"})
+      pool_b = pool_fixture(%{name: "Pool B"})
+      pool_c = pool_fixture(%{name: "Pool C"})
+
+      operator_pool_assignment_fixture(admin, pool_a, created_by_user_id: owner.id)
+      operator_pool_assignment_fixture(admin, pool_b, created_by_user_id: owner.id)
+      admin_scope = Scope.for_user(admin)
+
+      {:ok, %{api_key: key_a}} = Access.create_api_key(owner_scope, pool_a, %{display_name: "A"})
+      {:ok, %{api_key: key_b}} = Access.create_api_key(owner_scope, pool_b, %{display_name: "B"})
+      {:ok, %{api_key: key_c}} = Access.create_api_key(owner_scope, pool_c, %{display_name: "C"})
+
+      assert {:ok, visible_keys} = Access.list_api_keys(admin_scope)
+      assert Enum.map(visible_keys, & &1.id) |> Enum.sort() == Enum.sort([key_a.id, key_b.id])
+      assert {:ok, ^key_a} = Access.get_api_key(admin_scope, key_a.id)
+      assert {:error, %{code: :api_key_not_found}} = Access.get_api_key(admin_scope, key_c.id)
+    end
+
+    test "unassigned admins cannot list read or create API keys for any pool" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      owner_scope = Scope.for_user(owner)
+      %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+
+      pool = pool_fixture(%{name: "Hidden API Key Pool"})
+
+      {:ok, %{api_key: api_key}} =
+        Access.create_api_key(owner_scope, pool, %{display_name: "Hidden"})
+
+      admin_scope = Scope.for_user(admin)
+
+      assert {:ok, []} = Access.list_api_keys(admin_scope)
+      assert {:error, %{code: :api_key_not_found}} = Access.get_api_key(admin_scope, api_key.id)
+
+      assert {:error, %{code: :capability_denied}} =
+               Access.create_api_key(admin_scope, pool, %{display_name: "Denied"})
+
+      assert Repo.get!(APIKey, api_key.id).status == "active"
+    end
+
+    test "assigned admins cannot mutate or move API keys through unassigned pools" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      owner_scope = Scope.for_user(owner)
+      %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+
+      pool_a = pool_fixture(%{name: "Pool A"})
+      pool_c = pool_fixture(%{name: "Pool C"})
+
+      operator_pool_assignment_fixture(admin, pool_a, created_by_user_id: owner.id)
+      admin_scope = Scope.for_user(admin)
+
+      {:ok, %{api_key: assigned_key}} =
+        Access.create_api_key(owner_scope, pool_a, %{display_name: "Assigned"})
+
+      {:ok, %{api_key: hidden_key}} =
+        Access.create_api_key(owner_scope, pool_c, %{display_name: "Hidden"})
+
+      assert {:error, %{code: :capability_denied}} =
+               Access.create_api_key(admin_scope, pool_c, %{display_name: "Denied"})
+
+      assert {:error, %{code: :capability_denied}} =
+               Access.update_api_key(admin_scope, assigned_key, %{pool_id: pool_c.id})
+
+      assert {:error, %{code: :capability_denied}} =
+               Access.update_api_key(admin_scope, hidden_key, %{display_name: "Denied"})
+
+      assert {:error, %{code: :capability_denied}} =
+               Access.assign_api_keys_to_pool(admin_scope, pool_c, [])
+
+      assert Repo.get!(APIKey, assigned_key.id).pool_id == pool_a.id
+      assert Repo.get!(APIKey, hidden_key.id).display_name == "Hidden"
     end
   end
 

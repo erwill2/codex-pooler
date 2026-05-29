@@ -5,6 +5,7 @@ defmodule CodexPooler.Access.APIKeys.Assignment do
   alias CodexPooler.Access.APIKeys.{Errors, Policy, PolicyUpdate, Queries}
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Pools
+  alias CodexPooler.Pools.Authorization, as: PoolAuthorization
   alias CodexPooler.Pools.Pool
 
   @type access_error :: %{required(:code) => atom(), required(:message) => String.t()}
@@ -17,6 +18,12 @@ defmodule CodexPooler.Access.APIKeys.Assignment do
     api_key_ids = selected_api_key_ids(api_key_ids)
 
     with %Pool{} = pool <- normalize_pool(pool_or_id),
+         {:ok, _decision} <-
+           PoolAuthorization.require_capability(
+             scope,
+             PoolAuthorization.capability(:pool_api_key_manage),
+             pool_id: pool.id
+           ),
          {:ok, api_keys} <- Queries.list_api_keys(scope),
          {:ok, selected_api_keys} <- selected_api_keys(api_keys, api_key_ids) do
       move_api_keys_to_pool(scope, pool, selected_api_keys)
