@@ -30,28 +30,15 @@ defmodule CodexPooler.AccountsFixtures do
   def bootstrap_owner_fixture(attrs \\ %{}) do
     attrs = valid_bootstrap_attributes(attrs)
 
-    try do
-      case Accounts.bootstrap_owner(attrs) do
-        {:ok, result} ->
-          result
+    case Accounts.bootstrap_owner(attrs) do
+      {:ok, result} ->
+        result
 
-        {:error, :bootstrap_already_completed} ->
-          existing_owner_session_fixture!(attrs)
+      {:error, :bootstrap_already_completed} ->
+        existing_owner_session_fixture!(attrs)
 
-        {:error, %Ecto.Changeset{} = changeset} ->
-          if owner_membership_conflict?(changeset) do
-            existing_owner_session_fixture!(attrs)
-          else
-            raise "bootstrap_owner_fixture failed: #{inspect(changeset.errors)}"
-          end
-      end
-    rescue
-      error in Ecto.ConstraintError ->
-        if error.constraint == "memberships_single_instance_owner_active_uq" do
-          existing_owner_session_fixture!(attrs)
-        else
-          reraise error, __STACKTRACE__
-        end
+      {:error, %Ecto.Changeset{} = changeset} ->
+        raise "bootstrap_owner_fixture failed: #{inspect(changeset.errors)}"
     end
   end
 
@@ -117,11 +104,5 @@ defmodule CodexPooler.AccountsFixtures do
       updated_at: now
     )
     |> Repo.update!()
-  end
-
-  defp owner_membership_conflict?(changeset) do
-    Enum.any?(changeset.constraints, fn constraint ->
-      constraint.constraint == "memberships_single_instance_owner_active_uq"
-    end)
   end
 end

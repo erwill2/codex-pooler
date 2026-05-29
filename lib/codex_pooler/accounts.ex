@@ -47,6 +47,9 @@ defmodule CodexPooler.Accounts do
   @spec change_operator(User.t()) :: Ecto.Changeset.t()
   defdelegate change_operator(user), to: OperatorManagement
 
+  @spec operator_lifecycle(User.t()) :: OperatorManagement.operator_lifecycle()
+  defdelegate operator_lifecycle(user), to: OperatorManagement
+
   @spec create_operator(Scope.t() | User.t(), map(), map()) :: operator_result()
   defdelegate create_operator(actor, attrs, metadata \\ %{}), to: OperatorManagement
 
