@@ -4,10 +4,12 @@ defmodule CodexPooler.Accounts.OperatorLifecycleTest do
   alias CodexPooler.Accounts
   alias CodexPooler.Accounts.{Scope, Session, User}
   alias CodexPooler.Audit.AuditEvent
-  alias CodexPooler.Pools.Membership
+  alias CodexPooler.Pools
+  alias CodexPooler.Pools.{Membership, OperatorPoolAssignment}
   alias CodexPooler.Repo
 
   import CodexPooler.AccountsFixtures
+  import CodexPooler.PoolerFixtures, only: [pool_fixture: 1]
 
   describe "operator lifecycle contract" do
     @tag :operator_lifecycle
@@ -16,6 +18,7 @@ defmodule CodexPooler.Accounts.OperatorLifecycleTest do
       assert_operator_api!(:list_operators_for_management, 1)
       assert_operator_api!(:change_new_operator, 1)
       assert_operator_api!(:change_operator, 1)
+      assert_operator_api!(:operator_lifecycle, 1)
       assert_operator_api!(:create_operator, 3)
       assert_operator_api!(:update_operator, 4)
       assert_operator_api!(:update_current_operator_profile, 3)
@@ -75,6 +78,88 @@ defmodule CodexPooler.Accounts.OperatorLifecycleTest do
       assert Enum.any?(operators, &(&1.id == operator.id))
       assert audit = Repo.get_by(AuditEvent, action: "operator.create", actor_user_id: owner.id)
       refute inspect(audit.details) =~ temporary_password
+    end
+
+    @tag :operator_lifecycle
+    test "owners create instance admins with assigned pools in one transaction" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+      owner_scope = Scope.for_user(owner)
+      pool_a = pool_fixture(%{slug: "operator-admin-a", name: "Operator Admin A"})
+      pool_b = pool_fixture(%{slug: "operator-admin-b", name: "Operator Admin B"})
+
+      assert {:ok, %{user: %User{} = operator}} =
+               Accounts.create_operator(
+                 owner_scope,
+                 valid_operator_attributes(%{
+                   "email" => "assigned-admin@example.com",
+                   "role" => "instance_admin",
+                   "pool_ids" => [pool_a.id, pool_b.id]
+                 }),
+                 operator_metadata(%{request_id: "operator-create-assigned-admin"})
+               )
+
+      assert Repo.get_by(Membership,
+               user_id: operator.id,
+               role: "instance_admin",
+               status: "active"
+             )
+
+      refute Repo.get_by(Membership,
+               user_id: operator.id,
+               role: "instance_owner",
+               status: "active"
+             )
+
+      assigned_pool_ids =
+        OperatorPoolAssignment
+        |> where(
+          [assignment],
+          assignment.user_id == ^operator.id and assignment.status == "active"
+        )
+        |> select([assignment], assignment.pool_id)
+        |> Repo.all()
+        |> Enum.sort()
+
+      assert assigned_pool_ids == Enum.sort([pool_a.id, pool_b.id])
+      assert Accounts.operator_lifecycle(operator).role == "instance_admin"
+
+      assert Enum.sort(Accounts.operator_lifecycle(operator).assigned_pool_ids) ==
+               assigned_pool_ids
+
+      audit = Repo.get_by!(AuditEvent, action: "operator.create", actor_user_id: owner.id)
+      assert audit.details["role"] == "instance_admin"
+      assert Enum.sort(audit.details["assigned_pool_ids"]) == assigned_pool_ids
+      assert audit.details["assigned_pool_count"] == 2
+    end
+
+    @tag :operator_lifecycle
+    test "owners create instance owners without pool assignments" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+      pool = pool_fixture(%{slug: "ignored-owner-pool", name: "Ignored Owner Pool"})
+
+      assert {:ok, %{user: %User{} = created_owner}} =
+               Accounts.create_operator(
+                 Scope.for_user(owner),
+                 valid_operator_attributes(%{
+                   "email" => "created-owner@example.com",
+                   "role" => "instance_owner",
+                   "pool_ids" => [pool.id]
+                 }),
+                 operator_metadata(%{request_id: "operator-create-owner"})
+               )
+
+      assert Repo.get_by(Membership,
+               user_id: created_owner.id,
+               role: "instance_owner",
+               status: "active"
+             )
+
+      refute Repo.get_by(OperatorPoolAssignment, user_id: created_owner.id, status: "active")
+
+      assert Accounts.operator_lifecycle(created_owner) == %{
+               role: "instance_owner",
+               assigned_pool_ids: []
+             }
     end
 
     @tag :operator_lifecycle
@@ -237,6 +322,7 @@ defmodule CodexPooler.Accounts.OperatorLifecycleTest do
     test "operator management uses active memberships instead of cached scope roles" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
       %{user: admin} = operator_fixture(owner, %{"email" => "admin@example.com"})
+      %{user: target} = operator_fixture(owner, %{"email" => "target@example.com"})
 
       assert {:ok, operators} = Accounts.list_operators_for_management(Scope.for_user(owner, []))
       assert Enum.any?(operators, &(&1.id == owner.id))
@@ -253,7 +339,22 @@ defmodule CodexPooler.Accounts.OperatorLifecycleTest do
                  operator_metadata(%{request_id: "operator-stale-role-denied-contract"})
                )
 
+      assert {:error, :operator_management_denied} =
+               Accounts.update_operator(
+                 stale_owner_scope,
+                 target,
+                 %{"display_name" => "Stale Owner Update"},
+                 operator_metadata(%{request_id: "operator-stale-update-denied-contract"})
+               )
+
       refute Accounts.get_user_by_email("stale-owner-role@example.com")
+      assert Repo.reload!(target).display_name == "Operator"
+
+      refute Repo.get_by(AuditEvent,
+               action: "operator.update",
+               actor_user_id: admin.id,
+               target_id: target.id
+             )
     end
 
     @tag :operator_lifecycle
@@ -320,6 +421,157 @@ defmodule CodexPooler.Accounts.OperatorLifecycleTest do
       assert updated.display_name == "Updated Operator"
       assert updated.password_change_required == false
       assert Repo.get_by(AuditEvent, action: "operator.update", actor_user_id: owner.id)
+    end
+
+    @tag :operator_lifecycle
+    test "owners edit admin pool assignments transactionally" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+      owner_scope = Scope.for_user(owner)
+      original_pool = pool_fixture(%{slug: "operator-original", name: "Operator Original"})
+      new_pool = pool_fixture(%{slug: "operator-new", name: "Operator New"})
+      removed_pool = pool_fixture(%{slug: "operator-removed", name: "Operator Removed"})
+
+      {:ok, %{user: operator}} =
+        Accounts.create_operator(
+          owner_scope,
+          valid_operator_attributes(%{
+            "email" => "assignment-edit@example.com",
+            "role" => "instance_admin",
+            "pool_ids" => [original_pool.id, removed_pool.id]
+          }),
+          operator_metadata()
+        )
+
+      assert {:ok, %User{} = updated} =
+               Accounts.update_operator(
+                 owner_scope,
+                 operator,
+                 %{
+                   "display_name" => "Assignment Edited",
+                   "role" => "instance_admin",
+                   "pool_ids" => [original_pool.id, new_pool.id]
+                 },
+                 operator_metadata(%{request_id: "operator-assignment-edit"})
+               )
+
+      assert updated.display_name == "Assignment Edited"
+
+      active_pool_ids =
+        OperatorPoolAssignment
+        |> where(
+          [assignment],
+          assignment.user_id == ^operator.id and assignment.status == "active"
+        )
+        |> select([assignment], assignment.pool_id)
+        |> Repo.all()
+        |> Enum.sort()
+
+      assert active_pool_ids == Enum.sort([original_pool.id, new_pool.id])
+
+      assert Repo.get_by(OperatorPoolAssignment,
+               user_id: operator.id,
+               pool_id: removed_pool.id,
+               status: "revoked"
+             )
+
+      audit =
+        Repo.get_by!(AuditEvent,
+          action: "operator.update",
+          correlation_id: "operator-assignment-edit"
+        )
+
+      assert Enum.sort(audit.details["added_pool_ids"]) == [new_pool.id]
+      assert Enum.sort(audit.details["removed_pool_ids"]) == [removed_pool.id]
+    end
+
+    @tag :operator_lifecycle
+    test "owners promote and demote operators subject to the final owner invariant" do
+      reset_bootstrap_state_fixture!()
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+      owner_scope = Scope.for_user(owner)
+      pool = pool_fixture(%{slug: "demoted-owner-pool", name: "Demoted Owner Pool"})
+      %{user: target} = operator_fixture(owner_scope, %{"email" => "promoted@example.com"})
+
+      assert {:ok, %User{} = promoted} =
+               Accounts.update_operator(
+                 owner_scope,
+                 target,
+                 %{"role" => "instance_owner", "pool_ids" => [pool.id]},
+                 operator_metadata(%{request_id: "operator-promote-owner"})
+               )
+
+      assert Repo.get_by(Membership,
+               user_id: promoted.id,
+               role: "instance_owner",
+               status: "active"
+             )
+
+      refute Repo.get_by(OperatorPoolAssignment, user_id: promoted.id, status: "active")
+
+      assert {:ok, %User{} = demoted} =
+               Accounts.update_operator(
+                 owner_scope,
+                 promoted,
+                 %{"role" => "instance_admin", "pool_ids" => [pool.id]},
+                 operator_metadata(%{request_id: "operator-demote-owner"})
+               )
+
+      assert Repo.get_by(Membership,
+               user_id: demoted.id,
+               role: "instance_admin",
+               status: "active"
+             )
+
+      assert Repo.get_by(Membership,
+               user_id: demoted.id,
+               role: "instance_owner",
+               status: "revoked"
+             )
+
+      assert Repo.get_by(OperatorPoolAssignment,
+               user_id: demoted.id,
+               pool_id: pool.id,
+               status: "active"
+             )
+
+      assert {:error, :last_active_owner} =
+               Accounts.update_operator(
+                 owner_scope,
+                 owner,
+                 %{"role" => "instance_admin", "pool_ids" => [pool.id]},
+                 operator_metadata(%{request_id: "operator-final-owner-demote"})
+               )
+
+      assert Repo.get_by(Membership, user_id: owner.id, role: "instance_owner", status: "active")
+      refute Repo.get_by(AuditEvent, correlation_id: "operator-final-owner-demote")
+    end
+
+    @tag :operator_lifecycle
+    test "admins cannot escalate roles or assignments through direct context calls" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+      owner_scope = Scope.for_user(owner)
+      pool = pool_fixture(%{slug: "admin-denied-pool", name: "Admin Denied Pool"})
+      %{user: admin} = operator_fixture(owner_scope, %{"email" => "admin-denied@example.com"})
+      %{user: target} = operator_fixture(owner_scope, %{"email" => "target-denied@example.com"})
+      admin_scope = Scope.for_user(admin)
+
+      assert {:error, :operator_management_denied} =
+               Accounts.update_operator(
+                 admin_scope,
+                 target,
+                 %{"role" => "instance_owner", "pool_ids" => [pool.id]},
+                 operator_metadata(%{request_id: "operator-admin-escalation-denied"})
+               )
+
+      refute Repo.get_by(Membership, user_id: target.id, role: "instance_owner", status: "active")
+
+      refute Repo.get_by(OperatorPoolAssignment,
+               user_id: target.id,
+               pool_id: pool.id,
+               status: "active"
+             )
+
+      refute Repo.get_by(AuditEvent, correlation_id: "operator-admin-escalation-denied")
     end
 
     @tag :operator_lifecycle
@@ -405,12 +657,12 @@ defmodule CodexPooler.Accounts.OperatorLifecycleTest do
       assert Accounts.get_user_by_email_and_password(operator.email, reactivated_password)
     end
 
-    @tag :last_active_admin
-    test "protects the last active admin from deactivation" do
+    @tag :last_active_owner
+    test "protects the final active owner from deactivation" do
       reset_bootstrap_state_fixture!()
       %{user: owner, token: token} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
 
-      assert {:error, :last_active_admin} =
+      assert {:error, :last_active_owner} =
                call_operator_api!(
                  :deactivate_operator,
                  [owner, owner, %{"reason" => "self-disable"}, operator_metadata()]
@@ -419,6 +671,71 @@ defmodule CodexPooler.Accounts.OperatorLifecycleTest do
       assert Repo.reload!(owner).status == "active"
       assert Accounts.get_user_by_session_token(token)
       refute Repo.get_by(AuditEvent, action: "operator.deactivate", actor_user_id: owner.id)
+    end
+
+    @tag :last_active_owner
+    test "allows non-final owner deactivation but ignores inactive owners for final-owner safety" do
+      reset_bootstrap_state_fixture!()
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+      %{user: second_owner} = operator_fixture(owner, %{"email" => "second-owner@example.com"})
+
+      assert {:ok, _membership} =
+               Pools.create_instance_owner_membership(Scope.for_user(owner, []), second_owner)
+
+      assert {:ok, %User{} = disabled_second_owner} =
+               Accounts.deactivate_operator(
+                 owner,
+                 second_owner,
+                 %{"reason" => "rotation"},
+                 operator_metadata(%{request_id: "operator-second-owner-deactivate"})
+               )
+
+      assert disabled_second_owner.status == "disabled"
+
+      assert {:error, :last_active_owner} =
+               Accounts.deactivate_operator(
+                 owner,
+                 owner,
+                 %{"reason" => "inactive owner should not count"},
+                 operator_metadata(%{request_id: "operator-final-owner-active-check"})
+               )
+
+      assert Repo.reload!(owner).status == "active"
+    end
+
+    @tag :operator_lifecycle
+    test "migrated former global admins are effective owners for lifecycle actions" do
+      reset_bootstrap_state_fixture!()
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+
+      %{user: migrated_owner} =
+        operator_fixture(owner, %{"email" => "migrated-owner@example.com"})
+
+      Membership
+      |> Repo.get_by!(user_id: migrated_owner.id, role: "instance_admin", status: "active")
+      |> Membership.changeset(%{role: "instance_owner"})
+      |> Repo.update!()
+
+      migrated_scope = Scope.for_user(migrated_owner, [])
+
+      assert {:ok, operators} = Accounts.list_operators_for_management(migrated_scope)
+      assert Enum.any?(operators, &(&1.id == owner.id))
+
+      assert {:ok, %User{} = disabled_owner} =
+               Accounts.deactivate_operator(
+                 migrated_scope,
+                 owner,
+                 %{"reason" => "rollout owner migration"},
+                 operator_metadata(%{request_id: "operator-migrated-owner-lifecycle"})
+               )
+
+      assert disabled_owner.status == "disabled"
+
+      assert Repo.get_by(AuditEvent,
+               action: "operator.deactivate",
+               actor_user_id: migrated_owner.id,
+               target_id: owner.id
+             )
     end
   end
 
