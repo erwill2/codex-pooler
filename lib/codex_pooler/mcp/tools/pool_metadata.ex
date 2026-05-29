@@ -4,7 +4,6 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
   """
 
   alias CodexPooler.Access
-  alias CodexPooler.Accounts
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.MCP.PrivacyMatrix
   alias CodexPooler.MCP.Tools.DetailEnvelope
@@ -475,19 +474,15 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
     }
   end
 
-  defp scope_from_context(%{auth: %{operator: operator}}),
-    do: {:ok, Scope.for_user(operator, Accounts.roles_for_user(operator))}
+  defp scope_from_context(%{auth: %{scope: %Scope{} = scope}}), do: {:ok, scope}
+
+  defp scope_from_context(%{auth: %{operator: operator}}), do: {:ok, Scope.for_user(operator)}
 
   defp scope_from_context(_context) do
     {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
   end
 
-  defp load_pools(scope) do
-    case Pools.list_pools_for_management(scope) do
-      {:ok, pools} -> {:ok, pools}
-      {:error, _reason} -> Pools.list_pools(scope)
-    end
-  end
+  defp load_pools(scope), do: {:ok, Pools.list_visible_pools(scope)}
 
   defp resolve_optional_pool(_pools, selector) when selector in [nil, ""], do: {:ok, nil}
 
@@ -562,8 +557,8 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
     |> stringify_keys()
   end
 
-  defp upstream_presenter(identity, _pool_lookup) do
-    assignments = Upstreams.list_pool_assignments_for_identity(identity)
+  defp upstream_presenter(identity, pool_lookup) do
+    assignments = visible_assignments_for_identity(identity, pool_lookup)
     active_count = Enum.count(assignments, &(&1.status == "active"))
 
     %{
@@ -591,6 +586,15 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
       },
       metadata: %{status: metadata_status(identity.metadata), summary: "metadata keys omitted"}
     }
+  end
+
+  defp visible_assignments_for_identity(identity, pool_lookup) do
+    visible_pool_ids = pool_lookup |> Map.keys() |> MapSet.new()
+
+    identity
+    |> Upstreams.list_pool_assignments_for_identity()
+    |> Enum.reject(&(&1.status == "deleted"))
+    |> Enum.filter(&MapSet.member?(visible_pool_ids, &1.pool_id))
   end
 
   defp api_key_item(%{api_key: api_key, policy: policy, policy_bindings: bindings}, pool_lookup) do

@@ -8,6 +8,7 @@ defmodule CodexPooler.MCP.UpstreamsToolsTest do
   alias CodexPooler.MCP
   alias CodexPooler.MCP.{OperatorMCPKey, OperatorMCPSettings, Redaction, ToolDispatch}
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Assignments.PoolAssignments
 
   setup do
     reset_bootstrap_state_fixture!()
@@ -213,6 +214,124 @@ defmodule CodexPooler.MCP.UpstreamsToolsTest do
     assert MapSet.new(Enum.map(result["structuredContent"]["candidates"], & &1["id"])) ==
              MapSet.new([first.id, second.id])
 
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+  end
+
+  test "scoped admin upstream tools hide unassigned identities and ambiguity candidates", %{
+    owner: owner
+  } do
+    visible_pool = pool_fixture(%{name: "Visible Upstream Pool"})
+    hidden_pool = pool_fixture(%{name: "Hidden Upstream Pool"})
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    admin = admin |> Ecto.Changeset.change(password_change_required: false) |> Repo.update!()
+    operator_pool_assignment_fixture(admin, visible_pool, created_by_user_id: owner.id)
+
+    %{identity: visible_identity} =
+      active_upstream_assignment_fixture(visible_pool, %{
+        account_label: "Shared scoped upstream",
+        chatgpt_account_id: "acct-visible-scoped-upstream"
+      })
+
+    %{identity: hidden_identity} =
+      active_upstream_assignment_fixture(hidden_pool, %{
+        account_label: "Shared scoped upstream",
+        chatgpt_account_id: "acct-hidden-scoped-upstream"
+      })
+
+    assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(admin, true)
+
+    assert {:ok, %{raw_token: raw_token}} =
+             MCP.create_operator_token(admin, %{label: "Scoped upstream MCP"})
+
+    assert {:ok, admin_auth} = MCP.authenticate_token(raw_token)
+
+    assert {:ok, list_result} =
+             ToolDispatch.call("codex_pooler_list_upstreams", %{"limit" => 10}, %{
+               auth: admin_auth
+             })
+
+    assert [%{"id" => visible_id}] = list_result["structuredContent"]["items"]
+    assert visible_id == visible_identity.id
+    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_identity.id
+
+    assert {:ok, hidden_result} =
+             ToolDispatch.call(
+               "codex_pooler_get_upstream",
+               %{"selector" => hidden_identity.id},
+               %{
+                 auth: admin_auth
+               }
+             )
+
+    assert hidden_result["structuredContent"] == %{
+             "status" => "not_found",
+             "kind" => "upstream",
+             "item" => nil,
+             "candidates" => [],
+             "message" => "Upstream selector did not match"
+           }
+
+    assert {:ok, ambiguous_result} =
+             ToolDispatch.call(
+               "codex_pooler_get_upstream",
+               %{"selector" => "Shared scoped upstream"},
+               %{
+                 auth: admin_auth
+               }
+             )
+
+    assert ambiguous_result["structuredContent"]["status"] == "ok"
+    assert ambiguous_result["structuredContent"]["item"]["id"] == visible_identity.id
+    assert ambiguous_result["structuredContent"]["candidates"] == []
+    refute inspect(ambiguous_result) =~ hidden_identity.id
+    assert :ok = Redaction.assert_mcp_output_safe!(list_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(hidden_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(ambiguous_result)
+  end
+
+  test "scoped admin upstream summaries count only visible Pool assignments", %{owner: owner} do
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    admin = admin |> Ecto.Changeset.change(password_change_required: false) |> Repo.update!()
+
+    visible_pool = pool_fixture(%{name: "Visible upstream summary Pool"})
+    hidden_pool = pool_fixture(%{name: "Hidden upstream summary Pool"})
+    operator_pool_assignment_fixture(admin, visible_pool, created_by_user_id: owner.id)
+
+    assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(admin, true)
+
+    assert {:ok, %{raw_token: raw_token}} =
+             MCP.create_operator_token(admin, %{label: "Scoped upstream MCP"})
+
+    assert {:ok, admin_auth} = MCP.authenticate_token(raw_token)
+
+    %{identity: identity} =
+      active_upstream_assignment_fixture(visible_pool, %{
+        account_label: "Shared visibility upstream",
+        chatgpt_account_id: "acct-shared-visible"
+      })
+
+    assert {:ok, hidden_assignment} =
+             PoolAssignments.create_pool_assignment(hidden_pool, identity, %{
+               status: "active",
+               health_status: "active",
+               eligibility_status: "eligible"
+             })
+
+    assert {:ok, result} =
+             ToolDispatch.call("codex_pooler_get_upstream", %{"selector" => identity.id}, %{
+               auth: admin_auth
+             })
+
+    assert result["isError"] == false
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert text =~ "assignments=1 active of 1 Pool assignments"
+
+    item = result["structuredContent"]["item"]
+    assert item["id"] == identity.id
+    assert item["assignment_summary"]["count"] == 1
+    assert item["assignment_summary"]["summary"] == "1 active of 1 Pool assignments"
+    refute Jason.encode!(result["structuredContent"]) =~ hidden_pool.id
+    refute Jason.encode!(result["structuredContent"]) =~ hidden_assignment.id
     assert :ok = Redaction.assert_mcp_output_safe!(result)
   end
 end

@@ -197,6 +197,66 @@ defmodule CodexPooler.MCP.PoolApiKeysToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(result)
   end
 
+  test "scoped admin Pool API key tools return assigned-pool keys only", %{owner: owner} do
+    visible_pool = pool_fixture(%{name: "Visible Key Pool"})
+    hidden_pool = pool_fixture(%{name: "Hidden Key Pool"})
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    admin = admin |> Ecto.Changeset.change(password_change_required: false) |> Repo.update!()
+    operator_pool_assignment_fixture(admin, visible_pool, created_by_user_id: owner.id)
+
+    %{api_key: visible_key} =
+      active_api_key_fixture(visible_pool, %{display_name: "Shared scoped key"})
+
+    %{api_key: hidden_key} =
+      active_api_key_fixture(hidden_pool, %{display_name: "Shared scoped key"})
+
+    assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(admin, true)
+
+    assert {:ok, %{raw_token: raw_token}} =
+             MCP.create_operator_token(admin, %{label: "Scoped key MCP"})
+
+    assert {:ok, admin_auth} = MCP.authenticate_token(raw_token)
+
+    assert {:ok, list_result} =
+             ToolDispatch.call("codex_pooler_list_pool_api_keys", %{"limit" => 10}, %{
+               auth: admin_auth
+             })
+
+    assert [%{"id" => visible_id}] = list_result["structuredContent"]["items"]
+    assert visible_id == visible_key.id
+    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_key.id
+
+    assert {:ok, hidden_result} =
+             ToolDispatch.call("codex_pooler_get_pool_api_key", %{"selector" => hidden_key.id}, %{
+               auth: admin_auth
+             })
+
+    assert hidden_result["structuredContent"] == %{
+             "status" => "not_found",
+             "kind" => "pool_api_key",
+             "item" => nil,
+             "candidates" => [],
+             "message" => "Pool API key selector did not match"
+           }
+
+    assert {:ok, ambiguous_result} =
+             ToolDispatch.call(
+               "codex_pooler_get_pool_api_key",
+               %{"selector" => "Shared scoped key"},
+               %{
+                 auth: admin_auth
+               }
+             )
+
+    assert ambiguous_result["structuredContent"]["status"] == "ok"
+    assert ambiguous_result["structuredContent"]["item"]["id"] == visible_key.id
+    assert ambiguous_result["structuredContent"]["candidates"] == []
+    refute inspect(ambiguous_result) =~ hidden_key.id
+    assert :ok = Redaction.assert_mcp_output_safe!(list_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(hidden_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(ambiguous_result)
+  end
+
   test "ambiguous Pool API key display names return candidates", %{auth: auth} do
     first_pool = pool_fixture()
     second_pool = pool_fixture()

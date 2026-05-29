@@ -190,4 +190,95 @@ defmodule CodexPooler.MCP.PoolsToolsTest do
     assert Enum.map(candidates, & &1["id"]) == [first.id, second.id]
     assert :ok = Redaction.assert_mcp_output_safe!(result)
   end
+
+  test "unassigned scoped admin Pool tools return empty list and not-found get envelope", %{
+    owner: owner
+  } do
+    hidden_pool = pool_fixture(%{name: "Unassigned Hidden Pool"})
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    admin = admin |> Ecto.Changeset.change(password_change_required: false) |> Repo.update!()
+
+    assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(admin, true)
+
+    assert {:ok, %{raw_token: raw_token}} =
+             MCP.create_operator_token(admin, %{label: "Unassigned pool MCP"})
+
+    assert {:ok, admin_auth} = MCP.authenticate_token(raw_token)
+
+    assert {:ok, list_result} =
+             ToolDispatch.call("codex_pooler_list_pools", %{"limit" => 10}, %{auth: admin_auth})
+
+    assert list_result["isError"] == false
+    assert list_result["structuredContent"]["items"] == []
+    assert list_result["structuredContent"]["count"] == 0
+    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_pool.id
+
+    assert {:ok, get_result} =
+             ToolDispatch.call("codex_pooler_get_pool", %{"selector" => hidden_pool.id}, %{
+               auth: admin_auth
+             })
+
+    assert get_result["structuredContent"] == %{
+             "status" => "not_found",
+             "kind" => "pool",
+             "item" => nil,
+             "candidates" => [],
+             "message" => "Pool selector did not match"
+           }
+
+    refute inspect(get_result) =~ hidden_pool.id
+    assert :ok = Redaction.assert_mcp_output_safe!(list_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(get_result)
+  end
+
+  test "scoped admin Pool tools return assigned Pools only", %{owner: owner} do
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    admin = admin |> Ecto.Changeset.change(password_change_required: false) |> Repo.update!()
+
+    visible_pool = pool_fixture(%{name: "Scoped Pool"})
+    hidden_pool = pool_fixture(%{name: "Scoped Pool"})
+    operator_pool_assignment_fixture(admin, visible_pool, created_by_user_id: owner.id)
+
+    assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(admin, true)
+
+    assert {:ok, %{raw_token: raw_token}} =
+             MCP.create_operator_token(admin, %{label: "Scoped pool MCP"})
+
+    assert {:ok, admin_auth} = MCP.authenticate_token(raw_token)
+
+    assert {:ok, list_result} =
+             ToolDispatch.call("codex_pooler_list_pools", %{"limit" => 10}, %{auth: admin_auth})
+
+    assert list_result["isError"] == false
+    assert [%{"id" => visible_id}] = list_result["structuredContent"]["items"]
+    assert visible_id == visible_pool.id
+    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_pool.id
+
+    assert {:ok, hidden_result} =
+             ToolDispatch.call("codex_pooler_get_pool", %{"selector" => hidden_pool.id}, %{
+               auth: admin_auth
+             })
+
+    assert hidden_result["isError"] == false
+
+    assert hidden_result["structuredContent"] == %{
+             "status" => "not_found",
+             "kind" => "pool",
+             "item" => nil,
+             "candidates" => [],
+             "message" => "Pool selector did not match"
+           }
+
+    assert {:ok, ambiguous_result} =
+             ToolDispatch.call("codex_pooler_get_pool", %{"selector" => "Scoped Pool"}, %{
+               auth: admin_auth
+             })
+
+    assert ambiguous_result["structuredContent"]["status"] == "ok"
+    assert ambiguous_result["structuredContent"]["item"]["id"] == visible_pool.id
+    assert ambiguous_result["structuredContent"]["candidates"] == []
+    assert :ok = Redaction.assert_mcp_output_safe!(list_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(hidden_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(ambiguous_result)
+  end
 end

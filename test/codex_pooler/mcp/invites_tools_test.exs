@@ -207,6 +207,57 @@ defmodule CodexPooler.MCP.InvitesToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(get_result)
   end
 
+  test "scoped admin invite tools return assigned-pool invites only", %{
+    owner: owner,
+    scope: owner_scope
+  } do
+    visible_pool = pool_fixture(%{name: "Visible Invite Pool"})
+    hidden_pool = pool_fixture(%{name: "Hidden Invite Pool"})
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    admin = admin |> Ecto.Changeset.change(password_change_required: false) |> Repo.update!()
+    operator_pool_assignment_fixture(admin, visible_pool, created_by_user_id: owner.id)
+
+    assert {:ok, %{invite: visible_invite}} =
+             Access.create_invite(owner_scope, visible_pool, %{
+               invited_email: "visible-invite@example.com"
+             })
+
+    assert {:ok, %{invite: hidden_invite}} =
+             Access.create_invite(owner_scope, hidden_pool, %{
+               invited_email: "hidden-invite@example.com"
+             })
+
+    assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(admin, true)
+
+    assert {:ok, %{raw_token: raw_token}} =
+             MCP.create_operator_token(admin, %{label: "Scoped invite MCP"})
+
+    assert {:ok, admin_auth} = MCP.authenticate_token(raw_token)
+
+    assert {:ok, list_result} =
+             ToolDispatch.call("codex_pooler_list_invites", %{"limit" => 10}, %{auth: admin_auth})
+
+    assert [presented] = list_result["structuredContent"]["invites"]
+    assert presented["id"] == visible_invite.id
+    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_invite.id
+
+    assert {:ok, hidden_result} =
+             ToolDispatch.call("codex_pooler_get_invite", %{"selector" => hidden_invite.id}, %{
+               auth: admin_auth
+             })
+
+    assert hidden_result["structuredContent"] == %{
+             "status" => "not_found",
+             "kind" => "invite",
+             "item" => nil,
+             "candidates" => [],
+             "message" => "Invite selector did not match"
+           }
+
+    assert :ok = Redaction.assert_mcp_output_safe!(list_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(hidden_result)
+  end
+
   test "invite tools reject unexpected arguments as CallToolResult errors", %{auth: auth} do
     assert {:ok, result} =
              ToolDispatch.call("codex_pooler_list_invites", %{"unexpected" => true}, %{
