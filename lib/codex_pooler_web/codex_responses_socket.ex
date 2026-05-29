@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata, as: FinalizationMetadata
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
@@ -643,10 +644,48 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp run_response(parent, auth, payload, opts) do
-    Gateway.run_websocket_response(auth, payload, opts, fn data ->
-      send(parent, {:codex_response_chunk, data})
-    end)
+    with {:ok, payload, opts} <- maybe_coerce_public_v1_response_create(payload, opts) do
+      Gateway.run_websocket_response(auth, payload, opts, fn data ->
+        send(parent, {:codex_response_chunk, data})
+      end)
+    end
   end
+
+  defp maybe_coerce_public_v1_response_create(payload, %RequestOptions{} = opts)
+       when is_binary(payload) do
+    with true <- public_openai_responses_websocket?(opts),
+         {:ok, %{} = decoded} <- Jason.decode(payload),
+         true <- public_v1_response_create_frame?(decoded) do
+      decoded
+      |> Map.delete("type")
+      |> Responses.coerce(opts)
+      |> case do
+        {:ok, %{payload: coerced_payload, request_options: request_options}} ->
+          {:ok, Jason.encode!(coerced_payload), request_options}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      false -> {:ok, payload, opts}
+      {:error, _reason} -> {:ok, payload, opts}
+    end
+  end
+
+  defp maybe_coerce_public_v1_response_create(payload, opts), do: {:ok, payload, opts}
+
+  defp public_v1_response_create_frame?(%{"type" => "response.create"} = payload),
+    do: not Map.has_key?(payload, "generate")
+
+  defp public_v1_response_create_frame?(_payload), do: false
+
+  defp public_openai_responses_websocket?(%RequestOptions{
+         openai_compatibility: %{source_endpoint: "/v1/responses"},
+         transport: %{transport: "websocket"}
+       }),
+       do: true
+
+  defp public_openai_responses_websocket?(_opts), do: false
 
   defp response_task_failure do
     {:error,

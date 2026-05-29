@@ -371,7 +371,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :v1_websocket
-  test "GET /v1/responses websocket accepts opencode replay continuation items" do
+  test "GET /v1/responses websocket coerces public opencode replay frames before dispatch" do
     upstream =
       start_upstream(
         FakeUpstream.json_response(%{
@@ -414,13 +414,13 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
             %{
               "type" => "function_call",
               "id" => "fc_v1_ws_opencode_call",
-              "call_id" => "call_v1_ws_opencode_replay",
+              "call_id" => "",
               "name" => "lookup_fixture",
               "arguments" => "{\"value\":\"sample\"}"
             },
             %{
               "type" => "function_call_output",
-              "call_id" => "call_v1_ws_opencode_replay",
+              "call_id" => "",
               "output" => [
                 %{"type" => "input_text", "text" => "synthetic tool text"},
                 %{"type" => "input_image", "image_url" => "https://example.com/sample.png"}
@@ -440,12 +440,17 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert captured.json["store"] == false
       assert captured.json["previous_response_id"] == "resp_v1_ws_opencode_previous"
 
-      assert Enum.map(captured.json["input"], &(&1["type"] || "message:" <> &1["role"])) == [
-               "message:assistant",
+      assert Enum.map(captured.json["input"], & &1["type"]) == [
+               "message",
                "reasoning",
                "function_call",
                "function_call_output"
              ]
+
+      assert hd(captured.json["input"])["role"] == "assistant"
+
+      assert Enum.at(captured.json["input"], 2)["call_id"] == "fc_v1_ws_opencode_call"
+      assert Enum.at(captured.json["input"], 3)["call_id"] == "fc_v1_ws_opencode_call"
 
       assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
       assert request.endpoint == "/v1/responses"
@@ -457,7 +462,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       refute persistence_text =~ "synthetic summary"
       refute persistence_text =~ "synthetic tool text"
       refute persistence_text =~ "resp_v1_ws_opencode_previous"
-      refute persistence_text =~ "call_v1_ws_opencode_replay"
+      refute persistence_text =~ "fc_v1_ws_opencode_call"
       refute persistence_text =~ setup.authorization
       refute persistence_text =~ setup.raw_key
 
