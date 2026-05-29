@@ -251,7 +251,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
   def authorize(%Scope{} = scope, identity_or_id) do
     with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
          {:ok, pool_ids} <- lifecycle_pool_ids(identity),
-         :ok <- require_any_pool_operate(scope, pool_ids) do
+         :ok <- require_lifecycle_pool_access(scope, pool_ids) do
       {:ok, identity}
     else
       nil ->
@@ -311,6 +311,23 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
         {:error, reason} -> {:cont, {:error, reason}}
       end
     end) || {:error, lifecycle_error(:pool_assignment_not_found, "pool assignment was not found")}
+  end
+
+  defp require_all_pool_operate(%Scope{} = scope, pool_ids) when is_list(pool_ids) do
+    Enum.reduce_while(pool_ids, :ok, fn pool_id, :ok ->
+      case Pools.require_capability(scope, Pools.capability(:pool_operate), pool_id: pool_id) do
+        {:ok, _decision} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp require_lifecycle_pool_access(%Scope{} = scope, pool_ids) do
+    if Pools.owner?(scope) do
+      require_any_pool_operate(scope, pool_ids)
+    else
+      require_all_pool_operate(scope, pool_ids)
+    end
   end
 
   defp update_assignments_for_identity(identity_id, set) do

@@ -1075,7 +1075,6 @@ defmodule CodexPooler.UpstreamsTest do
       %{user: owner} = bootstrap_owner_fixture()
       owner_scope = Scope.for_user(owner, ["instance_owner"])
       %{user: admin} = operator_fixture(owner, %{"email" => "upstream-admin@example.com"})
-      admin_scope = Scope.for_user(admin, ["instance_admin"])
       pool = pool_fixture()
       identity = active_identity_fixture(%{chatgpt_account_id: "acct_scoped_lifecycle"})
 
@@ -1084,6 +1083,9 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert {:ok, _assignment} =
                PoolAssignments.activate_pool_assignment(assignment)
+
+      operator_pool_assignment_fixture(admin, pool, created_by_user_id: owner.id)
+      admin_scope = Scope.for_user(admin)
 
       assert {:ok, result} =
                Upstreams.pause_account_for_scope(admin_scope, identity.id, %{
@@ -1098,6 +1100,110 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert {:error, %{code: :pool_assignment_not_found}} =
                Upstreams.pause_account_for_scope(owner_scope, unassigned_identity.id, %{})
+    end
+
+    test "assigned-pool admin cannot mutate a shared identity with hidden assignments" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+      visible_pool = pool_fixture(%{name: "Visible Pool"})
+      hidden_pool = pool_fixture(%{name: "Hidden Pool"})
+      identity = active_identity_fixture(%{chatgpt_account_id: "acct_shared_hidden_lifecycle"})
+
+      assert {:ok, visible_assignment} =
+               PoolAssignments.create_pool_assignment(visible_pool, identity)
+
+      assert {:ok, visible_assignment} =
+               PoolAssignments.activate_pool_assignment(visible_assignment)
+
+      assert {:ok, hidden_assignment} =
+               PoolAssignments.create_pool_assignment(hidden_pool, identity)
+
+      assert {:ok, hidden_assignment} =
+               PoolAssignments.activate_pool_assignment(hidden_assignment)
+
+      operator_pool_assignment_fixture(admin, visible_pool, created_by_user_id: owner.id)
+      admin_scope = Scope.for_user(admin)
+
+      assert {:error, %{code: :capability_denied}} =
+               Upstreams.pause_account_for_scope(admin_scope, identity.id, %{
+                 reason: "scoped_pause"
+               })
+
+      assert {:error, %{code: :capability_denied}} =
+               Upstreams.soft_delete_account_for_scope(admin_scope, identity.id, %{
+                 reason: "scoped_delete"
+               })
+
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "active"
+      assert Repo.get!(PoolUpstreamAssignment, visible_assignment.id).status == "active"
+      assert Repo.get!(PoolUpstreamAssignment, hidden_assignment.id).status == "active"
+      assert audit_events("upstream_account.pause", identity.id) == []
+      assert audit_events("upstream_account.delete", identity.id) == []
+    end
+
+    test "assigned-pool admin cannot import an existing account into an unassigned target pool" do
+      configure_upstream_secret_key!()
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      owner_scope = Scope.for_user(owner)
+      %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+      source_pool = pool_fixture(%{name: "Source Pool"})
+      target_pool = pool_fixture(%{name: "Target Pool"})
+      account_id = "acct_import_unassigned_target"
+
+      operator_pool_assignment_fixture(admin, source_pool, created_by_user_id: owner.id)
+      admin_scope = Scope.for_user(admin)
+
+      assert {:ok, %{identity: identity, assignment: source_assignment}} =
+               Upstreams.import_codex_auth_json(
+                 owner_scope,
+                 source_pool,
+                 auth_json_fixture(account_id: account_id)
+               )
+
+      assert {:error, %{code: :capability_denied}} =
+               Upstreams.import_codex_auth_json(
+                 admin_scope,
+                 target_pool,
+                 auth_json_fixture(account_id: account_id)
+               )
+
+      assert Repo.aggregate(UpstreamIdentity, :count) == 1
+      assert Repo.aggregate(PoolUpstreamAssignment, :count) == 1
+      assert Repo.get!(PoolUpstreamAssignment, source_assignment.id).pool_id == source_pool.id
+      assert Upstreams.get_upstream_identity(identity.id).status == "active"
+    end
+
+    test "assigned-pool admin can import an existing account into an assigned target pool" do
+      configure_upstream_secret_key!()
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      owner_scope = Scope.for_user(owner)
+      %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+      source_pool = pool_fixture(%{name: "Source Pool"})
+      target_pool = pool_fixture(%{name: "Target Pool"})
+      account_id = "acct_import_assigned_target"
+
+      operator_pool_assignment_fixture(admin, source_pool, created_by_user_id: owner.id)
+      operator_pool_assignment_fixture(admin, target_pool, created_by_user_id: owner.id)
+      admin_scope = Scope.for_user(admin)
+
+      assert {:ok, %{identity: identity}} =
+               Upstreams.import_codex_auth_json(
+                 owner_scope,
+                 source_pool,
+                 auth_json_fixture(account_id: account_id)
+               )
+
+      assert {:ok, %{status: :existing, identity: imported, assignment: target_assignment}} =
+               Upstreams.import_codex_auth_json(
+                 admin_scope,
+                 target_pool,
+                 auth_json_fixture(account_id: account_id)
+               )
+
+      assert imported.id == identity.id
+      assert target_assignment.pool_id == target_pool.id
+      assert Repo.aggregate(UpstreamIdentity, :count) == 1
+      assert Repo.aggregate(PoolUpstreamAssignment, :count) == 2
     end
 
     test "scoped lifecycle entry points record sanitized user audit events" do
