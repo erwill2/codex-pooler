@@ -334,7 +334,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         filter_values
       )
 
-    socket = maybe_subscribe_pool_events(socket, pools)
+    socket = maybe_subscribe_pool_events(socket, filtered_pools)
 
     assign(socket,
       pools: pools,

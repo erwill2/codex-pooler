@@ -46,9 +46,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamFilterForm do
 
   defp filter_values(params) when is_map(params) do
     %{
-      "query" => string_param(params, "query") || "",
-      "pool_id" => string_param(params, "pool_id") || "",
-      "status" => string_param(params, "status") || ""
+      "query" => string_param(params, "query"),
+      "pool_id" => string_param(params, "pool_id"),
+      "status" => string_param(params, "status")
     }
   end
 

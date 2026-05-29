@@ -394,7 +394,9 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     {:ok, first_start} = InviteOnboarding.start_device(first_token)
 
     {:ok, first_completed} =
-      InviteOnboarding.poll_device(first_token, first_start.account.identity.id)
+      publish_from_task(fn ->
+        InviteOnboarding.poll_device(first_token, first_start.account.identity.id)
+      end)
 
     assert_receive {Events, %{topics: ["upstreams"], reason: "upstream_account_onboarded"}}
 
@@ -627,6 +629,12 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
         end
       )
     end
+  end
+
+  defp publish_from_task(fun) when is_function(fun, 0) do
+    fun
+    |> Task.async()
+    |> Task.await(5_000)
   end
 
   defp assert_public_footer(view, selector) do
