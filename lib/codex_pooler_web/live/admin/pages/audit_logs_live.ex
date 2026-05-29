@@ -17,7 +17,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
   def mount(_params, _session, socket) do
     {:ok,
      assign(socket,
-       page_title: "Admin audit logs",
+       page_title: "Audit logs",
        pools: [],
        selected_pool: nil,
        audit_logs: empty_audit_logs(),

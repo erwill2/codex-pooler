@@ -38,7 +38,7 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
     {:ok,
      socket
      |> assign(
-       page_title: "Admin system",
+       page_title: "System",
        selected_tab: @default_tab,
        system_tabs: system_tabs(development_helpers_available?),
        settings: settings,

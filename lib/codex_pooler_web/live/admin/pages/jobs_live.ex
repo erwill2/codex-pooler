@@ -19,7 +19,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
     {:ok,
      socket
      |> assign(
-       page_title: "Admin jobs",
+       page_title: "Jobs",
        jobs: [],
        worker_cards: worker_cards(%{}),
        recent_jobs: [],
