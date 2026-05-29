@@ -76,6 +76,7 @@
   "fixture_files": [
     "openai-node-responses-basic.json",
     "openai-python-chat-basic.json",
+    "opencode-responses-replay-continuation.json",
     "vercel-ai-responses-tool-continuation.json",
     "vercel-ai-sdk-openai-flat-tool.json"
   ]

@@ -371,6 +371,103 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :v1_websocket
+  test "GET /v1/responses websocket accepts opencode replay continuation items" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_websocket_opencode_replay",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    request_id = "v1-public-ws-opencode-#{System.unique_integer([:positive])}"
+
+    {conn, websocket, ref, _response_headers} =
+      public_v1_websocket_connect!(port, setup, request_id, [
+        {"openai-beta", "responses_websockets=2026-02-06"},
+        {"session-id", request_id}
+      ])
+
+    try do
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "previous_response_id" => "resp_v1_ws_opencode_previous",
+          "store" => false,
+          "input" => [
+            %{
+              "role" => "assistant",
+              "id" => "msg_v1_ws_opencode_assistant",
+              "content" => [%{"type" => "output_text", "text" => "synthetic assistant replay"}]
+            },
+            %{
+              "type" => "reasoning",
+              "id" => "rs_v1_ws_opencode_reasoning",
+              "summary" => [%{"type" => "summary_text", "text" => "synthetic summary"}],
+              "encrypted_content" => nil
+            },
+            %{
+              "type" => "function_call",
+              "id" => "fc_v1_ws_opencode_call",
+              "call_id" => "call_v1_ws_opencode_replay",
+              "name" => "lookup_fixture",
+              "arguments" => "{\"value\":\"sample\"}"
+            },
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_v1_ws_opencode_replay",
+              "output" => [
+                %{"type" => "input_text", "text" => "synthetic tool text"},
+                %{"type" => "input_image", "image_url" => "https://example.com/sample.png"}
+              ]
+            }
+          ]
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+      assert %{"id" => "resp_v1_websocket_opencode_replay"} = Jason.decode!(frame)
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.path == "/backend-api/codex/responses"
+      assert captured.json["type"] == "response.create"
+      assert captured.json["store"] == false
+      assert captured.json["previous_response_id"] == "resp_v1_ws_opencode_previous"
+
+      assert Enum.map(captured.json["input"], &(&1["type"] || "message:" <> &1["role"])) == [
+               "message:assistant",
+               "reasoning",
+               "function_call",
+               "function_call_output"
+             ]
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.endpoint == "/v1/responses"
+      assert request.transport == "websocket"
+      assert request.status == "succeeded"
+
+      persistence_text = inspect(request.request_metadata)
+      refute persistence_text =~ "synthetic assistant replay"
+      refute persistence_text =~ "synthetic summary"
+      refute persistence_text =~ "synthetic tool text"
+      refute persistence_text =~ "resp_v1_ws_opencode_previous"
+      refute persistence_text =~ "call_v1_ws_opencode_replay"
+      refute persistence_text =~ setup.authorization
+      refute persistence_text =~ setup.raw_key
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  @tag :v1_websocket
   test "GET /v1/responses keeps opencode continuity headers local without forwarding" do
     upstream =
       start_upstream(

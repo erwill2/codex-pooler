@@ -118,6 +118,90 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     end
 
     @tag :tool_result_previous_response
+    test "v1 Responses forwards opencode replay continuation item types without metadata leakage",
+         %{
+           conn: conn
+         } do
+      upstream =
+        start_upstream(
+          FakeUpstream.json_response(%{
+            "id" => "resp_v1_opencode_replay",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          })
+        )
+
+      setup = gateway_setup(upstream)
+
+      response_conn =
+        conn
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "previous_response_id" => "resp_v1_opencode_previous",
+          "store" => false,
+          "input" => [
+            %{
+              "role" => "assistant",
+              "id" => "msg_v1_opencode_assistant",
+              "content" => [%{"type" => "output_text", "text" => "synthetic assistant replay"}]
+            },
+            %{
+              "type" => "reasoning",
+              "id" => "rs_v1_opencode_reasoning",
+              "summary" => [%{"type" => "summary_text", "text" => "synthetic summary"}],
+              "encrypted_content" => nil
+            },
+            %{
+              "type" => "function_call",
+              "id" => "fc_v1_opencode_call",
+              "call_id" => "call_v1_opencode_replay",
+              "name" => "lookup_fixture",
+              "arguments" => "{\"value\":\"sample\"}"
+            },
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_v1_opencode_replay",
+              "output" => [
+                %{"type" => "input_text", "text" => "synthetic tool text"},
+                %{"type" => "input_image", "image_url" => "https://example.com/sample.png"}
+              ]
+            }
+          ]
+        })
+
+      assert %{"id" => "resp_v1_opencode_replay"} = json_response(response_conn, 200)
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.path == "/backend-api/codex/responses"
+      assert captured.json["previous_response_id"] == "resp_v1_opencode_previous"
+
+      assert Enum.map(captured.json["input"], & &1["type"]) == [
+               "message",
+               "reasoning",
+               "function_call",
+               "function_call_output"
+             ]
+
+      assert captured.json["input"] |> Enum.at(0) |> Map.get("role") == "assistant"
+      assert captured.json["input"] |> Enum.at(1) |> Map.get("summary") |> length() == 1
+
+      assert captured.json["input"] |> Enum.at(3) |> Map.get("output") |> Enum.map(& &1["type"]) ==
+               ["input_text", "input_image"]
+
+      metadata = persisted_gateway_metadata(setup.pool.id)
+      refute metadata =~ "synthetic assistant replay"
+      refute metadata =~ "synthetic summary"
+      refute metadata =~ "synthetic tool text"
+      refute metadata =~ "resp_v1_opencode_previous"
+      refute metadata =~ "msg_v1_opencode_assistant"
+      refute metadata =~ "rs_v1_opencode_reasoning"
+      refute metadata =~ "fc_v1_opencode_call"
+      refute metadata =~ "call_v1_opencode_replay"
+      refute metadata =~ "raw_request"
+    end
+
+    @tag :tool_result_previous_response
     test "v1 Responses rejects stale or malformed previous-response references before dispatch",
          _context do
       upstream =
