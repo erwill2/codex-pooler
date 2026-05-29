@@ -25,7 +25,6 @@ defmodule CodexPooler.Pools.Membership do
     |> validate_required([:user_id, :role, :status])
     |> validate_inclusion(:role, Authorization.role_values())
     |> validate_inclusion(:status, ["active", "revoked"])
-    |> unique_constraint(:role, name: :memberships_single_instance_owner_active_uq)
     |> unique_constraint(:role, name: :memberships_global_role_active_uq)
   end
 end

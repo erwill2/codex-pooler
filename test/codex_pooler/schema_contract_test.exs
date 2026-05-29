@@ -11,7 +11,7 @@ defmodule CodexPooler.SchemaContractTest do
   alias CodexPooler.Files.FileRecord
   alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, RoutingCircuitState}
   alias CodexPooler.InstanceSettings.Settings
-  alias CodexPooler.Pools.RoutingSettings
+  alias CodexPooler.Pools.{OperatorPoolAssignment, RoutingSettings}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota
 
@@ -19,7 +19,7 @@ defmodule CodexPooler.SchemaContractTest do
     account_quota_windows api_key_policy_bindings api_keys attempts audit_events bridge_owner_leases
     bridge_session_aliases codex_files codex_sessions codex_turns daily_rollups
     encrypted_secrets gateway_idempotency_keys instance_settings invite_acceptances invites ledger_entries memberships
-    models platform_bootstrap_state pricing_snapshots recovery_codes requests routing_circuit_states
+    models operator_pool_assignments platform_bootstrap_state pricing_snapshots recovery_codes requests routing_circuit_states
     sessions sync_runs pools pool_routing_settings pool_upstream_assignments totp_settings
     upstream_identities users
   )
@@ -51,6 +51,7 @@ defmodule CodexPooler.SchemaContractTest do
     CodexPooler.Accounting.Request,
     CodexPooler.Gateway.Persistence.RoutingCircuitState,
     CodexPooler.Pools.Membership,
+    OperatorPoolAssignment,
     CodexPooler.Pools.Pool,
     RoutingSettings,
     Quota.AccountQuotaWindow,
@@ -89,7 +90,7 @@ defmodule CodexPooler.SchemaContractTest do
     for name <- [
           "users_email_active_uq",
           "pools_slug_uq",
-          "memberships_single_instance_owner_active_uq",
+          "operator_pool_assignments_user_pool_active_uq",
           "api_key_policy_default_active_uq",
           "api_key_policy_model_active_uq",
           "encrypted_secrets_active_kind_uq",
@@ -109,8 +110,15 @@ defmodule CodexPooler.SchemaContractTest do
       assert Map.has_key?(indexes, name)
     end
 
+    refute Map.has_key?(indexes, "memberships_single_instance_owner_active_uq")
+
     assert indexes["users_email_active_uq"] =~ "lower(email)"
     assert indexes["users_email_active_uq"] =~ "WHERE (deleted_at IS NULL)"
+    assert indexes["operator_pool_assignments_user_pool_active_uq"] =~ "(user_id, pool_id)"
+
+    assert indexes["operator_pool_assignments_user_pool_active_uq"] =~
+             "WHERE (status = 'active'::text)"
+
     assert indexes["api_key_policy_model_active_uq"] =~ "lower(model_identifier)"
     assert indexes["ledger_entries_settlement_request_uq"] =~ "entry_kind = 'settlement'"
     assert indexes["account_quota_windows_evidence_identity_uq"] =~ "quota_scope"
@@ -129,6 +137,9 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert constraints["api_keys_status_check"] =~ "'paused'"
     refute constraints["api_keys_status_check"] =~ "'disabled'"
+    assert constraints["operator_pool_assignments_status_check"] =~ "'active'"
+    assert constraints["operator_pool_assignments_status_check"] =~ "'revoked'"
+    refute constraints["operator_pool_assignments_status_check"] =~ "'disabled'"
 
     assert constraints["requests_endpoint_check"] =~ "'/backend-api/codex/models'"
     assert constraints["requests_endpoint_check"] =~ "'/backend-api/codex/responses'"
@@ -259,7 +270,43 @@ defmodule CodexPooler.SchemaContractTest do
     assert fk_action("codex_files_upstream_identity_id_fkey") == {"n", "a"}
     assert fk_action("bridge_session_aliases_codex_session_id_fkey") == {"c", "a"}
     assert fk_action("bridge_owner_leases_pool_upstream_assignment_id_fkey") == {"n", "a"}
+    assert fk_action("operator_pool_assignments_user_id_fkey") == {"c", "a"}
+    assert fk_action("operator_pool_assignments_pool_id_fkey") == {"c", "a"}
+    assert fk_action("operator_pool_assignments_created_by_user_id_fkey") == {"a", "a"}
     assert fk_action("instance_settings_updated_by_user_id_fkey") == {"n", "a"}
+  end
+
+  test "operator pool assignments preserve the scoped admin grant storage contract" do
+    columns = table_columns("operator_pool_assignments")
+
+    assert Map.take(columns, [
+             "id",
+             "user_id",
+             "pool_id",
+             "status",
+             "created_by_user_id",
+             "created_at",
+             "updated_at",
+             "revoked_at"
+           ]) == %{
+             "id" => {"uuid", "NO"},
+             "user_id" => {"uuid", "NO"},
+             "pool_id" => {"uuid", "NO"},
+             "status" => {"text", "NO"},
+             "created_by_user_id" => {"uuid", "YES"},
+             "created_at" => {"timestamp without time zone", "NO"},
+             "updated_at" => {"timestamp without time zone", "NO"},
+             "revoked_at" => {"timestamp without time zone", "YES"}
+           }
+
+    assert OperatorPoolAssignment.__schema__(:source) == "operator_pool_assignments"
+    assert OperatorPoolAssignment.__schema__(:type, :user_id) == :binary_id
+    assert OperatorPoolAssignment.__schema__(:type, :pool_id) == :binary_id
+    assert OperatorPoolAssignment.__schema__(:type, :status) == :string
+    assert OperatorPoolAssignment.__schema__(:type, :created_by_user_id) == :binary_id
+    assert OperatorPoolAssignment.__schema__(:type, :created_at) == :utc_datetime_usec
+    assert OperatorPoolAssignment.__schema__(:type, :updated_at) == :utc_datetime_usec
+    assert OperatorPoolAssignment.__schema__(:type, :revoked_at) == :utc_datetime_usec
   end
 
   test "instance settings singleton table preserves the typed singleton contract" do

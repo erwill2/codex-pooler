@@ -37,7 +37,8 @@ model support, limits, session continuity, routing policy, and health.
 
 Operators get one place to manage accounts, keys, routing, request accounting,
 audit logs, and health without storing prompts, files, audio, images, bearer
-tokens, or raw Codex secrets.
+tokens, or raw Codex secrets. Instance owners keep the global administration
+surface, while instance admins work only with their assigned Pools.
 
 ## Highlights
 
@@ -58,8 +59,9 @@ tokens, or raw Codex secrets.
 - **Prompt-cache locality:** use a transient `prompt_cache_key` to prefer the
   same eligible upstream account for repeat stateless requests, improving
   provider-side cache locality without storing prompts or responses locally
-- **Operator dashboard:** manage Pools, Codex accounts, API keys, invites,
-  request logs, audit logs, jobs, operators, MCP access, and global settings
+- **Operator dashboard:** manage Pool-scoped accounts, API keys, invites,
+  usage, request logs, audit logs, MCP access, and the owner-only jobs,
+  operators, and system settings surfaces
 - **Privacy-minded observability:** store request, routing, and audit metadata
   without storing prompts, file bodies, audio, images, bearer tokens, cookies,
   raw Codex account tokens, or raw API keys
@@ -131,6 +133,19 @@ Use the generated Pool API key as the bearer token. That key represents the
 Pool, not a single Codex account, so Codex Pooler can pick the best eligible
 account for each request. Raw API keys are shown only once when created or
 rotated.
+
+## Operator Roles
+
+The first bootstrap account is an `instance_owner`. Owners have instance-wide
+administration access: they create Pools, assign operators to Pools, manage
+operators, inspect global jobs, and change system settings.
+
+Additional operators can be owners or `instance_admin`s. Instance admins are
+Pool-scoped: they can work only with active Pools assigned to them and metadata
+derived from those Pools. If no Pools are assigned, the admin UI shows empty
+Pool-scoped states instead of exposing global data. Archiving or deleting a Pool
+removes future instance-admin visibility for that Pool; historical request and
+audit rows for archived or deleted Pools remain owner-only.
 
 ## Harness Configuration
 
@@ -768,8 +783,10 @@ route-specific timeout defaults are required.
 Codex Pooler includes a metadata-only MCP endpoint at `/mcp` for trusted
 operators who want an MCP host to inspect Pools, upstream accounts, Pool API key
 metadata, operators, invites, request logs, audit logs, and MCP service status.
-The service is read-only and has no mutation tools, but connected MCP hosts can
-read administrative metadata, so only connect hosts you trust with that view.
+The service is read-only and has no mutation tools. It uses the same owner vs
+assigned-Pool visibility model as the admin UI, but connected MCP hosts can read
+the metadata visible to that operator, so only connect hosts you trust with that
+view.
 
 MCP access uses operator-owned bearer MCP tokens, not Pool API keys, browser
 sessions, cookies, query tokens, invite tokens, upstream tokens, or custom
