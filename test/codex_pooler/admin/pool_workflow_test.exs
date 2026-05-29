@@ -21,10 +21,12 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
       assert :ok = Events.subscribe_all_pools()
 
       assert {:ok, pool} =
-               PoolWorkflow.create_pool_with_related_settings(scope, %{
-                 "name" => "Workflow Commit",
-                 "routing_strategy" => "bridge_ring"
-               })
+               publish_from_task(fn ->
+                 PoolWorkflow.create_pool_with_related_settings(scope, %{
+                   "name" => "Workflow Commit",
+                   "routing_strategy" => "bridge_ring"
+                 })
+               end)
 
       assert Pools.get_pool(pool.id)
       assert_receive {Events, event}
@@ -41,11 +43,13 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
       assert :ok = Events.subscribe_all_pools()
 
       assert {:error, %{message: "selected API keys are not available"}} =
-               PoolWorkflow.create_pool_with_related_settings(scope, %{
-                 "name" => "Workflow Rollback",
-                 "api_key_ids" => [missing_api_key_id],
-                 "routing_strategy" => "bridge_ring"
-               })
+               publish_from_task(fn ->
+                 PoolWorkflow.create_pool_with_related_settings(scope, %{
+                   "name" => "Workflow Rollback",
+                   "api_key_ids" => [missing_api_key_id],
+                   "routing_strategy" => "bridge_ring"
+                 })
+               end)
 
       refute Repo.get_by(Pool, slug: "workflow-rollback")
       refute_receive {Events, _event}
@@ -65,13 +69,15 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
         upstream_assignment_fixture(target_pool, %{chatgpt_account_id: "acct_workflow_detach"})
 
       assert {:ok, updated_pool} =
-               PoolWorkflow.update_pool_with_related_settings(scope, target_pool, %{
-                 "name" => "Workflow Target Updated",
-                 "status" => "active",
-                 "routing_strategy" => "bridge_ring",
-                 "upstream_identity_ids" => [moved_identity.id],
-                 "api_key_ids" => []
-               })
+               publish_from_task(fn ->
+                 PoolWorkflow.update_pool_with_related_settings(scope, target_pool, %{
+                   "name" => "Workflow Target Updated",
+                   "status" => "active",
+                   "routing_strategy" => "bridge_ring",
+                   "upstream_identity_ids" => [moved_identity.id],
+                   "api_key_ids" => []
+                 })
+               end)
 
       assert updated_pool.id == target_pool.id
       assert updated_pool.name == "Workflow Target Updated"
@@ -94,5 +100,11 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
       assert event.reason == "pool_updated"
       refute_receive {Events, _event}
     end
+  end
+
+  defp publish_from_task(fun) when is_function(fun, 0) do
+    fun
+    |> Task.async()
+    |> Task.await(5_000)
   end
 end

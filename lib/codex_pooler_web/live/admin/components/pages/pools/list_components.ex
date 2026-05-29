@@ -48,8 +48,8 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           <AdminComponents.empty_state
             :if={@pools == []}
             id="pool-empty-state"
-            title="No Pools Found"
-            description="Create the first Pool before connecting upstreams or issuing API keys."
+            title={if @can_manage_pools?, do: "No Pools Found", else: "No assigned Pools"}
+            description={pool_empty_description(@can_manage_pools?)}
             icon="hero-server-stack"
           >
             <:actions>
@@ -159,6 +159,12 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     </dialog>
     """
   end
+
+  defp pool_empty_description(true),
+    do: "Create the first Pool before connecting upstreams or issuing API keys."
+
+  defp pool_empty_description(false),
+    do: "Ask an instance owner to assign you to a Pool before managing Pool-scoped resources."
 
   attr :form, Phoenix.HTML.Form, required: true
 

@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
   alias CodexPooler.Events
   alias CodexPooler.Pools
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.Admin.PoolForm
   alias CodexPoolerWeb.Admin.PoolListComponents
   alias CodexPoolerWeb.Admin.PoolsReadModel
@@ -372,25 +373,26 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
   end
 
   defp load_pools(socket) do
-    socket = maybe_subscribe_pool_events(socket)
-
-    assign(
-      socket,
+    page_state =
       PoolsReadModel.load(
         socket.assigns.current_scope,
         socket.assigns.pool_filters,
         socket.assigns.selected_pool_id
       )
-    )
+
+    socket
+    |> assign(page_state)
+    |> maybe_subscribe_pool_events(page_state.pools)
   end
 
-  defp maybe_subscribe_pool_events(socket) do
-    if connected?(socket) and !socket.assigns.subscribed_pool_events? do
-      :ok = Events.subscribe_all_pools()
-      assign(socket, :subscribed_pool_events?, true)
-    else
+  defp maybe_subscribe_pool_events(socket, pool_rows) do
+    pool_rows
+    |> Enum.map(& &1.pool.id)
+    |> MapSet.new()
+    |> then(fn target_pool_ids ->
+      {socket, _stale_pool_ids} = PoolEventSubscriptions.reconcile(socket, target_pool_ids)
       socket
-    end
+    end)
   end
 
   defp pool_inspector_tab(tab) when tab in ["overview", "upstreams", "api_keys"],

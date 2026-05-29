@@ -10,7 +10,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   alias CodexPooler.Accounts
   alias CodexPooler.Events
   alias CodexPooler.Pools
-  alias CodexPooler.Pools.Pool
+  alias CodexPooler.Pools.{OperatorPoolAssignment, Pool}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
@@ -21,6 +21,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   setup :register_and_log_in_user
 
   test "renders empty pools guidance without a duplicate reset action", %{conn: conn} do
+    Repo.delete_all(Pool)
+
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
 
     assert has_element?(view, "#pool-empty-state", "No Pools Found")
@@ -69,6 +71,70 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     refute log =~ "admin option loader unavailable"
     refute log =~ "capability_denied"
+  end
+
+  test "assigned admin sees only assigned pools without owner pool controls", %{scope: scope} do
+    {:ok, assigned_pool} =
+      Pools.create_pool(scope, %{slug: "browser-assigned", name: "Browser Assigned"})
+
+    {:ok, hidden_pool} =
+      Pools.create_pool(scope, %{slug: "browser-hidden", name: "Browser Hidden"})
+
+    %{user: admin, temporary_password: temporary_password} =
+      operator_fixture(scope, %{
+        "email" => "browser-assigned-admin@example.com",
+        "password_change_required" => "false"
+      })
+
+    operator_pool_assignment_fixture(admin, assigned_pool, created_by_user_id: scope.user.id)
+
+    assert {:ok, %{token: token}} =
+             Accounts.login_user(%{"email" => admin.email, "password" => temporary_password})
+
+    admin_conn = log_in_user(build_conn(), admin, token)
+    {:ok, view, html} = live(admin_conn, ~p"/admin/pools")
+
+    assert has_element?(view, "#pool-row-#{assigned_pool.id}")
+    refute html =~ hidden_pool.name
+    refute html =~ hidden_pool.slug
+    refute has_element?(view, "#pool-row-#{hidden_pool.id}")
+    refute has_element?(view, "#pools-page-create-action")
+    refute has_element?(view, "#pool-create-dialog")
+
+    state = :sys.get_state(view.pid)
+    refute state.socket.assigns.can_manage_pools?
+    assert Enum.map(state.socket.assigns.pools, & &1.pool.id) == [assigned_pool.id]
+  end
+
+  test "unassigned admin sees explicit assigned-pool empty state without owner controls", %{
+    scope: scope
+  } do
+    {:ok, hidden_pool} =
+      Pools.create_pool(scope, %{slug: "browser-unassigned-hidden", name: "Browser Hidden"})
+
+    %{user: admin, temporary_password: temporary_password} =
+      operator_fixture(scope, %{
+        "email" => "browser-unassigned-admin@example.com",
+        "password_change_required" => "false"
+      })
+
+    assert {:ok, %{token: token}} =
+             Accounts.login_user(%{"email" => admin.email, "password" => temporary_password})
+
+    admin_conn = log_in_user(build_conn(), admin, token)
+    {:ok, view, html} = live(admin_conn, ~p"/admin/pools")
+
+    assert has_element?(view, "#pool-empty-state", "No assigned Pools")
+
+    assert has_element?(
+             view,
+             "#pool-empty-state",
+             "Ask an instance owner to assign you to a Pool before managing Pool-scoped resources."
+           )
+
+    refute html =~ hidden_pool.name
+    refute has_element?(view, "#pools-page-create-action")
+    refute has_element?(view, "#pool-empty-create-action")
   end
 
   test "loads row summary data for pools without extra per-row queries", %{
@@ -294,12 +360,13 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     scope: scope
   } do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "admin-pools", name: "Admin Pools"})
+    expected_pool_total = Repo.aggregate(Pool, :count, :id) |> Integer.to_string()
 
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
 
     assert has_element?(view, "#admin-pools-live")
     assert has_element?(view, "#pool-metrics")
-    assert has_element?(view, "#pool-metric-total", "1")
+    assert has_element?(view, "#pool-metric-total", expected_pool_total)
     assert has_element?(view, "#pool-metric-total[data-density='compact']")
     assert has_element?(view, "#pool-metric-upstreams", "0")
     assert has_element?(view, "#pool-metric-upstreams .hero-cloud-arrow-up")
@@ -639,6 +706,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     {:ok, existing_pool} =
       Pools.create_pool(scope, %{slug: "duplicate-pool", name: "Duplicate Pool"})
 
+    initial_pool_count = Repo.aggregate(Pool, :count, :id)
+
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
 
     open_create_dialog(view)
@@ -648,7 +717,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     |> render_submit(%{"pool" => %{"name" => "Duplicate Pool!!!"}})
 
     assert has_element?(view, "#pool-create-dialog[open]")
-    assert Repo.aggregate(Pool, :count, :id) == 1
+    assert Repo.aggregate(Pool, :count, :id) == initial_pool_count
     assert has_element?(view, "#pool-row-#{existing_pool.id}", "Duplicate Pool")
   end
 
@@ -656,6 +725,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   test "create validation keeps selected routing and upstream values", %{conn: conn, scope: scope} do
     {:ok, _existing_pool} =
       Pools.create_pool(scope, %{slug: "duplicate-routed-pool", name: "Duplicate Routed Pool"})
+
+    initial_pool_count = Repo.aggregate(Pool, :count, :id)
 
     identity = active_identity_fixture(account_label: "Preserved create account")
 
@@ -688,7 +759,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     refute has_element?(view, "#pool_control_plane_analytics_forwarding_enabled[checked]")
     refute has_element?(view, "#pool_v1_compatibility_enabled[checked]")
 
-    assert Repo.aggregate(Pool, :count, :id) == 1
+    assert Repo.aggregate(Pool, :count, :id) == initial_pool_count
   end
 
   test "edits pool name and status while keeping the slug readonly", %{
@@ -1349,6 +1420,15 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   } do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "deletable-pool", name: "Deletable Pool"})
 
+    %{user: admin} =
+      operator_fixture(scope, %{
+        "email" => "pool-archive-assigned-admin@example.com",
+        "password_change_required" => "false"
+      })
+
+    operator_assignment =
+      operator_pool_assignment_fixture(admin, pool, created_by_user_id: scope.user.id)
+
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
 
     assert has_element?(view, "#delete-pool-#{pool.id}[disabled]")
@@ -1375,6 +1455,11 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     archived_pool = Repo.get!(Pool, pool.id)
 
     assert archived_pool.status == "archived"
+
+    revoked_assignment = Repo.get!(OperatorPoolAssignment, operator_assignment.id)
+    assert revoked_assignment.status == "revoked"
+    assert revoked_assignment.revoked_at
+
     assert has_element?(view, "#pool-row-#{pool.id}-status", "archived")
     refute has_element?(view, "#delete-pool-#{pool.id}[disabled]")
 
@@ -1401,6 +1486,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     })
 
     refute Repo.get(Pool, pool.id)
+    refute Repo.get(OperatorPoolAssignment, operator_assignment.id)
     refute has_element?(view, "#pool-row-#{pool.id}")
     refute has_element?(view, "#pool-delete-dialog")
   end
