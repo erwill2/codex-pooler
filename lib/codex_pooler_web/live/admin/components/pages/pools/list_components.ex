@@ -314,7 +314,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     ~H"""
     <div
       id="pools-grid"
-      class="grid min-w-0 gap-3 overflow-visible lg:grid-cols-2 2xl:grid-cols-3"
+      class="grid min-w-0 gap-3 overflow-visible lg:grid-cols-2 2xl:grid-cols-3 [@media(width>=112rem)]:grid-cols-4"
     >
       <.pool_card
         :for={pool_row <- @pools}
@@ -471,9 +471,16 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           data-chart-compact="true"
         >
         </div>
-        <p :if={@traffic_histogram_card.empty?} class="pool-activity-empty-copy">
-          No traffic in the last 24h
-        </p>
+        <div
+          :if={@traffic_histogram_card.empty?}
+          class="pool-activity-empty-state"
+          data-role="pool-traffic-empty-state"
+        >
+          <span class="pool-activity-empty-state-icon" aria-hidden="true">
+            <.icon name="hero-chart-bar" class="size-4" />
+          </span>
+          <p class="pool-activity-empty-copy">No traffic in the last 24h</p>
+        </div>
         <ul class="sr-only">
           <li :for={point <- @traffic_histogram_card.points}>
             {point.label}: {point.tokens} tokens, {point.requests} requests
