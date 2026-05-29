@@ -94,6 +94,7 @@ defmodule CodexPooler.PoolerFixtures do
     identity =
       %UpstreamIdentity{
         chatgpt_account_id: Map.get(attrs, :chatgpt_account_id),
+        account_email: Map.get(attrs, :account_email),
         account_label: Map.get(attrs, :account_label, "Primary upstream"),
         onboarding_method: Map.get(attrs, :onboarding_method, "import"),
         status: Map.get(attrs, :identity_status, "active"),
@@ -132,6 +133,7 @@ defmodule CodexPooler.PoolerFixtures do
     assert {:ok, identity} =
              IdentityLifecycle.create_upstream_identity(%{
                chatgpt_account_id: Map.get(attrs, :chatgpt_account_id, "acct_#{unique}"),
+               account_email: Map.get(attrs, :account_email),
                account_label: Map.get(attrs, :account_label, "Gateway upstream #{unique}"),
                onboarding_method: Map.get(attrs, :onboarding_method, "import"),
                metadata: metadata

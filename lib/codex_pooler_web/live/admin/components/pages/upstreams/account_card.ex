@@ -611,7 +611,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
 
   @spec recovery_invite_email(map(), String.t()) :: String.t() | nil
   defp recovery_invite_email(account, pool_id) do
-    [account.identity.chatgpt_account_id, account.label]
+    [
+      account.identity.account_email,
+      account.identity.chatgpt_account_id,
+      account.label
+    ]
     |> Enum.map(&present_string/1)
     |> Enum.reject(&is_nil/1)
     |> Enum.find(&valid_invite_email?(&1, pool_id))

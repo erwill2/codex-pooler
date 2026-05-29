@@ -1940,7 +1940,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
         %{identity: identity} =
           upstream_assignment_fixture(pool, %{
-            chatgpt_account_id: email,
+            chatgpt_account_id: "acct-#{status}-#{System.unique_integer([:positive])}",
+            account_email: email,
             account_label: "Recover #{status}",
             identity_status: status,
             identity_metadata: blocked_auth_metadata(status)
@@ -1953,8 +1954,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     %{identity: fallback_identity} =
       upstream_assignment_fixture(pool, %{
-        chatgpt_account_id: "acct-not-an-email",
-        account_label: fallback_email,
+        chatgpt_account_id: fallback_email,
+        account_label: "Fallback account label",
+        identity_status: "paused",
+        identity_metadata: blocked_auth_metadata("failed")
+      })
+
+    account_email = "stored-#{System.unique_integer([:positive])}@example.com"
+
+    %{identity: account_email_identity} =
+      upstream_assignment_fixture(pool, %{
+        chatgpt_account_id: "acct-renamed-not-an-email",
+        account_email: account_email,
+        account_label: "Renamed account label",
         identity_status: "paused",
         identity_metadata: blocked_auth_metadata("failed")
       })
@@ -1989,6 +2001,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#reinvite-upstream-account-#{fallback_identity.id}[href*='invited_email=#{encoded_fallback_email}']",
+             "Reinvite account"
+           )
+
+    encoded_account_email = URI.encode_www_form(account_email)
+
+    assert has_element?(
+             view,
+             "#reinvite-upstream-account-#{account_email_identity.id}[href*='invited_email=#{encoded_account_email}']",
              "Reinvite account"
            )
 
