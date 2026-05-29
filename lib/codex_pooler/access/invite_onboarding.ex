@@ -281,6 +281,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
   defp activate_verified_identity(identity, invite, method, info) do
     IdentityLifecycle.activate_upstream_identity_with_plan(identity, %{
       chatgpt_account_id: info.chatgpt_account_id,
+      account_email: info.email,
       account_label: info.email || identity.account_label,
       plan_family: info.plan_family,
       plan_label: info.plan_label,
@@ -288,6 +289,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
         identity.metadata
         |> complete_onboarding_metadata(invite, method)
         |> Map.put("chatgpt_user_id", info.chatgpt_user_id)
+        |> put_account_email(info.email)
     })
   end
 
@@ -297,6 +299,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
       assignment,
       %{
         chatgpt_account_id: info.chatgpt_account_id,
+        account_email: info.email,
         account_label: info.email || identity.account_label,
         plan_family: info.plan_family,
         plan_label: info.plan_label,
@@ -304,6 +307,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
           identity.metadata
           |> complete_onboarding_metadata(invite, method)
           |> Map.put("chatgpt_user_id", info.chatgpt_user_id)
+          |> put_account_email(info.email)
       },
       %{
         metadata: complete_onboarding_metadata(assignment.metadata, invite, method),
@@ -377,6 +381,11 @@ defmodule CodexPooler.Access.InviteOnboarding do
   end
 
   defp invite_bound?(metadata, invite), do: Map.get(metadata || %{}, "invite_id") == invite.id
+
+  defp put_account_email(metadata, email) when is_binary(email),
+    do: Map.put(metadata, "account_email", email)
+
+  defp put_account_email(metadata, _email), do: metadata
 
   defp present_string(value) when is_binary(value) do
     value = String.trim(value)

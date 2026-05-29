@@ -307,7 +307,9 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert Repo.aggregate(UpstreamIdentity, :count) == identity_count_before + 1
     assert Repo.aggregate(PoolUpstreamAssignment, :count) == assignment_count_before + 1
     assert Repo.aggregate(InviteAcceptance, :count) == acceptance_count_before + 1
-    assert Repo.one!(UpstreamIdentity).status == "active"
+    identity = Repo.one!(UpstreamIdentity)
+    assert identity.status == "active"
+    assert identity.account_email == "codex-user@example.com"
     assert Repo.one!(PoolUpstreamAssignment).status == "active"
     assert active_secret_count("access_token") == 1
     assert active_secret_count("refresh_token") == 1
@@ -378,7 +380,9 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
 
     assert has_element?(view, "#invite-accepted")
     assert has_element?(view, "#completed-account-email", "invited@example.com")
-    assert Repo.one!(UpstreamIdentity).status == "active"
+    identity = Repo.one!(UpstreamIdentity)
+    assert identity.status == "active"
+    assert identity.account_email == "invited@example.com"
     assert Repo.one!(PoolUpstreamAssignment).status == "active"
     assert active_secret_count("access_token") == 1
     assert active_secret_count("refresh_token") == 1
@@ -417,6 +421,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
 
     assert second_completed.identity.id == first_completed.identity.id
     assert second_completed.assignment.id == first_completed.assignment.id
+    assert second_completed.identity.account_email == "codex-user@example.com"
 
     assert Repo.aggregate(UpstreamIdentity, :count) == 1
     assert Repo.aggregate(PoolUpstreamAssignment, :count) == 1
@@ -473,6 +478,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert second_completed.identity.id == first_completed.identity.id
     assert second_completed.assignment.id != first_completed.assignment.id
     assert second_completed.assignment.pool_id == target_pool.id
+    assert second_completed.identity.account_email == "codex-user@example.com"
 
     assignments_by_pool =
       first_completed.identity
