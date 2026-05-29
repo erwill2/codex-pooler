@@ -3992,7 +3992,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         ]
       })
 
-    assert %{"error" => %{"code" => "file_assignment_conflict"}} = json_response(conn, 409)
+    assert_file_assignment_conflict_without_recovery!(conn)
     assert FakeUpstream.count(owner_file_upstream) == owner_dispatch_count
     assert FakeUpstream.count(other_file_upstream) == other_dispatch_count
 
@@ -4027,7 +4027,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         ]
       })
 
-    assert %{"error" => %{"code" => "file_assignment_conflict"}} = json_response(conn, 409)
+    assert_file_assignment_conflict_without_recovery!(conn)
     assert FakeUpstream.count(owner_file_upstream) == owner_dispatch_count
     assert FakeUpstream.count(other_file_upstream) == other_dispatch_count
 
@@ -4137,6 +4137,212 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute inspect(Repo.all(Request)) =~ "upload.invalid"
     refute inspect(Repo.all(Request)) =~ "download.invalid"
     refute inspect(Repo.all(Request)) =~ "conflict-other-token"
+  end
+
+  test "POST /backend-api/codex/responses fails closed for pinned reauth continuation anchors",
+       %{conn: _conn} do
+    pinned_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_pinned_reauth_should_not_dispatch",
+          "object" => "response"
+        })
+      )
+
+    fresh_start_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_pinned_reauth_fresh_start",
+          "object" => "response",
+          "usage" => %{
+            "input_tokens" => 5,
+            "output_tokens" => 2,
+            "total_tokens" => 7
+          }
+        })
+      )
+
+    setup = gateway_setup(pinned_upstream)
+
+    fresh_start =
+      gateway_upstream(
+        setup.pool,
+        fresh_start_upstream,
+        "upstream-token-pinned-reauth-fresh-start",
+        compact?: false
+      )
+
+    prime_routing_quota!(fresh_start.identity)
+    use_routing_strategy!(setup.pool, "bridge_ring", 2)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fresh_start.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    visible_input = [
+      %{
+        "type" => "message",
+        "role" => "user",
+        "content" => [
+          %{
+            "type" => "input_text",
+            "text" => "visible pinned reauth context must not persist"
+          }
+        ]
+      },
+      %{
+        "type" => "future_tool_call_output",
+        "call_id" => "call_pinned_reauth",
+        "output" => "visible tool result must not persist"
+      }
+    ]
+
+    mark_pinned_assignment_reauth_required!(setup)
+
+    previous_response_id = "resp_pinned_reauth_#{System.unique_integer([:positive])}"
+    register_previous_response_anchor!(auth, setup.assignment, previous_response_id)
+
+    turn_state = "turn-pinned-reauth-#{System.unique_integer([:positive])}"
+    register_turn_state_anchor!(auth, setup.assignment, turn_state)
+
+    local_header_cases =
+      for header <- [
+            "x-codex-session-id",
+            "session-id",
+            "x-session-affinity",
+            "session_id",
+            "x-codex-conversation-id"
+          ] do
+        value = "#{header}-pinned-reauth-#{System.unique_integer([:positive])}"
+        register_session_header_anchor!(auth, setup.assignment, value)
+        {"local #{header}", [{header, value}], %{"input" => visible_input}}
+      end
+
+    anchored_cases =
+      [
+        {"body previous_response_id", [],
+         %{
+           "previous_response_id" => previous_response_id,
+           "input" => visible_input
+         }},
+        {"header previous response", [{"x-codex-previous-response-id", previous_response_id}],
+         %{"input" => visible_input}},
+        {"accepted turn state", [{"x-codex-turn-state", turn_state}],
+         %{"input" => visible_input}},
+        {"tool result continuation", [],
+         %{
+           "previous_response_id" => previous_response_id,
+           "input" => [
+             %{
+               "type" => "future_tool_call_output",
+               "call_id" => "future_call_pinned_reauth",
+               "result" => %{
+                 "type" => "text",
+                 "text" => "visible future tool result must not persist"
+               }
+             }
+           ]
+         }}
+      ] ++ local_header_cases
+
+    for {{label, headers, payload}, index} <- Enum.with_index(anchored_cases) do
+      conn = post_backend_response(setup, headers, payload)
+
+      assert_pinned_reauth_recovery_response!(conn)
+
+      error_text = inspect(json_response(conn, 503))
+      refute error_text =~ previous_response_id, label
+      refute error_text =~ "visible pinned reauth context must not persist", label
+      refute error_text =~ "call_pinned_reauth", label
+      refute error_text =~ "visible tool result must not persist", label
+      refute error_text =~ setup.authorization, label
+      refute error_text =~ setup.raw_key, label
+      refute error_text =~ "Bearer ", label
+
+      assert FakeUpstream.count(pinned_upstream) == 0, label
+      assert FakeUpstream.count(fresh_start_upstream) == 0, label
+      assert Repo.aggregate(Attempt, :count) == 0, label
+
+      denied_requests =
+        Repo.all(
+          from(r in Request,
+            where: r.pool_id == ^setup.pool.id,
+            order_by: [asc: r.admitted_at, asc: r.id]
+          )
+        )
+
+      assert length(denied_requests) == index + 1, label
+      denied_request = List.last(denied_requests)
+      assert denied_request.status == "rejected", label
+      assert denied_request.last_error_code == "pinned_continuation_reauth_required", label
+
+      assert denied_request.request_metadata["continuity_denial"]["denial_family"] ==
+               "pinned_continuation_reauth"
+
+      denied_metadata_text =
+        inspect({
+          Enum.map(denied_requests, & &1.request_metadata),
+          RequestLogs.list(setup.pool)
+        })
+
+      refute denied_metadata_text =~ previous_response_id, label
+      refute denied_metadata_text =~ "visible pinned reauth context must not persist", label
+      refute denied_metadata_text =~ "call_pinned_reauth", label
+      refute denied_metadata_text =~ "visible tool result must not persist", label
+      refute denied_metadata_text =~ "future_call_pinned_reauth", label
+      refute denied_metadata_text =~ "visible future tool result must not persist", label
+      refute denied_metadata_text =~ setup.authorization, label
+      refute denied_metadata_text =~ setup.raw_key, label
+      refute denied_metadata_text =~ "upstream-token", label
+    end
+
+    fresh_conn =
+      post_backend_response(setup, [], %{
+        "input" => visible_input
+      })
+
+    assert %{"id" => "resp_pinned_reauth_fresh_start"} = json_response(fresh_conn, 200)
+    assert FakeUpstream.count(pinned_upstream) == 0
+    assert FakeUpstream.count(fresh_start_upstream) == 1
+
+    fresh_request =
+      Repo.one!(
+        from(r in Request,
+          where: r.pool_id == ^setup.pool.id and r.status == "succeeded",
+          order_by: [desc: r.admitted_at],
+          limit: 1
+        )
+      )
+
+    assert [fresh_attempt] =
+             Repo.all(from(a in Attempt, where: a.request_id == ^fresh_request.id))
+
+    assert fresh_request.status == "succeeded"
+    assert fresh_attempt.status == "succeeded"
+    assert fresh_attempt.pool_upstream_assignment_id == fresh_start.assignment.id
+
+    assert [captured] = FakeUpstream.requests(fresh_start_upstream)
+    assert captured.json["input"] == visible_input
+    refute Map.has_key?(captured.json, "previous_response_id")
+
+    metadata_text =
+      inspect(
+        {fresh_request.request_metadata, fresh_attempt.response_metadata,
+         RequestLogs.list(setup.pool)}
+      )
+
+    refute metadata_text =~ previous_response_id
+    refute metadata_text =~ "visible pinned reauth context must not persist"
+    refute metadata_text =~ "visible tool result must not persist"
+    refute metadata_text =~ "call_pinned_reauth"
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ setup.raw_key
+    refute metadata_text =~ "upstream-token"
   end
 
   test "POST /backend-api/codex/responses settles auto pricing from upstream response tier", %{
@@ -7426,5 +7632,110 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       [value | _rest] -> put_req_header(conn, "authorization", value)
       [] -> conn
     end
+  end
+
+  defp post_backend_response(setup, headers, payload) do
+    payload = Map.put(payload, "model", setup.model.exposed_model_id)
+
+    build_conn()
+    |> auth(setup)
+    |> put_request_headers(headers)
+    |> post("/backend-api/codex/responses", payload)
+  end
+
+  defp put_request_headers(conn, headers) do
+    Enum.reduce(headers, conn, fn {key, value}, conn -> put_req_header(conn, key, value) end)
+  end
+
+  defp register_previous_response_anchor!(auth, assignment, previous_response_id) do
+    session = register_session_header_anchor!(auth, assignment, "previous-anchor-session")
+
+    assert :ok =
+             Gateway.register_codex_session_continuity(
+               session,
+               %{},
+               Jason.encode!(%{"id" => previous_response_id})
+             )
+
+    session
+  end
+
+  defp register_turn_state_anchor!(auth, assignment, turn_state) do
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: turn_state})
+    pin_session_to_assignment!(session, assignment)
+  end
+
+  defp register_session_header_anchor!(auth, assignment, session_header) do
+    {:ok, session} = Gateway.start_codex_session(auth, %{session_header: session_header})
+    pin_session_to_assignment!(session, assignment)
+  end
+
+  defp pin_session_to_assignment!(session, assignment) do
+    session
+    |> Ecto.Changeset.change(%{pool_upstream_assignment_id: assignment.id})
+    |> Repo.update!()
+  end
+
+  defp mark_pinned_assignment_reauth_required!(setup) do
+    setup.identity
+    |> Ecto.Changeset.change(%{
+      status: "reauth_required",
+      metadata: %{
+        "base_url" => setup.identity.metadata["base_url"],
+        "token_refresh" => %{
+          "status" => "reauth_required",
+          "reason" => %{
+            "code" => "refresh_token_revoked",
+            "message" => "synthetic refresh state"
+          }
+        }
+      }
+    })
+    |> Repo.update!()
+
+    setup.assignment
+    |> Ecto.Changeset.change(%{
+      health_status: "disabled",
+      eligibility_status: "ineligible"
+    })
+    |> Repo.update!()
+  end
+
+  defp assert_pinned_reauth_recovery_response!(conn) do
+    assert get_resp_header(conn, "x-codex-recovery-kind") == ["restart_with_full_context"]
+
+    assert %{
+             "error" => %{
+               "code" => "pinned_continuation_reauth_required",
+               "retryable" => false,
+               "requires_new_upstream_session" => true,
+               "recovery_kind" => "restart_with_full_context",
+               "recovery" => recovery
+             }
+           } = json_response(conn, 503)
+
+    assert recovery["kind"] == "restart_with_full_context"
+    assert recovery["anchor_removal"]["body"] == ["previous_response_id"]
+
+    assert recovery["anchor_removal"]["headers"] == [
+             "x-codex-previous-response-id",
+             "x-codex-turn-state",
+             "x-codex-session-id",
+             "session-id",
+             "x-session-affinity",
+             "session_id",
+             "x-codex-conversation-id"
+           ]
+  end
+
+  defp assert_file_assignment_conflict_without_recovery!(conn) do
+    assert get_resp_header(conn, "x-codex-recovery-kind") == []
+
+    assert %{"error" => %{"code" => "file_assignment_conflict"} = error} =
+             json_response(conn, 409)
+
+    refute Map.has_key?(error, "requires_new_upstream_session")
+    refute Map.has_key?(error, "recovery_kind")
+    refute Map.has_key?(error, "recovery")
   end
 end
