@@ -118,6 +118,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
 
   defp normalize_input_item(%{"type" => "input_file"} = item), do: {:ok, item}
   defp normalize_input_item(%{"type" => "item_reference"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "reasoning"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "function_call"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "function_call_output"} = item), do: {:ok, item}
 
   defp normalize_input_item(%{} = item) do
     if ToolResultShape.tool_result?(item) do
@@ -286,6 +289,18 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     end
   end
 
+  defp validate_input_item(%{"role" => "assistant"} = item, _payload),
+    do: validate_assistant_replay_item(item)
+
+  defp validate_input_item(%{"type" => "message", "role" => "assistant"} = item, _payload),
+    do: validate_assistant_replay_item(item)
+
+  defp validate_input_item(%{"type" => "reasoning"} = item, _payload),
+    do: validate_reasoning_replay_item(item)
+
+  defp validate_input_item(%{"type" => "function_call"} = item, _payload),
+    do: validate_function_call_replay_item(item)
+
   defp validate_input_item(%{"type" => "message"} = item, _payload),
     do: validate_message_item(item)
 
@@ -307,13 +322,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
          _payload
        )
        when is_binary(call_id) and call_id != "" do
-    if Map.has_key?(item, "output") or Map.has_key?(item, "result"),
-      do: :ok,
-      else: {:error, Error.invalid_request("function_call_output requires output", "input")}
+    validate_function_call_output_item(item)
   end
 
   defp validate_input_item(%{"type" => "item_reference"} = item, payload),
     do: validate_item_reference(item, payload)
+
+  defp validate_input_item(%{"type" => _type}, _payload),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp validate_input_item(%{} = item, _payload) do
     if ToolResultShape.tool_result?(item),
@@ -531,6 +547,165 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     do: String.trim(value) != ""
 
   defp previous_response_id?(_payload), do: false
+
+  defp validate_assistant_replay_item(%{"role" => "assistant", "content" => content} = item) do
+    with :ok <- validate_exact_item_keys(item, ["type", "role", "content", "id"]),
+         :ok <- validate_optional_id(item) do
+      validate_assistant_replay_content(content)
+    end
+  end
+
+  defp validate_assistant_replay_item(_item),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_assistant_replay_content(content) when is_list(content) and content != [] do
+    Enum.reduce_while(content, :ok, fn part, _acc ->
+      case validate_assistant_replay_content_part(part) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_assistant_replay_content(_content),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_assistant_replay_content_part(%{"type" => "output_text", "text" => text} = part)
+       when is_binary(text) do
+    validate_exact_item_keys(part, ["type", "text"])
+  end
+
+  defp validate_assistant_replay_content_part(_part),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_reasoning_replay_item(%{"id" => id, "summary" => summary} = item)
+       when is_binary(id) do
+    with :ok <- validate_exact_item_keys(item, ["type", "id", "summary", "encrypted_content"]),
+         :ok <- validate_nonblank(id),
+         :ok <- validate_reasoning_replay_encrypted_content(Map.get(item, "encrypted_content")) do
+      validate_reasoning_replay_summary(summary)
+    end
+  end
+
+  defp validate_reasoning_replay_item(_item),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_reasoning_replay_encrypted_content(nil), do: :ok
+  defp validate_reasoning_replay_encrypted_content(value) when is_binary(value), do: :ok
+
+  defp validate_reasoning_replay_encrypted_content(_value),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_reasoning_replay_summary(summary) when is_list(summary) do
+    Enum.reduce_while(summary, :ok, fn part, _acc ->
+      case validate_reasoning_replay_summary_part(part) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_reasoning_replay_summary(_summary),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_reasoning_replay_summary_part(%{"type" => "summary_text", "text" => text} = part)
+       when is_binary(text) do
+    validate_exact_item_keys(part, ["type", "text"])
+  end
+
+  defp validate_reasoning_replay_summary_part(_part),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_function_call_replay_item(
+         %{"call_id" => call_id, "name" => name, "arguments" => arguments} = item
+       )
+       when is_binary(call_id) and is_binary(name) and is_binary(arguments) do
+    with :ok <- validate_exact_item_keys(item, ["type", "call_id", "name", "arguments", "id"]),
+         :ok <- validate_nonblank(call_id),
+         :ok <- validate_nonblank(name) do
+      validate_optional_id(item)
+    end
+  end
+
+  defp validate_function_call_replay_item(_item),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_function_call_output_item(item) do
+    cond do
+      Map.has_key?(item, "output") ->
+        with :ok <- validate_exact_item_keys(item, ["type", "call_id", "output", "id"]),
+             :ok <- validate_nonblank(Map.get(item, "call_id")),
+             :ok <- validate_optional_id(item) do
+          validate_function_call_output(Map.get(item, "output"))
+        end
+
+      Map.has_key?(item, "result") ->
+        with :ok <- validate_exact_item_keys(item, ["type", "call_id", "result", "id"]),
+             :ok <- validate_nonblank(Map.get(item, "call_id")) do
+          validate_optional_id(item)
+        end
+
+      true ->
+        {:error, Error.invalid_request("function_call_output requires output", "input")}
+    end
+  end
+
+  defp validate_function_call_output(output) when is_binary(output), do: :ok
+
+  defp validate_function_call_output(output) when is_list(output) do
+    Enum.reduce_while(output, :ok, fn part, _acc ->
+      case validate_function_call_output_part(part) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_function_call_output(_output),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_function_call_output_part(%{"type" => "input_text", "text" => text} = part)
+       when is_binary(text) do
+    validate_exact_item_keys(part, ["type", "text"])
+  end
+
+  defp validate_function_call_output_part(
+         %{"type" => "input_image", "image_url" => image_url} = part
+       )
+       when is_binary(image_url) do
+    validate_exact_item_keys(part, ["type", "image_url"])
+  end
+
+  defp validate_function_call_output_part(_part),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_optional_id(%{"id" => id}) when is_binary(id), do: validate_nonblank(id)
+
+  defp validate_optional_id(%{"id" => _id}),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_optional_id(_item), do: :ok
+
+  defp validate_nonblank(value) when is_binary(value) do
+    if String.trim(value) == "" do
+      {:error, Error.invalid_request("input item shape is not translatable", "input")}
+    else
+      :ok
+    end
+  end
+
+  defp validate_nonblank(_value),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_exact_item_keys(item, allowed_keys) do
+    case item |> Map.keys() |> Enum.reject(&(&1 in allowed_keys)) do
+      [] ->
+        :ok
+
+      [_key | _rest] ->
+        {:error, Error.invalid_request("input item shape is not translatable", "input")}
+    end
+  end
 
   defp validate_message_item(%{"role" => role, "content" => content})
        when role in ["system", "user", "assistant", "developer", "tool"] do

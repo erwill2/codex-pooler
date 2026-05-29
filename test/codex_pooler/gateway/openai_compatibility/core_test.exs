@@ -498,6 +498,162 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   end
 
   describe "Task 4 Responses continuation and input-reference validation" do
+    test "opencode replay continuations accept only the supported replay item shapes" do
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "previous_response_id" => "resp_fixture_opencode_replay",
+        "store" => false,
+        "input" => [
+          %{
+            "role" => "assistant",
+            "id" => "msg_fixture_assistant",
+            "content" => [%{"type" => "output_text", "text" => "synthetic assistant replay"}]
+          },
+          %{
+            "type" => "reasoning",
+            "id" => "rs_fixture_reasoning",
+            "summary" => [%{"type" => "summary_text", "text" => "synthetic summary"}],
+            "encrypted_content" => nil
+          },
+          %{
+            "type" => "function_call",
+            "id" => "fc_fixture_call",
+            "call_id" => "call_fixture",
+            "name" => "lookup_fixture",
+            "arguments" => "{\"value\":\"sample\"}"
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_fixture",
+            "output" => [
+              %{"type" => "input_text", "text" => "synthetic tool text"},
+              %{"type" => "input_image", "image_url" => "https://example.com/sample.png"}
+            ]
+          }
+        ]
+      }
+
+      assert {:ok, %{payload: coerced}} = Responses.coerce(payload)
+
+      assert Enum.map(coerced["input"], & &1["type"]) == [
+               "message",
+               "reasoning",
+               "function_call",
+               "function_call_output"
+             ]
+
+      assert %{"role" => "assistant", "content" => [%{"type" => "output_text"}]} =
+               Enum.at(coerced["input"], 0)
+
+      assert %{"type" => "function_call_output", "output" => output} =
+               Enum.at(coerced["input"], 3)
+
+      assert Enum.map(output, & &1["type"]) == ["input_text", "input_image"]
+    end
+
+    test "opencode replay continuations reject malformed or unsupported variants locally" do
+      invalid_items = [
+        %{"role" => "assistant", "content" => [%{"type" => "input_text", "text" => "bad"}]},
+        %{
+          "role" => "assistant",
+          "content" => [%{"type" => "output_text", "text" => "bad"}],
+          "status" => "completed"
+        },
+        %{"type" => "reasoning", "id" => "", "summary" => []},
+        %{
+          "type" => "reasoning",
+          "id" => "rs_fixture",
+          "summary" => [%{"type" => "text", "text" => "bad"}]
+        },
+        %{
+          "type" => "reasoning",
+          "id" => "rs_fixture",
+          "summary" => [],
+          "encrypted_content" => %{}
+        },
+        %{
+          "type" => "reasoning",
+          "id" => "rs_fixture",
+          "summary" => [],
+          "status" => "completed"
+        },
+        %{
+          "type" => "function_call",
+          "call_id" => "",
+          "name" => "lookup_fixture",
+          "arguments" => "{}"
+        },
+        %{
+          "type" => "function_call",
+          "call_id" => "call_fixture",
+          "name" => "lookup_fixture",
+          "arguments" => %{}
+        },
+        %{
+          "type" => "function_call",
+          "call_id" => "call_fixture",
+          "name" => "lookup_fixture",
+          "arguments" => "{}",
+          "status" => "completed"
+        },
+        %{
+          "type" => "function_call_output",
+          "call_id" => "call_fixture",
+          "output" => [%{"type" => "output_text", "text" => "bad"}]
+        },
+        %{"type" => "local_shell_call", "call_id" => "call_fixture"},
+        %{"type" => "mcp_approval_response", "call_id" => "call_fixture", "output" => "bad"},
+        %{"type" => "web_search_call", "id" => "ws_fixture"},
+        %{"type" => "unknown_fixture", "id" => "item_fixture"}
+      ]
+
+      Enum.each(invalid_items, fn item ->
+        assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+                 Responses.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "previous_response_id" => "resp_fixture_previous",
+                   "input" => [
+                     item,
+                     %{
+                       "type" => "function_call_output",
+                       "call_id" => "call_fixture",
+                       "output" => "ok"
+                     }
+                   ]
+                 })
+      end)
+    end
+
+    test "structured function_call_output preserves string behavior and rejects unsupported image refs" do
+      assert {:ok, %{payload: string_payload}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [
+                   %{
+                     "type" => "function_call_output",
+                     "call_id" => "call_fixture",
+                     "output" => "synthetic string output"
+                   }
+                 ]
+               })
+
+      assert [%{"output" => "synthetic string output"}] = string_payload["input"]
+
+      assert {:error, %{status: 400, code: "unsupported_input_image_format", param: "input"}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [
+                   %{
+                     "type" => "function_call_output",
+                     "call_id" => "call_fixture",
+                     "output" => [
+                       %{"type" => "input_image", "image_url" => "sediment://file_fixture"}
+                     ]
+                   }
+                 ]
+               })
+    end
+
     test "tool-result input normalization returns explicit results without raising" do
       assert {:ok, %{payload: payload}} =
                Responses.coerce(%{
