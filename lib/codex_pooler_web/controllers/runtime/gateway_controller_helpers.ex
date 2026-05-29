@@ -159,15 +159,20 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpers do
   @spec send_error(conn(), Contracts.gateway_error() | map()) :: conn()
   def send_error(conn, %{status: status, code: code, message: message} = error) do
     body = %{
-      "error" => %{
-        "message" => message,
-        "type" => "invalid_request_error",
-        "code" => to_string(code),
-        "param" => Map.get(error, :param)
-      }
+      "error" =>
+        Map.merge(
+          %{
+            "message" => message,
+            "type" => "invalid_request_error",
+            "code" => to_string(code),
+            "param" => Map.get(error, :param)
+          },
+          Contracts.recovery_error_fields(error)
+        )
     }
 
     conn
+    |> put_gateway_headers(Contracts.recovery_response_headers(error))
     |> put_status(status)
     |> json(body)
   end

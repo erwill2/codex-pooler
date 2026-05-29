@@ -4,6 +4,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   @behaviour WebSock
 
   alias CodexPooler.Gateway
+  alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata, as: FinalizationMetadata
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
@@ -658,12 +659,15 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp error_payload(%{code: code, message: message} = reason) do
-    %{
-      "message" => message,
-      "type" => "invalid_request_error",
-      "code" => to_string(code),
-      "param" => Map.get(reason, :param)
-    }
+    Map.merge(
+      %{
+        "message" => message,
+        "type" => "invalid_request_error",
+        "code" => to_string(code),
+        "param" => Map.get(reason, :param)
+      },
+      Contracts.recovery_error_fields(reason)
+    )
   end
 
   defp error_payload(reason) do

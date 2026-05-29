@@ -4,6 +4,7 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpersTest do
   import ExUnit.CaptureLog
   import CodexPooler.PoolerFixtures
 
+  alias CodexPooler.Gateway.Contracts
   alias CodexPoolerWeb.Runtime.GatewayControllerHelpers
 
   test "body results do not require a headers key", %{conn: conn} do
@@ -48,6 +49,61 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpersTest do
 
     assert {:error, %{status: 401, code: :api_key_disabled}} =
              GatewayControllerHelpers.authenticate_v1(conn)
+  end
+
+  test "send_error renders pinned continuation recovery header and body fields", %{conn: conn} do
+    conn =
+      GatewayControllerHelpers.send_error(
+        conn,
+        Contracts.pinned_continuation_reauth_required_error()
+      )
+
+    assert get_resp_header(conn, "x-codex-recovery-kind") == ["restart_with_full_context"]
+
+    assert %{
+             "error" => %{
+               "code" => "pinned_continuation_reauth_required",
+               "retryable" => false,
+               "requires_new_upstream_session" => true,
+               "recovery_kind" => "restart_with_full_context",
+               "recovery" => recovery
+             }
+           } = json_response(conn, 503)
+
+    assert recovery["kind"] == "restart_with_full_context"
+    assert recovery["anchor_removal"]["body"] == ["previous_response_id"]
+
+    assert recovery["anchor_removal"]["headers"] == [
+             "x-codex-previous-response-id",
+             "x-codex-turn-state",
+             "x-codex-session-id",
+             "session-id",
+             "x-session-affinity",
+             "session_id",
+             "x-codex-conversation-id"
+           ]
+  end
+
+  test "send_error leaves unrelated error shapes without recovery fields" do
+    for error <- [
+          %{status: 503, code: "session_assignment_unavailable", message: "session unavailable"},
+          %{status: 400, code: "unsupported_model_capability", message: "model unsupported"},
+          %{status: 400, code: "invalid_request", message: "request invalid"}
+        ] do
+      conn = GatewayControllerHelpers.send_error(Phoenix.ConnTest.build_conn(), error)
+      body = json_response(conn, error.status)
+
+      assert get_resp_header(conn, "x-codex-recovery-kind") == []
+
+      assert body == %{
+               "error" => %{
+                 "message" => error.message,
+                 "type" => "invalid_request_error",
+                 "code" => error.code,
+                 "param" => nil
+               }
+             }
+    end
   end
 
   test "late stream errors preserve a safe log reason" do
