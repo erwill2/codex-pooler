@@ -31,66 +31,52 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
   end
 
   @spec list_request_logs(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def list_request_logs(arguments, %{auth: %{operator: operator}}) do
-    scope = Scope.for_user(operator, [])
+  def list_request_logs(arguments, context) do
     limit = limit_arg(arguments)
     offset = offset_arg(arguments)
 
-    with {:ok, filters} <- request_log_filters(arguments),
+    with {:ok, scope} <- scope_from_context(context),
+         {:ok, filters} <- request_log_filters(arguments),
          {:ok, page} <- request_log_page(scope, arguments, limit, offset, filters) do
       structured = page_output(page, &RequestLogPresenter.list_item/1)
       {:ok, structured, RequestLogPresenter.list_text(structured)}
     end
   end
 
-  def list_request_logs(_arguments, _context) do
-    {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
-  end
-
   @spec get_request_log(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_request_log(%{"id" => id}, %{auth: %{operator: operator}}) do
-    scope = Scope.for_user(operator, [])
-
-    scope
-    |> request_log_detail(id)
-    |> detail_output(&RequestLogPresenter.item/1, "request_log")
-    |> then(fn structured -> {:ok, structured, RequestLogPresenter.detail_text(structured)} end)
-  end
-
-  def get_request_log(_arguments, _context) do
-    {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
+  def get_request_log(%{"id" => id}, context) do
+    with {:ok, scope} <- scope_from_context(context) do
+      scope
+      |> request_log_detail(id)
+      |> detail_output(&RequestLogPresenter.item/1, "request_log")
+      |> then(fn structured -> {:ok, structured, RequestLogPresenter.detail_text(structured)} end)
+    end
   end
 
   @spec list_audit_logs(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def list_audit_logs(arguments, %{auth: %{operator: operator}}) do
-    scope = Scope.for_user(operator, [])
+  def list_audit_logs(arguments, context) do
     limit = limit_arg(arguments)
     offset = offset_arg(arguments)
 
-    with {:ok, filters} <- audit_log_filters(arguments),
+    with {:ok, scope} <- scope_from_context(context),
+         {:ok, filters} <- audit_log_filters(arguments),
          {:ok, page} <- audit_log_page(scope, arguments, limit, offset, filters) do
       structured = page_output(page, &AuditLogPresenter.item/1)
       {:ok, structured, AuditLogPresenter.list_text(structured)}
     end
   end
 
-  def list_audit_logs(_arguments, _context) do
-    {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
-  end
-
   @spec get_audit_log(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_audit_log(%{"id" => id}, %{auth: %{operator: operator}}) do
-    scope = Scope.for_user(operator, [])
-
-    scope
-    |> audit_log_detail(id)
-    |> detail_output(&AuditLogPresenter.item/1, "audit_log")
-    |> then(fn structured -> {:ok, structured, AuditLogPresenter.detail_text(structured)} end)
+  def get_audit_log(%{"id" => id}, context) do
+    with {:ok, scope} <- scope_from_context(context) do
+      scope
+      |> audit_log_detail(id)
+      |> detail_output(&AuditLogPresenter.item/1, "audit_log")
+      |> then(fn structured -> {:ok, structured, AuditLogPresenter.detail_text(structured)} end)
+    end
   end
 
-  def get_audit_log(_arguments, _context) do
-    {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
-  end
+  def get_audit_log(_arguments, _context), do: mcp_actor_unavailable()
 
   defp list_request_logs_tool do
     %{
@@ -151,7 +137,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
       Use when an operator needs one exact administrative audit-event metadata record by id for a visible Pool.
       Returns a concise found/not-found envelope with the same sanitized actor, target, outcome, request correlation, pool, time, and re-sanitized detail summaries as the bounded list tool.
       Never returns raw before/after blobs, dirty details blobs, secret settings, raw emails, raw IPs, headers, cookies, request bodies, response bodies, prompts, websocket frames, bearer tokens, raw idempotency keys, tokens, temporary passwords, TOTP secrets, recovery secrets, SMTP secrets, metrics HMACs, or fingerprints.
-      Filters/limits: requires id; lookup is exact, scoped to the authenticated operator's visible Pools plus system events, and returns at most one metadata row.
+      Filters/limits: requires id; lookup is exact, scoped to the authenticated operator's visible Pools, with owner-only system events, and returns at most one metadata row.
       """,
       input_schema: detail_input_schema(),
       output_schema: detail_output_schema(),
@@ -364,6 +350,16 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
     end
   end
 
+  defp scope_from_context(%{auth: %{scope: %Scope{} = scope}}), do: {:ok, scope}
+
+  defp scope_from_context(%{auth: %{operator: operator}}), do: {:ok, Scope.for_user(operator)}
+
+  defp scope_from_context(_context), do: mcp_actor_unavailable()
+
+  defp mcp_actor_unavailable do
+    {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
+  end
+
   defp request_log_filters(arguments) do
     with {:ok, date_from} <- date_filter(arguments, "date_from", :start),
          {:ok, date_to} <- date_filter(arguments, "date_to", :end) do
@@ -424,7 +420,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
 
   defp visible_pool_id?(scope, pool_id) do
     scope
-    |> Pools.list_visible_pools()
+    |> Pools.list_log_filter_pools()
     |> Enum.any?(&(&1.id == pool_id))
   end
 

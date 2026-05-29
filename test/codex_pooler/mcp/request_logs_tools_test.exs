@@ -1239,6 +1239,66 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(missing)
   end
 
+  test "scoped admin request-log tools return assigned-pool logs only", %{user: owner} do
+    visible_pool =
+      pool_fixture(%{slug: "mcp-visible-request-logs", name: "MCP Visible Request Logs"})
+
+    hidden_pool =
+      pool_fixture(%{slug: "mcp-hidden-request-logs", name: "MCP Hidden Request Logs"})
+
+    %{user: admin} = operator_fixture(owner, %{"email" => unique_user_email()})
+    admin = admin |> Ecto.Changeset.change(password_change_required: false) |> Repo.update!()
+    operator_pool_assignment_fixture(admin, visible_pool, created_by_user_id: owner.id)
+
+    %{api_key: visible_key} =
+      active_api_key_fixture(visible_pool, %{display_name: "Visible request key"})
+
+    %{api_key: hidden_key} =
+      active_api_key_fixture(hidden_pool, %{display_name: "Hidden request key"})
+
+    visible_request =
+      request_fixture(%{pool: visible_pool, api_key: visible_key}, %{
+        correlation_id: "visible-request-log"
+      })
+
+    hidden_request =
+      request_fixture(%{pool: hidden_pool, api_key: hidden_key}, %{
+        correlation_id: "hidden-request-log"
+      })
+
+    assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(admin, true)
+
+    assert {:ok, %{raw_token: raw_token}} =
+             MCP.create_operator_token(admin, %{label: "Scoped logs MCP"})
+
+    assert {:ok, admin_auth} = MCP.authenticate_token(raw_token)
+
+    assert {:ok, list_result} =
+             ToolDispatch.call("codex_pooler_list_request_logs", %{"limit" => 10}, %{
+               auth: admin_auth
+             })
+
+    assert [presented] = list_result["structuredContent"]["items"]
+    assert presented["id"] == visible_request.id
+    refute Jason.encode!(list_result["structuredContent"]) =~ hidden_request.id
+
+    assert {:ok, hidden_result} =
+             ToolDispatch.call("codex_pooler_get_request_log", %{"id" => hidden_request.id}, %{
+               auth: admin_auth
+             })
+
+    assert hidden_result["structuredContent"] == %{
+             "status" => "not_found",
+             "kind" => "request_log",
+             "item" => nil,
+             "candidates" => [],
+             "message" => "request_log selector did not match"
+           }
+
+    assert :ok = Redaction.assert_mcp_output_safe!(list_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(hidden_result)
+  end
+
   defp failed_debug_request_fixture(pool, api_key, assignment, attrs) do
     request =
       request_fixture(%{pool: pool, api_key: api_key}, %{
