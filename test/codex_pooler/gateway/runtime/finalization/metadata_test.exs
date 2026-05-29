@@ -3,6 +3,62 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.MetadataTest do
 
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata
 
+  test "first-event metadata preserves local usage-limit classification and sanitized limit type" do
+    response = %Req.Response{
+      status: 200,
+      headers: [
+        {"content-type", ["text/event-stream"]},
+        {"x-codex-rate-limit-reached-type", ["workspace_owner_usage_limit_reached"]},
+        {"x-request-id", ["req_usage_limit_terminal"]}
+      ]
+    }
+
+    failure = %{
+      code: "usage_limit_exceeded",
+      upstream_code: "usage_limit_exceeded",
+      event_type: "response.failed",
+      data_type: "response.failed"
+    }
+
+    assert Metadata.first_event_stream_metadata(
+             response,
+             failure,
+             "upstream_terminal_failure",
+             %{}
+           ) == %{
+             "content_type" => "text/event-stream",
+             "error_kind" => "upstream_terminal_failure",
+             "rate_limit_reached_type" => "workspace_owner_usage_limit_reached",
+             "status_code" => 200,
+             "stream_error_code" => "usage_limit_exceeded",
+             "stream_failure_stage" => "first_event",
+             "stream_terminal_type" => "response.failed",
+             "upstream_request_id" => "req_usage_limit_terminal"
+           }
+  end
+
+  test "first-event metadata ignores missing and unknown rate limit reached types" do
+    failure = %{
+      code: "usage_limit_exceeded",
+      upstream_code: "usage_limit_exceeded",
+      event_type: "response.failed"
+    }
+
+    metadata =
+      Metadata.first_event_stream_metadata(
+        %Req.Response{
+          status: 200,
+          headers: [{"x-codex-rate-limit-reached-type", ["future_workspace_limit"]}]
+        },
+        failure,
+        "upstream_terminal_failure",
+        %{}
+      )
+
+    refute Map.has_key?(metadata, "rate_limit_reached_type")
+    assert metadata["stream_error_code"] == "usage_limit_exceeded"
+  end
+
   test "response metadata preserves known Codex rate limit reached type headers" do
     response = %Req.Response{
       status: 429,
