@@ -27,7 +27,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
        dashboard: nil,
        filter_form: to_form(%{"pool_id" => "", "window" => "24h"}, as: :filters),
        filter_error: nil,
-       pool_filter_options: PoolFilterComponents.all_pool_filter_options(),
+       pool_filter_options: [],
        subscribed_pool_ids: MapSet.new()
      )}
   end
@@ -89,6 +89,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
             label="Scope"
             hidden_id="stats-pool-filter"
             selected_value={@filter_form.params["pool_id"] || ""}
+            selected={stats_pool_filter_selected(@pool_filter_options)}
             options={@pool_filter_options}
           />
           <div class="grid gap-2">
@@ -192,7 +193,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
           dashboard: nil,
           filter_form: stats_filter_form(filters),
           filter_error: error,
-          pool_filter_options: PoolFilterComponents.all_pool_filter_options(),
+          pool_filter_options: [],
           current_params: params
         )
     end
@@ -293,8 +294,25 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
   defp query_param_order(_key), do: 2
 
   defp pool_filter_options(%{filters: %{pool_options: pool_options}}) do
-    PoolFilterComponents.pool_filter_options(pool_options)
+    case pool_options do
+      [] -> []
+      _pool_options -> PoolFilterComponents.pool_filter_options(pool_options)
+    end
   end
+
+  defp stats_pool_filter_selected([]) do
+    %{
+      label: "No assigned Pools",
+      value: "",
+      icon: "hero-server-stack",
+      icon_class: "text-base-content/60",
+      strategy_label: nil,
+      status: nil,
+      status_label: nil
+    }
+  end
+
+  defp stats_pool_filter_selected(_options), do: nil
 
   defp window_options, do: @window_options
 

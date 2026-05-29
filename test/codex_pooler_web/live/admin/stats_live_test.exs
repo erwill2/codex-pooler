@@ -1,18 +1,19 @@
 defmodule CodexPoolerWeb.Admin.StatsLiveTest do
   use CodexPoolerWeb.ConnCase, async: false
 
-  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
-
   import Phoenix.LiveViewTest
+  import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
 
   alias CodexPooler.Accounting.DailyRollup
+  alias CodexPooler.Accounts
   alias CodexPooler.Audit
   alias CodexPooler.Events
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
   alias CodexPooler.Jobs
   alias CodexPooler.Pools
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
 
   test "redirects unauthenticated operators to login" do
     assert {:error, {:redirect, %{to: "/login"}}} = live(build_conn(), ~p"/admin/stats")
@@ -267,6 +268,128 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       refute render(view) =~ second.raw_key
     end
 
+    test "assigned admin sees aggregate and filters only assigned pools", %{
+      conn: conn,
+      scope: scope
+    } do
+      {:ok, pool_a} = Pools.create_pool(scope, %{slug: "stats-scope-a", name: "Stats Scope A"})
+      {:ok, pool_b} = Pools.create_pool(scope, %{slug: "stats-scope-b", name: "Stats Scope B"})
+      {:ok, pool_c} = Pools.create_pool(scope, %{slug: "stats-scope-c", name: "Stats Scope C"})
+
+      assigned_a =
+        stats_usage_fixture(pool_a, %{
+          total_tokens: 10,
+          correlation_id: "stats-scope-a",
+          api_key_display_name: "Scoped A key"
+        })
+
+      assigned_b =
+        stats_usage_fixture(pool_b, %{
+          total_tokens: 20,
+          correlation_id: "stats-scope-b",
+          api_key_display_name: "Scoped B key"
+        })
+
+      hidden_c =
+        stats_usage_fixture(pool_c, %{
+          total_tokens: 30,
+          correlation_id: "stats-scope-c",
+          api_key_display_name: "Hidden C key"
+        })
+
+      admin_conn = log_in_scoped_admin(conn, scope, [pool_a, pool_b])
+
+      {:ok, view, _html} = live(admin_conn, ~p"/admin/stats?window=24h")
+
+      assert has_element?(view, "#stats-pool-filter[type='hidden'][value='']")
+      assert has_element?(view, "#stats-pool-filter-control", "All Pools")
+      assert has_element?(view, "#stats-pool-filter-control button[data-pool-id='#{pool_a.id}']")
+      assert has_element?(view, "#stats-pool-filter-control button[data-pool-id='#{pool_b.id}']")
+      refute has_element?(view, "#stats-pool-filter-control button[data-pool-id='#{pool_c.id}']")
+      refute has_element?(view, "#stats-pool-filter-control", "Stats Scope C")
+
+      assert has_element?(view, "#stats-kpi-requests", "2")
+      assert has_element?(view, "#stats-kpi-tokens", "30")
+      assert has_element?(view, "#stats-traffic-chart", "30 tokens")
+      assert has_element?(view, "#stats-api-key-table", "Scoped A key")
+      assert has_element?(view, "#stats-api-key-table", "Scoped B key")
+      refute has_element?(view, "#stats-api-key-table", "Hidden C key")
+
+      view
+      |> element("#stats-pool-filter-control button[data-pool-id='#{pool_b.id}']")
+      |> render_click()
+
+      assert_patch(view, ~p"/admin/stats?pool_id=#{pool_b.id}&window=24h")
+      assert has_element?(view, "#stats-pool-filter[value='#{pool_b.id}']")
+      assert has_element?(view, "#stats-kpi-tokens", "20")
+      assert has_element?(view, "#stats-api-key-table", "Scoped B key")
+      refute has_element?(view, "#stats-api-key-table", "Scoped A key")
+      refute has_element?(view, "#stats-api-key-table", "Hidden C key")
+      refute render(view) =~ assigned_a.raw_key
+      refute render(view) =~ assigned_b.raw_key
+      refute render(view) =~ hidden_c.raw_key
+
+      {:ok, blocked_view, _html} =
+        live(admin_conn, ~p"/admin/stats?pool_id=#{pool_c.id}&window=24h")
+
+      assert has_element?(blocked_view, "#stats-filter-error", "pool filter is not available")
+      refute has_element?(blocked_view, "#stats-kpis")
+      refute has_element?(blocked_view, "#stats-pool-filter-control", "Stats Scope C")
+      refute has_element?(blocked_view, "#stats-api-key-table", "Hidden C key")
+      refute render(blocked_view) =~ hidden_c.raw_key
+    end
+
+    test "unassigned admin sees empty scoped stats with no pool subscriptions", %{
+      conn: conn,
+      scope: scope
+    } do
+      {:ok, hidden_pool} =
+        Pools.create_pool(scope, %{slug: "stats-unassigned-live", name: "Stats Unassigned Live"})
+
+      hidden =
+        stats_usage_fixture(hidden_pool, %{
+          total_tokens: 44,
+          correlation_id: "stats-unassigned-live",
+          api_key_display_name: "Unassigned hidden key"
+        })
+
+      admin_conn = log_in_scoped_admin(conn, scope, [])
+
+      {:ok, view, _html} = live(admin_conn, ~p"/admin/stats?window=24h")
+
+      assert has_element?(view, "#stats-pool-filter[type='hidden'][value='']")
+
+      assert has_element?(
+               view,
+               "#stats-pool-filter-control [data-role='pool-filter-trigger']",
+               "No assigned Pools"
+             )
+
+      refute has_element?(
+               view,
+               "#stats-pool-filter-control [data-role='pool-filter-menu'] button"
+             )
+
+      refute has_element?(view, "#stats-pool-filter-control", "All Pools")
+      refute has_element?(view, "#stats-pool-filter-control", "Stats Unassigned Live")
+
+      assert has_element?(view, "#stats-kpi-requests", "0")
+      assert has_element?(view, "#stats-kpi-tokens", "0")
+      assert has_element?(view, "#stats-traffic-chart", "0 tokens / 0 requests")
+      refute has_element?(view, "#stats-api-key-table", "Unassigned hidden key")
+
+      state = :sys.get_state(view.pid)
+      assert state.socket.assigns.subscribed_pool_ids == MapSet.new()
+      assert state.socket.assigns.dashboard.filters.pool_options == []
+      assert state.socket.assigns.dashboard.charts.requests == []
+      assert state.socket.assigns.dashboard.charts.tokens == []
+      assert [%{code: :no_reporting_pools}] = state.socket.assigns.dashboard.empty_states
+
+      chart_html = view |> element("#stats-traffic-chart-plot") |> render()
+      assert chart_html =~ "data-chart-categories=\"[]\""
+      refute render(view) =~ hidden.raw_key
+    end
+
     test "selected Pool usage event reloads stats after the debounce", %{
       conn: conn,
       scope: scope
@@ -491,6 +614,23 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       #stats-kpi-quota-health
       #stats-traffic-chart
     )
+  end
+
+  defp log_in_scoped_admin(conn, scope, assigned_pools) do
+    %{user: admin, temporary_password: temporary_password} =
+      operator_fixture(scope, %{
+        "email" => unique_user_email(),
+        "password_change_required" => "false"
+      })
+
+    Enum.each(assigned_pools, fn pool ->
+      operator_pool_assignment_fixture(admin, pool, created_by_user_id: scope.user.id)
+    end)
+
+    assert {:ok, %{token: token}} =
+             Accounts.login_user(%{"email" => admin.email, "password" => temporary_password})
+
+    log_in_user(conn, admin, token)
   end
 
   defp stats_dashboard_fixture(pool, sensitive_marker) do
