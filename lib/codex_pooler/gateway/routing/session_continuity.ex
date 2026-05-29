@@ -12,6 +12,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
   alias CodexPooler.Gateway.Persistence.SessionContinuity, as: ContinuityStore
   alias CodexPooler.Gateway.Routing.BridgeRing
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   @type auth :: CodexPooler.Access.auth_context()
   @type payload :: map()
@@ -166,19 +167,99 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
       Enum.filter(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end)
 
     if candidates == [] do
-      {:error,
-       error(
-         503,
-         "session_assignment_unavailable",
-         "the upstream assignment for this Codex session is not currently available",
-         "model"
-       )}
+      {:error, pinned_session_assignment_unavailable_error(assignment_id)}
     else
       {:ok, candidates}
     end
   end
 
   def filter_codex_session_assignment(candidates, %RequestOptions{}), do: {:ok, candidates}
+
+  @spec pinned_session_assignment_unavailable_error(Ecto.UUID.t() | String.t()) :: gateway_error()
+  defp pinned_session_assignment_unavailable_error(assignment_id) do
+    case persisted_pinned_reauth_assignment(assignment_id) do
+      {:ok, %PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity, reason_code} ->
+        Contracts.pinned_continuation_reauth_required_error()
+        |> Map.put(:param, "model")
+        |> Map.put(
+          :continuity_denial,
+          pinned_reauth_continuity_metadata(assignment, identity, reason_code)
+        )
+
+      :error ->
+        session_assignment_unavailable_error()
+    end
+  end
+
+  @spec persisted_pinned_reauth_assignment(Ecto.UUID.t() | String.t()) ::
+          {:ok, PoolUpstreamAssignment.t(), UpstreamIdentity.t(), String.t()} | :error
+  defp persisted_pinned_reauth_assignment(assignment_id) when is_binary(assignment_id) do
+    case Repo.one(
+           from assignment in PoolUpstreamAssignment,
+             join: identity in UpstreamIdentity,
+             on: identity.id == assignment.upstream_identity_id,
+             where: assignment.id == ^assignment_id,
+             select: {assignment, identity}
+         ) do
+      {%PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity} ->
+        if revoked_refresh_token_pinned_reauth?(assignment, identity) do
+          {:ok, assignment, identity, "refresh_token_revoked"}
+        else
+          :error
+        end
+
+      nil ->
+        :error
+    end
+  end
+
+  @spec revoked_refresh_token_pinned_reauth?(PoolUpstreamAssignment.t(), UpstreamIdentity.t()) ::
+          boolean()
+  defp revoked_refresh_token_pinned_reauth?(assignment, identity) do
+    assignment.status == PoolUpstreamAssignment.active_status() and
+      assignment.health_status == PoolUpstreamAssignment.disabled_health_status() and
+      assignment.eligibility_status == PoolUpstreamAssignment.ineligible_status() and
+      identity.status == UpstreamIdentity.reauth_required_status() and
+      token_refresh_reason_code(identity.metadata) == "refresh_token_revoked"
+  end
+
+  @spec token_refresh_reason_code(term()) :: String.t() | nil
+  defp token_refresh_reason_code(%{
+         "token_refresh" => %{
+           "status" => "reauth_required",
+           "reason" => %{"code" => reason_code}
+         }
+       })
+       when is_binary(reason_code),
+       do: reason_code
+
+  defp token_refresh_reason_code(_metadata), do: nil
+
+  @spec pinned_reauth_continuity_metadata(
+          PoolUpstreamAssignment.t(),
+          UpstreamIdentity.t(),
+          String.t()
+        ) :: map()
+  defp pinned_reauth_continuity_metadata(assignment, identity, reason_code) do
+    %{
+      "denial_family" => "pinned_continuation_reauth",
+      "continuity_family" => "pinned_codex_session",
+      "upstream_lifecycle_family" => "reauth_required",
+      "token_refresh_reason_code_preview" => reason_code,
+      "pool_upstream_assignment_id" => assignment.id,
+      "upstream_identity_id" => identity.id
+    }
+  end
+
+  @spec session_assignment_unavailable_error() :: gateway_error()
+  defp session_assignment_unavailable_error do
+    error(
+      503,
+      "session_assignment_unavailable",
+      "the upstream assignment for this Codex session is not currently available",
+      "model"
+    )
+  end
 
   defp continuity_session_requested?(%RequestOptions{continuity: continuity}) do
     [
