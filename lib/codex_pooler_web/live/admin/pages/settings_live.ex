@@ -57,7 +57,7 @@ defmodule CodexPoolerWeb.Admin.SettingsLive do
       {:ok, user} ->
         {:noreply,
          socket
-         |> assign(:current_scope, Scope.for_user(user, socket.assigns.current_scope.roles))
+         |> assign(:current_scope, Scope.for_user(user))
          |> assign(:account_form, account_form(user))
          |> assign_mcp_panel()
          |> put_flash(:info, "Account settings updated")}
@@ -199,7 +199,7 @@ defmodule CodexPoolerWeb.Admin.SettingsLive do
 
       {:noreply,
        socket
-       |> assign(:current_scope, Scope.for_user(user, socket.assigns.current_scope.roles))
+       |> assign(:current_scope, Scope.for_user(user))
        |> assign(:password_form, password_form())
        |> assign_browser_sessions()
        |> put_flash(:info, "Password updated")}

@@ -1,7 +1,7 @@
 defmodule CodexPoolerWeb.Admin.SystemLive do
   use CodexPoolerWeb, :live_view
 
-  alias CodexPooler.{Catalog, InstanceSettings, MCP}
+  alias CodexPooler.{Catalog, InstanceSettings, MCP, Pools}
   alias CodexPooler.Dev.Seeds, as: DevSeeds
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.SystemPageComponents
@@ -31,41 +31,54 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    settings = InstanceSettings.ensure_singleton!()
-    form_params = SystemSettingsForm.params_from_settings(settings)
-    development_helpers_available? = CodexPoolerWeb.DevFeatures.enabled?()
+    if Pools.owner?(socket.assigns.current_scope) do
+      settings = InstanceSettings.ensure_singleton!()
+      form_params = SystemSettingsForm.params_from_settings(settings)
+      development_helpers_available? = CodexPoolerWeb.DevFeatures.enabled?()
 
-    {:ok,
-     socket
-     |> assign(
-       page_title: "System",
-       selected_tab: @default_tab,
-       system_tabs: system_tabs(development_helpers_available?),
-       settings: settings,
-       development_helpers_available?: development_helpers_available?,
-       mcp_key_count: MCP.count_operator_tokens(),
-       form_params: form_params,
-       group_snapshots: SystemSettingsForm.group_snapshots(form_params),
-       card_statuses: SystemSettingsForm.initial_card_statuses(),
-       development_action_status: nil,
-       smtp_test_status: nil
-     )
-     |> assign_forms()}
+      {:ok,
+       socket
+       |> assign(
+         page_title: "System",
+         owner_authorized?: true,
+         selected_tab: @default_tab,
+         system_tabs: system_tabs(development_helpers_available?),
+         settings: settings,
+         development_helpers_available?: development_helpers_available?,
+         mcp_key_count: MCP.count_operator_tokens(),
+         form_params: form_params,
+         group_snapshots: SystemSettingsForm.group_snapshots(form_params),
+         card_statuses: SystemSettingsForm.initial_card_statuses(),
+         development_action_status: nil,
+         smtp_test_status: nil
+       )
+       |> assign_forms()}
+    else
+      {:ok, assign(socket, page_title: "System", owner_authorized?: false)}
+    end
   end
 
   @impl true
   def handle_params(params, _uri, socket) do
-    development_helpers_available? = CodexPoolerWeb.DevFeatures.enabled?()
+    if socket.assigns.owner_authorized? do
+      development_helpers_available? = CodexPoolerWeb.DevFeatures.enabled?()
 
-    {:noreply,
-     socket
-     |> assign(:development_helpers_available?, development_helpers_available?)
-     |> assign(:system_tabs, system_tabs(development_helpers_available?))
-     |> assign(:mcp_key_count, MCP.count_operator_tokens())
-     |> assign(:selected_tab, normalize_tab(params["tab"], development_helpers_available?))}
+      {:noreply,
+       socket
+       |> assign(:development_helpers_available?, development_helpers_available?)
+       |> assign(:system_tabs, system_tabs(development_helpers_available?))
+       |> assign(:mcp_key_count, MCP.count_operator_tokens())
+       |> assign(:selected_tab, normalize_tab(params["tab"], development_helpers_available?))}
+    else
+      {:noreply, socket}
+    end
   end
 
   @impl true
+  def handle_event(_event, _params, %{assigns: %{owner_authorized?: false}} = socket) do
+    {:noreply, owner_denied(socket)}
+  end
+
   def handle_event("validate_instance_settings", %{"instance_settings" => params}, socket) do
     group = SystemSettingsForm.submitted_group(params)
 
@@ -247,7 +260,15 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
           description="Review and adjust instance-wide runtime settings without exposing stored credentials."
         />
 
-        <section id="system-workspace" class="grid gap-4">
+        <AdminComponents.empty_state
+          :if={!@owner_authorized?}
+          id="admin-system-owner-denied"
+          title="System settings require owner access"
+          description="Only instance owners can inspect or change global system settings."
+          icon="hero-lock-closed"
+        />
+
+        <section :if={@owner_authorized?} id="system-workspace" class="grid gap-4">
           <SystemPageComponents.system_tab_picker tabs={@system_tabs} selected_tab={@selected_tab} />
 
           <SystemPageComponents.instance_settings_panel
@@ -273,6 +294,10 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
       :forms,
       SystemSettingsForm.forms(socket.assigns.settings, socket.assigns.form_params)
     )
+  end
+
+  defp owner_denied(socket) do
+    put_flash(socket, :error, "Only instance owners can manage system settings")
   end
 
   defp put_group_form(socket, group, %Ecto.Changeset{} = changeset) do

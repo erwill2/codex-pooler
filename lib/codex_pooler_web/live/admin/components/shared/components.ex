@@ -1,6 +1,6 @@
 defmodule CodexPoolerWeb.Admin.Components do
   @moduledoc """
-  Shared components for the authenticated instance-admin LiveViews.
+  Shared components for the authenticated operator LiveViews.
   """
   use CodexPoolerWeb, :html
 
