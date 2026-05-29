@@ -20,6 +20,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
          :ok <- Validation.reject_unsupported_fields(payload, :responses),
          :ok <- Validation.require_model(payload),
          :ok <- reject_locally_unsupported_fields(payload),
+         {:ok, payload} <- normalize_recoverable_opencode_replay_call_ids(payload),
          :ok <- validate_input(payload),
          :ok <- validate_previous_response_continuation(payload),
          :ok <- validate_tools(payload),
@@ -85,6 +86,74 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   end
 
   defp normalize_input(payload), do: {:ok, payload}
+
+  defp normalize_recoverable_opencode_replay_call_ids(%{"input" => input} = payload)
+       when is_list(input) do
+    {:ok, Map.put(payload, "input", normalize_recoverable_opencode_replay_items(input))}
+  end
+
+  defp normalize_recoverable_opencode_replay_call_ids(payload), do: {:ok, payload}
+
+  defp normalize_recoverable_opencode_replay_items(input) do
+    input
+    |> do_normalize_recoverable_opencode_replay_items(0, [])
+    |> Enum.reverse()
+  end
+
+  defp do_normalize_recoverable_opencode_replay_items([call, output | rest], index, acc)
+       when is_map(call) and is_map(output) do
+    if recoverable_opencode_tool_replay_pair?(call, output) do
+      call_id = opencode_replay_call_id(call, index)
+
+      do_normalize_recoverable_opencode_replay_items(
+        rest,
+        index + 2,
+        [Map.put(output, "call_id", call_id), Map.put(call, "call_id", call_id) | acc]
+      )
+    else
+      do_normalize_recoverable_opencode_replay_items([output | rest], index + 1, [call | acc])
+    end
+  end
+
+  defp do_normalize_recoverable_opencode_replay_items([item | rest], index, acc),
+    do: do_normalize_recoverable_opencode_replay_items(rest, index + 1, [item | acc])
+
+  defp do_normalize_recoverable_opencode_replay_items([], _index, acc), do: acc
+
+  defp recoverable_opencode_tool_replay_pair?(call, output) do
+    function_call_replay_shape?(call) and function_call_output_replay_shape?(output) and
+      blank_call_id?(output) and recoverable_opencode_call_id?(call)
+  end
+
+  defp function_call_replay_shape?(%{
+         "type" => "function_call",
+         "name" => name,
+         "arguments" => arguments
+       })
+       when is_binary(name) and name != "" and is_binary(arguments),
+       do: true
+
+  defp function_call_replay_shape?(_item), do: false
+
+  defp function_call_output_replay_shape?(%{"type" => "function_call_output"} = item),
+    do: Map.has_key?(item, "output") or Map.has_key?(item, "result")
+
+  defp function_call_output_replay_shape?(_item), do: false
+
+  defp opencode_replay_call_id(call, _index) do
+    clean_string(Map.get(call, "call_id")) || clean_string(Map.get(call, "id"))
+  end
+
+  defp blank_call_id?(item), do: is_nil(clean_string(Map.get(item, "call_id")))
+
+  defp recoverable_opencode_call_id?(call), do: is_binary(opencode_replay_call_id(call, 0))
+
+  defp clean_string(value) when is_binary(value) do
+    value = String.trim(value)
+    if value == "", do: nil, else: value
+  end
+
+  defp clean_string(_value), do: nil
 
   defp normalize_input_items(input) do
     Enum.reduce_while(input, {:ok, []}, fn item, {:ok, acc} ->

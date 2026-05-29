@@ -551,6 +551,39 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       assert Enum.map(output, & &1["type"]) == ["input_text", "input_image"]
     end
 
+    test "opencode native replay repairs paired blank tool call ids only" do
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "previous_response_id" => "resp_fixture_opencode_native_replay",
+        "store" => false,
+        "input" => [
+          %{
+            "type" => "function_call",
+            "id" => "fc_fixture_native_call",
+            "call_id" => "",
+            "name" => "lookup_fixture",
+            "arguments" => "{\"value\":\"sample\"}"
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "",
+            "output" => "synthetic tool output"
+          }
+        ]
+      }
+
+      assert {:ok, %{payload: coerced}} = Responses.coerce(payload)
+
+      assert [
+               %{
+                 "type" => "function_call",
+                 "id" => "fc_fixture_native_call",
+                 "call_id" => "fc_fixture_native_call"
+               },
+               %{"type" => "function_call_output", "call_id" => "fc_fixture_native_call"}
+             ] = coerced["input"]
+    end
+
     test "opencode replay continuations reject malformed or unsupported variants locally" do
       invalid_items = [
         %{"role" => "assistant", "content" => [%{"type" => "input_text", "text" => "bad"}]},

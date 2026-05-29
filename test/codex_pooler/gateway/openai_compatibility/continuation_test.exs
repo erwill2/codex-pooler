@@ -202,6 +202,65 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     end
 
     @tag :tool_result_previous_response
+    test "v1 Responses forwards opencode native replay with recovered tool call ids", %{
+      conn: conn
+    } do
+      upstream =
+        start_upstream(
+          FakeUpstream.json_response(%{
+            "id" => "resp_v1_opencode_native_replay",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          })
+        )
+
+      setup = gateway_setup(upstream)
+
+      response_conn =
+        conn
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "previous_response_id" => "resp_v1_opencode_native_previous",
+          "store" => false,
+          "input" => [
+            %{
+              "type" => "function_call",
+              "id" => "fc_v1_opencode_native_call",
+              "call_id" => "",
+              "name" => "lookup_fixture",
+              "arguments" => "{\"value\":\"sample\"}"
+            },
+            %{
+              "type" => "function_call_output",
+              "call_id" => "",
+              "output" => "synthetic native tool text"
+            }
+          ]
+        })
+
+      assert %{"id" => "resp_v1_opencode_native_replay"} = json_response(response_conn, 200)
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.json["previous_response_id"] == "resp_v1_opencode_native_previous"
+
+      assert [
+               %{
+                 "type" => "function_call",
+                 "id" => "fc_v1_opencode_native_call",
+                 "call_id" => "fc_v1_opencode_native_call"
+               },
+               %{"type" => "function_call_output", "call_id" => "fc_v1_opencode_native_call"}
+             ] = captured.json["input"]
+
+      metadata = persisted_gateway_metadata(setup.pool.id)
+      refute metadata =~ "synthetic native tool text"
+      refute metadata =~ "resp_v1_opencode_native_previous"
+      refute metadata =~ "fc_v1_opencode_native_call"
+      refute metadata =~ "raw_request"
+    end
+
+    @tag :tool_result_previous_response
     test "v1 Responses rejects stale or malformed previous-response references before dispatch",
          _context do
       upstream =
