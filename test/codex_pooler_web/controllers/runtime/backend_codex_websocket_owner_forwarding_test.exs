@@ -870,6 +870,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
              } = Jason.decode!(error_frame)
 
       assert message =~ "owner_unavailable"
+      refute error_frame =~ "pinned_continuation_reauth_required"
       assert FakeUpstream.count(upstream) == 0
     after
       CodexResponsesSocket.terminate(:closed, Map.delete(state, :websocket_owner_downstream))
@@ -1138,6 +1139,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
     assert released_lease = released_owner_lease(state.codex_session.id, old_token)
     assert released_lease.metadata["release_reason"] == "owner_drained"
+    refute released_lease.metadata["release_reason"] == "pinned_continuation_reauth_required"
     refute released_lease.metadata["release_reason"] == "owner_crashed"
     assert Repo.get!(CodexTurn, turn.id).status == "interrupted"
     assert Repo.get!(CodexTurn, turn.id).error_code == "owner_drained"
@@ -1145,6 +1147,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     assert Repo.get!(Request, request.id).status == "failed"
     assert Repo.get!(Request, request.id).response_status_code == 499
     assert Repo.get!(Request, request.id).last_error_code == "owner_drained"
+    refute Repo.get!(Request, request.id).last_error_code == "pinned_continuation_reauth_required"
     assert Repo.get!(Attempt, attempt.id).network_error_code == "owner_drained"
 
     {:ok, reconnect_state} =
@@ -1206,6 +1209,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     refute Map.has_key?(stopped_state, :websocket_owner_monitor)
     refute Map.has_key?(stopped_state, :websocket_owner_pid)
     refute logs =~ "owner_unavailable_takeover"
+    refute logs =~ "pinned_continuation_reauth_required"
     refute logs =~ "owner_drained"
     refute logs =~ "client_disconnected"
     assert_no_leak!("local owner crash monitor logs", logs)
@@ -1353,6 +1357,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     refute Map.has_key?(kept_state, :websocket_owner_pid)
     refute logs =~ "owner_crashed"
     refute logs =~ "owner_drained"
+    refute logs =~ "pinned_continuation_reauth_required"
     assert_no_leak!("stale owner monitor logs", logs)
 
     assert Repo.get!(Request, request.id).status == "in_progress"
@@ -1860,6 +1865,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     assert logs =~ "websocket owner takeover attempted"
     assert logs =~ "websocket owner takeover succeeded"
     assert logs =~ "recovery_class=owner_unavailable_takeover"
+    refute logs =~ "pinned_continuation_reauth_required"
     assert logs =~ "operator_action=none"
     assert logs =~ "outcome=attempting"
     assert logs =~ "outcome=succeeded"

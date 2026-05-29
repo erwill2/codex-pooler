@@ -2482,7 +2482,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
       )
 
     debug = attempt.response_metadata["gateway_debug"]
-    assert debug["previous_response_id"]["action"] == "preserved"
+    refute Map.has_key?(debug, "previous_response_id")
+    assert debug["previous_response_id_summary"]["action"] == "preserved"
     assert debug["items"]["tool_result_types"] == ["custom_tool_call_output"]
     assert debug["shape"]["client"]["json"]["bytes"] > 0
     assert debug["shape"]["client"]["json"]["approx_tokens"] > 0
@@ -2837,6 +2838,199 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     metadata_text = inspect(denied_request.request_metadata || %{})
     refute metadata_text =~ "second ws"
     refute metadata_text =~ "resp_ws_unavailable_first"
+  end
+
+  @tag :websocket_pinned_reauth_recovery
+  test "websocket pinned reauth continuation returns in-frame recovery without fallback or owner replacement" do
+    pinned_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_pinned_reauth_should_not_dispatch",
+          "object" => "response"
+        })
+      )
+
+    fresh_start_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_pinned_reauth_fresh_start_should_not_dispatch",
+          "object" => "response"
+        })
+      )
+
+    setup = gateway_setup(pinned_upstream)
+
+    fresh_start =
+      gateway_upstream(
+        setup.pool,
+        fresh_start_upstream,
+        "upstream-token-ws-pinned-reauth-fresh-start",
+        compact?: false
+      )
+
+    prime_routing_quota!(fresh_start.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fresh_start.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    turn_state = "turn-ws-pinned-reauth-#{System.unique_integer([:positive])}"
+    previous_response_id = "resp_ws_pinned_reauth_#{System.unique_integer([:positive])}"
+    visible_input = "visible websocket pinned reauth context must not persist"
+
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: turn_state})
+    session = pin_session_to_assignment!(session, setup.assignment)
+
+    assert :ok =
+             Gateway.register_codex_session_continuity(
+               session,
+               %{},
+               %{"id" => previous_response_id}
+             )
+
+    lease_before = active_owner_lease_for_session!(session.id)
+    mark_pinned_assignment_reauth_required!(setup)
+
+    assert {:ok, state} =
+             CodexResponsesSocket.init(%{
+               auth: auth,
+               opts: %{
+                 request_id: "ws-pinned-reauth-frame",
+                 accepted_turn_state: turn_state,
+                 client_ip: "127.0.0.1"
+               }
+             })
+
+    try do
+      assert state.codex_session.id == session.id
+      assert_owner_lease_not_replaced!(session.id, lease_before)
+
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => visible_input,
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => previous_response_id
+        })
+
+      assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+      assert {:push, {:text, error_frame}, _state_after} = receive_socket_done(state)
+
+      assert_pinned_reauth_websocket_frame!(error_frame)
+      refute error_frame =~ previous_response_id
+      refute error_frame =~ visible_input
+      refute error_frame =~ setup.authorization
+      refute error_frame =~ setup.raw_key
+      refute error_frame =~ "Bearer "
+
+      assert FakeUpstream.count(pinned_upstream) == 0
+      assert FakeUpstream.count(fresh_start_upstream) == 0
+      assert_pinned_reauth_rejected_request!("ws-pinned-reauth-frame")
+      assert Repo.aggregate(Attempt, :count) == 0
+
+      metadata_text = inspect(Accounting.list_request_logs(setup.pool))
+      refute metadata_text =~ previous_response_id
+      refute metadata_text =~ visible_input
+      refute metadata_text =~ setup.authorization
+      refute metadata_text =~ setup.raw_key
+      assert_owner_lease_not_replaced!(session.id, lease_before)
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  @tag :websocket_pinned_reauth_recovery
+  test "websocket per-message dispatch returns pinned reauth recovery without fallback attempts" do
+    pinned_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_pinned_reauth_dispatch_should_not_run",
+          "object" => "response"
+        })
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_pinned_reauth_fallback_should_not_run",
+          "object" => "response"
+        })
+      )
+
+    setup = gateway_setup(pinned_upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-ws-pinned-reauth-fallback",
+        compact?: false
+      )
+
+    prime_routing_quota!(fallback.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    previous_response_id = "resp_ws_pinned_dispatch_#{System.unique_integer([:positive])}"
+    visible_tool_output = "visible websocket tool output must not persist"
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{previous_response_id: previous_response_id})
+
+    session = pin_session_to_assignment!(session, setup.assignment)
+    mark_pinned_assignment_reauth_required!(setup)
+
+    payload =
+      Jason.encode!(%{
+        "type" => "response.create",
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "type" => "future_tool_call_output",
+            "call_id" => "call_ws_pinned_reauth",
+            "output" => visible_tool_output
+          }
+        ],
+        "stream" => true,
+        "generate" => true,
+        "previous_response_id" => previous_response_id
+      })
+
+    assert {:error, error} =
+             execute_websocket_response(
+               auth,
+               payload,
+               %{
+                 request_id: "ws-pinned-reauth-dispatch",
+                 codex_session: session,
+                 previous_response_id: previous_response_id
+               },
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_pinned_reauth_gateway_error!(error)
+    refute_received {:websocket_frame, _frame}
+    assert FakeUpstream.count(pinned_upstream) == 0
+    assert FakeUpstream.count(fallback_upstream) == 0
+    assert_pinned_reauth_rejected_request!("ws-pinned-reauth-dispatch")
+    assert Repo.aggregate(Attempt, :count) == 0
+
+    metadata_text = inspect({error, Accounting.list_request_logs(setup.pool)})
+    refute metadata_text =~ previous_response_id
+    refute metadata_text =~ visible_tool_output
+    refute metadata_text =~ "call_ws_pinned_reauth"
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ setup.raw_key
+    refute metadata_text =~ "upstream-token"
   end
 
   @tag :task_6_websocket_resume
@@ -5876,6 +6070,102 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
       "receive_timeout_ms" => Keyword.get(opts, :receive_timeout_ms, 30_000),
       "stale_after_ms" => Keyword.get(opts, :stale_after_ms, 60_000)
     }
+  end
+
+  defp pin_session_to_assignment!(session, assignment) do
+    session
+    |> Ecto.Changeset.change(%{pool_upstream_assignment_id: assignment.id})
+    |> Repo.update!()
+  end
+
+  defp mark_pinned_assignment_reauth_required!(setup) do
+    setup.identity
+    |> Ecto.Changeset.change(%{
+      status: "reauth_required",
+      metadata: %{
+        "base_url" => setup.identity.metadata["base_url"],
+        "token_refresh" => %{
+          "status" => "reauth_required",
+          "reason" => %{
+            "code" => "refresh_token_revoked",
+            "message" => "synthetic refresh state"
+          }
+        }
+      }
+    })
+    |> Repo.update!()
+
+    setup.assignment
+    |> Ecto.Changeset.change(%{
+      health_status: "disabled",
+      eligibility_status: "ineligible"
+    })
+    |> Repo.update!()
+  end
+
+  defp active_owner_lease_for_session!(codex_session_id) do
+    assert [lease] =
+             Repo.all(
+               from lease in BridgeOwnerLease,
+                 where: lease.codex_session_id == ^codex_session_id and lease.status == "active"
+             )
+
+    lease
+  end
+
+  defp assert_owner_lease_not_replaced!(codex_session_id, lease_before) do
+    lease_after = active_owner_lease_for_session!(codex_session_id)
+    assert lease_after.id == lease_before.id
+    assert lease_after.lease_token == lease_before.lease_token
+  end
+
+  defp assert_pinned_reauth_websocket_frame!(frame) do
+    assert %{
+             "type" => "error",
+             "status" => 503,
+             "error" => error
+           } = Jason.decode!(frame)
+
+    assert error["code"] == "pinned_continuation_reauth_required"
+    assert error["retryable"] == false
+    assert error["requires_new_upstream_session"] == true
+    assert error["recovery_kind"] == "restart_with_full_context"
+    assert error["recovery"]["kind"] == "restart_with_full_context"
+    assert error["recovery"]["anchor_removal"]["body"] == ["previous_response_id"]
+
+    assert error["recovery"]["anchor_removal"]["headers"] == [
+             "x-codex-previous-response-id",
+             "x-codex-turn-state",
+             "x-codex-session-id",
+             "session-id",
+             "x-session-affinity",
+             "session_id",
+             "x-codex-conversation-id"
+           ]
+  end
+
+  defp assert_pinned_reauth_gateway_error!(error) do
+    assert error.status == 503
+    assert error.code == "pinned_continuation_reauth_required"
+    assert error.retryable == false
+    assert error.requires_new_upstream_session == true
+    assert error.recovery["kind"] == "restart_with_full_context"
+    assert error.recovery["anchor_removal"]["body"] == ["previous_response_id"]
+  end
+
+  defp assert_pinned_reauth_rejected_request!(correlation_id) do
+    assert [request] =
+             Repo.all(
+               from request in Request,
+                 where: request.correlation_id == ^correlation_id
+             )
+
+    assert request.status == "rejected"
+    assert request.response_status_code == 503
+    assert request.last_error_code == "pinned_continuation_reauth_required"
+    refute request.request_metadata["requires_new_upstream_session"] == false
+
+    request
   end
 
   defp codex_rate_limits_payload(used_percent, reset_at) do
