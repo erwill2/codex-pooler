@@ -15,7 +15,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
   def mount(_params, _session, socket) do
     {:ok,
      assign(socket,
-       page_title: "Admin API keys",
+       page_title: "API keys",
        pools: [],
        pool_lookup: %{},
        api_keys: [],

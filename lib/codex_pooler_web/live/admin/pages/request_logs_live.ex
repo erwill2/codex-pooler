@@ -23,7 +23,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
     {:ok,
      socket
      |> assign(
-       page_title: "Admin request logs",
+       page_title: "Request logs",
        pools: [],
        selected_pool: nil,
        request_logs: empty_request_logs(),

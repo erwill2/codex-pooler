@@ -23,7 +23,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
   def mount(_params, _session, socket) do
     {:ok,
      assign(socket,
-       page_title: "Admin stats",
+       page_title: "Stats",
        dashboard: nil,
        filter_form: to_form(%{"pool_id" => "", "window" => "24h"}, as: :filters),
        filter_error: nil,
