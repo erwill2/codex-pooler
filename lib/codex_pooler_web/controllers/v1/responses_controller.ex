@@ -32,6 +32,7 @@ defmodule CodexPoolerWeb.V1.ResponsesController do
         conn
         |> GatewayHelpers.request_opts()
         |> RequestOptions.for_websocket()
+        |> RequestOptions.put_openai_compatibility(public_openai_responses_stream: true)
         |> RequestOptions.put_continuity(accepted_turn_state: nil)
         |> RequestOptions.mark_openai_compatibility_origin(
           @public_responses_endpoint,

@@ -9,6 +9,7 @@ defmodule CodexPooler.Gateway.Service do
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Denials
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.TranscriptionPayload
   alias CodexPooler.Gateway.Persistence.CodexSession
@@ -255,26 +256,45 @@ defmodule CodexPooler.Gateway.Service do
         {:ok, WebSocketCodec.warmup_result()}
 
       true ->
-        request_options =
-          opts
-          |> request_options("/backend-api/codex/responses", payload)
-          |> RequestOptions.put_transport(
-            transport: "websocket",
-            upstream_endpoint: "/backend-api/codex/responses",
-            route_class: RouteClass.proxy_websocket(),
-            websocket_writer: push_frame
-          )
-          |> RequestOptions.put_continuity(
-            codex_turn_id: SessionContinuity.websocket_turn_id(payload)
-          )
+        with {:ok, coerced} <- coerce_websocket_response_payload(payload, opts) do
+          request_options =
+            coerced.request_options
+            |> request_options(coerced.endpoint, coerced.payload)
+            |> RequestOptions.put_transport(
+              transport: "websocket",
+              upstream_endpoint: coerced.endpoint,
+              route_class: RouteClass.proxy_websocket(),
+              websocket_writer: push_frame
+            )
+            |> RequestOptions.put_continuity(
+              codex_turn_id: SessionContinuity.websocket_turn_id(coerced.payload)
+            )
 
-        execute(
-          auth,
-          "/backend-api/codex/responses",
-          payload,
-          request_options
-        )
+          execute(
+            auth,
+            coerced.endpoint,
+            coerced.payload,
+            request_options
+          )
+        end
     end
+  end
+
+  defp coerce_websocket_response_payload(
+         %{"type" => "response.create"} = payload,
+         %RequestOptions{openai_compatibility: %{public_openai_responses_stream: true}} = opts
+       ) do
+    payload
+    |> Map.drop(["type", "generate"])
+    |> Responses.coerce(opts)
+    |> case do
+      {:ok, coerced} -> {:ok, %{coerced | payload: Map.put(coerced.payload, "generate", true)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp coerce_websocket_response_payload(payload, opts) do
+    {:ok, %{endpoint: "/backend-api/codex/responses", payload: payload, request_options: opts}}
   end
 
   defp handle_websocket_response_processed(auth, payload, opts) do

@@ -91,7 +91,11 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
       {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"id" => "resp_v1_websocket_continuity"} = Jason.decode!(frame)
+      assert %{
+               "type" => "response.completed",
+               "response" => %{"id" => "resp_v1_websocket_continuity"}
+             } = Jason.decode!(frame)
+
       assert_receive_finalized_request!()
 
       conn
@@ -289,13 +293,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   @tag :v1_websocket
   test "GET /v1/responses upgrades and dispatches through the public websocket route" do
     upstream =
-      start_upstream(
-        FakeUpstream.json_response(%{
-          "id" => "resp_v1_websocket_public",
-          "object" => "response",
-          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-        })
-      )
+      start_upstream(public_websocket_completed_response("resp_v1_websocket_public"))
 
     setup = gateway_setup(upstream)
     assert :ok = Events.subscribe_pool(setup.pool)
@@ -326,7 +324,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
       {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"id" => "resp_v1_websocket_public"} = Jason.decode!(frame)
+      assert %{
+               "type" => "response.completed",
+               "response" => %{"id" => "resp_v1_websocket_public"}
+             } = Jason.decode!(frame)
 
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.method == "WEBSOCKET"
@@ -373,13 +374,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   @tag :v1_websocket
   test "GET /v1/responses websocket coerces public opencode replay frames before dispatch" do
     upstream =
-      start_upstream(
-        FakeUpstream.json_response(%{
-          "id" => "resp_v1_websocket_opencode_replay",
-          "object" => "response",
-          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-        })
-      )
+      start_upstream(public_websocket_completed_response("resp_v1_websocket_opencode_replay"))
 
     setup = gateway_setup(upstream)
     assert :ok = Events.subscribe_pool(setup.pool)
@@ -432,12 +427,16 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
       {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
 
-      assert %{"id" => "resp_v1_websocket_opencode_replay"} = Jason.decode!(frame)
+      assert %{
+               "type" => "response.completed",
+               "response" => %{"id" => "resp_v1_websocket_opencode_replay"}
+             } = Jason.decode!(frame)
 
       assert [captured] = FakeUpstream.requests(upstream)
       assert captured.path == "/backend-api/codex/responses"
       assert captured.json["type"] == "response.create"
       assert captured.json["generate"] == true
+      assert captured.json["stream"] == true
       assert captured.json["store"] == false
       assert captured.json["previous_response_id"] == "resp_v1_ws_opencode_previous"
 
@@ -452,6 +451,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
       assert Enum.at(captured.json["input"], 2)["call_id"] == "fc_v1_ws_opencode_call"
       assert Enum.at(captured.json["input"], 3)["call_id"] == "fc_v1_ws_opencode_call"
+
+      assert_receive_finalized_request!()
 
       assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
       assert request.endpoint == "/v1/responses"
@@ -476,13 +477,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   @tag :v1_websocket
   test "GET /v1/responses keeps opencode continuity headers local without forwarding" do
     upstream =
-      start_upstream(
-        FakeUpstream.json_response(%{
-          "id" => "resp_v1_websocket_continuity",
-          "object" => "response",
-          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
-        })
-      )
+      start_upstream(public_websocket_completed_response("resp_v1_websocket_continuity"))
 
     setup = gateway_setup(upstream)
     assert :ok = Events.subscribe_pool(setup.pool)
@@ -1566,6 +1561,84 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :v1_websocket
+  test "GET /v1/responses websocket terminates typeless upstream detail frames" do
+    upstream_detail = "synthetic detail-only upstream frame must not persist"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.websocket_text_frames([
+          Jason.encode!(%{"detail" => upstream_detail})
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    assert :ok = Events.subscribe_pool(setup.pool)
+    port = start_public_endpoint!()
+    turn_state = "v1-ws-detail-terminal-#{System.unique_integer([:positive])}"
+
+    {conn, websocket, ref, _response_headers} =
+      public_v1_websocket_connect!(port, setup, turn_state, [
+        {"openai-beta", "responses_websockets=2026-02-06"}
+      ])
+
+    started = System.monotonic_time(:millisecond)
+
+    try do
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, _websocket, terminal_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      elapsed_ms = elapsed_ms(started)
+
+      assert elapsed_ms < @ttfh_threshold_ms
+
+      assert %{
+               "type" => "response.failed",
+               "error" => %{"code" => "upstream_terminal_failure"},
+               "response" => %{
+                 "status" => "failed",
+                 "error" => %{"code" => "upstream_terminal_failure"}
+               }
+             } = Jason.decode!(terminal_frame)
+
+      refute terminal_frame =~ upstream_detail
+
+      assert_receive {Events,
+                      %{
+                        reason: "request_finalized",
+                        payload: %{"status" => "failed"}
+                      }},
+                     @websocket_frame_timeout
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.endpoint == "/v1/responses"
+      assert request.transport == "websocket"
+      assert request.status == "failed"
+      assert request.last_error_code == "upstream_terminal_failure"
+
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert attempt.status == "failed"
+      refute attempt.network_error_code == "stream_idle_timeout"
+
+      persistence_text = inspect({request.request_metadata, attempt.response_metadata})
+      refute persistence_text =~ upstream_detail
+      refute persistence_text =~ setup.authorization
+      refute persistence_text =~ setup.raw_key
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  @tag :v1_websocket
   test "GET /v1/responses websocket reports idle timeout after visible output" do
     release_ref = make_ref()
     setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 150})
@@ -2004,6 +2077,23 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
            }
          }}
       ]
+  end
+
+  defp public_websocket_completed_response(response_id) do
+    FakeUpstream.sse_stream(
+      [
+        {"response.completed",
+         %{
+           "type" => "response.completed",
+           "response" => %{
+             "id" => response_id,
+             "status" => "completed",
+             "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+           }
+         }}
+      ],
+      done: false
+    )
   end
 
   defp receive_public_websocket_until_completed!(conn, websocket, ref) do

@@ -217,6 +217,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     end
   end
 
+  defp backend_streaming_required?(%RequestOptions{openai_compatibility: compatibility}) do
+    compatibility.collect_openai_response_stream or compatibility.public_openai_responses_stream or
+      compatibility.public_openai_chat_stream
+  end
+
   defp backend_streaming_required?(opts) when is_map(opts) do
     Enum.any?(
       [
