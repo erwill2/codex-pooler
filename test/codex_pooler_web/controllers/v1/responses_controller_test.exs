@@ -16,6 +16,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       public_websocket_receive_text!: 3,
       public_websocket_send_text!: 4,
       put_model_source_assignments!: 2,
+      assert_pre_first_stream_idle_timeout!: 1,
       start_public_endpoint!: 0,
       start_upstream: 1,
       use_routing_strategy!: 3
@@ -1229,6 +1230,170 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert attempt.network_error_code == "stream_idle_timeout"
     after
       Process.send_after(upstream_pid, {:fake_upstream_release_timeout, release_ref}, 250)
+      Mint.HTTP.close(http_conn)
+    end
+  end
+
+  @tag :streaming_timing
+  test "POST /v1/responses streaming keeps silent pre-first-event SSE stalls metadata-only" do
+    release_ref = make_ref()
+    setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 100})
+
+    upstream =
+      start_upstream(
+        FakeUpstream.timeout_after_sse_headers(notify: self(), release_ref: release_ref)
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+
+    {:ok, http_conn, ref, started} =
+      start_public_v1_responses_request(port, setup, %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "silent after headers stall fixture",
+        "stream" => true
+      })
+
+    assert_receive {:fake_upstream_timeout_barrier, :after_sse_headers, upstream_pid,
+                    ^release_ref},
+                   @timing_observation_timeout_ms
+
+    try do
+      {http_conn, status, response_headers, header_elapsed_ms, chunks, done?} =
+        await_public_response_headers!(
+          http_conn,
+          ref,
+          started,
+          @timing_observation_timeout_ms
+        )
+
+      assert status == 200
+      assert header_elapsed_ms < @ttfh_threshold_ms
+      assert header_value(response_headers, "content-type") =~ "text/event-stream"
+
+      body =
+        await_public_response_done!(
+          http_conn,
+          ref,
+          chunks,
+          done?,
+          @failure_observation_timeout_ms
+        )
+
+      total_elapsed_ms = elapsed_ms(started)
+      silent_gap_elapsed_ms = await_silent_gap!(started, 250)
+
+      assert total_elapsed_ms >= 100
+      assert silent_gap_elapsed_ms >= 250
+      assert body == ""
+      refute body =~ "response.created"
+      refute body =~ "response.failed"
+      refute body =~ "response.completed"
+      refute body =~ "[DONE]"
+      refute body =~ "stream_idle_timeout"
+
+      assert FakeUpstream.count(upstream) == 1
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+      assert request.endpoint == "/backend-api/codex/responses"
+      assert request.transport == "http_sse"
+      assert request.status == "failed"
+      assert request.last_error_code == "stream_idle_timeout"
+
+      assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+               "/v1/responses"
+
+      assert attempt.status == "failed"
+      assert attempt.network_error_code == "stream_idle_timeout"
+
+      assert_pre_first_stream_idle_timeout!(setup)
+    after
+      send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+      Mint.HTTP.close(http_conn)
+    end
+  end
+
+  @tag :streaming_timing
+  test "POST /v1/responses streaming keeps partial pre-first-event SSE stalls metadata-only" do
+    release_ref = make_ref()
+    setup_runtime_ingress_override(%OperationalSettings{upstream_receive_timeout_ms: 100})
+
+    upstream =
+      start_upstream(
+        FakeUpstream.timeout_mid_stream(
+          ~s(event: response.created\ndata: {"type":"response.created","response":{"id":"resp_public_raw_partial_stall"),
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+
+    {:ok, http_conn, ref, started} =
+      start_public_v1_responses_request(port, setup, %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "partial frame stall fixture",
+        "stream" => true
+      })
+
+    assert_receive {:fake_upstream_timeout_barrier, :mid_stream, upstream_pid, ^release_ref},
+                   @timing_observation_timeout_ms
+
+    try do
+      {http_conn, status, response_headers, header_elapsed_ms, chunks, done?} =
+        await_public_response_headers!(
+          http_conn,
+          ref,
+          started,
+          @timing_observation_timeout_ms
+        )
+
+      assert status == 200
+      assert header_elapsed_ms < @ttfh_threshold_ms
+      assert header_value(response_headers, "content-type") =~ "text/event-stream"
+
+      body =
+        await_public_response_done!(
+          http_conn,
+          ref,
+          chunks,
+          done?,
+          @failure_observation_timeout_ms
+        )
+
+      total_elapsed_ms = elapsed_ms(started)
+      silent_gap_elapsed_ms = await_silent_gap!(started, 250)
+
+      assert total_elapsed_ms >= 100
+      assert silent_gap_elapsed_ms >= 250
+      assert body == ""
+      refute body =~ "response.created"
+      refute body =~ "response.failed"
+      refute body =~ "response.completed"
+      refute body =~ "[DONE]"
+      refute body =~ "resp_public_raw_partial_stall"
+      refute body =~ "stream_idle_timeout"
+
+      assert FakeUpstream.count(upstream) == 1
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+      assert request.endpoint == "/backend-api/codex/responses"
+      assert request.transport == "http_sse"
+      assert request.status == "failed"
+      assert request.last_error_code == "stream_idle_timeout"
+
+      assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+               "/v1/responses"
+
+      assert attempt.status == "failed"
+      assert attempt.network_error_code == "stream_idle_timeout"
+
+      assert_pre_first_stream_idle_timeout!(setup)
+    after
+      send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
       Mint.HTTP.close(http_conn)
     end
   end

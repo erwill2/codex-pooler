@@ -125,6 +125,35 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     assert_safe_stream_metadata!(request, [attempt])
   end
 
+  def assert_pre_first_stream_idle_timeout!(setup) do
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.transport == "http_sse"
+    assert request.retry_count == 0
+    assert request.last_error_code == "stream_idle_timeout"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == "stream_idle_timeout"
+    assert attempt.error_message == "upstream stream idle timeout"
+    assert attempt.response_metadata["error_kind"] == "stream_interrupted"
+
+    refute Map.has_key?(attempt.response_metadata, "stream_failure_stage")
+    refute Map.has_key?(attempt.response_metadata, "stream_terminal_type")
+    refute Map.has_key?(attempt.response_metadata, "stream_error_code")
+
+    metadata_text = inspect({request.request_metadata, attempt.response_metadata})
+    refute metadata_text =~ "response.created"
+    refute metadata_text =~ "response.failed"
+    refute metadata_text =~ "[DONE]"
+    refute metadata_text =~ "data:"
+    refute metadata_text =~ "Bearer "
+    refute metadata_text =~ "authorization"
+    refute metadata_text =~ "cookie"
+    refute metadata_text =~ "upstream-token"
+    refute metadata_text =~ "auth.json"
+  end
+
   def assert_safe_stream_metadata!(request, attempts) do
     metadata_text =
       inspect({request.request_metadata, Enum.map(attempts, & &1.response_metadata)})

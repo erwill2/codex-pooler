@@ -3049,6 +3049,174 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert attempt.response_metadata["error_code"] == "upstream_network_error"
   end
 
+  test "POST /backend-api/codex/responses keeps silent pre-first-event SSE stalls metadata-only" do
+    release_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.timeout_after_sse_headers(notify: self(), release_ref: release_ref)
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_silent_fallback_should_not_run",
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-silent-fallback",
+        compact?: false
+      )
+
+    setup =
+      setup
+      |> Map.put(:fallback_assignment, fallback.assignment)
+      |> Map.put(:fallback_identity, fallback.identity)
+      |> Map.put(
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert {:ok, %{stream: stream}} =
+             execute_gateway_service(
+               auth,
+               "/backend-api/codex/responses",
+               %{
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "silent after headers stall fixture",
+                 "stream" => true
+               },
+               %{
+                 request_id: "silent-after-headers-stall",
+                 upstream_endpoint: "/backend-api/codex/responses",
+                 receive_timeout: 100
+               }
+             )
+
+    stream_conn =
+      Phoenix.ConnTest.build_conn()
+      |> Plug.Conn.put_resp_content_type("text/event-stream")
+      |> Plug.Conn.send_chunked(200)
+
+    assert stream_conn.status == 200
+    assert get_resp_header(stream_conn, "content-type") == ["text/event-stream; charset=utf-8"]
+
+    assert {:ok, stream_conn} = stream.(stream_conn)
+
+    refute stream_conn.resp_body =~ "response.created"
+    refute stream_conn.resp_body =~ "response.failed"
+    refute stream_conn.resp_body =~ "[DONE]"
+    refute stream_conn.resp_body =~ "resp_silent_fallback_should_not_run"
+
+    assert_receive {:fake_upstream_timeout_barrier, :after_sse_headers, upstream_pid,
+                    ^release_ref},
+                   1_000
+
+    send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+
+    assert FakeUpstream.count(upstream) == 1
+    assert FakeUpstream.count(fallback_upstream) == 0
+    assert_pre_first_stream_idle_timeout!(setup)
+  end
+
+  test "POST /backend-api/codex/responses keeps partial pre-first-event SSE stalls metadata-only" do
+    release_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.timeout_mid_stream(
+          ~s(event: response.created\ndata: {"type":"response.created","response":{"id":"resp_raw_partial_stall"}),
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_partial_fallback_should_not_run",
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-partial-fallback",
+        compact?: false
+      )
+
+    setup =
+      setup
+      |> Map.put(:fallback_assignment, fallback.assignment)
+      |> Map.put(:fallback_identity, fallback.identity)
+      |> Map.put(
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert {:ok, %{stream: stream}} =
+             execute_gateway_service(
+               auth,
+               "/backend-api/codex/responses",
+               %{
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "partial frame stall fixture",
+                 "stream" => true
+               },
+               %{
+                 request_id: "partial-frame-stall",
+                 upstream_endpoint: "/backend-api/codex/responses",
+                 receive_timeout: 100
+               }
+             )
+
+    stream_conn =
+      Phoenix.ConnTest.build_conn()
+      |> Plug.Conn.put_resp_content_type("text/event-stream")
+      |> Plug.Conn.send_chunked(200)
+
+    assert stream_conn.status == 200
+    assert get_resp_header(stream_conn, "content-type") == ["text/event-stream; charset=utf-8"]
+
+    assert {:ok, stream_conn} = stream.(stream_conn)
+
+    refute stream_conn.resp_body =~ "response.created"
+    refute stream_conn.resp_body =~ "response.failed"
+    refute stream_conn.resp_body =~ "[DONE]"
+    refute stream_conn.resp_body =~ "resp_raw_partial_stall"
+    refute stream_conn.resp_body =~ "resp_partial_fallback_should_not_run"
+
+    assert_receive {:fake_upstream_timeout_barrier, :mid_stream, upstream_pid, ^release_ref},
+                   1_000
+
+    send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+
+    assert FakeUpstream.count(upstream) == 1
+    assert FakeUpstream.count(fallback_upstream) == 0
+    assert_pre_first_stream_idle_timeout!(setup)
+  end
+
   test "unsupported upstream field stripping is scoped to local backend responses route" do
     upstream =
       start_upstream(
@@ -5395,6 +5563,62 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert FakeUpstream.count(failing_upstream) == 1
     assert FakeUpstream.count(fallback_upstream) == 0
     assert_stream_terminal_failure!(setup, "upstream_request_timeout")
+  end
+
+  @tag :task_4_first_event_stream_retry
+  test "SSE first-and-only usage-limit terminal failure stays failed without retry" do
+    first_upstream =
+      FakeUpstream.sse_stream(
+        [
+          {"response.failed",
+           %{
+             "type" => "response.failed",
+             "response" => %{
+               "id" => "resp_usage_limit_terminal",
+               "status" => "failed",
+               "error" => %{"code" => "usage_limit_exceeded"},
+               "usage" => %{
+                 "input_tokens" => 10,
+                 "cached_input_tokens" => 4,
+                 "output_tokens" => 2,
+                 "reasoning_tokens" => 1,
+                 "total_tokens" => 12
+               }
+             }
+           }}
+        ],
+        done: false,
+        headers: [{"x-codex-rate-limit-reached-type", "workspace_owner_usage_limit_reached"}]
+      )
+
+    {setup, failing_upstream, fallback_upstream} = stream_retry_setup(first_upstream)
+
+    execute_backend_stream!(setup, "first-and-only-usage-limit-terminal")
+
+    assert FakeUpstream.count(failing_upstream) == 1
+    assert FakeUpstream.count(fallback_upstream) == 0
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "http_sse"
+    assert request.status == "failed"
+    assert request.retry_count == 0
+    assert request.last_error_code == "usage_limit_exceeded"
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == "usage_limit_exceeded"
+
+    assert attempt.response_metadata["rate_limit_reached_type"] ==
+             "workspace_owner_usage_limit_reached"
+
+    metadata_text = inspect({request.request_metadata, attempt.response_metadata})
+    assert metadata_text =~ "workspace_owner_usage_limit_reached"
+    refute metadata_text =~ "resp_usage_limit_terminal"
+    refute metadata_text =~ "x-codex-rate-limit-reached-type"
+    refute metadata_text =~ "Bearer "
+    refute metadata_text =~ "cookie"
+    refute metadata_text =~ "upstream-token"
+    refute metadata_text =~ "auth.json"
   end
 
   test "SSE downstream closed chunk is logged as client disconnect" do
