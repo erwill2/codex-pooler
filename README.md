@@ -72,81 +72,6 @@ surface, while instance admins work only with their assigned Pools.
   worker, scheduler, and migration roles for Kubernetes-friendly, multinode
   growth
 
-## Quick Start With Docker Compose
-
-This runs the published release image with a local Postgres database. It is the
-fastest way to try Codex Pooler on a laptop or small server.
-
-Prerequisites:
-
-- Docker with Compose
-- `openssl`
-
-Start Codex Pooler:
-
-```bash
-git clone https://github.com/icoretech/codex-pooler.git
-cd codex-pooler
-
-scripts/self-host/generate-env.sh
-docker compose pull
-docker compose up -d
-```
-
-Open `http://localhost:4000`. On the first visit, create the owner account at
-`/bootstrap`, then sign in and start with `/admin/pools`.
-
-Useful commands:
-
-```bash
-docker compose ps
-docker compose logs -f app
-docker compose down
-```
-
-To remove the local database too:
-
-```bash
-docker compose down -v
-```
-
-## First Runtime Setup
-
-After bootstrap:
-
-1. Create a Pool in `/admin/pools`
-2. Import or connect Codex accounts in `/admin/upstreams`
-3. Create a Pool API key in `/admin/api-keys`
-4. Point Codex or SDK clients at one of the runtime base URLs:
-
-Treat an imported Codex `auth.json` as owned by Codex Pooler after import. Do
-not keep using the same `auth.json` from another Codex install, machine, or
-automation unless you accept that provider refresh-token rotation can invalidate
-one copy and move the account to `reauth_required`.
-
-```text
-Codex backend base URL: http://localhost:4000/backend-api/codex
-OpenAI SDK base URL:    http://localhost:4000/v1
-```
-
-Use the generated Pool API key as the bearer token. That key represents the
-Pool, not a single Codex account, so Codex Pooler can pick the best eligible
-account for each request. Raw API keys are shown only once when created or
-rotated.
-
-## Operator Roles
-
-The first bootstrap account is an `instance_owner`. Owners have instance-wide
-administration access: they create Pools, assign operators to Pools, manage
-operators, inspect global jobs, and change system settings.
-
-Additional operators can be owners or `instance_admin`s. Instance admins are
-Pool-scoped: they can work only with active Pools assigned to them and metadata
-derived from those Pools. If no Pools are assigned, the admin UI shows empty
-Pool-scoped states instead of exposing global data. Archiving or deleting a Pool
-removes future instance-admin visibility for that Pool; historical request and
-audit rows for archived or deleted Pools remain owner-only.
-
 ## Harness Configuration
 
 Keep Pool API keys and MCP tokens in environment variables when the harness
@@ -752,6 +677,81 @@ console.log(text);
 For deployed instances, change `baseURL` to `https://pooler.example.com/v1`.
 
 </details>
+
+## Quick Start With Docker Compose
+
+This runs the published release image with a local Postgres database. It is the
+fastest way to try Codex Pooler on a laptop or small server.
+
+Prerequisites:
+
+- Docker with Compose
+- `openssl`
+
+Start Codex Pooler:
+
+```bash
+git clone https://github.com/icoretech/codex-pooler.git
+cd codex-pooler
+
+scripts/self-host/generate-env.sh
+docker compose pull
+docker compose up -d
+```
+
+Open `http://localhost:4000`. On the first visit, create the owner account at
+`/bootstrap`, then sign in and start with `/admin/pools`.
+
+Useful commands:
+
+```bash
+docker compose ps
+docker compose logs -f app
+docker compose down
+```
+
+To remove the local database too:
+
+```bash
+docker compose down -v
+```
+
+## First Runtime Setup
+
+After bootstrap:
+
+1. Create a Pool in `/admin/pools`
+2. Import or connect Codex accounts in `/admin/upstreams`
+3. Create a Pool API key in `/admin/api-keys`
+4. Point Codex or SDK clients at one of the runtime base URLs:
+
+Treat an imported Codex `auth.json` as owned by Codex Pooler after import. Do
+not keep using the same `auth.json` from another Codex install, machine, or
+automation unless you accept that provider refresh-token rotation can invalidate
+one copy and move the account to `reauth_required`.
+
+```text
+Codex backend base URL: http://localhost:4000/backend-api/codex
+OpenAI SDK base URL:    http://localhost:4000/v1
+```
+
+Use the generated Pool API key as the bearer token. That key represents the
+Pool, not a single Codex account, so Codex Pooler can pick the best eligible
+account for each request. Raw API keys are shown only once when created or
+rotated.
+
+## Operator Roles
+
+The first bootstrap account is an `instance_owner`. Owners have instance-wide
+administration access: they create Pools, assign operators to Pools, manage
+operators, inspect global jobs, and change system settings.
+
+Additional operators can be owners or `instance_admin`s. Instance admins are
+Pool-scoped: they can work only with active Pools assigned to them and metadata
+derived from those Pools. If no Pools are assigned, the admin UI shows empty
+Pool-scoped states instead of exposing global data. Archiving or deleting a Pool
+removes future instance-admin visibility for that Pool; historical request and
+audit rows for archived or deleted Pools remain owner-only.
 
 ## Runtime Compatibility
 
