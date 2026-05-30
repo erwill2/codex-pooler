@@ -100,8 +100,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   defp refresh_reconciliation_quota(identity, assignment, opts) do
     windows =
       Keyword.get(opts, :quota_windows) || metadata_quota_windows(identity, assignment) ||
-        codex_usage_quota_windows(identity, assignment, opts) ||
-        Quota.Windows.existing_quota_window_attrs(identity)
+        codex_usage_quota_windows(identity, assignment, opts)
 
     case windows do
       :auth_unavailable ->
@@ -110,6 +109,9 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
           "quota_refresh_auth_unavailable",
           "quota refresh requires account reauthentication"
         )
+
+      :usage_unavailable ->
+        step_result(:failed, "quota_refresh_unavailable", "quota windows were not available")
 
       [_ | _] ->
         case Quota.Windows.upsert_quota_windows(identity, windows, delete_missing?: true) do
@@ -156,10 +158,10 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
           retry_codex_usage_after_token_refresh(identity, assignment, opts)
 
         _error ->
-          nil
+          :usage_unavailable
       end
     else
-      _unavailable -> nil
+      _unavailable -> :auth_unavailable
     end
   end
 

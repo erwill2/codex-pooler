@@ -209,6 +209,50 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert window.credits == 75
     end
 
+    test "does not report stale persisted quota as refreshed when live usage is unavailable" do
+      stale_observed_at = DateTime.add(DateTime.utc_now(), -3_600, :second)
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/codex/usage" => {404, %{"error" => "missing"}},
+             "/wham/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/wham/usage" => {404, %{"error" => "missing"}}
+           }}
+        )
+
+      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   used_percent: Decimal.new("47"),
+                   reset_at: DateTime.add(stale_observed_at, -60, :second),
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: stale_observed_at
+                 }
+               ])
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :partial
+      assert result.quota.status == :failed
+      assert result.quota.code == "quota_refresh_unavailable"
+
+      [window] = QuotaWindows.list_quota_windows(identity)
+      assert window.observed_at == DateTime.truncate(stale_observed_at, :microsecond)
+    end
+
     test "enqueues account reconciliation jobs for active pools" do
       {pool, assignment} = active_assignment_fixture(%{})
 
