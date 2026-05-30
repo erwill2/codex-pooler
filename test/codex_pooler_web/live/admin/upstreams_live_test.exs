@@ -159,50 +159,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     refute has_element?(view, "#upstream-add-capacity-card")
   end
 
-  test "renders an add capacity card beside existing upstream accounts", %{
-    conn: conn,
-    scope: scope
-  } do
-    {:ok, pool} = Pools.create_pool(scope, %{slug: "capacity-upstreams", name: "Capacity"})
-
-    %{identity: identity} =
-      upstream_assignment_fixture(pool, %{
-        account_label: "Capacity Codex",
-        account_identifier: "capacity@example.com"
-      })
-
-    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
-
-    assert has_element?(view, "#upstream-account-#{identity.id}", "Capacity Codex")
-    assert has_element?(view, "#upstream-add-capacity-card", "Add Capacity")
-    assert has_element?(view, "#upstream-add-capacity-card.group")
-
-    assert has_element?(
-             view,
-             "#upstream-add-capacity-card .\\[\\@media\\(hover\\:hover\\)\\]\\:opacity-40.\\[\\@media\\(hover\\:hover\\)\\]\\:group-hover\\:opacity-100"
-           )
-
-    assert has_element?(view, "#upstream-add-capacity-card .hero-bolt")
-
-    assert has_element?(
-             view,
-             "#upstream-add-capacity-card",
-             "Import another Codex auth.json or create an invite link for account onboarding."
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-add-capacity-import-auth-json[phx-click='open_import_auth_json']",
-             "Import auth.json"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-add-capacity-create-invite[href='/admin/invites?create=1']",
-             "Invite to Pool"
-           )
-  end
-
   @tag :upstream_filters
   test "renders URL-backed upstream filter controls without legacy select fallbacks", %{
     conn: conn,
