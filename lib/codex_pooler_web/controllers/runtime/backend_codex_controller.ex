@@ -2,11 +2,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
   use CodexPoolerWeb, :controller
 
   alias CodexPooler.ControlPlaneRoutes
+  alias CodexPooler.Gateway
   alias CodexPooler.Gateway.ControlPlaneProxy
   alias CodexPooler.Gateway.Metadata
   alias CodexPooler.Gateway.OpenAICompatibility.{Chat, ChatCompletions}
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Service
   alias CodexPooler.Pools
   alias CodexPooler.RouteClass
   alias CodexPoolerWeb.Runtime.ControlPlaneJson
@@ -140,10 +140,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
               conn
               |> GatewayHelpers.request_opts()
               |> Map.put(:upstream_endpoint, "/backend-api/transcribe")
-              |> Map.put(:forced_transcription_model, Service.backend_transcription_model())
+              |> Map.put(:forced_transcription_model, Gateway.backend_transcription_model())
               |> RequestOptions.from_conn_metadata("/backend-api/transcribe", payload)
 
-            Service.execute_multipart(auth, "/backend-api/transcribe", payload, opts)
+            Gateway.execute_multipart(auth, "/backend-api/transcribe", payload, opts)
           end
         )
 
@@ -228,7 +228,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
     route_class = RequestOptions.route_class(request_options)
 
     GatewayHelpers.admit(conn, route_class, %{endpoint: local_endpoint}, fn ->
-      Service.execute(auth, accounting_endpoint, payload, request_options)
+      Gateway.execute(auth, accounting_endpoint, payload, request_options)
     end)
   end
 
@@ -288,7 +288,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
       RequestOptions.route_class(coerced.request_options),
       %{endpoint: local_endpoint},
       fn ->
-        Service.execute(auth, accounting_endpoint, coerced.payload, coerced.request_options)
+        Gateway.execute(auth, accounting_endpoint, coerced.payload, coerced.request_options)
       end
     )
   end

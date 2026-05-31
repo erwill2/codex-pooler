@@ -25,7 +25,7 @@ defmodule CodexPoolerWeb.V1.ResponsesController do
   end
 
   def websocket(conn, _params) do
-    PublicGatewayDispatch.websocket(conn, @public_responses_endpoint, fn auth ->
+    PublicGatewayDispatch.websocket(conn, fn auth ->
       turn_state = accepted_turn_state(conn)
 
       request_options =

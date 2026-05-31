@@ -2,8 +2,8 @@ defmodule CodexPoolerWeb.Runtime.BackendFileController do
   use CodexPoolerWeb, :controller
 
   alias CodexPooler.Files
+  alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Service
   alias CodexPooler.RouteClass
   alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
 
@@ -16,7 +16,7 @@ defmodule CodexPoolerWeb.Runtime.BackendFileController do
   def uploaded(conn, %{"file_id" => file_id}) do
     with_authenticated_file_admission(conn, "/backend-api/files/uploaded", fn auth ->
       with {:ok, result} <-
-             Service.mark_uploaded(
+             Gateway.mark_uploaded(
                auth,
                file_id,
                request_options(conn, "/backend-api/files/uploaded", %{})
@@ -51,7 +51,7 @@ defmodule CodexPoolerWeb.Runtime.BackendFileController do
          :ok <- require_json_content_type(conn),
          {:ok, payload} <- GatewayHelpers.read_json_body(conn),
          {:ok, %{body: body}} <-
-           Service.create_upstream_file(
+           Gateway.create_upstream_file(
              auth,
              payload,
              request_options(conn, "/backend-api/files", payload)

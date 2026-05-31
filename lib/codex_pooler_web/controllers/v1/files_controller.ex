@@ -2,9 +2,9 @@ defmodule CodexPoolerWeb.V1.FilesController do
   use CodexPoolerWeb, :controller
 
   alias CodexPooler.Files
+  alias CodexPooler.Gateway
   alias CodexPooler.Gateway.OpenAICompatibility.Files, as: FilesAdapter
   alias CodexPooler.Gateway.Payloads.{FileRequestMetadata, RequestOptions}
-  alias CodexPooler.Gateway.Service
   alias CodexPooler.RouteClass
   alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
   alias CodexPoolerWeb.V1.PublicGatewayDispatch
@@ -37,7 +37,7 @@ defmodule CodexPoolerWeb.V1.FilesController do
     with_authenticated_file_admission(conn, "/v1/files", fn auth ->
       with {:ok, validated} <- FilesAdapter.validate_create(params),
            {:ok, result} <-
-             Service.create_v1_file(auth, validated, request_options(conn, "/v1/files")) do
+             Gateway.create_v1_file(auth, validated, request_options(conn, "/v1/files")) do
         {:ok, %{status: 200, headers: [], body: Files.response_shape(result.file)}}
       end
     end)

@@ -1,9 +1,9 @@
 defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
   @moduledoc false
 
+  alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Service
   alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
   alias CodexPoolerWeb.V1.PublicGatewayResult
 
@@ -31,9 +31,8 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
     end
   end
 
-  @spec websocket(conn(), String.t(), (auth() -> conn())) :: conn()
-  def websocket(conn, endpoint, upgrade_fun)
-      when is_binary(endpoint) and is_function(upgrade_fun, 1) do
+  @spec websocket(conn(), (auth() -> conn())) :: conn()
+  def websocket(conn, upgrade_fun) when is_function(upgrade_fun, 1) do
     case GatewayHelpers.authenticate_v1(conn) do
       {:ok, auth} ->
         upgrade_fun.(auth)
@@ -77,7 +76,7 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
     route_class = RequestOptions.route_class(request_options)
 
     GatewayHelpers.admit(conn, route_class, %{endpoint: endpoint}, fn ->
-      Service.execute(auth, endpoint, payload, request_options)
+      Gateway.execute(auth, endpoint, payload, request_options)
     end)
   end
 end
