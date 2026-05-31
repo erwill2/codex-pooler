@@ -15,6 +15,7 @@ defmodule CodexPooler.PoolerFixtures do
   alias CodexPooler.Accounting.LedgerEntry
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Accounts.User
+  alias CodexPooler.Alerts.Schemas.{AlertChannel, AlertIncident, AlertIncidentTarget, AlertRule}
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Pools.{Membership, OperatorPoolAssignment, Pool}
   alias CodexPooler.Repo
@@ -186,6 +187,116 @@ defmodule CodexPooler.PoolerFixtures do
     |> Repo.insert!()
   end
 
+  def alert_rule_fixture(pool \\ pool_fixture(), attrs \\ %{}) do
+    attrs = Map.new(attrs)
+    now = now()
+
+    %AlertRule{}
+    |> AlertRule.changeset(%{
+      pool_id: Map.get(attrs, :pool_id, pool.id),
+      scope_type: Map.get(attrs, :scope_type, "pool"),
+      rule_kind: Map.get(attrs, :rule_kind, "pool_no_usable_assignments"),
+      display_name: Map.get(attrs, :display_name, "Pool usable assignment coverage"),
+      severity: Map.get(attrs, :severity, "critical"),
+      cooldown_minutes: Map.get(attrs, :cooldown_minutes, AlertRule.default_cooldown_minutes()),
+      state: Map.get(attrs, :state, "active"),
+      model: Map.get(attrs, :model),
+      min_usable_assignments: Map.get(attrs, :min_usable_assignments),
+      target_state: Map.get(attrs, :target_state),
+      window_selector: Map.get(attrs, :window_selector),
+      threshold_used_percent: Map.get(attrs, :threshold_used_percent),
+      created_by_user_id: Map.get(attrs, :created_by_user_id),
+      disabled_at: Map.get(attrs, :disabled_at),
+      metadata: Map.get(attrs, :metadata, %{}),
+      created_at: Map.get(attrs, :created_at, now),
+      updated_at: Map.get(attrs, :updated_at, now)
+    })
+    |> Repo.insert!()
+  end
+
+  def alert_channel_fixture(attrs \\ %{}) do
+    attrs = Map.new(attrs)
+    now = now()
+
+    %AlertChannel{}
+    |> AlertChannel.changeset(%{
+      channel_type: Map.get(attrs, :channel_type, "email"),
+      display_name: Map.get(attrs, :display_name, "Operations email"),
+      state: Map.get(attrs, :state, "active"),
+      email_to: Map.get(attrs, :email_to, "alerts@example.com"),
+      endpoint_scheme: Map.get(attrs, :endpoint_scheme),
+      endpoint_host: Map.get(attrs, :endpoint_host),
+      endpoint_path_prefix: Map.get(attrs, :endpoint_path_prefix),
+      endpoint_fingerprint: Map.get(attrs, :endpoint_fingerprint),
+      webhook_signing_secret_ciphertext: Map.get(attrs, :webhook_signing_secret_ciphertext),
+      webhook_signing_secret_nonce: Map.get(attrs, :webhook_signing_secret_nonce),
+      webhook_signing_secret_aad: Map.get(attrs, :webhook_signing_secret_aad, %{}),
+      webhook_signing_secret_key_version: Map.get(attrs, :webhook_signing_secret_key_version),
+      created_by_user_id: Map.get(attrs, :created_by_user_id),
+      disabled_at: Map.get(attrs, :disabled_at),
+      metadata: Map.get(attrs, :metadata, %{}),
+      created_at: Map.get(attrs, :created_at, now),
+      updated_at: Map.get(attrs, :updated_at, now)
+    })
+    |> Repo.insert!()
+  end
+
+  def alert_incident_fixture(attrs \\ %{}) do
+    attrs = Map.new(attrs)
+    now = now()
+    pool = Map.get(attrs, :pool)
+    upstream_identity = Map.get(attrs, :upstream_identity)
+    upstream_identity_id = Map.get(attrs, :upstream_identity_id) || maybe_id(upstream_identity)
+
+    pool_id =
+      Map.get(attrs, :pool_id) || maybe_id(pool) ||
+        maybe_pool_id_for_incident(upstream_identity_id)
+
+    scope_type =
+      Map.get(attrs, :scope_type) ||
+        if(upstream_identity_id, do: "upstream_identity", else: "pool")
+
+    %AlertIncident{}
+    |> AlertIncident.changeset(%{
+      dedupe_key: Map.get(attrs, :dedupe_key, "alert:fixture:#{unique_suffix()}"),
+      scope_type: scope_type,
+      rule_kind: Map.get(attrs, :rule_kind, "pool_no_usable_assignments"),
+      severity: Map.get(attrs, :severity, "critical"),
+      state: Map.get(attrs, :state, "open"),
+      pool_id: if(scope_type == "pool", do: pool_id),
+      upstream_identity_id: if(scope_type == "upstream_identity", do: upstream_identity_id),
+      occurrence_count: Map.get(attrs, :occurrence_count, 1),
+      first_seen_at: Map.get(attrs, :first_seen_at, now),
+      last_seen_at: Map.get(attrs, :last_seen_at, now),
+      acknowledged_at: Map.get(attrs, :acknowledged_at),
+      resolved_at: Map.get(attrs, :resolved_at),
+      safe_evidence_snapshot: Map.get(attrs, :safe_evidence_snapshot, %{}),
+      suppression_metadata: Map.get(attrs, :suppression_metadata, %{}),
+      created_at: Map.get(attrs, :created_at, now),
+      updated_at: Map.get(attrs, :updated_at, now)
+    })
+    |> Repo.insert!()
+  end
+
+  def alert_incident_target_fixture(incident, rule, pool, attrs \\ %{}) do
+    attrs = Map.new(attrs)
+    now = now()
+
+    %AlertIncidentTarget{}
+    |> AlertIncidentTarget.changeset(%{
+      incident_id: Map.get(attrs, :incident_id, incident.id),
+      rule_id: Map.get(attrs, :rule_id, rule.id),
+      pool_id: Map.get(attrs, :pool_id, pool.id),
+      first_matched_at: Map.get(attrs, :first_matched_at, now),
+      last_matched_at: Map.get(attrs, :last_matched_at, now),
+      resolved_at: Map.get(attrs, :resolved_at),
+      metadata: Map.get(attrs, :metadata, %{}),
+      created_at: Map.get(attrs, :created_at, now),
+      updated_at: Map.get(attrs, :updated_at, now)
+    })
+    |> Repo.insert!()
+  end
+
   def request_fixture(%{pool: pool, api_key: api_key}, attrs \\ %{}) do
     %Request{
       pool_id: pool.id,
@@ -285,6 +396,12 @@ defmodule CodexPooler.PoolerFixtures do
   defp unique_suffix do
     "#{System.system_time(:nanosecond)}-#{System.unique_integer([:positive])}"
   end
+
+  defp maybe_id(%{id: id}), do: id
+  defp maybe_id(_value), do: nil
+
+  defp maybe_pool_id_for_incident(nil), do: pool_fixture().id
+  defp maybe_pool_id_for_incident(_upstream_identity_id), do: nil
 
   defp fixture_scope(user_id) when is_binary(user_id) do
     user_id
