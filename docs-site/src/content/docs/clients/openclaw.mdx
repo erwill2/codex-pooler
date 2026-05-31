@@ -1,0 +1,95 @@
+---
+title: OpenClaw
+description: Configure OpenClaw with Codex Pooler's narrow OpenAI-compatible /v1 surface, PI runtime pin, model metadata, and operator MCP endpoint.
+---
+
+OpenClaw should use Codex Pooler through the narrow OpenAI-compatible `/v1` surface. Keep `openai/*` model names when you want OpenClaw and its tools to treat the model as the canonical OpenAI provider path.
+
+For a deployed instance, use these URLs:
+
+```text
+OpenAI-compatible base URL:
+https://pooler.example.com/v1
+
+Operator MCP URL:
+https://pooler.example.com/mcp
+```
+
+For local setup, replace the host with `http://localhost:4000`.
+
+## Provider shape
+
+OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surface, use a Pool API key for model requests, and pin the agent runtime to PI.
+
+```json5
+{
+  agents: {
+    defaults: {
+      model: { primary: "openai/gpt-5.5" },
+    },
+  },
+  models: {
+    mode: "merge",
+    providers: {
+      openai: {
+        baseUrl: "https://pooler.example.com/v1",
+        apiKey: "<pool-api-key>",
+        api: "openai-responses",
+        agentRuntime: { id: "pi" },
+        timeoutSeconds: 300,
+        models: [
+          {
+            id: "gpt-5.5",
+            name: "GPT-5.5 via Codex Pooler",
+            reasoning: true,
+            input: ["text", "image"],
+            contextWindow: 400000,
+            contextTokens: 256000,
+            maxTokens: 128000,
+          },
+        ],
+      },
+    },
+  },
+}
+```
+
+Define only model ids your assigned Pool can serve. If you run Codex Pooler locally, set `baseUrl` to `http://localhost:4000/v1`.
+
+## Operator MCP server
+
+Add Codex Pooler as a remote Streamable HTTP MCP server only when OpenClaw should inspect metadata that the operator can already see in the admin UI.
+
+```json5
+{
+  mcp: {
+    servers: {
+      codex_pooler: {
+        url: "https://pooler.example.com/mcp",
+        transport: "streamable-http",
+        headers: {
+          Authorization: "Bearer <operator-mcp-token>",
+        },
+      },
+    },
+  },
+}
+```
+
+Use `http://localhost:4000/mcp` only for local setup.
+
+MCP uses an operator-owned MCP token, not a Pool API key. Don't reuse the Pool API key from the model provider block for `/mcp`.
+
+## Custom provider option
+
+If you want to keep Codex Pooler separate from OpenClaw's built-in OpenAI provider behavior, you can use a custom provider id such as `codex-pooler/gpt-5.5` instead.
+
+That follows OpenClaw's generic custom-provider shape, but tools that look specifically for `openai/gpt-*` model refs won't see it as canonical OpenAI. Prefer the `openai` provider shape above unless you need that separation.
+
+## Compatibility notes
+
+OpenClaw model requests use Codex Pooler's narrow OpenAI-compatible `/v1` support for selected SDK routes. Codex Pooler doesn't provide full OpenAI API parity.
+
+`GET /v1/responses` is narrow Responses websocket compatibility, not `/v1/realtime` support. `/v1/realtime` and OpenAI Realtime SDK websocket or session routes are unsupported.
+
+The operator MCP endpoint is rooted at `/mcp`. It uses an operator-owned MCP token, not a Pool API key.

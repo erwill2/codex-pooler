@@ -1,0 +1,130 @@
+---
+title: OpenAI-Compatible SDKs
+description: Use selected OpenAI SDK routes through Codex Pooler's narrow /v1 compatibility surface without implying full OpenAI API parity.
+---
+
+Codex Pooler provides narrow OpenAI-compatible `/v1` support for selected SDK routes. It translates supported requests into Codex-compatible work, then sends them through the same Pool routing, limit checks, account selection, and accounting path used by Codex backend clients.
+
+It doesn't provide full OpenAI API parity.
+
+## Base URL and authentication
+
+Use the `/v1` base URL and a Pool API key:
+
+```text
+Base URL:
+https://pooler.example.com/v1
+
+Authorization:
+Bearer <pool-api-key>
+```
+
+For local setup, use `http://localhost:4000/v1`.
+
+## Python SDK
+
+```python
+import os
+
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ["CODEX_POOLER_API_KEY"],
+    base_url="https://pooler.example.com/v1",
+)
+
+response = client.responses.create(
+    model="gpt-5.5",
+    input="Write a short setup confirmation.",
+)
+
+print(response.output_text)
+```
+
+## Node SDK
+
+```js
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  apiKey: process.env.CODEX_POOLER_API_KEY,
+  baseURL: "https://pooler.example.com/v1",
+});
+
+const response = await client.responses.create({
+  model: "gpt-5.5",
+  input: "Write a short setup confirmation.",
+});
+
+console.log(response.output_text);
+```
+
+## Vercel AI SDK
+
+```ts
+import { createOpenAI } from "@ai-sdk/openai";
+import { generateText } from "ai";
+
+const pooler = createOpenAI({
+  apiKey: process.env.CODEX_POOLER_API_KEY,
+  baseURL: "https://pooler.example.com/v1",
+});
+
+const { text } = await generateText({
+  model: pooler.responses("gpt-5.5"),
+  prompt: "Write a short setup confirmation.",
+});
+
+console.log(text);
+```
+
+## Selected route support
+
+The OpenAI-compatible `/v1` surface supports selected routes only:
+
+- `GET /v1/models`
+- `POST /v1/responses`
+- `GET /v1/responses`, narrow Responses websocket compatibility only
+- `POST /v1/responses/compact`
+- `POST /v1/chat/completions`
+- `GET /v1/usage`
+- `GET /v1/files`
+- `POST /v1/files`
+- `GET /v1/files/:file_id`
+- `GET /v1/files/:file_id/content`, deterministic unsupported content read after ownership checks
+- `DELETE /v1/files/:file_id`, deterministic unsupported delete after ownership checks
+- `POST /v1/audio/transcriptions`
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
+
+The `/v1` surface is compatibility over Codex routing, not a separate OpenAI engine. Supported requests still require a Pool API key and a Pool with eligible upstream capacity for the requested model.
+
+## Unsupported boundaries
+
+These `/v1` routes are unsupported and may return deterministic OpenAI-shaped unsupported endpoint errors when explicitly routed:
+
+- `POST /v1/images/variations`
+- `POST /v1/embeddings`
+- `POST /v1/batches`
+- `POST /v1/moderations`
+- `POST /v1/fine_tuning/jobs`
+- `GET /v1/responses/:response_id`
+- `POST /v1/responses/:response_id/cancel`
+- `DELETE /v1/responses/:response_id`
+- `/v1/realtime` and OpenAI Realtime SDK websocket or session routes
+
+`GET /v1/responses` is narrow Responses websocket compatibility, not `/v1/realtime` support. OpenAI Realtime SDK websocket and session routes are not supported.
+
+## MCP stays separate
+
+The operator MCP endpoint is rooted at `/mcp`, not under `/v1`. It uses operator-owned MCP bearer tokens and returns metadata only.
+
+```text
+MCP URL:
+https://pooler.example.com/mcp
+
+Authorization:
+Bearer <operator-mcp-token>
+```
+
+Don't use Pool API keys, browser sessions, cookies, query tokens, invite tokens, upstream tokens, or custom headers as MCP authentication.

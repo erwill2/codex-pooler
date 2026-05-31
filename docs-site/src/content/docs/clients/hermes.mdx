@@ -1,0 +1,118 @@
+---
+title: Hermes Agent
+description: Configure Hermes Agent with Codex Pooler's narrow OpenAI-compatible /v1 surface and operator MCP endpoint.
+---
+
+Hermes Agent should use Codex Pooler through the narrow OpenAI-compatible `/v1` surface unless a Codex backend route is documented for the specific Hermes path you are testing.
+
+The recommended setup is the Hermes `openai-api` provider. It keeps Hermes on its OpenAI API path, sends model requests to `/v1`, and keeps the Pool API key separate from the operator MCP token.
+
+For a deployed instance, use these URLs:
+
+```text
+OpenAI API base URL:
+https://pooler.example.com/v1
+
+Operator MCP URL:
+https://pooler.example.com/mcp
+```
+
+For local setup, replace the host with `http://localhost:4000`.
+
+## Recommended `openai-api` provider
+
+Store the Pool API key and operator MCP token in a private Hermes environment file such as `~/.hermes/.env`.
+
+```bash
+OPENAI_API_KEY=<pool-api-key>
+OPENAI_BASE_URL=https://pooler.example.com/v1
+CODEX_POOLER_MCP_KEY=<operator-mcp-token>
+```
+
+Then point `~/.hermes/config.yaml` at the same `/v1` base URL and force the Responses transport mode.
+
+```yaml
+model:
+  default: gpt-5.5
+  provider: openai-api
+  base_url: https://pooler.example.com/v1
+  api_mode: codex_responses
+
+mcp_servers:
+  codex_pooler:
+    url: https://pooler.example.com/mcp
+    headers:
+      Authorization: "Bearer ${CODEX_POOLER_MCP_KEY}"
+    enabled: true
+    timeout: 120
+    connect_timeout: 60
+```
+
+Use `http://localhost:4000/v1` and `http://localhost:4000/mcp` for a local Codex Pooler instance.
+
+Test the model path with a one-shot prompt:
+
+```bash
+hermes -z 'Reply with exactly: hermes openai api ok' --ignore-rules
+```
+
+That test should create normal `/v1` traffic using the Pool API key. The MCP entry is separate and should authenticate only with an operator-owned MCP token.
+
+## Alternate `openai-codex` credential-pool path
+
+Hermes can also use its `openai-codex` provider against Codex Pooler, but this path is less direct. Hermes treats `openai-codex` as an OAuth provider by default, so add a Pool API key credential ahead of any device-code credential and keep the credential `base_url` on `/v1`.
+
+Keep endpoint and MCP token values in the environment:
+
+```bash
+HERMES_CODEX_BASE_URL=https://pooler.example.com/v1
+CODEX_POOLER_MCP_KEY=<operator-mcp-token>
+```
+
+Set the provider in `~/.hermes/config.yaml`:
+
+```yaml
+model:
+  default: gpt-5.5
+  provider: openai-codex
+  base_url: https://pooler.example.com/v1
+
+mcp_servers:
+  codex_pooler:
+    url: https://pooler.example.com/mcp
+    headers:
+      Authorization: "Bearer ${CODEX_POOLER_MCP_KEY}"
+    enabled: true
+    timeout: 120
+    connect_timeout: 60
+```
+
+Add a credential-pool entry for Codex Pooler in the Hermes `auth.json` file. This example shows only placeholders. Don't paste a real key into public docs or shared files.
+
+```json
+{
+  "active_provider": "openai-codex",
+  "credential_pool": {
+    "openai-codex": [
+      {
+        "label": "codex-pooler",
+        "auth_type": "api_key",
+        "priority": -10,
+        "source": "manual",
+        "access_token": "<pool-api-key>",
+        "base_url": "https://pooler.example.com/v1"
+      }
+    ]
+  }
+}
+```
+
+Use the `openai-api` path first unless you specifically need to test Hermes credential-pool behavior.
+
+## Compatibility notes
+
+Hermes model requests use Codex Pooler's narrow OpenAI-compatible `/v1` support for selected SDK routes. Codex Pooler doesn't provide full OpenAI API parity.
+
+`GET /v1/responses` is narrow Responses websocket compatibility, not `/v1/realtime` support. `/v1/realtime` and OpenAI Realtime SDK websocket or session routes are unsupported.
+
+The operator MCP endpoint is rooted at `/mcp`. It uses an operator-owned MCP token, not a Pool API key.
