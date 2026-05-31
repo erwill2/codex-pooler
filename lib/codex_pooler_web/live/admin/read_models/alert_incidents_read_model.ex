@@ -76,6 +76,10 @@ defmodule CodexPoolerWeb.Admin.AlertIncidentsReadModel do
           required(:delivery_summary) => delivery_summary()
         }
   @type page_state :: %{
+          required(:manageable_pools) => [term()],
+          required(:pool_lookup) => %{String.t() => term()},
+          required(:rules) => [AlertRule.t()],
+          required(:channels) => [AlertChannel.t()],
           required(:incidents) => [incident_row()],
           required(:filter_form) => Phoenix.HTML.Form.t(),
           required(:filter_values) => %{String.t() => String.t()},
@@ -99,6 +103,10 @@ defmodule CodexPoolerWeb.Admin.AlertIncidentsReadModel do
     rows = incident_rows(incidents, filters, channels)
 
     %{
+      manageable_pools: pools,
+      pool_lookup: Map.new(pools, &{&1.id, &1}),
+      rules: rules,
+      channels: channels,
       incidents: Enum.take(rows, @page_size),
       filter_form: to_form(form_values, as: :filters, errors: form_errors(filter_errors)),
       filter_values: form_values,
