@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.SettingsLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Accounts
   alias CodexPooler.Accounts.Scope
@@ -291,7 +291,12 @@ defmodule CodexPoolerWeb.Admin.SettingsLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <AdminComponents.admin_shell flash={@flash} current_scope={@current_scope} active_nav={:settings}>
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:settings}
+      alert_notification_center={@alert_notification_center}
+    >
       <section id="admin-settings-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="settings-page-header"

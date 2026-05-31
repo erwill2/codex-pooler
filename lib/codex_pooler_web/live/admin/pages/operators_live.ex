@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.OperatorsLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Accounts
   alias CodexPooler.Accounts.User
@@ -262,7 +262,12 @@ defmodule CodexPoolerWeb.Admin.OperatorsLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <AdminComponents.admin_shell flash={@flash} current_scope={@current_scope} active_nav={:operators}>
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:operators}
+      alert_notification_center={@alert_notification_center}
+    >
       <section id="admin-operators-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="operators-page-header"

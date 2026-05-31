@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.InvitesLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Access
   alias CodexPooler.Events
@@ -172,7 +172,12 @@ defmodule CodexPoolerWeb.Admin.InvitesLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <AdminComponents.admin_shell flash={@flash} current_scope={@current_scope} active_nav={:invites}>
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:invites}
+      alert_notification_center={@alert_notification_center}
+    >
       <section id="admin-invites-live" class="grid gap-6">
         <AdminComponents.page_header
           id="invite-page-header"
