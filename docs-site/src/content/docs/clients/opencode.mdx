@@ -1,0 +1,95 @@
+---
+title: OpenCode
+description: Configure OpenCode with Codex Pooler's narrow OpenAI-compatible /v1 surface and remote operator MCP endpoint.
+---
+
+OpenCode should use Codex Pooler through the narrow OpenAI-compatible `/v1` surface. The Pool API key authenticates model requests. A separate operator MCP token authenticates the remote MCP endpoint.
+
+For a deployed instance, use these URLs:
+
+```text
+OpenCode provider base URL:
+https://pooler.example.com/v1
+
+Remote MCP URL:
+https://pooler.example.com/mcp
+```
+
+For local setup, replace the host with `http://localhost:4000`.
+
+## Provider example
+
+Store the Pool API key outside the config and read it through environment expansion.
+
+```jsonc
+{
+  "provider": {
+    "openai": {
+      "npm": "@ai-sdk/openai",
+      "name": "Codex Pooler",
+      "options": {
+        "baseURL": "https://pooler.example.com/v1",
+        "apiKey": "{env:CODEX_POOLER_API_KEY}",
+        "reasoningEffort": "high",
+        "reasoningSummary": "auto",
+        "textVerbosity": "medium",
+        "include": ["reasoning.encrypted_content"],
+        "store": false
+      },
+      "models": {
+        "gpt-5.5": {
+          "id": "gpt-5.5",
+          "name": "GPT-5.5 via Codex Pooler",
+          "family": "gpt",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": false,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 400000,
+            "input": 256000,
+            "output": 128000
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Define only model ids your assigned Pool can serve. If you run Codex Pooler locally, set `baseURL` to `http://localhost:4000/v1`.
+
+## Remote MCP example
+
+Add Codex Pooler as a remote MCP server when the OpenCode host should inspect metadata that the operator can already see in the admin UI.
+
+```jsonc
+{
+  "mcp": {
+    "codex_pooler": {
+      "type": "remote",
+      "url": "https://pooler.example.com/mcp",
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer <operator-mcp-token>"
+      },
+      "enabled": true,
+      "timeout": 30000
+    }
+  }
+}
+```
+
+Use a dedicated operator MCP token for hosts that persist remote MCP headers. Don't use a Pool API key for `/mcp`.
+
+## Compatibility notes
+
+Codex Pooler provides narrow OpenAI-compatible `/v1` support for selected SDK routes. Supported OpenCode traffic should stay on `/v1/responses` or `/v1/chat/completions`, depending on the OpenAI provider path OpenCode uses.
+
+`GET /v1/responses` is narrow Responses websocket compatibility, not `/v1/realtime` support. `/v1/realtime` and OpenAI Realtime SDK websocket or session routes are unsupported.
+
+Unsupported `/v1` routes return deterministic OpenAI-shaped unsupported endpoint errors when explicitly routed. Don't treat Codex Pooler as full OpenAI API parity.

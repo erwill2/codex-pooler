@@ -1,0 +1,81 @@
+---
+title: Codex CLI
+description: Configure Codex CLI with Codex Pooler backend compatibility, HTTP/SSE fallback, and operator MCP access.
+---
+
+Codex CLI should talk to Codex Pooler through the Codex backend compatibility route. Use `/backend-api/codex`, not the OpenAI-compatible `/v1` SDK surface.
+
+For a deployed instance, the Codex backend base URL is:
+
+```text
+https://pooler.example.com/backend-api/codex
+```
+
+For local setup and local smoke checks, use:
+
+```text
+http://localhost:4000/backend-api/codex
+```
+
+Keep your Pool API key in an environment variable. Don't paste raw keys into `~/.codex/config.toml`.
+
+## Websocket provider
+
+Use the websocket-capable provider for normal Codex backend behavior. Keep `name = "OpenAI"` because Codex uses that provider family for its backend Responses protocol.
+
+```toml
+model = "gpt-5.5"
+model_provider = "codex-pooler-ws"
+
+[model_providers.codex-pooler-ws]
+name = "OpenAI"
+base_url = "https://pooler.example.com/backend-api/codex"
+env_key = "CODEX_POOLER_API_KEY"
+wire_api = "responses"
+supports_websockets = true
+requires_openai_auth = true
+```
+
+With a local Codex Pooler instance, change `base_url` to `http://localhost:4000/backend-api/codex`.
+
+## HTTP/SSE provider
+
+Keep an HTTP/SSE provider when you need to force non-websocket behavior for a client check or when your runtime can't open backend websocket streams.
+
+```toml
+[model_providers.codex-pooler-http]
+name = "OpenAI"
+base_url = "https://pooler.example.com/backend-api/codex"
+env_key = "CODEX_POOLER_API_KEY"
+wire_api = "responses"
+supports_websockets = false
+requires_openai_auth = true
+```
+
+Both providers use the same Pool API key and the same Codex backend compatibility route. Codex Pooler routes each request through Pool policy, account eligibility, limits, session continuity, and request accounting.
+
+## Operator MCP endpoint
+
+Codex Pooler also exposes an operator MCP endpoint at `/mcp`. MCP uses an operator-owned MCP token, not a Pool API key.
+
+```toml
+[mcp_servers.codex_pooler]
+url = "https://pooler.example.com/mcp"
+bearer_token_env_var = "CODEX_POOLER_MCP_KEY"
+```
+
+Set the token separately:
+
+```bash
+export CODEX_POOLER_MCP_KEY="<operator-mcp-token>"
+```
+
+Use `http://localhost:4000/mcp` only for local setup.
+
+## Route boundaries
+
+`/backend-api/codex/*` is an authenticated Codex backend compatibility surface. It is not a wildcard proxy and it is not the OpenAI-compatible `/v1` SDK surface.
+
+The backend route family includes `GET /backend-api/codex/models`, `POST /backend-api/codex/responses`, backend websocket response-stream compatibility on `GET /backend-api/codex/responses`, and `POST /backend-api/codex/responses/compact`.
+
+`POST /backend-api/codex/realtime/calls` is a Codex backend control-plane SDP proxy route. It is not OpenAI Realtime SDK compatibility.
