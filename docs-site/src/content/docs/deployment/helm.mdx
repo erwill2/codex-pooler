@@ -1,0 +1,142 @@
+---
+title: Helm
+description: Deploy Codex Pooler to Kubernetes with separate release roles.
+---
+
+The Helm chart in `charts/codex-pooler` deploys the same Codex Pooler release image into Kubernetes. It separates web traffic, background work, scheduled work, and migration work so each role can scale and restart on its own.
+
+Use this page as the public shape of the chart. Keep environment-specific secrets, private image repository names, internal hostnames, and operational evidence out of values files and public docs.
+
+## Chart shape
+
+The chart has four release roles:
+
+- `app`, serves HTTP with `OBAN_MODE=web` and `PHX_SERVER=true`
+- `oban.worker`, runs background jobs with `OBAN_MODE=worker`
+- `oban.scheduler`, runs scheduled jobs with `OBAN_MODE=scheduler`
+- `migrations`, runs release migrations before app rollout when enabled
+
+All roles use the same image repository and tag. Only the app role serves HTTP. Worker, scheduler, and migration pods don't expose the Phoenix endpoint.
+
+## Image expectations
+
+Set an explicit immutable image tag for real deployments. Don't rely on `latest` outside local scaffolding or temporary testing.
+
+```yaml
+image:
+  repository: ghcr.io/icoretech/codex-pooler
+  tag: v0.1.0
+  pullPolicy: IfNotPresent
+```
+
+The chart `appVersion` is informational. Treat `image.tag` as the deployable release version.
+
+## Required secrets
+
+By default, the chart expects an existing Kubernetes Secret:
+
+```yaml
+secrets:
+  create: false
+  existingSecret: codex-pooler-secrets
+```
+
+That secret must provide the release values needed before Codex Pooler can read database-managed settings:
+
+- `database-url`
+- `secret-key-base`
+- `totp-encryption-key`
+- `totp-key-version`
+- `upstream-secret-key`
+- `upstream-secret-key-version`
+
+Don't put upstream access tokens, Pool API keys, MCP tokens, cookies, `auth.json`, SMTP passwords, or raw client payloads into chart values.
+
+## Host and ingress
+
+Set the public host through chart values:
+
+```yaml
+config:
+  host: pooler.example.com
+
+ingress:
+  enabled: true
+  hosts:
+    - host: pooler.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+```
+
+Public client examples should use `https://pooler.example.com` as the deployed base URL.
+
+## Role topology
+
+The default topology is conservative:
+
+```yaml
+app:
+  enabled: true
+  replicaCount: 1
+
+oban:
+  worker:
+    enabled: true
+    replicaCount: 1
+  scheduler:
+    enabled: true
+    replicaCount: 1
+
+migrations:
+  enabled: true
+```
+
+The migration hook runs database migrations and imports the vendored OpenAI pricing feed. The scheduler keeps scheduled background work separate from request-serving pods.
+
+## Websocket replica caveat
+
+Keep the web app at one replica unless you intentionally configure the multi-replica websocket topology.
+
+Backend websocket sessions own a live upstream websocket inside an app pod. Multiple app replicas need clustering, owner-forwarding, and the explicit unsafe topology acknowledgement:
+
+```yaml
+clustering:
+  enabled: true
+  query: <headless-service-dns-name>
+
+app:
+  replicaCount: 2
+  websocketContinuity:
+    ownerForwarding:
+      enabled: true
+    allowUnsafeMultiReplica: true
+```
+
+Only set `allowUnsafeMultiReplica: true` after you have verified the topology you are running. Without that proof, keep `app.replicaCount: 1`.
+
+## Render safely before install
+
+Render manifests locally before applying them:
+
+```bash
+helm template codex-pooler ./charts/codex-pooler \
+  --set image.repository=ghcr.io/icoretech/codex-pooler \
+  --set image.tag=v0.1.0 \
+  --set config.host=pooler.example.com \
+  --set ingress.enabled=true \
+  --set ingress.hosts[0].host=pooler.example.com
+```
+
+Inspect the output for the expected app, worker, scheduler, migration, Secret reference, Service, and Ingress resources. The rendered app Deployment should serve HTTP. Worker, scheduler, and migration resources should not.
+
+For install or upgrade, provide your production values file from a private path:
+
+```bash
+helm upgrade --install codex-pooler ./charts/codex-pooler \
+  --namespace codex-pooler \
+  --create-namespace \
+  --values ./values.production.yaml
+```
+
+Keep `values.production.yaml` private if it contains secret names, internal DNS names, ingress details, or environment-specific settings.

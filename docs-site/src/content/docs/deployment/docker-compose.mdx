@@ -1,0 +1,119 @@
+---
+title: Docker Compose
+description: Run Codex Pooler with Docker Compose for a small self-hosted install.
+---
+
+Docker Compose is the quickest self-host path for a laptop, lab server, or small single-node install. It runs the Codex Pooler release image with a local Postgres database and writes the release secrets into a private `.env` file.
+
+Use it when you want a simple first install before moving to Kubernetes.
+
+## Prerequisites
+
+You need:
+
+- Docker with Compose
+- `openssl`
+- A checked-out Codex Pooler repository
+
+```bash
+git clone https://github.com/icoretech/codex-pooler.git
+cd codex-pooler
+```
+
+## Generate the local environment
+
+Create the local `.env` file before starting the stack:
+
+```bash
+scripts/self-host/generate-env.sh
+```
+
+The generated `.env` contains release secrets, encryption roots, database settings, and image settings such as `CODEX_POOLER_IMAGE` and `CODEX_POOLER_IMAGE_TAG`. Keep it private. Don't commit it, paste it into tickets, or reuse values between public installs.
+
+For real installs, run an explicit release image tag instead of a floating tag. The tag should identify the exact image you meant to deploy.
+
+```bash
+CODEX_POOLER_IMAGE=ghcr.io/icoretech/codex-pooler
+CODEX_POOLER_IMAGE_TAG=v0.1.0
+```
+
+## Start Codex Pooler
+
+Pull and start the stack:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+Open the local site:
+
+```text
+http://localhost:4000
+```
+
+On the first visit, create the owner account at `/bootstrap`. After sign-in, start with `/admin/pools`.
+
+## Bootstrap runtime access
+
+After the owner account exists:
+
+1. Create a Pool in `/admin/pools`
+2. Import or connect upstream accounts in `/admin/upstreams`
+3. Create a Pool API key in `/admin/api-keys`
+4. Point clients at one of the runtime base URLs
+
+```text
+Codex backend compatibility route:
+http://localhost:4000/backend-api/codex
+
+OpenAI-compatible /v1 surface:
+http://localhost:4000/v1
+
+Operator MCP endpoint:
+http://localhost:4000/mcp
+```
+
+Use a Pool API key for `/backend-api` and `/v1`. Use an operator MCP token for `/mcp`.
+
+For a deployed host, replace `http://localhost:4000` with `https://pooler.example.com`.
+
+## Health and readiness
+
+Check that the web process responds before handing traffic to clients:
+
+```bash
+curl -fsS http://localhost:4000/healthz
+curl -fsS http://localhost:4000/readyz
+```
+
+`/healthz` confirms the endpoint is alive. `/readyz` is the safer check for accepting runtime traffic.
+
+You can inspect the Compose stack with:
+
+```bash
+docker compose ps
+docker compose logs -f app
+```
+
+## Stop or reset
+
+Stop the stack while keeping the database volume:
+
+```bash
+docker compose down
+```
+
+Stop the stack and remove the local database volume:
+
+```bash
+docker compose down -v
+```
+
+Only use `down -v` when you intentionally want to remove local Codex Pooler data.
+
+## Compose limits
+
+Docker Compose is a simple self-host flow, not a high-availability topology. It is best for a single web process and local Postgres.
+
+Backend websocket sessions keep live upstream websocket state inside the web app process. Don't scale Compose web replicas unless you also design clustering and owner-forwarding for that environment. If you need multiple web replicas, use the Helm chart and keep the replica caveat in that deployment plan.

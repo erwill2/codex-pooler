@@ -1,0 +1,113 @@
+---
+title: Alerts and incident signals
+description: Read public-safe Codex Pooler alerts, health states, request metadata, audit metadata, jobs, and system settings signals without exposing content bodies.
+---
+
+Codex Pooler gives operators public-safe signals for routing health, account readiness, client access, and administrative activity. These signals are designed to help you decide what to inspect next without exposing private client content.
+
+Alerts and incident summaries should stay metadata-only. They may name affected Pools, upstreams, Pool API keys by label or prefix, route families, models, status classes, safe error codes, timestamps, retry counts, durations, and job states. They must not include raw prompt text, generated content, payload contents, file contents, media contents, websocket contents, credentials, session material, provider secrets, MCP tokens, or raw Pool API keys.
+
+## What operators can monitor
+
+Use the admin UI to watch the product surfaces that affect runtime availability:
+
+1. Pools, to confirm the routing boundary is active and has usable policy
+2. upstreams, to confirm accounts are active, fresh, and assigned to the right Pools
+3. API keys, to confirm clients use active Pool API keys with the expected policy
+4. request logs, to see status, route family, model, duration, retry, and accounting metadata
+5. audit logs, to review administrative changes and security-relevant events
+6. jobs, to check scheduled maintenance, refresh, catalog, mail, and cleanup work
+7. system settings, to confirm instance-wide controls and write-only secret settings are in the expected state
+8. metadata, to connect the affected Pool, upstream, client credential, route, status, and time window without viewing content bodies
+
+An alert should point to one or more of those surfaces. It shouldn't copy private evidence into public notes.
+
+## Alert severity model
+
+Use a simple severity model when writing operator-facing alerts:
+
+1. Info, a state changed but traffic isn't known to be affected
+2. Watch, a state may reduce capacity or needs follow-up if it persists
+3. Degraded, some traffic may fail, retry, or route to fewer upstreams
+4. Outage, an assigned Pool can't serve the expected runtime traffic
+5. Security, credentials, roles, invites, MCP gates, or audit metadata need owner review
+
+Keep severity tied to user-visible impact and operator action. Avoid implementation details and infrastructure labels.
+
+## Pool signals
+
+Pool alerts usually mean a routing boundary isn't ready for the clients that depend on it.
+
+Common Pool signals include:
+
+1. No active upstreams are assigned to a Pool
+2. A Pool is paused, archived, or disabled for new runtime traffic
+3. Model policy doesn't include the model clients are requesting
+4. Routing policy leaves no eligible upstream after health and quota checks
+5. Assigned admins don't have visibility into the Pool they expect to manage
+
+A public-safe summary can name the Pool label and affected route family. It shouldn't include client prompt text, payload contents, raw API keys, or infrastructure addresses.
+
+## Upstream signals
+
+Upstream alerts usually point to account readiness or capacity.
+
+Common upstream states include:
+
+1. `active`, the upstream can be selected for eligible traffic
+2. `paused`, the upstream is configured but not used for new traffic
+3. `reauth_required`, the upstream needs operator attention before routing can resume
+4. `refreshing`, Codex Pooler is updating account or quota evidence
+5. `exhausted` or `limited`, quota evidence suggests the upstream shouldn't receive some requests
+
+When several upstreams are affected, summarize counts by state and Pool. Don't publish account identifiers, raw emails, or provider credential details.
+
+## Pool API key signals
+
+Pool API key alerts are about runtime client access. A client can fail before routing if the key is paused, revoked, expired, scoped to the wrong Pool, or blocked by policy.
+
+Safe metadata includes key label, prefix, Pool, status, timestamps, and usage summary. The raw key is shown only once on create or rotate and should never appear in alerts, tickets, screenshots, docs, or chat messages.
+
+## Request log signals
+
+Request logs are the first place to check user-visible runtime problems. They show metadata about admitted, rejected, retried, failed, and completed requests.
+
+Useful request log fields include route family, HTTP method, status class, Pool, upstream label, model, timing, retry count, safe error code, token counts, cost metadata, and timestamp.
+
+Don't treat request logs as a transcript. They don't contain prompt text, generated content, payload contents, websocket contents, file contents, or media contents.
+
+## Audit log signals
+
+Audit logs help explain administrative change. They are useful when an alert starts after a Pool edit, upstream change, key rotation, invite action, operator role change, MCP gate change, or system settings update.
+
+Safe audit fields include actor class, masked actor identity, action, target kind, outcome, Pool label, request correlation metadata, and timestamp. Avoid publishing raw change data, secret settings, raw credentials, raw emails, payload contents, or private identifiers.
+
+## Job signals
+
+Jobs cover scheduled and background work. Job alerts usually point to stale data or delayed maintenance rather than a request payload issue.
+
+Watch for jobs that are stuck, retrying, cancelled, or failing repeatedly. The affected product area matters more than the worker internals. For example, a quota refresh problem can reduce upstream eligibility, while a catalog refresh problem can affect model or pricing metadata.
+
+Job alerts should cite worker area, queue, state, attempt count, and time window when those fields are available. They shouldn't include raw job args if those args could contain private content or credentials.
+
+## System settings signals
+
+System settings alerts are owner-facing. They can affect routing admission, runtime limits, diagnostics, ingress trust, circuit behavior, MCP service availability, metrics authentication, pricing catalog refresh, operator email, and SMTP delivery.
+
+Secret settings stay write-only. Alerts can mention fingerprint, key version, validation status, or setting family, but not raw values. If a setting changes during active traffic, remember that new runtime work sees the new value after the settings cache reloads, while in-flight requests keep the values they started with.
+
+## Public-safe incident summaries
+
+A good incident summary states impact, affected metadata, current state, and next operator check. Keep it short and content-safe.
+
+Use this shape:
+
+```text
+Status: degraded
+Impact: requests for example-pool are retrying more often than normal
+Signals: request logs show elevated 5xx status classes for one route family, upstream metadata shows two assigned upstreams in reauth_required
+Next check: review upstream readiness and recent audit logs for account or Pool changes
+Privacy: no prompt text, generated content, payload contents, credentials, or file contents were inspected
+```
+
+This kind of summary is safe to share because it names product metadata and states, not private content or internal infrastructure.

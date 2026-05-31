@@ -1,0 +1,95 @@
+---
+title: Operator admin UI
+description: Manage Pools, upstream accounts, Pool API keys, request metadata, audit metadata, jobs, and system settings from Codex Pooler.
+---
+
+Codex Pooler's admin UI is the browser workspace for people who run a self-hosted instance. It helps operators prepare capacity, issue client credentials, inspect routing health, and review metadata about activity.
+
+The admin UI is metadata-only. Operators can see route names, Pool labels, upstream labels, model names, statuses, timings, token counts, safe error codes, and audit summaries. They don't see raw prompt text, generated content, payload contents, file contents, media contents, credentials, session material, provider secrets, or raw Pool API keys.
+
+## Roles and visibility
+
+The first account created during bootstrap is an instance owner. Owners can manage the whole instance, including Pools, operators, global jobs, and system settings.
+
+Instance admins work inside assigned Pools. They can manage Pool-scoped upstreams, Pool API keys, request logs, and audit logs for those Pools. If an admin isn't assigned to a Pool, the Pool-scoped pages show empty states instead of global data.
+
+Historical request logs and audit logs for archived or deleted Pools are owner-only. This keeps old metadata available for accountability without exposing global history to admins who no longer own that Pool.
+
+## Pools
+
+Pools are the main routing boundary. A Pool groups upstream account assignments, routing policy, model access, and the Pool API keys used by clients.
+
+Use the Pools page to answer operator questions such as:
+
+1. Which Pools exist and who can operate them
+2. Which upstreams are assigned to each Pool
+3. Whether routing policy allows new client work
+4. Which models and limits the Pool is expected to serve
+5. Whether a Pool should stay active, be paused, or be archived
+
+A Pool API key represents the Pool, not a single upstream. Runtime clients send the key to `/backend-api` or the narrow OpenAI-compatible `/v1` surface, then Codex Pooler chooses an eligible upstream based on Pool policy, model support, health, limit evidence, and session continuity.
+
+## Upstreams
+
+An upstream is a Codex account identity or Pool assignment that Codex Pooler can route eligible work to. Operators use the upstreams page to add accounts, check readiness, pause accounts, and review account status.
+
+Safe upstream metadata can include labels, assignment state, model support, quota window state, freshness state, stored account identifiers, and last observed routing status. Secret material is stored behind the upstream secret store. The UI doesn't show provider credentials after import.
+
+Common upstream states mean:
+
+1. `active`, the account can be considered for eligible Pool traffic
+2. `paused`, the account stays configured but isn't selected for new traffic
+3. `reauth_required`, the account needs operator attention before it can route work again
+4. `refreshing`, the account is updating provider credentials or quota evidence
+
+## Pool API keys
+
+Pool API keys are bearer credentials for runtime clients. Create one for each client, environment, or automation boundary that should use a Pool.
+
+The raw key is shown only once when created or rotated. After that, operators see metadata such as label, prefix, Pool, status, policy summary, usage counters, and timestamps. Use that metadata to rotate stale keys, pause a client, or confirm which Pool a client is allowed to use.
+
+Pool API keys are separate from operator browser sessions and MCP tokens. Don't use a Pool API key for admin UI sign-in or the operator MCP endpoint.
+
+## Invites and operators
+
+Owners can invite operators and assign Pool access. Use invites for onboarding people who need browser access, then keep ongoing permissions on the operator record.
+
+Invite and operator pages should be treated as account-management surfaces. They show masked identity metadata, status, role, Pool assignments, and authentication setup state. They don't reveal passwords, temporary credentials, TOTP secrets, MCP tokens, or raw emails beyond the UI's safe display format.
+
+## Request logs
+
+Request logs show routing and accounting metadata for runtime traffic. They are meant for operational questions, not content review.
+
+Request logs can help answer:
+
+1. Which Pool received traffic
+2. Which route family handled the request
+3. Which model was requested
+4. Whether the request succeeded, failed, retried, or was rejected
+5. How long the request took
+6. Which upstream assignment was selected, when that metadata is visible to the operator
+7. Whether usage or cost reporting metadata is available
+
+Request logs don't show raw prompt text, generated content, payload contents, uploaded file contents, media contents, websocket contents, credentials, session material, or raw idempotency keys.
+
+## Audit logs
+
+Audit logs track administrative changes and security-relevant events as metadata. They help owners and assigned admins understand who changed what, when it happened, and whether it succeeded.
+
+Audit records can include actor class, masked actor identity, action, target kind, outcome, time, Pool label, request correlation metadata, and sanitized detail summaries. They don't expose raw change blobs, secret settings, raw credentials, prompt text, provider payloads, or private identifiers.
+
+Use audit logs to confirm control-plane changes such as Pool edits, upstream lifecycle changes, key creation or rotation, invite changes, operator permission updates, system settings changes, and MCP gate changes.
+
+## Jobs
+
+The jobs page is owner-facing. It shows background work metadata so owners can see whether scheduled and queued maintenance tasks are healthy.
+
+Job metadata can include worker name, queue, state, attempt count, timestamps, and safe error class. It is a status surface, not a deep recovery guide, and it doesn't reveal job args that contain secrets or raw client content.
+
+Typical job areas include catalog refresh, quota evidence refresh, accounting maintenance, email delivery, and cleanup tasks. A failed or retrying job usually means an owner should check the affected product area, for example upstream quota freshness or mail delivery settings.
+
+## System settings
+
+System settings are owner-facing controls for instance behavior. They cover runtime limits, route admission, diagnostics, ingress trust, circuit thresholds, model metadata, pricing catalog settings, operator email, MCP service gates, metrics authentication, and SMTP delivery.
+
+Secret settings are write-only. The UI may show fingerprints, key versions, status, or validation results, but not raw secret values. New settings apply to new runtime work after the settings cache reloads; in-flight requests and already-open streams keep the values they started with.
