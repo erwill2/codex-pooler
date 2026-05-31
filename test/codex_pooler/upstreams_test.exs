@@ -3878,6 +3878,207 @@ defmodule CodexPooler.UpstreamsTest do
       assert unrelated_selection.blocked_windows == []
     end
 
+    test "newer reset-bearing usage evidence advances reset-bearing header evidence" do
+      identity = active_identity_fixture()
+      observed_at = ~U[2026-04-27 12:00:00Z]
+      old_reset_at = DateTime.add(observed_at, 900, :second)
+      new_observed_at = DateTime.add(observed_at, 60, :second)
+      new_reset_at = DateTime.add(new_observed_at, 604_800, :second)
+
+      assert {:ok, [header_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_headers(
+                 identity,
+                 [
+                   {"x-codex-secondary-used-percent", ["100"]},
+                   {"x-codex-secondary-window-minutes", ["10080"]},
+                   {"x-codex-secondary-reset-at", [DateTime.to_iso8601(old_reset_at)]}
+                 ],
+                 observed_at
+               )
+
+      assert header_window.source == "codex_response_headers"
+      assert Decimal.equal?(header_window.used_percent, Decimal.new("100.000"))
+      refute QuotaWindows.usable_window?(header_window, observed_at)
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows(
+                 identity,
+                 [
+                   %{
+                     quota_key: "account",
+                     window_kind: "secondary",
+                     window_minutes: 10_080,
+                     used_percent: Decimal.new("0"),
+                     reset_at: new_reset_at,
+                     source: "codex_usage_api",
+                     source_precision: "observed",
+                     quota_scope: "account",
+                     quota_family: "account",
+                     observed_at: new_observed_at,
+                     freshness_state: "fresh"
+                   }
+                 ]
+               )
+
+      assert merged_window.id == header_window.id
+      assert merged_window.source == "codex_usage_api"
+      assert DateTime.compare(merged_window.reset_at, new_reset_at) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("0"))
+      assert QuotaWindows.usable_window?(merged_window, new_observed_at)
+    end
+
+    test "newer usage evidence cannot roll back a later header reset" do
+      identity = active_identity_fixture()
+      observed_at = ~U[2026-04-27 12:00:00Z]
+      header_reset_at = DateTime.add(observed_at, 604_800, :second)
+      usage_observed_at = DateTime.add(observed_at, 60, :second)
+      usage_reset_at = DateTime.add(observed_at, 900, :second)
+
+      assert {:ok, [header_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_headers(
+                 identity,
+                 [
+                   {"x-codex-secondary-used-percent", ["20"]},
+                   {"x-codex-secondary-window-minutes", ["10080"]},
+                   {"x-codex-secondary-reset-at", [DateTime.to_iso8601(header_reset_at)]}
+                 ],
+                 observed_at
+               )
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows(
+                 identity,
+                 [
+                   %{
+                     quota_key: "account",
+                     window_kind: "secondary",
+                     window_minutes: 10_080,
+                     used_percent: Decimal.new("0"),
+                     reset_at: usage_reset_at,
+                     source: "codex_usage_api",
+                     source_precision: "observed",
+                     quota_scope: "account",
+                     quota_family: "account",
+                     observed_at: usage_observed_at,
+                     freshness_state: "fresh"
+                   }
+                 ]
+               )
+
+      assert merged_window.id == header_window.id
+      assert merged_window.source == "codex_response_headers"
+      assert DateTime.compare(merged_window.reset_at, header_reset_at) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("20.000"))
+    end
+
+    test "usage evidence does not override higher-precedence rate-limit event evidence" do
+      identity = active_identity_fixture()
+      observed_at = ~U[2026-04-27 12:00:00Z]
+      event_reset_at = DateTime.add(observed_at, 900, :second)
+      usage_observed_at = DateTime.add(observed_at, 60, :second)
+      usage_reset_at = DateTime.add(usage_observed_at, 604_800, :second)
+
+      assert {:ok, [event_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_rate_limit_event(
+                 identity,
+                 %{
+                   "type" => "codex.rate_limits",
+                   "rate_limits" => %{
+                     "secondary" => %{
+                       "used_percent" => 100,
+                       "window_minutes" => 10_080,
+                       "reset_at" => DateTime.to_unix(event_reset_at)
+                     }
+                   }
+                 },
+                 observed_at
+               )
+
+      assert event_window.source == "codex_rate_limit_event"
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows(
+                 identity,
+                 [
+                   %{
+                     quota_key: "account",
+                     window_kind: "secondary",
+                     window_minutes: 10_080,
+                     used_percent: Decimal.new("0"),
+                     reset_at: usage_reset_at,
+                     source: "codex_usage_api",
+                     source_precision: "observed",
+                     quota_scope: "account",
+                     quota_family: "account",
+                     observed_at: usage_observed_at,
+                     freshness_state: "fresh"
+                   }
+                 ]
+               )
+
+      assert merged_window.id == event_window.id
+      assert merged_window.source == "codex_rate_limit_event"
+      assert DateTime.compare(merged_window.reset_at, event_reset_at) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("100.0"))
+    end
+
+    test "headers cannot roll back a reset advanced by usage evidence" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      old_reset_at = DateTime.add(observed_at, 900, :second)
+      usage_observed_at = DateTime.add(observed_at, 60, :second)
+      usage_reset_at = DateTime.add(usage_observed_at, 604_800, :second)
+      header_observed_at = DateTime.add(usage_observed_at, 60, :second)
+
+      assert {:ok, [_header_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_headers(
+                 identity,
+                 [
+                   {"x-codex-secondary-used-percent", ["100"]},
+                   {"x-codex-secondary-window-minutes", ["10080"]},
+                   {"x-codex-secondary-reset-at", [DateTime.to_iso8601(old_reset_at)]}
+                 ],
+                 observed_at
+               )
+
+      assert {:ok, [usage_window]} =
+               QuotaWindows.upsert_quota_windows(
+                 identity,
+                 [
+                   %{
+                     quota_key: "account",
+                     window_kind: "secondary",
+                     window_minutes: 10_080,
+                     used_percent: Decimal.new("0"),
+                     reset_at: usage_reset_at,
+                     source: "codex_usage_api",
+                     source_precision: "observed",
+                     quota_scope: "account",
+                     quota_family: "account",
+                     observed_at: usage_observed_at,
+                     freshness_state: "fresh"
+                   }
+                 ]
+               )
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_headers(
+                 identity,
+                 [
+                   {"x-codex-secondary-used-percent", ["100"]},
+                   {"x-codex-secondary-window-minutes", ["10080"]},
+                   {"x-codex-secondary-reset-at", [DateTime.to_iso8601(old_reset_at)]}
+                 ],
+                 header_observed_at
+               )
+
+      assert merged_window.id == usage_window.id
+      assert merged_window.source == "codex_usage_api"
+      assert DateTime.compare(merged_window.reset_at, usage_reset_at) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("0"))
+      assert QuotaWindows.usable_window?(merged_window, header_observed_at)
+    end
+
     test "resetless usage evidence cannot downgrade reset-bearing header evidence" do
       identity = active_identity_fixture()
       observed_at = ~U[2026-04-27 12:00:00Z]

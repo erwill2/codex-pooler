@@ -151,9 +151,55 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     incoming_quality = quality_key(evidence, timestamp)
     existing_quality = quality_key(existing, timestamp)
 
-    resetless_weekly_rate_limit_supersedes?(evidence, existing) ||
-      incoming_quality >= existing_quality
+    reset_bearing_rate_limit_event_supersedes?(evidence, existing) or
+      (not reset_bearing_rollback?(evidence, existing, timestamp) and
+         (resetless_weekly_rate_limit_supersedes?(evidence, existing) ||
+            newer_usage_reset_supersedes?(evidence, existing) ||
+            incoming_quality >= existing_quality))
   end
+
+  defp reset_bearing_rate_limit_event_supersedes?(
+         %Evidence{source: "codex_rate_limit_event", reset_at: %DateTime{}} = evidence,
+         %Quota.AccountQuotaWindow{} = existing
+       ) do
+    same_evidence_identity?(evidence, existing) and
+      merge_precedence(evidence) > merge_precedence(existing)
+  end
+
+  defp reset_bearing_rate_limit_event_supersedes?(_evidence, _existing), do: false
+
+  defp reset_bearing_rollback?(
+         %Evidence{reset_at: %DateTime{} = reset_at} = evidence,
+         %Quota.AccountQuotaWindow{reset_at: %DateTime{} = existing_reset_at} = existing,
+         timestamp
+       ) do
+    same_evidence_identity?(evidence, existing) and
+      Evidence.current_freshness_state(existing, timestamp) == "fresh" and
+      DateTime.compare(reset_at, existing_reset_at) == :lt
+  end
+
+  defp reset_bearing_rollback?(_evidence, _existing, _timestamp), do: false
+
+  defp newer_usage_reset_supersedes?(
+         %Evidence{
+           source: "codex_usage_api",
+           source_precision: source_precision,
+           reset_at: %DateTime{} = reset_at,
+           observed_at: %DateTime{} = observed_at
+         } = evidence,
+         %Quota.AccountQuotaWindow{
+           source: "codex_response_headers",
+           reset_at: %DateTime{} = existing_reset_at,
+           observed_at: %DateTime{} = existing_observed_at
+         } = existing
+       )
+       when source_precision in ["observed", "authoritative"] do
+    same_evidence_identity?(evidence, existing) and
+      DateTime.compare(observed_at, existing_observed_at) == :gt and
+      DateTime.compare(reset_at, existing_reset_at) == :gt
+  end
+
+  defp newer_usage_reset_supersedes?(_evidence, _existing), do: false
 
   defp resetless_weekly_rate_limit_supersedes?(
          %Evidence{
