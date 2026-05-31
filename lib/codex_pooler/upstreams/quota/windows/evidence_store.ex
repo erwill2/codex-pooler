@@ -151,14 +151,14 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     incoming_quality = quality_key(evidence, timestamp)
     existing_quality = quality_key(existing, timestamp)
 
-    reset_bearing_rate_limit_event_supersedes?(evidence, existing) or
+    higher_precedence_rate_limit_event_supersedes?(evidence, existing) or
       (not reset_bearing_rollback?(evidence, existing, timestamp) and
          (resetless_weekly_rate_limit_supersedes?(evidence, existing) ||
             newer_usage_reset_supersedes?(evidence, existing) ||
             incoming_quality >= existing_quality))
   end
 
-  defp reset_bearing_rate_limit_event_supersedes?(
+  defp higher_precedence_rate_limit_event_supersedes?(
          %Evidence{source: "codex_rate_limit_event", reset_at: %DateTime{}} = evidence,
          %Quota.AccountQuotaWindow{} = existing
        ) do
@@ -166,7 +166,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       merge_precedence(evidence) > merge_precedence(existing)
   end
 
-  defp reset_bearing_rate_limit_event_supersedes?(_evidence, _existing), do: false
+  defp higher_precedence_rate_limit_event_supersedes?(_evidence, _existing), do: false
 
   defp reset_bearing_rollback?(
          %Evidence{reset_at: %DateTime{} = reset_at} = evidence,
