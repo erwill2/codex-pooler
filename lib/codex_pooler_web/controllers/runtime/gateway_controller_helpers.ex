@@ -7,7 +7,7 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpers do
   require Logger
 
   alias CodexPooler.Access
-  alias CodexPooler.Gateway
+  alias CodexPooler.Gateway.Admission, as: GatewayAdmission
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata, as: FinalizationMetadata
 
@@ -22,7 +22,7 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpers do
   def admit(conn, route_class, metadata \\ %{}, fun) when is_function(fun, 0) do
     metadata = Map.merge(metadata, request_metadata(conn))
 
-    Gateway.run_admitted(route_class, metadata, fun)
+    GatewayAdmission.run_admitted(route_class, metadata, fun)
   end
 
   @spec authenticate(conn()) :: {:ok, Access.auth_context()} | {:error, Contracts.gateway_error()}

@@ -3,7 +3,7 @@ defmodule CodexPoolerWeb.Plugs.AdminBrowserAdmission do
 
   import Plug.Conn
 
-  alias CodexPooler.Gateway
+  alias CodexPooler.Gateway.Admission, as: GatewayAdmission
 
   def init(opts), do: opts
 
@@ -14,12 +14,12 @@ defmodule CodexPoolerWeb.Plugs.AdminBrowserAdmission do
       path: "/" <> Enum.join(conn.path_info, "/")
     }
 
-    case Gateway.admit_browser(metadata) do
+    case GatewayAdmission.admit_browser(metadata) do
       {:ok, lease} ->
         conn
         |> put_private(:codex_pooler_admission_lease, lease)
         |> register_before_send(fn conn ->
-          Gateway.release_admission(conn.private.codex_pooler_admission_lease)
+          GatewayAdmission.release_admission(conn.private.codex_pooler_admission_lease)
           conn
         end)
 

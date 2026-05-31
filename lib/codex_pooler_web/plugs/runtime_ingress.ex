@@ -4,7 +4,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   import Plug.Conn
 
   alias CodexPooler.Access
-  alias CodexPooler.Gateway
+  alias CodexPooler.Gateway.Admission, as: GatewayAdmission
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Pools
   alias CodexPoolerWeb.Plugs.RuntimeIngress.{CompressedBody, Firewall}
@@ -86,10 +86,10 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
       path: conn.request_path
     }
 
-    case Gateway.admit_mcp(metadata) do
+    case GatewayAdmission.admit_mcp(metadata) do
       {:ok, lease} ->
         register_before_send(conn, fn conn ->
-          Gateway.release_admission(lease)
+          GatewayAdmission.release_admission(lease)
           conn
         end)
 
