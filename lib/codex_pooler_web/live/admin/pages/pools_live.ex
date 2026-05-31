@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.PoolsLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Admin.PoolWorkflow
   alias CodexPooler.Events
@@ -265,7 +265,12 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <AdminComponents.admin_shell flash={@flash} current_scope={@current_scope} active_nav={:pools}>
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:pools}
+      alert_notification_center={@alert_notification_center}
+    >
       <section id="admin-pools-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="pool-page-header"

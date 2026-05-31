@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.UpstreamsLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Events
   alias CodexPooler.Pools
@@ -288,7 +288,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <AdminComponents.admin_shell flash={@flash} current_scope={@current_scope} active_nav={:upstreams}>
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:upstreams}
+      alert_notification_center={@alert_notification_center}
+    >
       <UpstreamPageComponents.upstreams_page
         pools={@pools}
         pool_options={@pool_options}

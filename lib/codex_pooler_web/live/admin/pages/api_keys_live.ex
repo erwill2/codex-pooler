@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.ApiKeysLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Access
   alias CodexPooler.Access.APIKey
@@ -248,7 +248,12 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
     assigns = assign(assigns, :policy_limit_fields, ApiKeyPolicyForm.limit_fields())
 
     ~H"""
-    <AdminComponents.admin_shell flash={@flash} current_scope={@current_scope} active_nav={:api_keys}>
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:api_keys}
+      alert_notification_center={@alert_notification_center}
+    >
       <section id="admin-api-keys-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="api-key-page-header"
