@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.RequestLogsLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Accounting
   alias CodexPooler.Events
@@ -102,6 +102,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       flash={@flash}
       current_scope={@current_scope}
       active_nav={:request_logs}
+      alert_notification_center={@alert_notification_center}
     >
       <section id="admin-request-logs-live" class="grid gap-6">
         <AdminComponents.page_header

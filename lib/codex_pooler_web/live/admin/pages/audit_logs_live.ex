@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.AuditLogsLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Audit
   alias CodexPooler.Pools
@@ -76,6 +76,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLive do
       flash={@flash}
       current_scope={@current_scope}
       active_nav={:audit_logs}
+      alert_notification_center={@alert_notification_center}
     >
       <div id="audit-event-details-drawer-root" class="drawer drawer-end">
         <input
