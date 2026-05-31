@@ -1,0 +1,211 @@
+---
+title: Routing Strategies
+description: How Codex Pooler admits, classifies, matches, and routes requests through a Pool to an eligible upstream account.
+---
+
+Routing is the path from a client request to one upstream account. Codex Pooler uses a Pool API key to identify the Pool, checks whether the request can run there, then chooses an eligible upstream account for that turn.
+
+A Pool API key represents a Pool. It doesn't represent one upstream account. That is the main difference from direct account credentials: clients stay configured with one stable key, while Codex Pooler can choose among the Pool's active upstream assignments for each supported request.
+
+Use this page with [Runtime Routes](/reference/runtime-routes/) and [Operator admin UI](/operators/admin-ui/) when you need to understand why a request did, or didn't, choose a specific account.
+
+## The Request Path
+
+Every runtime request follows the same broad path:
+
+1. Codex Pooler authenticates the bearer token as a Pool API key.
+2. It admits the request into the route family and route class, such as normal HTTP, stream, websocket, compact, file upload, audio transcription, or backend control-plane proxy.
+3. It classifies the requested model and route surface, either the Codex backend compatibility route or the narrow OpenAI-compatible `/v1` surface.
+4. It finds the authenticated Pool and starts from that Pool's configured upstream assignments.
+5. It applies hard eligibility checks for assignment status, upstream status, model support, requested capabilities, quota, health, route-class circuit state, file affinity, and session continuity.
+6. It orders the remaining eligible upstream accounts using the Pool's routing strategy and routing preferences.
+7. It tries the ordered shortlist. If one upstream fails in a retryable way, Codex Pooler can move to the next eligible account in that shortlist.
+8. It records metadata-only request, route, attempt, quota, and audit evidence. It doesn't store raw prompts, completions, files, audio, images, credentials, or websocket frames.
+
+The important split is this: eligibility decides what is allowed. Strategy decides which allowed account is preferred first.
+
+## Hard Eligibility Checks
+
+Hard eligibility checks remove upstream accounts from consideration before strategy ordering begins. A routing strategy can't select an account that failed these checks.
+
+<table>
+  <thead>
+    <tr>
+      <th>Check</th>
+      <th>What it means for users</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Pool access</td>
+      <td>The Pool API key must be active and tied to the Pool that should receive the request</td>
+    </tr>
+    <tr>
+      <td>Pool assignments</td>
+      <td>The upstream account must be assigned to that Pool and active for routing</td>
+    </tr>
+    <tr>
+      <td>Upstream lifecycle</td>
+      <td>Paused, disabled, deleted, or reauth-required upstream accounts aren&#x27;t eligible for new ordinary work</td>
+    </tr>
+    <tr>
+      <td>Model availability</td>
+      <td>The requested model must be exposed to the Pool and mapped to the assignment</td>
+    </tr>
+    <tr>
+      <td>Capability support</td>
+      <td>The assignment must support the requested shape, such as streaming, tools, reasoning, image input, audio transcription, service tier, or compact responses when that support is known and required</td>
+    </tr>
+    <tr>
+      <td>Quota</td>
+      <td>Quota evidence must be usable for the account, model, and limit family. Exhausted, stale, resetless, wrong-model, wrong-account, or untrusted evidence can remove an account</td>
+    </tr>
+    <tr>
+      <td>Health</td>
+      <td>Route-class circuit state can temporarily remove an account for a route after repeated backend failures</td>
+    </tr>
+    <tr>
+      <td>Session continuity</td>
+      <td>Existing Codex sessions, websocket sessions, previous response links, and file affinity can pin the request to the upstream assignment that owns that state</td>
+    </tr>
+  </tbody>
+</table>
+
+If every account fails eligibility, the request is rejected before upstream dispatch. Common user-facing outcomes include no eligible backend, no compatible backend, quota exhaustion, quota evidence unavailable, session assignment unavailable, or file assignment conflict.
+
+## Strategy And Preference Choices
+
+After eligibility, Codex Pooler orders the remaining accounts. The Pool's strategy affects preference, not permission.
+
+<table>
+  <thead>
+    <tr>
+      <th>Strategy</th>
+      <th>User-facing behavior</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Bridge ring</td>
+      <td>Default strategy. It spreads requests with stable scoring, then uses continuity, prompt-cache locality, and temporary demotions to keep useful stickiness without pinning every stateless request</td>
+    </tr>
+    <tr>
+      <td>Deterministic rotation</td>
+      <td>Rotates the eligible set from a stable request seed so repeated independent requests don&#x27;t always start with the same account</td>
+    </tr>
+    <tr>
+      <td>Least recent success</td>
+      <td>Prefers accounts that haven&#x27;t recently completed successful work, which can help spread successful turns across the Pool</td>
+    </tr>
+    <tr>
+      <td>Quota first</td>
+      <td>Prefers eligible accounts with more usable remaining quota evidence for the requested model</td>
+    </tr>
+  </tbody>
+</table>
+
+The ring size controls how many ordered eligible accounts are tried for a request. A ring size of `3` means Codex Pooler prepares up to three eligible upstream accounts in order. If the first account fails in a retryable way, it can try the next one. The ring doesn't include accounts that failed eligibility.
+
+Temporary demotion also affects order. When an upstream attempt fails with a retryable backend or network reason, Codex Pooler can demote that assignment briefly so another eligible account is tried first. A later success clears that demotion.
+
+## Session Continuity Versus Stateless Routing
+
+Session continuity is stronger than ordinary stateless routing.
+
+Stateless requests can be routed to any eligible upstream account in the Pool. Strategy, quota headroom, prompt-cache locality, and recent failures shape the order.
+
+Session-bound requests are different. If a request belongs to an existing Codex session, websocket session, previous response chain, or file affinity, Codex Pooler keeps it with the upstream assignment that owns that state. This protects resumable conversations, websocket reconnects, tool-result continuations, and uploaded file references.
+
+Continuity headers are local routing inputs. Codex Pooler reads them in this order:
+
+1. `x-codex-session-id`
+2. `session-id`
+3. `x-session-affinity`
+4. `session_id`
+5. `x-codex-conversation-id`
+
+`session-id` and `x-session-affinity` aren't forwarded upstream. They help Codex Pooler find the local routing state only.
+
+If the pinned upstream assignment is no longer eligible, Codex Pooler doesn't silently move that session to a different account. The user should check the upstream's lifecycle state, reauth status, Pool assignment, model support, quota evidence, and route health.
+
+## Prompt-Cache Locality
+
+Prompt-cache locality is a preference for stateless requests that share a `prompt_cache_key`.
+
+When prompt-cache affinity is enabled for the Pool and there is no stronger continuity rule, Codex Pooler uses the transient `prompt_cache_key` as a routing seed. That makes repeat stateless requests prefer the same eligible upstream account, which can improve provider-side cache locality.
+
+This doesn't store prompts or responses locally. The raw prompt-cache key isn't stored as request evidence. It is used as a routing input, then request and routing logs remain metadata-only.
+
+Prompt-cache locality can be skipped when:
+
+<table>
+  <thead>
+    <tr>
+      <th>Condition</th>
+      <th>Result</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>No <code>prompt_cache_key</code> is present</td>
+      <td>Normal strategy ordering applies</td>
+    </tr>
+    <tr>
+      <td>Prompt-cache affinity is disabled on the Pool</td>
+      <td>Normal strategy ordering applies</td>
+    </tr>
+    <tr>
+      <td>Only one upstream account is eligible</td>
+      <td>There is nothing to choose among</td>
+    </tr>
+    <tr>
+      <td>A Codex session, idempotency key, or durable affinity already applies</td>
+      <td>The stronger continuity rule wins</td>
+    </tr>
+  </tbody>
+</table>
+
+## Fallback Behavior
+
+Fallback is bounded by eligibility and ring size.
+
+If the first chosen upstream account returns a retryable backend status, rate limit, network error, authorization failure, or server error, Codex Pooler can try the next eligible account in the route plan. It records safe attempt metadata and may briefly demote the failing assignment for the same Pool and model.
+
+Fallback doesn't bypass hard checks. It won't use a paused account, an account without model support, an account with unusable quota evidence, or an account that conflicts with session or file affinity. For session-bound work, fallback is intentionally limited because moving the request to another account could break the conversation state.
+
+## What Operators Configure
+
+Operators configure routing from the admin UI. The exact visibility depends on role, but the user-facing controls are:
+
+<table>
+  <thead>
+    <tr>
+      <th>Admin area</th>
+      <th>What users can configure or inspect</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Pools</td>
+      <td>Pool lifecycle, Pool assignments, Pool API key assignments, routing strategy, ring size, sticky websocket sessions, HTTP affinity, prompt-cache affinity, analytics forwarding, and <code>/v1</code> compatibility</td>
+    </tr>
+    <tr>
+      <td>Upstreams</td>
+      <td>Upstream account readiness, lifecycle state, Pool assignment, model support, quota evidence freshness, and reauth state</td>
+    </tr>
+    <tr>
+      <td>Pool API keys</td>
+      <td>Which client credential represents the Pool, plus key status and policy metadata</td>
+    </tr>
+    <tr>
+      <td>System settings</td>
+      <td>Gateway admission defaults, route-class limits, diagnostics, circuit thresholds, model metadata, pricing catalog settings, and runtime policy controls</td>
+    </tr>
+    <tr>
+      <td>Request logs</td>
+      <td>Metadata-only evidence about route family, Pool, model, selected upstream metadata, status, retries, duration, quota state, and safe error codes</td>
+    </tr>
+  </tbody>
+</table>
+
+The admin UI doesn't expose raw prompts, completions, request bodies, response bodies, file bytes, audio bytes, image bytes, websocket frames, bearer tokens, raw Pool API keys after creation, upstream tokens, or Codex `auth.json` contents.

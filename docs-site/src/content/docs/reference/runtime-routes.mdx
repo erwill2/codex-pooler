@@ -1,0 +1,365 @@
+---
+title: Runtime Routes
+description: Public route families for Codex backend clients, OpenAI-compatible SDK clients, MCP hosts, and usage checks.
+---
+
+Codex Pooler keeps runtime traffic, operator metadata, browser pages, health checks, and metrics on separate route families. This page covers the public runtime and operator API surfaces only. It is a reference for choosing the right base URL, not an exhaustive Phoenix route dump.
+
+## Quick map
+
+<table>
+  <thead>
+    <tr>
+      <th>Route family</th>
+      <th>Use it for</th>
+      <th>Auth boundary</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>/backend-api/codex</code></td>
+      <td>Codex backend compatibility route for Codex-compatible clients</td>
+      <td>Pool API key bearer auth</td>
+    </tr>
+    <tr>
+      <td><code>/backend-api</code></td>
+      <td>Backend file bridge, audio transcription, and backend usage routes</td>
+      <td>Pool API key bearer auth</td>
+    </tr>
+    <tr>
+      <td><code>/v1</code></td>
+      <td>Narrow OpenAI-compatible /v1 support for selected SDK routes</td>
+      <td>Pool API key bearer auth</td>
+    </tr>
+    <tr>
+      <td><code>/mcp</code></td>
+      <td>Read-only operator MCP endpoint for metadata lookup</td>
+      <td>Operator-owned MCP bearer token</td>
+    </tr>
+    <tr>
+      <td>Usage routes</td>
+      <td>Runtime usage checks exposed on compatibility paths</td>
+      <td>Pool API key bearer auth</td>
+    </tr>
+  </tbody>
+</table>
+
+A Pool API key represents a Pool. It doesn't represent one upstream account. Codex Pooler uses the Pool policy, model support, limits, health, routing state, and session continuity to select an eligible upstream account for each supported runtime request.
+
+## Backend API routes
+
+Use the backend API when a client expects Codex backend semantics. The main base URL is:
+
+```text
+https://pooler.example.com/backend-api/codex
+```
+
+Supported Codex backend compatibility routes include:
+
+<table>
+  <thead>
+    <tr>
+      <th>Route</th>
+      <th>Meaning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>GET /backend-api/codex/models</code></td>
+      <td>List backend models visible to the authenticated Pool</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/responses</code></td>
+      <td>Send backend Responses requests through Pool routing and accounting</td>
+    </tr>
+    <tr>
+      <td><code>GET /backend-api/codex/responses</code></td>
+      <td>Backend websocket response-stream compatibility</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/responses/compact</code></td>
+      <td>Backend compact compatibility</td>
+    </tr>
+    <tr>
+      <td><code>/backend-api/codex/v1/*</code></td>
+      <td>Explicit backend aliases for clients that use <code>/backend-api/codex/v1</code> as a base URL</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/images/generations</code></td>
+      <td>Backend image generation proxy route</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/images/edits</code></td>
+      <td>Backend image edit proxy route</td>
+    </tr>
+  </tbody>
+</table>
+
+The `/backend-api/codex/*` surface is explicit authenticated Codex backend compatibility. It isn't a wildcard proxy and it isn't the OpenAI SDK surface.
+
+## Backend control-plane routes
+
+Codex Pooler also exposes exact authenticated backend control-plane proxy routes under `/backend-api/codex`. These routes forward to exact upstream control-plane paths and keep request logs metadata-only.
+
+Public examples include:
+
+<table>
+  <thead>
+    <tr>
+      <th>Route</th>
+      <th>Meaning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>GET /backend-api/codex/thread/goal/get</code></td>
+      <td>Backend thread-goal lookup compatibility</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/thread/goal/get</code></td>
+      <td>Backend thread-goal lookup compatibility with JSON body</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/thread/goal/set</code></td>
+      <td>Backend thread-goal update compatibility</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/thread/goal/clear</code></td>
+      <td>Backend thread-goal clear compatibility</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/analytics-events/events</code></td>
+      <td>Backend analytics event proxy route</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/memories/trace_summarize</code></td>
+      <td>Backend memory trace summary proxy route</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/alpha/search</code></td>
+      <td>Backend alpha search proxy route</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/codex/safety/arc</code></td>
+      <td>Backend safety proxy route</td>
+    </tr>
+    <tr>
+      <td><code>GET /backend-api/codex/agent-identities/jwks</code></td>
+      <td>Backend agent identity JWKS route</td>
+    </tr>
+  </tbody>
+</table>
+
+`POST /backend-api/codex/realtime/calls` is a Codex backend control-plane SDP proxy route only. It is not OpenAI Realtime SDK compatibility.
+
+## Backend files, audio, and usage
+
+The `/backend-api` family also includes backend routes that don't live under `/backend-api/codex`:
+
+<table>
+  <thead>
+    <tr>
+      <th>Route</th>
+      <th>Meaning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>POST /backend-api/files</code></td>
+      <td>Create upstream-backed file metadata and return an upstream upload URL</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/files/:file_id/uploaded</code></td>
+      <td>Finalize an upstream-backed file upload</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/transcribe</code></td>
+      <td>Backend audio transcription compatibility</td>
+    </tr>
+    <tr>
+      <td><code>GET /backend-api/wham/usage</code></td>
+      <td>Backend usage route</td>
+    </tr>
+    <tr>
+      <td><code>GET /api/codex/usage</code></td>
+      <td>Usage route</td>
+    </tr>
+    <tr>
+      <td><code>GET /wham/usage</code></td>
+      <td>Usage route</td>
+    </tr>
+    <tr>
+      <td><code>GET /backend-api/wham/agent-identities/jwks</code></td>
+      <td>Backend WHAM agent identity JWKS route</td>
+    </tr>
+  </tbody>
+</table>
+
+The backend file bridge stores metadata only. File bytes stay upstream-backed.
+
+## OpenAI-compatible /v1 routes
+
+Use `/v1` when a client or SDK needs an OpenAI-shaped base URL:
+
+```text
+https://pooler.example.com/v1
+```
+
+Codex Pooler provides narrow OpenAI-compatible /v1 support for selected SDK routes. Supported requests are translated into Codex-compatible work, then sent through the same Pool routing, limit checks, account selection, and accounting path as backend traffic. It doesn't provide full OpenAI API parity.
+
+Supported `/v1` routes include:
+
+<table>
+  <thead>
+    <tr>
+      <th>Route</th>
+      <th>Meaning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>GET /v1/models</code></td>
+      <td>List models visible to the authenticated Pool</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/responses</code></td>
+      <td>OpenAI-shaped Responses request compatibility</td>
+    </tr>
+    <tr>
+      <td><code>GET /v1/responses</code></td>
+      <td>Narrow Responses websocket compatibility only</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/responses/compact</code></td>
+      <td>Compact compatibility</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/chat/completions</code></td>
+      <td>Chat Completions compatibility</td>
+    </tr>
+    <tr>
+      <td><code>GET /v1/usage</code></td>
+      <td>Usage route</td>
+    </tr>
+    <tr>
+      <td><code>GET /v1/files</code></td>
+      <td>File metadata listing</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/files</code></td>
+      <td>File metadata create route</td>
+    </tr>
+    <tr>
+      <td><code>GET /v1/files/:file_id</code></td>
+      <td>File metadata lookup</td>
+    </tr>
+    <tr>
+      <td><code>GET /v1/files/:file_id/content</code></td>
+      <td>Deterministic unsupported content read after ownership checks</td>
+    </tr>
+    <tr>
+      <td><code>DELETE /v1/files/:file_id</code></td>
+      <td>Deterministic unsupported delete after ownership checks</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/audio/transcriptions</code></td>
+      <td>Audio transcription compatibility</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/images/generations</code></td>
+      <td>Image generation compatibility</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/images/edits</code></td>
+      <td>Image edit compatibility</td>
+    </tr>
+  </tbody>
+</table>
+
+`GET /v1/responses` is narrow Responses websocket compatibility. It is not `/v1/realtime` support.
+
+## Unsupported /v1 boundary
+
+Unsupported `/v1` routes return deterministic OpenAI-shaped unsupported endpoint errors when explicitly routed. They don't enter gateway dispatch.
+
+Unsupported public routes include:
+
+<table>
+  <thead>
+    <tr>
+      <th>Route</th>
+      <th>Boundary</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>POST /v1/images/variations</code></td>
+      <td>Unsupported endpoint</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/embeddings</code></td>
+      <td>Unsupported endpoint</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/batches</code></td>
+      <td>Unsupported endpoint</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/moderations</code></td>
+      <td>Unsupported endpoint</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/fine_tuning/jobs</code></td>
+      <td>Unsupported endpoint</td>
+    </tr>
+    <tr>
+      <td><code>GET /v1/responses/:response_id</code></td>
+      <td>Unsupported endpoint</td>
+    </tr>
+    <tr>
+      <td><code>POST /v1/responses/:response_id/cancel</code></td>
+      <td>Unsupported endpoint</td>
+    </tr>
+    <tr>
+      <td><code>DELETE /v1/responses/:response_id</code></td>
+      <td>Unsupported endpoint</td>
+    </tr>
+    <tr>
+      <td><code>/v1/realtime</code></td>
+      <td>Unsupported Realtime SDK route family</td>
+    </tr>
+  </tbody>
+</table>
+
+OpenAI Realtime SDK websocket and session routes are not supported.
+
+## MCP endpoint
+
+The operator MCP endpoint is rooted at `/mcp`, not under `/backend-api` or `/v1`.
+
+<table>
+  <thead>
+    <tr>
+      <th>Route</th>
+      <th>Meaning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>POST /mcp</code></td>
+      <td>JSON-RPC Streamable HTTP endpoint</td>
+    </tr>
+    <tr>
+      <td><code>GET /mcp</code></td>
+      <td>Routed endpoint, but stateless SSE is unavailable today</td>
+    </tr>
+    <tr>
+      <td><code>OPTIONS /mcp</code></td>
+      <td>Allowed MCP methods response</td>
+    </tr>
+  </tbody>
+</table>
+
+MCP uses operator-owned bearer MCP tokens. It doesn't accept Pool API keys, browser sessions, cookies, query tokens, invite tokens, upstream tokens, or custom headers as authentication.
+
+MCP output is metadata-only and scoped by the operator's owner or assigned-Pool visibility. It is an operator inspection endpoint, not a runtime client endpoint.
