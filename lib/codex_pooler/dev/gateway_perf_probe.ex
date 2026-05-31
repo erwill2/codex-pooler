@@ -18,6 +18,7 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
   @process_context_key {__MODULE__, :request_context}
   @default_root Path.join(["tmp", "gateway-perf"])
   @default_phase "measured"
+  @budget_phase "measured"
   @unknown "unknown"
 
   @type context :: %{
@@ -35,7 +36,14 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
           command: String.t(),
           source_table: String.t(),
           query_time_ms: float(),
-          checkout_ms: float()
+          checkout_ms: float(),
+          run_id: String.t(),
+          scenario: String.t(),
+          phase: String.t(),
+          route_family: String.t(),
+          route_path: String.t(),
+          request_index: non_neg_integer() | nil,
+          request_id: String.t() | nil
         }
   @type request_entry :: %{
           run_id: String.t(),
@@ -94,8 +102,8 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
 
   def handle_event(@repo_query_event, measurements, metadata, server) do
     with true <- is_pid(server),
-         %{run_id: run_id} <- Process.get(@process_context_key) do
-      GenServer.cast(server, {:query, run_id, query_entry(measurements, metadata)})
+         %{run_id: run_id} = context <- Process.get(@process_context_key) do
+      GenServer.cast(server, {:query, run_id, query_entry(context, measurements, metadata)})
     end
 
     :ok
@@ -213,14 +221,21 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
     end
   end
 
-  defp query_entry(measurements, metadata) do
+  defp query_entry(context, measurements, metadata) do
     {command, source_table} = query_fingerprint(metadata)
 
     %{
       command: command,
       source_table: source_table,
       query_time_ms: duration_ms(Map.get(measurements, :query_time)),
-      checkout_ms: duration_ms(Map.get(measurements, :queue_time))
+      checkout_ms: duration_ms(Map.get(measurements, :queue_time)),
+      run_id: context.run_id,
+      scenario: context.scenario,
+      phase: context.phase,
+      route_family: context.route_family,
+      route_path: context.route_path,
+      request_index: context.request_index,
+      request_id: context.request_id
     }
   end
 
@@ -334,20 +349,31 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
   defp query_summary(run) do
     queries = Enum.reverse(run.queries)
     requests = Enum.reverse(run.requests)
-    request_count = length(requests)
-    query_count = length(queries)
-    query_total = sum_by(queries, :query_time_ms)
-    checkouts = Enum.map(queries, & &1.checkout_ms)
+    measured_requests = measured_requests(requests)
+    measured_successful_requests = successful_requests(measured_requests)
+    measured_successful_request_keys = MapSet.new(measured_successful_requests, &request_key/1)
+    budget_queries = Enum.filter(queries, &budget_query?(&1, measured_successful_request_keys))
+    request_count = length(measured_successful_requests)
+    query_count = length(budget_queries)
+    query_total = sum_by(budget_queries, :query_time_ms)
+    checkouts = Enum.map(budget_queries, & &1.checkout_ms)
 
-    Map.merge(run_group_fields(run), %{
+    Map.merge(run_group_fields(run, measured_successful_requests), %{
+      budget_phase: @budget_phase,
+      budget_scope: "successful_measured_requests",
       request_count: request_count,
+      measured_request_count: length(measured_requests),
+      measured_success_count: request_count,
+      measured_failure_count: length(measured_requests) - request_count,
+      all_phase_request_count: length(requests),
+      all_phase_query_count_total: length(queries),
       query_count_total: query_count,
       query_count_per_request: ratio(query_count, request_count),
       query_time_ms_total: rounded(query_total),
       query_time_ms_per_request: rounded(ratio(query_total, request_count)),
       max_checkout_ms: rounded(max_value(checkouts)),
       p95_checkout_ms: rounded(percentile(checkouts, 95)),
-      fingerprints: fingerprints(queries),
+      fingerprints: fingerprints(budget_queries),
       started_at: run.started_at,
       finished_at: finished_at(run)
     })
@@ -355,12 +381,17 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
 
   defp request_summary(run) do
     requests = Enum.reverse(run.requests)
+    measured_requests = measured_requests(requests)
+    measured_successful_requests = successful_requests(measured_requests)
     durations = Enum.map(requests, & &1.duration_ms)
 
-    Map.merge(run_group_fields(run), %{
+    Map.merge(run_group_fields(run, requests), %{
       request_count: length(requests),
       success_count: Enum.count(requests, &(&1.outcome == "success")),
       failure_count: Enum.count(requests, &(&1.outcome == "failure")),
+      measured_request_count: length(measured_requests),
+      measured_success_count: length(measured_successful_requests),
+      measured_failure_count: length(measured_requests) - length(measured_successful_requests),
       status_counts: status_counts(requests),
       p50_duration_ms: rounded(percentile(durations, 50)),
       p95_duration_ms: rounded(percentile(durations, 95)),
@@ -373,9 +404,7 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
     })
   end
 
-  defp run_group_fields(run) do
-    requests = Enum.reverse(run.requests)
-
+  defp run_group_fields(run, requests) do
     %{
       run_id: run.run_id,
       scenario: common_value(requests, :scenario, @unknown),
@@ -399,6 +428,36 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
       :retry_count,
       :outcome
     ])
+  end
+
+  defp measured_requests(requests), do: Enum.filter(requests, &(&1.phase == @budget_phase))
+
+  defp successful_requests(requests), do: Enum.filter(requests, &(&1.outcome == "success"))
+
+  defp budget_query?(query, request_keys), do: MapSet.member?(request_keys, request_key(query))
+
+  defp request_key(%{request_index: request_index} = entry) when is_integer(request_index) do
+    {
+      :request_context,
+      Map.get(entry, :phase),
+      Map.get(entry, :scenario),
+      Map.get(entry, :route_path),
+      request_index
+    }
+  end
+
+  defp request_key(%{request_id: request_id}) when is_binary(request_id) and request_id != "" do
+    {:request_id, request_id}
+  end
+
+  defp request_key(entry) do
+    {
+      :request_context,
+      Map.get(entry, :phase),
+      Map.get(entry, :scenario),
+      Map.get(entry, :route_path),
+      nil
+    }
   end
 
   defp fingerprints(queries) do

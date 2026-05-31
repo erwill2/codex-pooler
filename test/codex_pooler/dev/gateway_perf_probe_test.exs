@@ -79,7 +79,12 @@ defmodule CodexPooler.Dev.GatewayPerfProbeTest do
 
     assert query_summary["run_id"] == "probe-test"
     assert query_summary["scenario"] == "backend-short-10c"
+    assert query_summary["phase"] == "measured"
+    assert query_summary["budget_scope"] == "successful_measured_requests"
+    assert query_summary["request_count"] == 1
     assert query_summary["query_count_total"] == 1
+    assert query_summary["query_count_per_request"] == 1.0
+    assert is_number(query_summary["query_count_per_request"])
 
     assert [%{"command" => "SELECT", "source_table" => "requests"}] =
              query_summary["fingerprints"]
@@ -162,8 +167,12 @@ defmodule CodexPooler.Dev.GatewayPerfProbeTest do
     request_summary =
       probe_dir |> Path.join("request-summary.json") |> File.read!() |> Jason.decode!()
 
+    assert query_summary["request_count"] == 2
+    assert query_summary["measured_request_count"] == 2
+    assert query_summary["measured_success_count"] == 2
     assert query_summary["query_count_total"] == 3
-    assert query_summary["query_count_per_request"] > 0
+    assert query_summary["query_count_per_request"] == 1.5
+    assert is_number(query_summary["query_count_per_request"])
     assert query_summary["query_time_ms_total"] > 0
 
     assert query_summary["fingerprints"] == [
@@ -206,6 +215,140 @@ defmodule CodexPooler.Dev.GatewayPerfProbeTest do
     refute all_artifacts =~ "WHERE prompt"
     refute all_artifacts =~ "WHERE raw_body"
     refute all_artifacts =~ "VALUES ($1, $2)"
+  end
+
+  test "query budget uses successful measured requests and excludes warmup and cooldown", %{
+    root: root
+  } do
+    pid = start_supervised!({GatewayPerfProbe, root: root, name: :gateway_perf_probe_phase_test})
+
+    emit_probe_request(%{
+      path: "/backend-api/codex/responses",
+      run_id: "probe-phase-test",
+      scenario: "warmup-default",
+      phase: "warmup",
+      profile: "short-ok",
+      request_id: "req_warmup_probe_phase",
+      request_index: "1",
+      status: 200,
+      queries: repeated_queries(5, "warmup_queries")
+    })
+
+    emit_probe_request(%{
+      path: "/backend-api/codex/responses",
+      run_id: "probe-phase-test",
+      scenario: "short-25c",
+      phase: "measured",
+      profile: "short-ok",
+      request_id: "req_measured_success_probe_phase",
+      request_index: "2",
+      status: 200,
+      queries: repeated_queries(2, "measured_success_queries")
+    })
+
+    emit_probe_request(%{
+      path: "/backend-api/codex/responses",
+      run_id: "probe-phase-test",
+      scenario: "short-25c",
+      phase: "measured",
+      profile: "short-ok",
+      request_id: "req_measured_failure_probe_phase",
+      request_index: "3",
+      status: 500,
+      queries: repeated_queries(7, "measured_failure_queries")
+    })
+
+    emit_probe_request(%{
+      path: "/backend-api/codex/responses",
+      run_id: "probe-phase-test",
+      scenario: "cooldown-default",
+      phase: "cooldown",
+      profile: "short-ok",
+      request_id: "req_cooldown_probe_phase",
+      request_index: "4",
+      status: 200,
+      queries: repeated_queries(11, "cooldown_queries")
+    })
+
+    assert :ok = GatewayPerfProbe.flush(pid, "probe-phase-test")
+
+    probe_dir = Path.join([root, "probe-phase-test", "probe"])
+
+    query_summary =
+      probe_dir |> Path.join("query-summary.json") |> File.read!() |> Jason.decode!()
+
+    request_summary =
+      probe_dir |> Path.join("request-summary.json") |> File.read!() |> Jason.decode!()
+
+    assert query_summary["scenario"] == "short-25c"
+    assert query_summary["phase"] == "measured"
+    assert query_summary["budget_phase"] == "measured"
+    assert query_summary["budget_scope"] == "successful_measured_requests"
+    assert query_summary["all_phase_request_count"] == 4
+    assert query_summary["all_phase_query_count_total"] == 25
+    assert query_summary["measured_request_count"] == 2
+    assert query_summary["measured_success_count"] == 1
+    assert query_summary["measured_failure_count"] == 1
+    assert query_summary["request_count"] == 1
+    assert query_summary["query_count_total"] == 2
+    assert query_summary["query_count_per_request"] == 2.0
+    assert is_number(query_summary["query_count_per_request"])
+
+    assert [fingerprint] = query_summary["fingerprints"]
+    assert fingerprint["count"] == 2
+    assert fingerprint["source_table"] == "measured_success_queries"
+
+    assert request_summary["request_count"] == 4
+    assert request_summary["success_count"] == 3
+    assert request_summary["failure_count"] == 1
+    assert request_summary["measured_request_count"] == 2
+    assert request_summary["measured_success_count"] == 1
+    assert request_summary["measured_failure_count"] == 1
+  end
+
+  test "local short-25c dry-run writes top-level measured plan summary without changing scenario contract" do
+    run_id = "probe-contract-dry-run-#{System.unique_integer([:positive])}"
+    run_dir = Path.join(["tmp", "gateway-perf", run_id])
+
+    on_exit(fn -> File.rm_rf!(run_dir) end)
+
+    assert {output, 0} =
+             System.cmd(
+               "bash",
+               [
+                 "scripts/dev/gateway-perf-run.sh",
+                 "--scenario",
+                 "short-25c",
+                 "--run-id",
+                 run_id,
+                 "--dry-run"
+               ],
+               stderr_to_stdout: true
+             )
+
+    assert output =~ "summary: tmp/gateway-perf/#{run_id}/summary.json"
+
+    scenario_plan = run_dir |> Path.join("scenario.json") |> File.read!() |> Jason.decode!()
+    summary = run_dir |> Path.join("summary.json") |> File.read!() |> Jason.decode!()
+
+    assert Enum.map(scenario_plan["plan"], & &1["phase"]) == ["warmup", "measured", "cooldown"]
+
+    assert Enum.map(scenario_plan["plan"], & &1["name"]) == [
+             "warmup-default",
+             "short-25c",
+             "cooldown-default"
+           ]
+
+    assert [measured] = Enum.filter(summary["scenarios"], &(&1["phase"] == "measured"))
+    assert measured["name"] == "short-25c"
+    assert measured["driver_scenario"] == "short-25c"
+    assert measured["duration_seconds"] == 120
+    assert measured["concurrency"] == 25
+
+    assert summary["scenario_count"] == 3
+    assert summary["failed_scenario_count"] == 0
+    assert summary["artifact_paths"]["probe"] == "tmp/gateway-perf/#{run_id}/probe"
+    assert File.exists?(Path.join(run_dir, "summary.json"))
   end
 
   test "without a running probe telemetry does not write artifacts", %{root: root} do
@@ -264,14 +407,20 @@ defmodule CodexPooler.Dev.GatewayPerfProbeTest do
   end
 
   defp emit_successful_probe_request(%{} = attrs) do
+    attrs = Map.put_new(attrs, :phase, "measured")
+    emit_probe_request(Map.put_new(attrs, :status, 200))
+  end
+
+  defp emit_probe_request(%{} = attrs) do
     conn =
       Plug.Test.conn("POST", attrs.path)
       |> Plug.Conn.put_req_header("x-codex-pooler-perf-run-id", attrs.run_id)
       |> Plug.Conn.put_req_header("x-codex-pooler-perf-scenario", attrs.scenario)
       |> Plug.Conn.put_req_header("x-codex-pooler-perf-profile", attrs.profile)
+      |> Plug.Conn.put_req_header("x-codex-pooler-perf-phase", attrs.phase)
       |> Plug.Conn.put_req_header("x-codex-pooler-perf-request-index", attrs.request_index)
       |> Plug.Conn.put_req_header("x-request-id", attrs.request_id)
-      |> Plug.Conn.resp(200, "")
+      |> Plug.Conn.resp(attrs.status, "")
 
     :telemetry.execute([:phoenix, :endpoint, :start], %{system_time: System.system_time()}, %{
       conn: conn
@@ -293,6 +442,16 @@ defmodule CodexPooler.Dev.GatewayPerfProbeTest do
       %{duration: System.convert_time_unit(25, :millisecond, :native)},
       %{conn: conn}
     )
+  end
+
+  defp repeated_queries(count, source) do
+    Enum.map(1..count, fn _index ->
+      %{
+        query: ~s(SELECT * FROM "#{source}"),
+        params: [],
+        source: source
+      }
+    end)
   end
 
   defp read_probe_artifacts!(probe_dir) do
