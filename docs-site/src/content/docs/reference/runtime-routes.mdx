@@ -231,7 +231,7 @@ Supported `/v1` routes include:
     </tr>
     <tr>
       <td><code>POST /v1/responses/compact</code></td>
-      <td>Compact compatibility</td>
+      <td>Routed public path that returns an OpenAI-shaped unsupported endpoint response</td>
     </tr>
     <tr>
       <td><code>POST /v1/chat/completions</code></td>
@@ -277,6 +277,8 @@ Supported `/v1` routes include:
 </table>
 
 `GET /v1/responses` is narrow Responses websocket compatibility. It is not `/v1/realtime` support.
+
+For exact endpoint-by-endpoint destinations, translation behavior, partial support, and unsupported boundaries, see the [Endpoint Routing Matrix](/reference/endpoint-routing/).
 
 ## Unsupported /v1 boundary
 
