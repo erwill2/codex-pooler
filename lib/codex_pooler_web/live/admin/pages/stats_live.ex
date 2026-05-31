@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.StatsLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Admin.Stats
   alias CodexPooler.Events
@@ -75,7 +75,12 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <AdminComponents.admin_shell flash={@flash} current_scope={@current_scope} active_nav={:stats}>
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:stats}
+      alert_notification_center={@alert_notification_center}
+    >
       <section id="admin-stats" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="stats-page-header"

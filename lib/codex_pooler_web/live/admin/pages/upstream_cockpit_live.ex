@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.Events
   alias CodexPooler.Pools
@@ -259,7 +259,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <AdminComponents.admin_shell flash={@flash} current_scope={@current_scope} active_nav={:upstreams}>
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:upstreams}
+      alert_notification_center={@alert_notification_center}
+    >
       <section id="upstream-cockpit" class="grid gap-6">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <.link

@@ -1,5 +1,5 @@
 defmodule CodexPoolerWeb.Admin.SystemLive do
-  use CodexPoolerWeb, :live_view
+  use CodexPoolerWeb, :admin_live_view
 
   alias CodexPooler.{Catalog, InstanceSettings, MCP, Pools}
   alias CodexPooler.Dev.Seeds, as: DevSeeds
@@ -252,7 +252,12 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <AdminComponents.admin_shell flash={@flash} current_scope={@current_scope} active_nav={:system}>
+    <AdminComponents.admin_shell
+      flash={@flash}
+      current_scope={@current_scope}
+      active_nav={:system}
+      alert_notification_center={@alert_notification_center}
+    >
       <section id="admin-system-live" class="grid min-w-0 gap-6">
         <AdminComponents.page_header
           id="system-page-header"
