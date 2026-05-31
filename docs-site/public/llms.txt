@@ -1,0 +1,44 @@
+# Codex Pooler public docs for agents
+
+Canonical docs base: https://docs.codex-pooler.com/
+Canonical llms index: https://docs.codex-pooler.com/llms.txt
+
+Primary public docs:
+- https://docs.codex-pooler.com/
+- https://docs.codex-pooler.com/getting-started/quick-start/
+- https://docs.codex-pooler.com/reference/runtime-routes/
+- https://docs.codex-pooler.com/reference/routing-strategies/
+
+What Codex Pooler is:
+Codex Pooler is a self-hosted gateway for sharing Codex account capacity across agents, tools, and teams. Clients use stable Pool API keys, and operators manage Pools, upstream accounts, routing, request logs, audit logs, and metadata-only MCP access.
+
+Supported route families:
+- /backend-api: Codex backend compatibility route for authenticated Codex clients. Important paths include /backend-api/codex/models, /backend-api/codex/responses, /backend-api/codex/responses/compact, /backend-api/codex/v1/* aliases, /backend-api/files, /backend-api/transcribe, and usage routes such as /backend-api/wham/usage.
+- /v1: narrow OpenAI-compatible /v1 surface for selected SDK routes. Supported examples include /v1/models, /v1/responses, GET /v1/responses for narrow Responses websocket compatibility, /v1/chat/completions, /v1/usage, /v1/files, /v1/audio/transcriptions, /v1/images/generations, and /v1/images/edits.
+- /mcp: root operator MCP endpoint. POST /mcp is metadata-only, read-only Streamable HTTP JSON-RPC. It uses operator-owned MCP bearer tokens, not Pool API keys or browser sessions.
+
+Unsupported boundaries:
+- Codex Pooler does not provide full OpenAI API parity.
+- Unsupported /v1 routes may return deterministic OpenAI-shaped unsupported endpoint errors when explicitly routed.
+- Unsupported /v1 examples include /v1/embeddings, /v1/batches, /v1/moderations, /v1/fine_tuning/jobs, /v1/images/variations, response retrieve, response cancel, and response delete routes.
+- /v1/realtime and OpenAI Realtime SDK websocket or session routes are unsupported.
+- GET /v1/responses is narrow Responses websocket compatibility, not /v1/realtime support.
+- POST /backend-api/codex/realtime/calls is a Codex backend control-plane SDP proxy route, not OpenAI Realtime SDK compatibility.
+- GET /mcp stateless SSE is unavailable today.
+
+Credential boundaries:
+- Use Pool API keys for /backend-api and /v1 runtime requests.
+- Use operator-owned MCP tokens for /mcp.
+- Do not use Pool API keys for /mcp.
+- Do not use MCP tokens for /backend-api or /v1.
+- Do not put raw keys, tokens, cookies, auth.json, access tokens, refresh tokens, invite tokens, or upstream secrets in docs, tickets, logs, screenshots, examples, or prompts.
+
+Privacy boundaries:
+- Codex Pooler observability is metadata-only. Safe examples can mention route family, endpoint path, method, status class, Pool label, upstream label, model name, synthetic request-log id, error code, retry count, duration, token count, and timestamp.
+- Do not include raw prompts, completions, request bodies, response bodies, multipart bodies, websocket frames, file bytes, audio bytes, image bytes, data URLs, transcripts, bearer tokens, cookies, Pool API keys, MCP tokens, auth.json, access tokens, refresh tokens, raw upload URLs, raw idempotency keys, private hostnames, real account ids, raw emails, or private IP addresses.
+
+Agent guidance:
+- Start with https://docs.codex-pooler.com/clients/codex-cli/ when configuring Codex backend clients.
+- Use https://docs.codex-pooler.com/reference/routing-strategies/ when configuring Pools and routing behavior.
+- Keep examples on http://localhost:4000 for local setup or https://pooler.example.com for deployed product examples.
+- Use https://docs.codex-pooler.com/ links as canonical docs URLs.
