@@ -316,6 +316,34 @@ defmodule CodexPooler.HelmRuntimeContractTest do
     refute rendered =~ "upstream-secret-key: not-base64"
   end
 
+  test "app ServiceMonitor renders optional Prometheus collection without embedding metric secrets" do
+    rendered =
+      helm_template!([
+        "--set",
+        "monitoring.serviceMonitor.enabled=true",
+        "--set-string",
+        "monitoring.serviceMonitor.labels.release=kube-prometheus-stack",
+        "--set-string",
+        "monitoring.serviceMonitor.bearerTokenSecret.name=codex-pooler-metrics",
+        "--set-string",
+        "monitoring.serviceMonitor.bearerTokenSecret.key=token"
+      ])
+
+    service_monitor = source_doc!(rendered, "codex-pooler/templates/servicemonitor.yaml")
+
+    assert service_monitor =~ "kind: ServiceMonitor"
+    assert service_monitor =~ "release: kube-prometheus-stack"
+    assert service_monitor =~ "app.kubernetes.io/component: app"
+    assert service_monitor =~ ~r/namespaceSelector:\n\s+matchNames:\n\s+- default/
+    assert service_monitor =~ ~r/- port: http\n\s+path: "\/metrics"/
+    assert service_monitor =~ ~r/interval: "30s"\n\s+scrapeTimeout: "10s"/
+
+    assert service_monitor =~
+             ~r/bearerTokenSecret:\n\s+name: "codex-pooler-metrics"\n\s+key: "token"/
+
+    refute service_monitor =~ "CODEX_POOLER_METRICS_BEARER_TOKEN"
+  end
+
   defp helm_template!(extra_args \\ []) do
     case helm_template_result(extra_args) do
       {:ok, rendered} -> rendered

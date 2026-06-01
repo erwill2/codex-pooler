@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttempt do
   Tracks and classifies the first SSE event for a streaming gateway attempt.
   """
 
+  alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
   @type classification ::
@@ -53,6 +54,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttempt do
 
   defp classify_incomplete_first_event(buffer) do
     if StreamProtocol.oversized_incomplete_sse_block?(buffer) do
+      BufferTelemetry.record_oversized_incomplete(
+        "first_event",
+        byte_size(buffer),
+        StreamProtocol.max_incomplete_sse_block_bytes()
+      )
+
       {{:write, buffer}, %{classified?: true, buffer: ""}}
     else
       {:buffered, %{classified?: false, buffer: buffer}}

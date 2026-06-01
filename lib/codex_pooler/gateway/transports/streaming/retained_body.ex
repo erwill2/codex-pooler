@@ -1,6 +1,8 @@
 defmodule CodexPooler.Gateway.Transports.Streaming.RetainedBody do
   @moduledoc false
 
+  alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
+
   @max_bytes 65_536
 
   @type t :: binary()
@@ -12,9 +14,17 @@ defmodule CodexPooler.Gateway.Transports.Streaming.RetainedBody do
   def append(body, "") when is_binary(body), do: body
 
   def append(body, data) when is_binary(body) do
-    [body, data]
-    |> IO.iodata_to_binary()
-    |> suffix(@max_bytes)
+    retained = IO.iodata_to_binary([body, data])
+
+    if byte_size(body) < @max_bytes and byte_size(retained) > @max_bytes do
+      BufferTelemetry.record_retained_body_truncated(
+        "retained_body",
+        byte_size(retained),
+        @max_bytes
+      )
+    end
+
+    suffix(retained, @max_bytes)
   end
 
   @spec max_bytes() :: pos_integer()

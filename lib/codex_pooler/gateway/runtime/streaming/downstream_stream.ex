@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
 
   alias CodexPooler.Gateway.OpenAICompatibility.ChatCompletions
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
   @type state :: map()
@@ -51,7 +52,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
         normalize_public_openai_responses_stream_data(data, state)
 
       codex_responses_stream_endpoint?(endpoint) ->
-        normalize_codex_responses_stream_data(data, state)
+        normalize_codex_responses_stream_data(data, endpoint, opts, state)
 
       true ->
         {normalize_endpoint_data(endpoint, data), state}
@@ -80,7 +81,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
 
   defp normalize_public_openai_responses_stream_data(data, state), do: {data, state}
 
-  defp normalize_codex_responses_stream_data(data, state) when is_binary(data) do
+  defp normalize_codex_responses_stream_data(data, endpoint, opts, state) when is_binary(data) do
     buffer = Map.get(state, :codex_responses_sse_buffer, "")
 
     if buffer == "" and not codex_responses_sse_chunk?(data) do
@@ -91,6 +92,14 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
 
       data =
         if oversized_incomplete_sse_prefix?(blocks, buffer, buffered_data) do
+          BufferTelemetry.record_oversized_incomplete(
+            "codex_responses_sse",
+            byte_size(buffered_data),
+            StreamProtocol.max_incomplete_sse_block_bytes(),
+            request_options: opts,
+            endpoint: endpoint
+          )
+
           buffered_data
         else
           blocks
@@ -102,7 +111,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
     end
   end
 
-  defp normalize_codex_responses_stream_data(data, state), do: {data, state}
+  defp normalize_codex_responses_stream_data(data, _endpoint, _opts, state), do: {data, state}
 
   defp normalize_endpoint_data("/backend-api/codex/responses", data) when is_binary(data) do
     StreamProtocol.normalize_codex_responses_sse_data(data)

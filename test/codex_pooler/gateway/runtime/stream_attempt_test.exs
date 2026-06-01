@@ -22,11 +22,18 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttemptTest do
     end
 
     test "releases oversized incomplete first events without retaining them" do
+      attach_stream_buffer_telemetry()
       state = StreamAttempt.first_event_state()
       oversized = String.duplicate("data: unavailable-upstream-prefix", 12_000)
 
       assert {{:write, ^oversized}, state} = StreamAttempt.classify_first_event(oversized, state)
       assert state == %{classified?: true, buffer: ""}
+
+      assert_receive {[:codex_pooler, :gateway, :stream_buffer, :oversized],
+                      %{bytes: bytes, count: 1, max_bytes: 65_536},
+                      %{buffer: "first_event", endpoint: "unknown", route_class: "unknown"}}
+
+      assert bytes > 65_536
     end
 
     test "classifies retryable first terminal failures without writing them" do
@@ -293,5 +300,21 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttemptTest do
 
   defp sse_event(event, payload) do
     "event: " <> event <> "\n" <> "data: " <> Jason.encode!(payload) <> "\n\n"
+  end
+
+  defp attach_stream_buffer_telemetry do
+    handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:codex_pooler, :gateway, :stream_buffer, :oversized],
+      fn event, measurements, metadata, _config ->
+        send(parent, {event, measurements, metadata})
+      end,
+      :ok
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
   end
 end

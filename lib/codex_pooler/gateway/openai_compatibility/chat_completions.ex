@@ -1,6 +1,7 @@
 defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   @moduledoc false
 
+  alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
   @spec normalize_response(map(), map()) :: map()
@@ -42,6 +43,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
     {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffered_data, bounded?: true)
 
     if oversized_incomplete_sse_prefix?(blocks, buffer, buffered_data) do
+      BufferTelemetry.record_oversized_incomplete(
+        "public_openai_chat_sse",
+        byte_size(buffered_data),
+        StreamProtocol.max_incomplete_sse_block_bytes()
+      )
+
       {buffered_data, %{state | buffer: ""}}
     else
       normalize_stream_blocks(blocks, buffer, state)

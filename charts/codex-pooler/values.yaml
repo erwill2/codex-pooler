@@ -35,6 +35,21 @@ config:
   lang: "C.UTF-8"
   lcAll: "C.UTF-8"
 
+monitoring:
+  serviceMonitor:
+    enabled: false
+    labels: {}
+    annotations: {}
+    interval: 30s
+    scrapeTimeout: 10s
+    path: /metrics
+    scheme: http
+    bearerTokenSecret:
+      name: ""
+      key: ""
+    metricRelabelings: []
+    relabelings: []
+
 clustering:
   enabled: false
   query: ""

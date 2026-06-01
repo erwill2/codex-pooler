@@ -63,6 +63,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
     end
 
     test "passes through oversized incomplete backend codex SSE prefixes without retaining them" do
+      attach_stream_buffer_telemetry()
       opts = RequestOptions.build(%{}, "/backend-api/codex/responses", %{"stream" => true})
       state = DownstreamStream.initial_state(:relay, opts)
       oversized = String.duplicate("data: unavailable-upstream-prefix", 12_000)
@@ -76,6 +77,33 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                )
 
       assert state.codex_responses_sse_buffer == ""
+
+      assert_receive {[:codex_pooler, :gateway, :stream_buffer, :oversized],
+                      %{bytes: bytes, count: 1, max_bytes: 65_536},
+                      %{
+                        buffer: "codex_responses_sse",
+                        endpoint: "/backend-api/codex/responses",
+                        route_class: route_class
+                      }}
+
+      assert bytes > 65_536
+      assert is_binary(route_class)
     end
+  end
+
+  defp attach_stream_buffer_telemetry do
+    handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:codex_pooler, :gateway, :stream_buffer, :oversized],
+      fn event, measurements, metadata, _config ->
+        send(parent, {event, measurements, metadata})
+      end,
+      :ok
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
   end
 end

@@ -4,6 +4,8 @@ defmodule CodexPoolerWeb.Telemetry do
 
   alias CodexPooler.Dev.GatewayPerfProbe
 
+  @type metric :: Telemetry.Metrics.t()
+
   def start_link(arg) do
     Supervisor.start_link(__MODULE__, arg, name: __MODULE__)
   end
@@ -15,6 +17,7 @@ defmodule CodexPoolerWeb.Telemetry do
     children =
       [
         perf_probe_child(),
+        CodexPoolerWeb.Telemetry.MemorySampler,
         {:telemetry_poller, period: 10_000},
         {TelemetryMetricsPrometheus.Core, metrics: prometheus_metrics()}
       ]
@@ -86,7 +89,8 @@ defmodule CodexPoolerWeb.Telemetry do
     ]
   end
 
-  defp prometheus_metrics do
+  @spec prometheus_metrics() :: [metric()]
+  def prometheus_metrics do
     [
       counter("phoenix.endpoint.stop.count",
         event_name: [:phoenix, :endpoint, :stop],
@@ -114,10 +118,84 @@ defmodule CodexPoolerWeb.Telemetry do
         unit: :byte,
         description: "Total BEAM memory in bytes."
       ),
+      last_value("vm.memory.processes.bytes",
+        event_name: [:vm, :memory],
+        measurement: :processes,
+        unit: :byte,
+        description: "BEAM process memory in bytes."
+      ),
+      last_value("vm.memory.processes_used.bytes",
+        event_name: [:vm, :memory],
+        measurement: :processes_used,
+        unit: :byte,
+        description: "BEAM process memory actively used in bytes."
+      ),
+      last_value("vm.memory.binary.bytes",
+        event_name: [:vm, :memory],
+        measurement: :binary,
+        unit: :byte,
+        description: "BEAM binary memory in bytes."
+      ),
+      last_value("vm.memory.ets.bytes",
+        event_name: [:vm, :memory],
+        measurement: :ets,
+        unit: :byte,
+        description: "BEAM ETS memory in bytes."
+      ),
+      last_value("vm.memory.atom.bytes",
+        event_name: [:vm, :memory],
+        measurement: :atom,
+        unit: :byte,
+        description: "BEAM atom table memory in bytes."
+      ),
+      last_value("vm.memory.code.bytes",
+        event_name: [:vm, :memory],
+        measurement: :code,
+        unit: :byte,
+        description: "BEAM loaded code memory in bytes."
+      ),
+      last_value("vm.system_counts.process_count",
+        event_name: [:vm, :system_counts],
+        measurement: :process_count,
+        description: "Current BEAM process count."
+      ),
+      last_value("vm.system_counts.port_count",
+        event_name: [:vm, :system_counts],
+        measurement: :port_count,
+        description: "Current BEAM port count."
+      ),
       last_value("vm.total_run_queue_lengths.total",
         event_name: [:vm, :total_run_queue_lengths],
         measurement: :total,
         description: "Total BEAM scheduler run queue length."
+      ),
+      counter("codex_pooler.gateway.stream_buffer.oversized.count",
+        event_name: [:codex_pooler, :gateway, :stream_buffer, :oversized],
+        measurement: :count,
+        tags: [:buffer, :transport, :route_class, :endpoint],
+        description: "Oversized incomplete stream buffers released without retention."
+      ),
+      distribution("codex_pooler.gateway.stream_buffer.oversized.bytes",
+        event_name: [:codex_pooler, :gateway, :stream_buffer, :oversized],
+        measurement: :bytes,
+        tags: [:buffer, :transport, :route_class, :endpoint],
+        unit: :byte,
+        description: "Size of oversized incomplete stream buffers.",
+        reporter_options: [buckets: [65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152]]
+      ),
+      counter("codex_pooler.gateway.stream_buffer.truncated.count",
+        event_name: [:codex_pooler, :gateway, :stream_buffer, :truncated],
+        measurement: :count,
+        tags: [:buffer, :transport, :route_class, :endpoint],
+        description: "Retained stream bodies truncated to their bounded suffix."
+      ),
+      distribution("codex_pooler.gateway.stream_buffer.truncated.bytes",
+        event_name: [:codex_pooler, :gateway, :stream_buffer, :truncated],
+        measurement: :bytes,
+        tags: [:buffer, :transport, :route_class, :endpoint],
+        unit: :byte,
+        description: "Pre-truncation retained stream body sizes.",
+        reporter_options: [buckets: [65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152]]
       )
     ]
   end

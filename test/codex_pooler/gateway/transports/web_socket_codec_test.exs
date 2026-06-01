@@ -74,12 +74,35 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebSocketCodecTest do
     end
 
     test "drops oversized incomplete SSE buffers instead of retaining them" do
+      attach_stream_buffer_telemetry()
       request_id = "websocket-buffer-oversized"
       oversized = String.duplicate("data: unavailable-upstream-prefix", 12_000)
 
       assert {[], ""} = WebSocketCodec.stream_messages(request_id, oversized, "")
+
+      assert_receive {[:codex_pooler, :gateway, :stream_buffer, :oversized],
+                      %{bytes: bytes, count: 1, max_bytes: 65_536},
+                      %{buffer: "websocket_sse", endpoint: "unknown", route_class: "unknown"}}
+
+      assert bytes > 65_536
     end
   end
 
   defp unexpected_push(_frame), do: flunk("websocket stream results should not push directly")
+
+  defp attach_stream_buffer_telemetry do
+    handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
+    parent = self()
+
+    :telemetry.attach(
+      handler_id,
+      [:codex_pooler, :gateway, :stream_buffer, :oversized],
+      fn event, measurements, metadata, _config ->
+        send(parent, {event, measurements, metadata})
+      end,
+      :ok
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
 end
