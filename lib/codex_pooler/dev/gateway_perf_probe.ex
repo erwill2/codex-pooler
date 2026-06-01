@@ -296,6 +296,8 @@ defmodule CodexPooler.Dev.GatewayPerfProbe do
     end
   rescue
     _error -> %{}
+  catch
+    :exit, _reason -> %{}
   end
 
   defp ensure_run(%{runs: runs} = state, context) do

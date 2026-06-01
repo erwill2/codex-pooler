@@ -5,9 +5,24 @@ defmodule CodexPoolerWeb.Telemetry do
   alias CodexPooler.Dev.GatewayPerfProbe
 
   @type metric :: Telemetry.Metrics.t()
+  @type repo_query_tags :: %{source: String.t(), command: String.t()}
+  @type http_tags :: %{method: String.t(), status_class: String.t()}
+  @type http_route_tags :: %{method: String.t(), route: String.t(), status_class: String.t()}
+  @type admission_tags :: %{route_class: String.t(), transport: String.t()}
 
   @repo_query_buckets [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5]
+  @admission_queue_buckets [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5]
   @repo_source_pattern ~r/\A[a-zA-Z0-9_.-]+\z/
+  @safe_route_pattern ~r/\A[a-zA-Z0-9_.*:\/{}-]+\z/
+  @safe_tag_pattern ~r/\A[a-zA-Z0-9_.:-]+\z/
+  @repo_source_query_patterns [
+    ~r/\bfrom\s+"?([a-zA-Z0-9_.-]+)"?/i,
+    ~r/\bjoin\s+"?([a-zA-Z0-9_.-]+)"?/i,
+    ~r/\binsert\s+into\s+"?([a-zA-Z0-9_.-]+)"?/i,
+    ~r/\bupdate\s+"?([a-zA-Z0-9_.-]+)"?/i,
+    ~r/\bdelete\s+from\s+"?([a-zA-Z0-9_.-]+)"?/i,
+    ~r/\btruncate\s+(?:table\s+)?"?([a-zA-Z0-9_.-]+)"?/i
+  ]
 
   def start_link(arg) do
     Supervisor.start_link(__MODULE__, arg, name: __MODULE__)
@@ -100,6 +115,12 @@ defmodule CodexPoolerWeb.Telemetry do
         measurement: :duration,
         description: "Total Phoenix endpoint requests."
       ),
+      counter("codex_pooler.http.request.count",
+        event_name: [:phoenix, :endpoint, :stop],
+        tags: [:method, :status_class],
+        tag_values: &http_request_tag_values/1,
+        description: "Total HTTP requests by method and status class."
+      ),
       distribution("phoenix.endpoint.stop.duration.seconds",
         event_name: [:phoenix, :endpoint, :stop],
         measurement: :duration,
@@ -115,47 +136,53 @@ defmodule CodexPoolerWeb.Telemetry do
         description: "Phoenix router dispatch duration by route.",
         reporter_options: [buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5]]
       ),
+      counter("codex_pooler.http.route.count",
+        event_name: [:phoenix, :router_dispatch, :stop],
+        tags: [:route, :method, :status_class],
+        tag_values: &http_route_tag_values/1,
+        description: "Total routed HTTP requests by route, method, and status class."
+      ),
       counter("codex_pooler.repo.query.count",
         event_name: [:codex_pooler, :repo, :query],
         measurement: :total_time,
-        tags: [:source],
+        tags: [:source, :command],
         tag_values: &repo_query_tag_values/1,
-        description: "Total Ecto repository queries by source."
+        description: "Total Ecto repository queries by source and SQL command."
       ),
       distribution("codex_pooler.repo.query.total_time.seconds",
         event_name: [:codex_pooler, :repo, :query],
         measurement: :total_time,
         unit: {:native, :second},
-        tags: [:source],
+        tags: [:source, :command],
         tag_values: &repo_query_tag_values/1,
-        description: "Total Ecto repository query time by source.",
+        description: "Total Ecto repository query time by source and SQL command.",
         reporter_options: [buckets: @repo_query_buckets]
       ),
       distribution("codex_pooler.repo.query.query_time.seconds",
         event_name: [:codex_pooler, :repo, :query],
         measurement: :query_time,
         unit: {:native, :second},
-        tags: [:source],
+        tags: [:source, :command],
         tag_values: &repo_query_tag_values/1,
-        description: "Ecto repository database execution time by source.",
+        description: "Ecto repository database execution time by source and SQL command.",
         reporter_options: [buckets: @repo_query_buckets]
       ),
       distribution("codex_pooler.repo.query.queue_time.seconds",
         event_name: [:codex_pooler, :repo, :query],
         measurement: :queue_time,
         unit: {:native, :second},
-        tags: [:source],
+        tags: [:source, :command],
         tag_values: &repo_query_tag_values/1,
-        description: "Ecto repository connection checkout queue time by source.",
+        description: "Ecto repository connection checkout queue time by source and SQL command.",
         reporter_options: [buckets: @repo_query_buckets]
       ),
       distribution("codex_pooler.repo.query.decode_time.seconds",
         event_name: [:codex_pooler, :repo, :query],
         measurement: :decode_time,
         unit: {:native, :second},
-        tags: [:source],
+        tags: [:source, :command],
         tag_values: &repo_query_tag_values/1,
-        description: "Ecto repository decode time by source.",
+        description: "Ecto repository decode time by source and SQL command.",
         reporter_options: [buckets: @repo_query_buckets]
       ),
       last_value("vm.memory.total.bytes",
@@ -194,11 +221,23 @@ defmodule CodexPoolerWeb.Telemetry do
         unit: :byte,
         description: "BEAM atom table memory in bytes."
       ),
+      last_value("vm.memory.atom_used.bytes",
+        event_name: [:vm, :memory],
+        measurement: :atom_used,
+        unit: :byte,
+        description: "BEAM atom table memory used in bytes."
+      ),
       last_value("vm.memory.code.bytes",
         event_name: [:vm, :memory],
         measurement: :code,
         unit: :byte,
         description: "BEAM loaded code memory in bytes."
+      ),
+      last_value("vm.memory.system.bytes",
+        event_name: [:vm, :memory],
+        measurement: :system,
+        unit: :byte,
+        description: "BEAM system memory in bytes."
       ),
       last_value("vm.system_counts.process_count",
         event_name: [:vm, :system_counts],
@@ -214,6 +253,64 @@ defmodule CodexPoolerWeb.Telemetry do
         event_name: [:vm, :total_run_queue_lengths],
         measurement: :total,
         description: "Total BEAM scheduler run queue length."
+      ),
+      last_value("vm.total_run_queue_lengths.cpu",
+        event_name: [:vm, :total_run_queue_lengths],
+        measurement: :cpu,
+        description: "CPU scheduler run queue length."
+      ),
+      last_value("vm.total_run_queue_lengths.io",
+        event_name: [:vm, :total_run_queue_lengths],
+        measurement: :io,
+        description: "IO scheduler run queue length."
+      ),
+      counter("codex_pooler.gateway.admission.accepted.count",
+        event_name: [:codex_pooler, :gateway, :admission, :accepted],
+        tags: [:route_class, :transport],
+        tag_values: &admission_tag_values/1,
+        description: "Gateway admission requests accepted immediately."
+      ),
+      counter("codex_pooler.gateway.admission.enqueued.count",
+        event_name: [:codex_pooler, :gateway, :admission, :enqueued],
+        tags: [:route_class, :transport],
+        tag_values: &admission_tag_values/1,
+        description: "Gateway admission requests queued by the local bulkhead."
+      ),
+      counter("codex_pooler.gateway.admission.dequeued.count",
+        event_name: [:codex_pooler, :gateway, :admission, :dequeued],
+        tags: [:route_class, :transport],
+        tag_values: &admission_tag_values/1,
+        description: "Gateway admission requests dequeued into execution."
+      ),
+      counter("codex_pooler.gateway.admission.rejected.count",
+        event_name: [:codex_pooler, :gateway, :admission, :rejected],
+        tags: [:route_class, :transport],
+        tag_values: &admission_tag_values/1,
+        description: "Gateway admission requests rejected by the local bulkhead."
+      ),
+      counter("codex_pooler.gateway.admission.timeout.count",
+        event_name: [:codex_pooler, :gateway, :admission, :timeout],
+        tags: [:route_class, :transport],
+        tag_values: &admission_tag_values/1,
+        description: "Gateway admission requests that timed out while queued."
+      ),
+      distribution("codex_pooler.gateway.admission.dequeued_time.seconds",
+        event_name: [:codex_pooler, :gateway, :admission, :dequeued],
+        measurement: :queued_ms,
+        unit: {:millisecond, :second},
+        tags: [:route_class, :transport],
+        tag_values: &admission_tag_values/1,
+        description: "Gateway admission queue time for dequeued requests.",
+        reporter_options: [buckets: @admission_queue_buckets]
+      ),
+      distribution("codex_pooler.gateway.admission.timeout_time.seconds",
+        event_name: [:codex_pooler, :gateway, :admission, :timeout],
+        measurement: :queued_ms,
+        unit: {:millisecond, :second},
+        tags: [:route_class, :transport],
+        tag_values: &admission_tag_values/1,
+        description: "Gateway admission queue time for timed-out requests.",
+        reporter_options: [buckets: @admission_queue_buckets]
       ),
       counter("codex_pooler.gateway.stream_buffer.oversized.count",
         event_name: [:codex_pooler, :gateway, :stream_buffer, :oversized],
@@ -250,27 +347,148 @@ defmodule CodexPoolerWeb.Telemetry do
     if GatewayPerfProbe.enabled?(), do: GatewayPerfProbe
   end
 
+  @spec repo_query_tag_values(map()) :: repo_query_tags()
   defp repo_query_tag_values(metadata) do
-    %{source: repo_query_source(metadata[:source])}
+    %{source: repo_query_source(metadata), command: repo_query_command(metadata[:query])}
   end
 
-  defp repo_query_source(nil), do: "unknown"
+  @spec repo_query_source(map()) :: String.t()
+  defp repo_query_source(metadata) do
+    repo_query_source_value(metadata[:source]) ||
+      repo_query_source_from_query(metadata[:query]) ||
+      "unknown"
+  end
 
-  defp repo_query_source(source) when is_atom(source) do
+  @spec repo_query_source_value(term()) :: String.t() | nil
+  defp repo_query_source_value(nil), do: nil
+
+  defp repo_query_source_value(source) when is_atom(source) do
     source
     |> Atom.to_string()
-    |> repo_query_source()
+    |> repo_query_source_value()
   end
 
-  defp repo_query_source(source) when is_binary(source) do
+  defp repo_query_source_value(source) when is_binary(source) do
     source = String.trim(source)
 
     if String.length(source) <= 80 and Regex.match?(@repo_source_pattern, source) do
       source
     else
+      nil
+    end
+  end
+
+  defp repo_query_source_value(_source), do: nil
+
+  @spec repo_query_source_from_query(term()) :: String.t() | nil
+  defp repo_query_source_from_query(query) when is_binary(query) do
+    Enum.find_value(@repo_source_query_patterns, fn pattern ->
+      case Regex.run(pattern, query, capture: :all_but_first) do
+        [source] -> repo_query_source_value(source)
+        _other -> nil
+      end
+    end)
+  end
+
+  defp repo_query_source_from_query(_query), do: nil
+
+  @spec repo_query_command(term()) :: String.t()
+  defp repo_query_command(query) when is_binary(query) do
+    case Regex.run(~r/\A\s*(?:--[^\n]*\n\s*)*([a-zA-Z]+)/, query, capture: :all_but_first) do
+      [command] -> normalize_repo_command(command)
+      _other -> "unknown"
+    end
+  end
+
+  defp repo_query_command(_query), do: "unknown"
+
+  @spec normalize_repo_command(String.t()) :: String.t()
+  defp normalize_repo_command(command) do
+    command =
+      command
+      |> String.downcase()
+      |> String.trim()
+
+    cond do
+      command in ~w(select insert update delete begin commit rollback truncate) ->
+        command
+
+      Regex.match?(~r/\A[a-z]+\z/, command) ->
+        "other"
+
+      true ->
+        "unknown"
+    end
+  end
+
+  @spec http_request_tag_values(map()) :: http_tags()
+  defp http_request_tag_values(metadata) do
+    conn = metadata[:conn]
+
+    %{
+      method: safe_tag_value(conn_value(conn, :method), "unknown"),
+      status_class: status_class(conn_value(conn, :status))
+    }
+  end
+
+  @spec http_route_tag_values(map()) :: http_route_tags()
+  defp http_route_tag_values(metadata) do
+    metadata
+    |> http_request_tag_values()
+    |> Map.put(:route, safe_route(metadata[:route]))
+  end
+
+  @spec admission_tag_values(map()) :: admission_tags()
+  defp admission_tag_values(metadata) do
+    %{
+      route_class: safe_tag_value(metadata[:route_class], "unknown"),
+      transport: safe_tag_value(metadata[:transport], "unknown")
+    }
+  end
+
+  @spec conn_value(term(), atom()) :: term()
+  defp conn_value(%{method: method}, :method), do: method
+  defp conn_value(%{status: status}, :status), do: status
+  defp conn_value(_conn, _key), do: nil
+
+  @spec status_class(term()) :: String.t()
+  defp status_class(status) when is_integer(status) and status >= 100 and status <= 599 do
+    "#{div(status, 100)}xx"
+  end
+
+  defp status_class(_status), do: "unknown"
+
+  @spec safe_route(term()) :: String.t()
+  defp safe_route(route) when is_binary(route) do
+    route = String.trim(route)
+
+    if route != "" and String.length(route) <= 120 and Regex.match?(@safe_route_pattern, route) do
+      route
+    else
       "unknown"
     end
   end
 
-  defp repo_query_source(_source), do: "unknown"
+  defp safe_route(_route), do: "unknown"
+
+  @spec safe_tag_value(term(), String.t()) :: String.t()
+  defp safe_tag_value(nil, fallback), do: fallback
+
+  defp safe_tag_value(value, fallback) when is_atom(value) do
+    value
+    |> Atom.to_string()
+    |> safe_tag_value(fallback)
+  end
+
+  defp safe_tag_value(value, fallback) when is_binary(value) do
+    value = String.trim(value)
+
+    if value != "" and String.length(value) <= 80 and Regex.match?(@safe_tag_pattern, value) do
+      value
+    else
+      fallback
+    end
+  end
+
+  defp safe_tag_value(_value, fallback), do: fallback
 end

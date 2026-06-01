@@ -27,15 +27,20 @@ The `release` label and scrape interval should match your own Prometheus Operato
 
 Build your Grafana or Prometheus dashboard around the signals needed to correlate a fast memory spike:
 
-1. Kubernetes cgroup working set versus pod memory limit
-2. BEAM memory total, processes, binary, ETS, code, and atom memory by pod
-3. BEAM process count, port count, and run queue
-4. app restarts, OOM events, and last terminated reason
-5. request rate and p95 endpoint/router latency
-6. stream-buffer oversized and truncated events
-7. Ecto query rate, queries per request, hot query sources, and DB queue p95
+1. Kubernetes cgroup working set versus pod memory limit, RSS/cache split, and cgroup memory not explained by BEAM total
+2. BEAM memory total, processes, binary, ETS, code, atom, atom used, and system memory by pod
+3. BEAM process count, port count, total run queue, CPU run queue, and IO run queue
+4. app restarts, OOM events, and current pod last terminated reason
+5. request rate, HTTP status class rate, and p95 endpoint/router latency
+6. gateway admission accepted, queued, rejected, timed-out, and queue-time p95 signals
+7. stream-buffer oversized and truncated events
+8. Ecto query rate, queries per request, hot query sources by safe source and SQL command, unknown query rate, and DB queue p95
 
 Read the dashboard as a correlation view. If cgroup memory climbs while BEAM total stays flat, look outside normal BEAM heap attribution. If `vm_memory_binary_bytes` climbs with cgroup memory, inspect streaming response retention, file bodies, and upstream transport buffering. If process count, ports, or run queue climb, inspect stuck request processes, websocket ownership, and overloaded route classes.
+
+![Codex Pooler Grafana memory triage dashboard](/codex-pooler-grafana.png)
+
+[Download the starter Grafana dashboard JSON](/operators/monitoring/codex-pooler-memory-triage.json)
 
 ## Useful PromQL
 
@@ -50,6 +55,22 @@ vm_memory_total_bytes{namespace="codex-pooler", job="codex-pooler-app"}
 vm_memory_binary_bytes{namespace="codex-pooler", job="codex-pooler-app"}
 vm_memory_processes_bytes{namespace="codex-pooler", job="codex-pooler-app"}
 vm_memory_ets_bytes{namespace="codex-pooler", job="codex-pooler-app"}
+vm_memory_system_bytes{namespace="codex-pooler", job="codex-pooler-app"}
+```
+
+```text
+clamp_min(
+  max by (pod) (
+    container_memory_working_set_bytes{
+      namespace="codex-pooler",
+      container="app",
+      image!=""
+    }
+  )
+  - on (pod)
+  vm_memory_total_bytes{namespace="codex-pooler", job="codex-pooler-app"},
+  0
+)
 ```
 
 ```text
@@ -72,16 +93,55 @@ sum by (pod) (
 
 ```text
 topk(10,
-  sum by (source) (
+  sum by (source, command) (
     rate(codex_pooler_repo_query_count{namespace="codex-pooler", job="codex-pooler-app"}[5m])
   )
 )
 ```
 
 ```text
+sum by (pod, command) (
+  rate(codex_pooler_repo_query_count{
+    namespace="codex-pooler",
+    job="codex-pooler-app",
+    source="unknown"
+  }[5m])
+)
+```
+
+```text
 histogram_quantile(0.95,
-  sum by (le, source) (
+  sum by (le, source, command) (
     rate(codex_pooler_repo_query_total_time_seconds_bucket{
+      namespace="codex-pooler",
+      job="codex-pooler-app"
+    }[5m])
+  )
+)
+```
+
+```text
+sum by (method, status_class) (
+  rate(codex_pooler_http_request_count{
+    namespace="codex-pooler",
+    job="codex-pooler-app"
+  }[5m])
+)
+```
+
+```text
+sum by (route_class, transport) (
+  rate(codex_pooler_gateway_admission_enqueued_count{
+    namespace="codex-pooler",
+    job="codex-pooler-app"
+  }[5m])
+)
+```
+
+```text
+histogram_quantile(0.95,
+  sum by (le, route_class, transport) (
+    rate(codex_pooler_gateway_admission_dequeued_time_seconds_bucket{
       namespace="codex-pooler",
       job="codex-pooler-app"
     }[5m])
