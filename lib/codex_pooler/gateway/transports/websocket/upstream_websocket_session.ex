@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession do
 
   use GenServer
 
+  alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.ConnectionUpgrade
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.ReceiveState
@@ -186,7 +187,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession do
     receive_state = %ReceiveState{
       writer: request.writer,
       timeouts: request.timeouts,
-      message_mapper: request.message_mapper
+      message_mapper: request.message_mapper,
+      frame_observer: request.frame_observer
     }
 
     with {:ok, state} <-
@@ -428,21 +430,23 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession do
     end)
   end
 
-  defp prepend_receive_body(%ReceiveState{body: body} = receive_state, text),
-    do: %{receive_state | body: [["data: ", text, "\n\n"] | body]}
+  defp append_receive_body(%ReceiveState{body: body} = receive_state, text) do
+    %{receive_state | body: RetainedBody.append(body, ["data: ", text, "\n\n"])}
+  end
 
   defp handle_text_frame(state, %ReceiveState{} = receive_state, raw_text, text) do
     receive_state =
       raw_text
       |> maybe_put_terminal_upstream_error_code(receive_state)
       |> put_websocket_frame_headers(raw_text)
-      |> prepend_receive_body(text)
+      |> append_receive_body(text)
 
     case retryable_first_text_frame(raw_text, receive_state) do
       {:ok, reason} ->
         {:halt, {:failure, state, receive_state, reason}}
 
       :error ->
+        observe_frame(receive_state, text)
         receive_state.writer.(text)
 
         receive_state = maybe_mark_downstream_output_started(receive_state, raw_text)
@@ -515,6 +519,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession do
 
   defp receive_body(%ReceiveState{body: body}), do: websocket_body(body)
 
+  defp observe_frame(%ReceiveState{frame_observer: observer}, text)
+       when is_function(observer, 1) do
+    observer.(text)
+  end
+
+  defp observe_frame(%ReceiveState{}, _text), do: :ok
+
   defp map_message(text, mapper) when is_function(mapper, 1), do: mapper.(text)
   defp map_message(text, _mapper), do: text
 
@@ -547,7 +558,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession do
     end
   end
 
-  defp websocket_body(chunks), do: chunks |> Enum.reverse() |> IO.iodata_to_binary()
+  defp websocket_body(body) when is_binary(body), do: body
 
   defp mint_socket(conn), do: Mint.HTTP.get_socket(conn)
 

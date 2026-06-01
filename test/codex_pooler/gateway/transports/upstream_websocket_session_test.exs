@@ -183,6 +183,71 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
     assert %{"type" => "response.completed"} = Jason.decode!(completed_frame)
   end
 
+  test "returns only bounded retained body while writing every upstream websocket frame" do
+    parent = self()
+
+    events =
+      [%{"type" => "response.created", "response" => %{"id" => "resp_ws_bounded_body"}}] ++
+        for index <- 1..240 do
+          %{
+            "type" => "response.output_text.delta",
+            "sequence_number" => index,
+            "delta" => String.duplicate("bounded-websocket-retained-body-sentinel", 16)
+          }
+        end ++
+        [
+          %{
+            "type" => "response.completed",
+            "response" => %{
+              "id" => "resp_ws_bounded_body",
+              "usage" => %{
+                "input_tokens" => 1,
+                "output_tokens" => 1,
+                "total_tokens" => 2
+              }
+            }
+          }
+        ]
+
+    upstream = start_upstream(FakeUpstream.sse_stream(events))
+    {:ok, session} = UpstreamWebSocketSession.start_link([])
+
+    request = %Request{
+      url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
+      headers: [{"authorization", "Bearer synthetic-upstream-token"}],
+      payload:
+        Jason.encode!(%{
+          "model" => "upstream-test-model",
+          "input" => [%{"type" => "message", "role" => "user", "content" => "sample"}],
+          "stream" => true
+        }),
+      timeouts: @timeouts,
+      writer: fn text -> send(parent, {:upstream_websocket_frame, text}) end,
+      message_mapper: nil
+    }
+
+    assert {:ok, %{body: retained_body, terminal: "response.completed", status: 200}} =
+             UpstreamWebSocketSession.request(session, request)
+
+    written_frames =
+      1..length(events)
+      |> Enum.map(fn _index ->
+        assert_receive {:upstream_websocket_frame, frame}, 1_000
+        frame
+      end)
+
+    assert Enum.map(written_frames, &Jason.decode!/1) == events
+
+    full_body =
+      written_frames
+      |> Enum.map(&["data: ", &1, "\n\n"])
+      |> IO.iodata_to_binary()
+
+    assert byte_size(retained_body) <= 65_536
+    assert byte_size(retained_body) < byte_size(full_body)
+    assert String.ends_with?(full_body, retained_body)
+  end
+
   test "non-101 websocket upgrade failure preserves the leaf reason and drops the body" do
     upstream =
       start_upstream(

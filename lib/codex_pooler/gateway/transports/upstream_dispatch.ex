@@ -207,7 +207,8 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       payload: payload_body,
       timeouts: timeouts,
       writer: writer,
-      message_mapper: message_mapper
+      message_mapper: message_mapper,
+      frame_observer: websocket_frame_observer(identity)
     }
 
     case owner_transport(request_options) do
@@ -329,13 +330,11 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
          request
        ) do
     RateLimitObserver.record_websocket_frame_headers(identity, frame_headers)
-    RateLimitObserver.record_complete_events(identity, body)
     mark_visible_output(request, body)
     result
   end
 
-  defp record_upstream_websocket_body({:ok, %{body: body}} = result, identity, request) do
-    RateLimitObserver.record_complete_events(identity, body)
+  defp record_upstream_websocket_body({:ok, %{body: body}} = result, _identity, request) do
     mark_visible_output(request, body)
     result
   end
@@ -346,15 +345,19 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
          request
        ) do
     RateLimitObserver.record_websocket_frame_headers(identity, frame_headers)
-    RateLimitObserver.record_complete_events(identity, body)
     mark_visible_output(request, body)
     result
   end
 
-  defp record_upstream_websocket_body({:error, %{body: body}} = result, identity, request) do
-    RateLimitObserver.record_complete_events(identity, body)
+  defp record_upstream_websocket_body({:error, %{body: body}} = result, _identity, request) do
     mark_visible_output(request, body)
     result
+  end
+
+  defp websocket_frame_observer(identity) do
+    fn frame ->
+      RateLimitObserver.record_complete_events(identity, frame)
+    end
   end
 
   defp websocket_headers(identity, token) do

@@ -5,9 +5,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Rece
     :writer,
     :timeouts,
     :message_mapper,
+    :frame_observer,
     :terminal_upstream_error_code,
     downstream_output_started?: false,
-    body: [],
+    body: "",
     websocket_frame_headers: %{}
   ]
 
@@ -16,9 +17,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Rece
           timeouts: map(),
           message_mapper:
             CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.message_mapper(),
+          frame_observer:
+            CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Request.frame_observer(),
           terminal_upstream_error_code: String.t() | nil,
           downstream_output_started?: boolean(),
           websocket_frame_headers: %{optional(String.t()) => String.t()},
-          body: [iodata()]
+          body: binary()
         }
 end
