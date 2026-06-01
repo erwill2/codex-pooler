@@ -61,5 +61,21 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
                  state
                )
     end
+
+    test "passes through oversized incomplete backend codex SSE prefixes without retaining them" do
+      opts = RequestOptions.build(%{}, "/backend-api/codex/responses", %{"stream" => true})
+      state = DownstreamStream.initial_state(:relay, opts)
+      oversized = String.duplicate("data: unavailable-upstream-prefix", 12_000)
+
+      assert {^oversized, state} =
+               DownstreamStream.normalize_data(
+                 oversized,
+                 "/backend-api/codex/responses",
+                 opts,
+                 state
+               )
+
+      assert state.codex_responses_sse_buffer == ""
+    end
   end
 end

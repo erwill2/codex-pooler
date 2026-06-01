@@ -86,12 +86,17 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
     if buffer == "" and not codex_responses_sse_chunk?(data) do
       {data, state}
     else
-      {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffer <> data, bounded?: false)
+      buffered_data = buffer <> data
+      {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffered_data, bounded?: true)
 
       data =
-        blocks
-        |> Enum.map(&StreamProtocol.normalize_codex_responses_sse_block/1)
-        |> IO.iodata_to_binary()
+        if oversized_incomplete_sse_prefix?(blocks, buffer, buffered_data) do
+          buffered_data
+        else
+          blocks
+          |> Enum.map(&StreamProtocol.normalize_codex_responses_sse_block/1)
+          |> IO.iodata_to_binary()
+        end
 
       {data, Map.put(state, :codex_responses_sse_buffer, buffer)}
     end
@@ -126,6 +131,11 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
       String.contains?(data, "\nevent: ") or String.contains?(data, "\ndata: ") or
       String.contains?(data, "\n\n")
   end
+
+  defp oversized_incomplete_sse_prefix?([], "", data),
+    do: StreamProtocol.oversized_incomplete_sse_block?(data)
+
+  defp oversized_incomplete_sse_prefix?(_blocks, _buffer, _data), do: false
 
   defp public_openai_chat_stream?(%RequestOptions{
          openai_compatibility: %{public_openai_chat_stream: true}

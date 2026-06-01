@@ -47,7 +47,15 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttempt do
 
     case StreamProtocol.first_complete_event(buffer) do
       {:ok, event} -> classify_complete_first_event(buffer, event)
-      :incomplete -> {:buffered, %{classified?: false, buffer: buffer}}
+      :incomplete -> classify_incomplete_first_event(buffer)
+    end
+  end
+
+  defp classify_incomplete_first_event(buffer) do
+    if StreamProtocol.oversized_incomplete_sse_block?(buffer) do
+      {{:write, buffer}, %{classified?: true, buffer: ""}}
+    else
+      {:buffered, %{classified?: false, buffer: buffer}}
     end
   end
 

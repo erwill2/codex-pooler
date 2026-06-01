@@ -14,8 +14,19 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
 
   @spec normalize_data(binary(), state()) :: {binary(), state()}
   def normalize_data(data, state) when is_binary(data) do
-    {blocks, buffer} = StreamProtocol.complete_sse_blocks(state.buffer <> data, bounded?: false)
+    buffered_data = state.buffer <> data
+    {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffered_data, bounded?: true)
 
+    if oversized_incomplete_sse_prefix?(blocks, buffer, buffered_data) do
+      {buffered_data, %{state | buffer: ""}}
+    else
+      normalize_blocks(blocks, buffer, state)
+    end
+  end
+
+  def normalize_data(data, state), do: {data, state}
+
+  defp normalize_blocks(blocks, buffer, state) do
     {iodata, state} =
       Enum.map_reduce(blocks, %{state | buffer: buffer}, fn block, stream_state ->
         normalize_block(block, stream_state)
@@ -25,8 +36,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
 
     {IO.iodata_to_binary(iodata), state}
   end
-
-  def normalize_data(data, state), do: {data, state}
 
   defp normalize_block("data: [DONE]", state), do: {[], state}
 
@@ -55,6 +64,11 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
         {[], state}
     end
   end
+
+  defp oversized_incomplete_sse_prefix?([], "", data),
+    do: StreamProtocol.oversized_incomplete_sse_block?(data)
+
+  defp oversized_incomplete_sse_prefix?(_blocks, _buffer, _data), do: false
 
   defp terminal_prefix(decoded, state) do
     {created_prefix, state} =

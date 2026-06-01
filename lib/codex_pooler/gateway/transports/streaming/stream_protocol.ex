@@ -26,6 +26,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
     -secondary-used-percent
     -secondary-window-minutes
   )
+  @max_incomplete_sse_block_bytes 65_536
 
   @type terminal_failure :: %{
           required(:code) => String.t(),
@@ -44,6 +45,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
   def public_openai_responses_stream_state do
     PublicResponses.new_state()
   end
+
+  @spec max_incomplete_sse_block_bytes() :: pos_integer()
+  def max_incomplete_sse_block_bytes, do: @max_incomplete_sse_block_bytes
+
+  @spec oversized_incomplete_sse_block?(binary()) :: boolean()
+  def oversized_incomplete_sse_block?(buffer) when is_binary(buffer),
+    do: byte_size(buffer) > @max_incomplete_sse_block_bytes
 
   @spec normalize_codex_responses_sse_data(binary()) :: binary()
   def normalize_codex_responses_sse_data(data) do
@@ -682,5 +690,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
   end
 
   defp maybe_bound_incomplete_sse_block(buffer, false), do: buffer
+
+  defp maybe_bound_incomplete_sse_block(buffer, true) do
+    if oversized_incomplete_sse_block?(buffer), do: "", else: buffer
+  end
+
   defp first_map(values), do: Enum.find(values, &is_map/1)
 end

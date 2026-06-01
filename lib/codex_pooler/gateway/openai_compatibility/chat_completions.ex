@@ -38,8 +38,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
   @spec normalize_stream_data(binary(), stream_state()) :: {binary(), stream_state()}
   def normalize_stream_data(data, state) when is_binary(data) and is_map(state) do
-    {blocks, buffer} = StreamProtocol.complete_sse_blocks(state.buffer <> data, bounded?: false)
+    buffered_data = state.buffer <> data
+    {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffered_data, bounded?: true)
 
+    if oversized_incomplete_sse_prefix?(blocks, buffer, buffered_data) do
+      {buffered_data, %{state | buffer: ""}}
+    else
+      normalize_stream_blocks(blocks, buffer, state)
+    end
+  end
+
+  def normalize_stream_data(data, state), do: {data, state}
+
+  defp normalize_stream_blocks(blocks, buffer, state) do
     {iodata, state} =
       Enum.map_reduce(blocks, %{state | buffer: buffer}, fn block, stream_state ->
         normalize_stream_block(block, stream_state)
@@ -49,8 +60,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
     {IO.iodata_to_binary(iodata), state}
   end
-
-  def normalize_stream_data(data, state), do: {data, state}
 
   defp normalize_stream_block("data: [DONE]", state), do: {[], state}
 
@@ -98,6 +107,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   end
 
   defp normalize_stream_event(_type, _decoded, state), do: {[], state}
+
+  defp oversized_incomplete_sse_prefix?([], "", data),
+    do: StreamProtocol.oversized_incomplete_sse_block?(data)
+
+  defp oversized_incomplete_sse_prefix?(_blocks, _buffer, _data), do: false
 
   defp maybe_role_chunk(%{role_sent?: true} = state), do: {[], state}
 

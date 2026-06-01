@@ -100,7 +100,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebSocketCodec do
 
   def stream_messages(request_id, data, buffer)
       when is_binary(request_id) and is_binary(data) and is_binary(buffer) do
-    {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffer <> data, bounded?: false)
+    {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffer <> data, bounded?: true)
 
     messages =
       case messages_from_sse_blocks(blocks) do

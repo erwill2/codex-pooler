@@ -3,6 +3,14 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
 
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
+  describe "complete_sse_blocks/2" do
+    test "bounds oversized incomplete SSE blocks when requested" do
+      oversized = String.duplicate("data: unavailable-upstream-prefix", 12_000)
+
+      assert {[], ""} = StreamProtocol.complete_sse_blocks(oversized, bounded?: true)
+    end
+  end
+
   describe "normalize_public_openai_responses_sse_data/2" do
     test "carries incomplete response stream state explicitly" do
       state = StreamProtocol.public_openai_responses_stream_state()

@@ -72,6 +72,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebSocketCodecTest do
       assert Jason.decode!(message)["type"] == "response.completed"
       refute Process.get({:websocket_sse_buffer, request_id})
     end
+
+    test "drops oversized incomplete SSE buffers instead of retaining them" do
+      request_id = "websocket-buffer-oversized"
+      oversized = String.duplicate("data: unavailable-upstream-prefix", 12_000)
+
+      assert {[], ""} = WebSocketCodec.stream_messages(request_id, oversized, "")
+    end
   end
 
   defp unexpected_push(_frame), do: flunk("websocket stream results should not push directly")

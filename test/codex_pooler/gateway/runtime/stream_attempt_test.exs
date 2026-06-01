@@ -21,6 +21,14 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttemptTest do
       refute Process.get({:codex_first_stream_event_buffer, "attempt-stream-classification"})
     end
 
+    test "releases oversized incomplete first events without retaining them" do
+      state = StreamAttempt.first_event_state()
+      oversized = String.duplicate("data: unavailable-upstream-prefix", 12_000)
+
+      assert {{:write, ^oversized}, state} = StreamAttempt.classify_first_event(oversized, state)
+      assert state == %{classified?: true, buffer: ""}
+    end
+
     test "classifies retryable first terminal failures without writing them" do
       state = StreamAttempt.first_event_state()
 
