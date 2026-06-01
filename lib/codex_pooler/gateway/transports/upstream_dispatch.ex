@@ -50,7 +50,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
             url: String.t(),
             token: String.t(),
             upstream_payload: binary() | {:multipart, list()},
-            original_payload: map(),
+            original_payload: map() | nil,
             identity: UpstreamIdentity.t(),
             accounting_request: AccountingRequest.t() | nil,
             writer: Transport.websocket_writer(),

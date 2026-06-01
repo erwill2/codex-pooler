@@ -191,13 +191,35 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession do
       frame_observer: request.frame_observer
     }
 
-    with {:ok, state} <-
-           ensure_connection(state, key, request.url, request.headers, request.timeouts),
-         {:ok, state} <- send_text(state, request.payload),
-         {result, state} <-
-           receive_events(state, receive_state) do
-      {:ok, result, state}
+    connect_and_send_request(
+      state,
+      key,
+      request.url,
+      request.headers,
+      request.timeouts,
+      request.payload,
+      receive_state
+    )
+  end
+
+  defp connect_and_send_request(state, key, url, headers, timeouts, payload, receive_state) do
+    case ensure_connection(state, key, url, headers, timeouts) do
+      {:ok, state} -> send_request_payload(state, payload, receive_state)
+      {:error, reason, state} -> {:error, reason, state}
     end
+  end
+
+  defp send_request_payload(state, payload, receive_state) do
+    case send_text(state, payload) do
+      {:ok, state} -> await_sent_request(state, receive_state)
+      {:error, reason, state} -> {:error, reason, state}
+    end
+  end
+
+  defp await_sent_request(state, receive_state) do
+    :erlang.garbage_collect(self())
+    {result, state} = receive_events(state, receive_state)
+    {:ok, result, state}
   end
 
   defp request_error(reason, state) do

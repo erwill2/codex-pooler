@@ -111,6 +111,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
     assert_receive {:fake_upstream_chunk_sent, 1}, 1_000
     assert_receive {:fake_upstream_chunk_barrier, 1, barrier_pid, ^first_release_ref}, 1_000
 
+    assert {:current_stacktrace, stacktrace} = Process.info(session, :current_stacktrace)
+    assert stack_has_mfa?(stacktrace, UpstreamWebSocketSession, :await_sent_request, 2)
+
     send_task =
       Task.async(fn ->
         UpstreamWebSocketSession.send_request_frame(
@@ -298,5 +301,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
     {:ok, upstream} = FakeUpstream.start_link(mode)
     on_exit(fn -> FakeUpstream.stop(upstream) end)
     upstream
+  end
+
+  defp stack_has_mfa?(stacktrace, module, function, arity) do
+    Enum.any?(stacktrace, fn
+      {^module, ^function, ^arity, _location} -> true
+      _frame -> false
+    end)
   end
 end

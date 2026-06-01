@@ -358,6 +358,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
     assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
 
+    assert {:current_stacktrace, stacktrace} =
+             Process.info(submit_task.pid, :current_stacktrace)
+
+    assert stack_has_mfa?(stacktrace, WebsocketOwnerSession, :await_reserved_frame, 3)
+
     assert {:ok, second_downstream} =
              WebsocketOwnerSession.attach_downstream(owner, %{
                pid: second_target,
@@ -606,5 +611,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
         send(parent, {:collected_owner_frame, label, message})
         collector_loop(parent, label)
     end
+  end
+
+  defp stack_has_mfa?(stacktrace, module, function, arity) do
+    Enum.any?(stacktrace, fn
+      {^module, ^function, ^arity, _location} -> true
+      _frame -> false
+    end)
   end
 end

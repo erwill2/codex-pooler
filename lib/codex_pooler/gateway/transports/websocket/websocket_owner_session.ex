@@ -152,25 +152,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
        when is_map(downstream) do
     case reserve_frame(owner, downstream) do
       {:ok, reservation} ->
-        task =
-          Task.Supervisor.async_nolink(@task_supervisor, fn ->
-            Process.flag(:sensitive, true)
-            send_upstream(reservation, upstream_payload)
-          end)
-
-        :ok = activate_reserved_frame(owner, reservation.ref, task)
-
-        result =
-          case Task.yield(task, :infinity) || Task.shutdown(task, :brutal_kill) do
-            {:ok, task_result} -> task_result
-            {:exit, _reason} -> {:error, :owner_crashed}
-            nil -> {:error, :owner_crashed}
-          end
-
-        case finish_reserved_frame(owner, reservation.ref, result) do
-          {:ok, effective_result} -> effective_result
-          {:error, reason} -> {:error, reason}
-        end
+        start_reserved_frame(owner, reservation, upstream_payload)
 
       {:error, reason} ->
         {:error, reason}
@@ -449,6 +431,39 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   defp finish_reserved_frame(owner, ref, result) do
     GenServer.call(owner, {:finish_reserved_frame, ref, result}, owner_call_timeout())
+  end
+
+  defp start_reserved_frame(owner, reservation, upstream_payload) do
+    task =
+      Task.Supervisor.async_nolink(@task_supervisor, fn ->
+        Process.flag(:sensitive, true)
+        send_upstream(reservation, upstream_payload)
+      end)
+
+    case activate_reserved_frame(owner, reservation.ref, task) do
+      :ok ->
+        await_reserved_frame(owner, reservation.ref, task)
+
+      {:error, reason} ->
+        _result = Task.shutdown(task, :brutal_kill)
+        {:error, reason}
+    end
+  end
+
+  defp await_reserved_frame(owner, ref, task) do
+    :erlang.garbage_collect(self())
+
+    result =
+      case Task.yield(task, :infinity) || Task.shutdown(task, :brutal_kill) do
+        {:ok, task_result} -> task_result
+        {:exit, _reason} -> {:error, :owner_crashed}
+        nil -> {:error, :owner_crashed}
+      end
+
+    case finish_reserved_frame(owner, ref, result) do
+      {:ok, effective_result} -> effective_result
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp send_upstream(

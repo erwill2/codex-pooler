@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
 
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.FailureResponse
+  alias CodexPooler.Gateway.Payloads.ContinuityPayload
   alias CodexPooler.Gateway.Runtime.Dispatch.PreparedContext
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
   alias CodexPooler.Gateway.Runtime.Finalization
@@ -73,8 +74,11 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
     dispatch_request =
       dispatch_request(prepared_context,
         accounting_request: context.reserved.request,
-        writer: writer
+        writer: writer,
+        original_payload: nil
       )
+
+    prepared_context = release_websocket_payload(prepared_context)
 
     dispatch_websocket_result(prepared_context, dispatch_request, callbacks, started)
   end
@@ -552,12 +556,26 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
       url: prepared_context.url,
       token: prepared_context.token,
       upstream_payload: prepared_context.upstream_payload,
-      original_payload: context.payload,
+      original_payload: Keyword.get(opts, :original_payload, context.payload),
       identity: context.identity,
       accounting_request: Keyword.get(opts, :accounting_request),
       writer: Keyword.get(opts, :writer),
       request_options: context.request_options
     }
+  end
+
+  defp release_websocket_payload(%PreparedContext{context: context} = prepared_context) do
+    %{prepared_context | context: %{context | payload: continuity_payload(context.payload)}}
+  end
+
+  defp continuity_payload(payload) when is_map(payload) do
+    case ContinuityPayload.previous_response_id(payload) do
+      previous_response_id when is_binary(previous_response_id) ->
+        %{"previous_response_id" => previous_response_id}
+
+      nil ->
+        %{}
+    end
   end
 
   defp websocket_upstream?(payload, opts) do
