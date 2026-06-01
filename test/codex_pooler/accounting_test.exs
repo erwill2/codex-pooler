@@ -143,6 +143,52 @@ defmodule CodexPooler.AccountingTest do
              ] == "[REDACTED]"
     end
 
+    test "accumulates request metadata in memory before explicit persistence" do
+      setup = accounting_setup()
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "input" => "raw prompt"},
+                 %{
+                   correlation_id: "corr-metadata-accumulate",
+                   request_metadata: %{"routing" => %{"strategy" => "pool_order"}}
+                 }
+               )
+
+      assert {:ok, accumulated} =
+               Accounting.accumulate_request_metadata(reserved.request, %{
+                 "routing" => %{"selected_bridge_candidate_id" => setup.assignment.id},
+                 "authorization" => "Bearer sk-cxp-secret",
+                 "input" => "raw prompt"
+               })
+
+      assert accumulated.request_metadata["routing"]["strategy"] == "pool_order"
+
+      assert accumulated.request_metadata["routing"]["selected_bridge_candidate_id"] ==
+               setup.assignment.id
+
+      assert accumulated.request_metadata["authorization"] == "[REDACTED]"
+      assert accumulated.request_metadata["input"] == "[REDACTED]"
+
+      persisted_before = Repo.get!(CodexPooler.Accounting.Request, reserved.request.id)
+      assert persisted_before.request_metadata["routing"]["strategy"] == "pool_order"
+      refute persisted_before.request_metadata["routing"]["selected_bridge_candidate_id"]
+
+      assert {:ok, persisted_after} =
+               Accounting.persist_request_metadata(accumulated, reload?: false)
+
+      assert persisted_after.request_metadata["routing"]["strategy"] == "pool_order"
+
+      assert persisted_after.request_metadata["routing"]["selected_bridge_candidate_id"] ==
+               setup.assignment.id
+
+      metadata_text = inspect(persisted_after.request_metadata)
+      refute metadata_text =~ "raw prompt"
+      refute metadata_text =~ "sk-cxp-secret"
+    end
+
     test "timeout before headers finalizes as failed with unknown usage" do
       setup = accounting_setup()
 
@@ -166,6 +212,83 @@ defmodule CodexPooler.AccountingTest do
       assert result.request.status == "failed"
       assert result.settlement.usage_status == "usage_unknown"
       assert result.request.last_error_code == "timeout_before_headers"
+    end
+
+    test "healthy reservation settlement avoids duplicate ledger rereads" do
+      setup = accounting_setup()
+
+      {_result, commands} =
+        count_repo_commands(fn ->
+          assert {:ok, reserved} =
+                   Accounting.reserve(
+                     setup.auth,
+                     setup.model,
+                     %{
+                       "model" => setup.model.exposed_model_id,
+                       "input" => "metadata only",
+                       "max_output_tokens" => 5
+                     },
+                     %{correlation_id: "corr-ledger-rereads"}
+                   )
+
+          assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+          Accounting.finalize_success(
+            reserved.request,
+            attempt,
+            %{status: "usage_known", input_tokens: 7, output_tokens: 3, total_tokens: 10},
+            %{response_status_code: 200}
+          )
+        end)
+
+      assert command_count(commands, "ledger_entries", "SELECT") <= 4
+      assert command_count(commands, "ledger_entries", "INSERT") == 3
+    end
+
+    test "repeated finalization reuses existing settlement without duplicate rollups" do
+      setup = accounting_setup()
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "max_output_tokens" => 5},
+                 %{correlation_id: "corr-idempotent-finalize"}
+               )
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      usage = %{status: "usage_known", input_tokens: 7, output_tokens: 3, total_tokens: 10}
+
+      assert {:ok, first} =
+               Accounting.finalize_success(reserved.request, attempt, usage, %{
+                 response_status_code: 200
+               })
+
+      assert {:ok, second} =
+               Accounting.finalize_success(first.request, first.attempt, usage, %{
+                 response_status_code: 200
+               })
+
+      assert first.settlement.id == second.settlement.id
+      assert first.release.id == second.release.id
+
+      assert Repo.aggregate(
+               from(e in LedgerEntry,
+                 where: e.request_id == ^reserved.request.id and e.entry_kind == "settlement"
+               ),
+               :count
+             ) == 1
+
+      assert [rollup] =
+               Repo.all(
+                 from r in DailyRollup,
+                   where: r.api_key_id == ^setup.api_key.id and r.dimension_kind == "api_key"
+               )
+
+      assert rollup.request_count == 1
+      assert rollup.success_count == 1
+      assert rollup.total_tokens == 10
     end
 
     test "releases stale undispatched reservations without settling usage" do
@@ -467,4 +590,50 @@ defmodule CodexPooler.AccountingTest do
       assert rollup.total_tokens == 24
     end
   end
+
+  defp count_repo_commands(fun) do
+    parent = self()
+    handler_id = "accounting-test-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo do
+            send(parent, {handler_id, metadata[:source], command_name(metadata[:query])})
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_commands(handler_id, %{})}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_commands(handler_id, commands) do
+    receive do
+      {^handler_id, source, command} ->
+        key = {source, command}
+        drain_repo_commands(handler_id, Map.update(commands, key, 1, &(&1 + 1)))
+    after
+      0 -> commands
+    end
+  end
+
+  defp command_count(commands, source, command), do: Map.get(commands, {source, command}, 0)
+
+  defp command_name(query) when is_binary(query) do
+    query
+    |> String.trim_leading()
+    |> String.split(~r/\s+/, parts: 2)
+    |> List.first()
+    |> String.upcase()
+  end
+
+  defp command_name(_query), do: nil
 end

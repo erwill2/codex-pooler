@@ -88,8 +88,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
   @spec create_attempt(Request.t(), PoolUpstreamAssignment.t(), map()) ::
           {:ok, Attempt.t()} | {:error, Ecto.Changeset.t()}
   def create_attempt(%Request{} = request, %PoolUpstreamAssignment{} = assignment, attrs \\ %{}) do
-    model = request.model_id && Repo.get(Model, request.model_id)
-    pricing_snapshot = PricingResolution.latest_snapshot_for_request(request, model)
+    model = attempt_model(request, attrs)
+    pricing_snapshot = attempt_pricing_snapshot(request, model, attrs)
     timestamp = now(attrs)
 
     attempt_number =
@@ -114,7 +114,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
 
     case Repo.insert(attempt_changes) do
       {:ok, attempt} ->
-        IdentitySnapshot.persist_request_identity_snapshot(request, assignment)
+        IdentitySnapshot.persist_request_identity_snapshot(request, assignment, attrs)
         {:ok, attempt}
 
       {:error, _changeset} = error ->
@@ -282,7 +282,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
     {request, attempt}
   end
 
-  defp build_settlement_context(request, _attempt, reservation, usage, pricing, finalization) do
+  defp build_settlement_context(_request, _attempt, reservation, usage, pricing, finalization) do
     usage = fill_unknown_usage_from_reservation(usage, reservation, finalization.timestamp)
     snapshot = pricing.snapshot
 
@@ -299,18 +299,12 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         response_status_code: finalization.response_status_code,
         retry_count: finalization.retry_count,
         settled_cost: settled_cost
-      },
-      settlement_existed?:
-        not is_nil(
-          Repo.get_by(LedgerEntry,
-            source_event_id: LedgerEntries.settlement_source_event_id(request.id)
-          )
-        )
+      }
     }
   end
 
   defp persist_settlement_entries(request, attempt, reservation, state) do
-    settlement =
+    {settlement, settlement_status} =
       request
       |> LedgerEntries.settlement_attrs(attempt, reservation, %{
         usage: state.usage,
@@ -318,7 +312,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         context: state.settlement_context,
         timestamp: state.timestamp
       })
-      |> LedgerEntries.create_or_get!()
+      |> LedgerEntries.create_or_get_with_status!()
 
     release =
       request
@@ -329,7 +323,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
       })
       |> LedgerEntries.create_or_get!()
 
-    unless state.settlement_existed?, do: Rollups.accumulate!(request, settlement)
+    if settlement_status == :inserted, do: Rollups.accumulate!(request, settlement)
 
     %{settlement: settlement, release: release}
   end
@@ -420,6 +414,19 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
   defp normalize_model(%Model{} = model), do: model
   defp normalize_model(id) when is_binary(id), do: Repo.get(Model, id)
   defp normalize_model(_id), do: nil
+
+  defp attempt_model(_request, %{model: %Model{} = model}), do: model
+
+  defp attempt_model(%Request{model_id: model_id}, _attrs) when is_binary(model_id),
+    do: Repo.get(Model, model_id)
+
+  defp attempt_model(_request, _attrs), do: nil
+
+  defp attempt_pricing_snapshot(_request, _model, %{pricing_snapshot: pricing_snapshot}),
+    do: pricing_snapshot
+
+  defp attempt_pricing_snapshot(%Request{} = request, model, _attrs),
+    do: PricingResolution.latest_snapshot_for_request(request, model)
 
   defp request_status_to_attempt_status("succeeded"), do: "succeeded"
   defp request_status_to_attempt_status("cancelled"), do: "cancelled"

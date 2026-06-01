@@ -11,6 +11,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   @entry_settlement "settlement"
   @amount_recorded "recorded"
   @usage_pending "usage_pending"
+  @source_event_conflict_target {:unsafe_fragment,
+                                 "(source_event_id) WHERE source_event_id IS NOT NULL"}
 
   @type cost :: Decimal.t() | nil
   @type estimate :: %{
@@ -69,19 +71,33 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
           required(:usage) => usage(),
           required(:timestamp) => DateTime.t()
         }
+  @type create_status :: :inserted | :existing
 
   @spec create_or_get!(map()) :: LedgerEntry.t()
   def create_or_get!(attrs) do
+    attrs
+    |> create_or_get_with_status!()
+    |> elem(0)
+  end
+
+  @spec create_or_get_with_status!(map()) :: {LedgerEntry.t(), create_status()}
+  def create_or_get_with_status!(attrs) do
     source_event_id = attrs.source_event_id
+    attrs = Map.put_new(attrs, :id, Ecto.UUID.generate())
 
-    case Repo.get_by(LedgerEntry, source_event_id: source_event_id) do
-      %LedgerEntry{} = entry ->
-        entry
+    case Repo.insert_all(LedgerEntry, [attrs],
+           on_conflict: :nothing,
+           conflict_target: @source_event_conflict_target,
+           returning: true
+         ) do
+      {1, [%LedgerEntry{} = entry]} ->
+        {entry, :inserted}
 
-      nil ->
-        attrs
-        |> then(&struct(LedgerEntry, &1))
-        |> Repo.insert!()
+      {1, [entry]} when is_map(entry) ->
+        {struct(LedgerEntry, entry), :inserted}
+
+      {0, []} ->
+        {Repo.get_by!(LedgerEntry, source_event_id: source_event_id), :existing}
     end
   end
 
