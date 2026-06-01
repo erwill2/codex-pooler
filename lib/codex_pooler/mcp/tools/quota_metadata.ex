@@ -224,10 +224,12 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
   defp enum_filter(arguments, key, values) do
     case Map.get(arguments, key) do
       nil -> {:ok, nil}
-      value when is_binary(value) -> enum_value(value, values, key)
+      value when is_binary(value) -> value |> blank_to_nil() |> enum_value(values, key)
       _value -> invalid_argument(key)
     end
   end
+
+  defp enum_value(nil, _values, _key), do: {:ok, nil}
 
   defp enum_value(value, values, key) do
     if value in values, do: {:ok, value}, else: invalid_argument(key)
@@ -236,17 +238,13 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
   defp plan_family_filter(arguments) do
     case Map.get(arguments, "plan_family") do
       nil -> {:ok, nil}
-      value when is_binary(value) -> trimmed_plan_family(value)
+      value when is_binary(value) -> value |> blank_to_nil() |> trimmed_plan_family()
       _value -> invalid_argument("plan_family")
     end
   end
 
-  defp trimmed_plan_family(value) do
-    case String.trim(value) do
-      "" -> invalid_argument("plan_family")
-      trimmed -> {:ok, trimmed}
-    end
-  end
+  defp trimmed_plan_family(nil), do: {:ok, nil}
+  defp trimmed_plan_family(value), do: {:ok, value}
 
   defp boolean_filter(arguments, key) do
     case Map.get(arguments, key) do

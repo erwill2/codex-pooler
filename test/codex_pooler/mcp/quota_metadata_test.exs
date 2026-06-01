@@ -491,8 +491,7 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
     invalid_cases = [
       {%{"status" => "archived"}, "invalid_arguments: Invalid status"},
       {%{"freshness_status" => "old"}, "invalid_arguments: Invalid freshness_status"},
-      {%{"routing_usable" => "true"}, "invalid_arguments: Invalid tool arguments"},
-      {%{"plan_family" => "   "}, "invalid_arguments: Invalid plan_family"}
+      {%{"routing_usable" => "true"}, "invalid_arguments: Invalid tool arguments"}
     ]
 
     for {arguments, expected_text} <- invalid_cases do
@@ -505,6 +504,28 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
       refute Map.has_key?(result, "structuredContent")
       assert :ok = Redaction.assert_mcp_output_safe!(result)
     end
+  end
+
+  test "list upstream quotas treats blank optional string filters as omitted", %{auth: auth} do
+    pool = pool_fixture()
+    %{identity: identity} = upstream_assignment_fixture(pool, %{plan_family: "team"})
+
+    assert {:ok, result} =
+             ToolDispatch.call(
+               "codex_pooler_list_upstream_quotas",
+               %{
+                 "pool_id" => "   ",
+                 "status" => "",
+                 "plan_family" => "   ",
+                 "freshness_status" => ""
+               },
+               %{auth: auth}
+             )
+
+    assert result["isError"] == false
+    assert result["structuredContent"]["filters"] == %{"applied" => [], "count" => 0}
+    assert Enum.any?(result["structuredContent"]["items"], &(&1["id"] == identity.id))
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
   end
 
   test "quota tools do not echo forbidden caller values in successful outputs", %{auth: auth} do
