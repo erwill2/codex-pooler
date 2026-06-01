@@ -66,7 +66,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
              {:ok, rate_limit_state} =
                RateLimitObserver.record_events(context.identity, data, rate_limit_state(state))
 
-             maybe_mark_visible_stream_output(context.reserved.request, data)
+             state = maybe_mark_visible_stream_output(state, context.reserved.request, data)
              {:ok, %{state | chunks: [data | state.chunks], rate_limit: rate_limit_state}}
            end,
            write_keepalive: fn state -> {:ok, state} end,
@@ -96,10 +96,16 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
     end
   end
 
-  defp maybe_mark_visible_stream_output(request, data) do
-    if StreamProtocol.stream_data_visible?(data),
-      do: SessionContinuity.mark_codex_turn_visible(request),
-      else: :ok
+  defp maybe_mark_visible_stream_output(%{visible_output_marked?: true} = state, _request, _data),
+    do: state
+
+  defp maybe_mark_visible_stream_output(state, request, data) do
+    if StreamProtocol.stream_data_visible?(data) do
+      SessionContinuity.mark_codex_turn_visible(request)
+      Map.put(state, :visible_output_marked?, true)
+    else
+      state
+    end
   end
 
   defp rate_limit_state(%{rate_limit: %{buffer: buffer}}) when is_binary(buffer),

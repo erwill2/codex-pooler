@@ -333,9 +333,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
 
     state = put_rate_limit_state(state, rate_limit_state)
 
-    if visible_data?.(data) do
-      mark_visible_output(reserved.request)
-    end
+    state = maybe_mark_visible_output(state, reserved.request, visible_data?.(data))
 
     DownstreamStream.normalize_data(
       data,
@@ -344,6 +342,16 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
       state
     )
   end
+
+  defp maybe_mark_visible_output(%{visible_output_marked?: true} = state, _request, _visible?),
+    do: state
+
+  defp maybe_mark_visible_output(state, request, true) do
+    mark_visible_output(request)
+    Map.put(state, :visible_output_marked?, true)
+  end
+
+  defp maybe_mark_visible_output(state, _request, _visible?), do: state
 
   defp stream_headers(response) do
     content_type = header(response, "content-type") || "text/event-stream"

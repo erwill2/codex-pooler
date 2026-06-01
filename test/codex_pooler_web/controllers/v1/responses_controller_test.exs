@@ -765,6 +765,50 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert attempt.status == "succeeded"
   end
 
+  test "POST /v1/responses non-streaming marks visible upstream output once", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => "first"}},
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => "second"}},
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => "third"}},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_non_stream_visible_once",
+               "status" => "completed",
+               "output" => [
+                 %{
+                   "type" => "message",
+                   "content" => [%{"type" => "output_text", "text" => "synthetic answer"}]
+                 }
+               ],
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    {conn, queries} =
+      capture_repo_queries(fn ->
+        conn
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic v1 visible marker request"
+        })
+      end)
+
+    assert %{"id" => "resp_v1_non_stream_visible_once"} = json_response(conn, 200)
+    assert visible_codex_turn_update_count(queries) == 1
+  end
+
   @tag :tool_result_previous_response
   test "POST /v1/responses forwards safe continuation shape and rejects malformed item references without echoing payloads",
        %{
@@ -1592,6 +1636,47 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.transport == "http_sse"
     assert request.status == "succeeded"
+  end
+
+  @tag :streaming_sequence
+  test "POST /v1/responses streaming marks visible upstream output once", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => "first"}},
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => "second"}},
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => "third"}},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_stream_visible_once",
+               "status" => "completed",
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    {conn, queries} =
+      capture_repo_queries(fn ->
+        conn
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic streaming visible marker request",
+          "stream" => true
+        })
+      end)
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "resp_v1_stream_visible_once"
+    assert visible_codex_turn_update_count(queries) == 1
   end
 
   @tag :streaming_timing
@@ -2657,6 +2742,65 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     {:ok, conn, ref, started}
   end
+
+  defp capture_repo_queries(fun) do
+    parent = self()
+    handler_id = "v1-responses-controller-test-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo do
+            send(
+              parent,
+              {handler_id, metadata[:source], query_command(metadata[:query]), metadata[:query]}
+            )
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_queries(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_queries(handler_id, queries) do
+    receive do
+      {^handler_id, source, command, query} ->
+        drain_repo_queries(handler_id, [
+          %{source: source, command: command, query: query} | queries
+        ])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp visible_codex_turn_update_count(queries) do
+    Enum.count(queries, fn
+      %{source: "codex_turns", command: "UPDATE", query: query} when is_binary(query) ->
+        query =~ ~s("first_visible_output_at") and
+          query =~ ~s("first_visible_output_at" IS NULL)
+
+      _query ->
+        false
+    end)
+  end
+
+  defp query_command(query) when is_binary(query) do
+    query
+    |> String.trim_leading()
+    |> String.split(~r/\s+/, parts: 2)
+    |> List.first()
+    |> String.upcase()
+  end
+
+  defp query_command(_query), do: "UNKNOWN"
 
   defp await_public_response_headers!(conn, ref, started, timeout_ms) do
     await_public_response_headers!(conn, ref, started, timeout_ms, nil, nil, [], false)
