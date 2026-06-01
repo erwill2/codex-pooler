@@ -1,0 +1,80 @@
+---
+title: Monitoring and memory triage
+description: Collect Prometheus metrics, use Grafana dashboards, and investigate Codex Pooler production memory spikes without exposing request content.
+---
+
+Codex Pooler exposes Prometheus metrics at `/metrics`. Metrics auth is managed from `/admin/system`; if a bearer token is configured, Prometheus must scrape with the matching Kubernetes Secret reference instead of putting the raw token in Helm values.
+
+Use monitoring for runtime evidence only. Dashboards, alerts, logs, tickets, and copied queries must not include prompts, response bodies, uploaded files, websocket frames, cookies, bearer tokens, upstream secrets, or raw Pool API keys.
+
+## Collector path
+
+The Helm chart can render a Prometheus Operator `ServiceMonitor` for the app service:
+
+```yaml
+monitoring:
+  serviceMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack
+    interval: 10s
+    scrapeTimeout: 5s
+```
+
+The `release` label and scrape interval should match your own Prometheus Operator selectors and scrape budget. For fast OOM investigations, prefer a short interval for the app ServiceMonitor and keep broader Kubernetes collectors at their normal cadence.
+
+## Memory dashboard
+
+Build your Grafana or Prometheus dashboard around the signals needed to correlate a fast memory spike:
+
+1. Kubernetes cgroup working set versus pod memory limit
+2. BEAM memory total, processes, binary, ETS, code, and atom memory by pod
+3. BEAM process count, port count, and run queue
+4. app restarts, OOM events, and last terminated reason
+5. request rate and p95 endpoint/router latency
+6. stream-buffer oversized and truncated events
+
+Read the dashboard as a correlation view. If cgroup memory climbs while BEAM total stays flat, look outside normal BEAM heap attribution. If `vm_memory_binary_bytes` climbs with cgroup memory, inspect streaming response retention, file bodies, and upstream transport buffering. If process count, ports, or run queue climb, inspect stuck request processes, websocket ownership, and overloaded route classes.
+
+## Useful PromQL
+
+```text
+max by (pod) (
+  container_memory_working_set_bytes{namespace="codex-pooler", container="app", image!=""}
+)
+```
+
+```text
+vm_memory_total_bytes{namespace="codex-pooler", job="codex-pooler-app"}
+vm_memory_binary_bytes{namespace="codex-pooler", job="codex-pooler-app"}
+vm_memory_processes_bytes{namespace="codex-pooler", job="codex-pooler-app"}
+vm_memory_ets_bytes{namespace="codex-pooler", job="codex-pooler-app"}
+```
+
+```text
+increase(kube_pod_container_status_restarts_total{
+  namespace="codex-pooler",
+  exported_container="app"
+}[15m])
+```
+
+```text
+rate(codex_pooler_gateway_stream_buffer_oversized_count_total[5m])
+rate(codex_pooler_gateway_stream_buffer_truncated_count_total[5m])
+```
+
+## Memory sampler logs
+
+The in-process memory sampler is enabled by default. When BEAM total memory or cgroup usage crosses the configured threshold, it logs a sanitized snapshot with memory categories, process and port counts, top processes by memory, and top processes by message queue length.
+
+Emergency tuning environment variables:
+
+```bash
+CODEX_POOLER_MEMORY_SAMPLER_ENABLED=true
+CODEX_POOLER_MEMORY_SAMPLER_THRESHOLD_RATIO=0.70
+CODEX_POOLER_MEMORY_SAMPLER_MIN_INTERVAL_MS=60000
+CODEX_POOLER_MEMORY_SAMPLER_TOP_PROCESSES=20
+CODEX_POOLER_MEMORY_SAMPLER_LIMIT_BYTES=1073741824
+```
+
+Use a lower threshold or shorter interval only during active investigation, because logs are the only signal likely to capture a spike that reaches OOM before the next Prometheus scrape.
