@@ -1,9 +1,12 @@
 defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
   use CodexPooler.DataCase, async: false
 
+  alias CodexPooler.Access
   alias CodexPooler.Access.APIKeyPolicyBinding
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.LedgerEntry
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
   alias CodexPooler.Repo
   alias Ecto.Adapters.SQL.Sandbox
 
@@ -195,6 +198,75 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
       assert reserved.reservation.total_tokens == 512
     end
 
+    test "reservation locks exactly one authoritative effective policy row" do
+      setup = accounting_setup()
+
+      update_default_policy!(setup.api_key, %{
+        max_requests_per_minute: 60,
+        max_tokens_per_day: 10_000,
+        max_tokens_per_week: 10_000,
+        max_output_tokens_per_request: 1_024
+      })
+
+      insert_model_policy!(setup.api_key, setup.model.exposed_model_id, %{
+        max_requests_per_minute: 60,
+        max_tokens_per_day: 10_000,
+        max_tokens_per_week: 10_000,
+        max_output_tokens_per_request: 768
+      })
+
+      {{:ok, reserved}, queries} =
+        capture_repo_queries(fn ->
+          Accounting.reserve(
+            setup.auth,
+            setup.model,
+            %{"model" => String.upcase(setup.model.exposed_model_id), "max_output_tokens" => 1},
+            %{correlation_id: "corr-single-policy-lock"}
+          )
+        end)
+
+      policy_selects = table_commands(queries, "api_key_policy_bindings", "SELECT")
+
+      assert length(policy_selects) == 1
+      assert Enum.all?(policy_selects, &String.contains?(&1.query, "FOR UPDATE"))
+      assert reserved.estimate.output_tokens == 768
+      assert reserved.reservation.output_tokens == 768
+    end
+
+    test "reservation snapshot inputs do not read policy bindings before reservation" do
+      setup = accounting_setup()
+      {:ok, policy} = Access.normalize_api_key_policy(setup.api_key)
+      payload = %{"model" => setup.model.exposed_model_id, "input" => "snapshot estimate only"}
+
+      request_options =
+        RequestOptions.build(
+          %{
+            requested_model: setup.model.exposed_model_id,
+            effective_model: setup.model.exposed_model_id,
+            api_key_policy: policy
+          },
+          "/backend-api/codex/responses",
+          payload
+        )
+
+      {snapshot_inputs, queries} =
+        capture_repo_queries(fn ->
+          AccountingReservation.reservation_snapshot_inputs(
+            setup.auth,
+            setup.model,
+            payload,
+            "/backend-api/codex/responses",
+            request_options
+          )
+        end)
+
+      assert command_count(queries, "api_key_policy_bindings", "SELECT") == 0
+      assert snapshot_inputs.estimated_output_tokens == 512
+
+      assert snapshot_inputs.estimated_total_tokens ==
+               snapshot_inputs.estimated_input_tokens + snapshot_inputs.estimated_output_tokens
+    end
+
     test "concurrent token reservations near limit cannot oversubscribe with tiny caps" do
       setup = accounting_setup()
       parent = self()
@@ -280,6 +352,59 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
                :count
              ) == 1
     end
+
+    test "concurrent model policy reservations serialize through the same lock-time policy row" do
+      setup = accounting_setup()
+      parent = self()
+
+      update_default_policy!(setup.api_key, %{
+        max_requests_per_minute: 60,
+        max_tokens_per_day: 10_000,
+        max_tokens_per_week: 10_000
+      })
+
+      insert_model_policy!(setup.api_key, setup.model.exposed_model_id, %{
+        max_requests_per_minute: 60,
+        max_tokens_per_day: 512,
+        max_tokens_per_week: 10_000
+      })
+
+      tasks =
+        for index <- 1..2 do
+          Task.async(fn ->
+            Sandbox.allow(Repo, parent, self())
+
+            Accounting.reserve(
+              setup.auth,
+              setup.model,
+              %{"model" => String.upcase(setup.model.exposed_model_id), "max_output_tokens" => 1},
+              %{correlation_id: "corr-concurrent-model-policy-#{index}"}
+            )
+          end)
+        end
+
+      results = Task.await_many(tasks, 15_000)
+
+      assert Enum.count(results, &match?({:ok, _reserved}, &1)) == 1
+
+      assert [error] =
+               Enum.flat_map(results, fn
+                 {:error, error} -> [error]
+                 {:ok, _reserved} -> []
+               end)
+
+      assert error.code == :api_key_policy_limit_exceeded
+      assert error.message =~ "max_tokens_per_day"
+
+      assert Repo.aggregate(
+               from(e in LedgerEntry,
+                 where:
+                   e.api_key_id == ^setup.api_key.id and e.entry_kind == "reservation" and
+                     e.amount_status == "recorded"
+               ),
+               :count
+             ) == 1
+    end
   end
 
   defp insert_model_policy!(api_key, model_identifier, attrs) do
@@ -300,4 +425,59 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
     }
     |> Repo.insert!()
   end
+
+  defp capture_repo_queries(fun) do
+    parent = self()
+    handler_id = "api-key-policy-reservation-test-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo do
+            send(
+              parent,
+              {handler_id, metadata[:source], command_name(metadata[:query]), metadata[:query]}
+            )
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_queries(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_queries(handler_id, queries) do
+    receive do
+      {^handler_id, source, command, query} ->
+        drain_repo_queries(handler_id, [
+          %{source: source, command: command, query: query} | queries
+        ])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp table_commands(queries, source, command) do
+    Enum.filter(queries, &(&1.source == source and &1.command == command))
+  end
+
+  defp command_count(queries, source, command),
+    do: length(table_commands(queries, source, command))
+
+  defp command_name(query) when is_binary(query) do
+    query
+    |> String.trim_leading()
+    |> String.split(~r/\s+/, parts: 2)
+    |> List.first()
+    |> String.upcase()
+  end
+
+  defp command_name(_query), do: nil
 end

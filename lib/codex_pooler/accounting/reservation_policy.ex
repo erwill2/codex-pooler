@@ -4,21 +4,10 @@ defmodule CodexPooler.Accounting.ReservationPolicy do
   import Ecto.Query
 
   alias CodexPooler.Access.APIKeyPolicyBinding
-  alias CodexPooler.Accounting.{LedgerEntry, Metadata}
+  alias CodexPooler.Accounting.Metadata
+  alias CodexPooler.Accounting.RequestLifecycle.LedgerEntries
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Repo
-
-  @entry_release "release"
-  @entry_settlement "settlement"
-  @amount_recorded "recorded"
-  @usage_known "usage_known"
-
-  @spec effective_policy(term(), String.t() | nil) :: struct() | nil
-  def effective_policy(api_key, requested_model) do
-    api_key.id
-    |> effective_policy_query(requested_model)
-    |> Repo.one()
-  end
 
   @spec policy_for_update(term(), String.t() | nil, struct() | nil) :: struct() | nil
   def policy_for_update(api_key, requested_model, candidate_policy \\ nil) do
@@ -84,9 +73,16 @@ defmodule CodexPooler.Accounting.ReservationPolicy do
   defp effective_binding?(_binding, _requested_model), do: false
 
   defp enforce_window_reservation_limits(api_key, policy, estimate, timestamp) do
-    minute_usage = ledger_window_usage(api_key.id, DateTime.add(timestamp, -60, :second))
-    daily_usage = ledger_window_usage(api_key.id, beginning_of_day(timestamp))
-    weekly_usage = ledger_window_usage(api_key.id, DateTime.add(timestamp, -7, :day))
+    window_usages =
+      LedgerEntries.window_usages(api_key.id,
+        minute: DateTime.add(timestamp, -60, :second),
+        daily: beginning_of_day(timestamp),
+        weekly: DateTime.add(timestamp, -7, :day)
+      )
+
+    minute_usage = window_usages.minute
+    daily_usage = window_usages.daily
+    weekly_usage = window_usages.weekly
 
     [
       {:max_requests_per_minute, policy.max_requests_per_minute,
@@ -102,44 +98,6 @@ defmodule CodexPooler.Accounting.ReservationPolicy do
         {:error, error} -> {:halt, {:error, error}}
       end
     end)
-  end
-
-  defp ledger_window_usage(api_key_id, since) do
-    entries =
-      Repo.all(
-        from e in LedgerEntry,
-          where:
-            e.api_key_id == ^api_key_id and e.amount_status == @amount_recorded and
-              e.occurred_at >= ^since
-      )
-
-    Enum.reduce(
-      entries,
-      %{
-        effective_request_count: 0,
-        effective_total_tokens: 0,
-        effective_cost_micros: Decimal.new(0)
-      },
-      fn entry, acc ->
-        sign = if entry.entry_kind == @entry_release, do: -1, else: 1
-
-        cost =
-          if entry.entry_kind == @entry_settlement and entry.usage_status == @usage_known,
-            do: entry.settled_cost_micros,
-            else: entry.estimated_cost_micros
-
-        %{
-          effective_request_count:
-            acc.effective_request_count + sign * (entry.request_count || 0),
-          effective_total_tokens: acc.effective_total_tokens + sign * (entry.total_tokens || 0),
-          effective_cost_micros:
-            Decimal.add(
-              acc.effective_cost_micros,
-              Decimal.mult(cost || Decimal.new(0), Decimal.new(sign))
-            )
-        }
-      end
-    )
   end
 
   defp enforce_request_token_limits(policy, estimate) do
