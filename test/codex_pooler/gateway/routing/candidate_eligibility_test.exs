@@ -5,6 +5,9 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Gateway.Routing.CandidateEligibility.FilterInput
+  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
+  alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
+  alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   describe "filter_runtime_compatible_candidates/1" do
     test "auto and default do not narrow the candidate set" do
@@ -148,8 +151,100 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
     end
   end
 
+  describe "preloaded routing state" do
+    test "quota eligibility consumes route-state windows without querying the repository" do
+      eligible_identity = upstream_identity("eligible-identity")
+      missing_identity = upstream_identity("missing-identity")
+
+      eligible_candidate =
+        {assignment("eligible-assignment", eligible_identity), eligible_identity}
+
+      missing_candidate = {assignment("missing-assignment", missing_identity), missing_identity}
+
+      route_state =
+        RouteState.new(%{
+          visible_model: quota_model(),
+          candidates: [eligible_candidate, missing_candidate]
+        })
+        |> RouteState.put_quota_window_snapshots(%{
+          eligible_identity.id => [account_window(Decimal.new("15"))],
+          missing_identity.id => [account_window(Decimal.new("100"))]
+        })
+
+      assert {:ok, [^eligible_candidate], %{"routing_state" => "precise"}} =
+               CandidateEligibility.filter_quota_eligible_candidates(
+                 filter_input(quota_model(), %{"model" => "sample-model"}, request_options(), [
+                   eligible_candidate,
+                   missing_candidate
+                 ]),
+                 route_state
+               )
+    end
+
+    test "circuit eligibility consumes route-state snapshots without live circuit reads" do
+      open_identity = upstream_identity("open-identity")
+      closed_identity = upstream_identity("closed-identity")
+
+      open_candidate = {assignment("open-assignment", open_identity), open_identity}
+      closed_candidate = {assignment("closed-assignment", closed_identity), closed_identity}
+
+      route_state =
+        RouteState.new(%{
+          visible_model: quota_model(),
+          candidates: [open_candidate, closed_candidate],
+          circuit_eligibility_snapshots: %{
+            "open-assignment" => false,
+            "closed-assignment" => true
+          }
+        })
+
+      assert {:ok, [^closed_candidate]} =
+               CandidateEligibility.filter_circuit_eligible_candidates(
+                 filter_input(quota_model(), %{"model" => "sample-model"}, request_options(), [
+                   open_candidate,
+                   closed_candidate
+                 ]),
+                 route_state
+               )
+    end
+  end
+
   defp candidate(assignment_id) do
     {%{id: assignment_id, metadata: %{}}, %{id: "#{assignment_id}-identity", metadata: %{}}}
+  end
+
+  defp assignment(id, %UpstreamIdentity{} = identity) do
+    %PoolUpstreamAssignment{id: id, upstream_identity_id: identity.id, metadata: %{}}
+  end
+
+  defp upstream_identity(id) do
+    %UpstreamIdentity{id: id, metadata: %{}}
+  end
+
+  defp request_options do
+    RequestOptions.build(%{}, "/backend-api/codex/responses", %{"model" => "sample-model"})
+  end
+
+  defp quota_model do
+    %Model{exposed_model_id: "sample-model", upstream_model_id: "sample-upstream-model"}
+  end
+
+  defp account_window(used_percent) do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    %AccountQuotaWindow{
+      quota_key: "account",
+      window_kind: "primary",
+      window_minutes: 300,
+      used_percent: used_percent,
+      reset_at: DateTime.add(observed_at, 900, :second),
+      source: "codex_usage_api",
+      source_precision: "observed",
+      quota_scope: "account",
+      quota_family: "account",
+      freshness_state: "fresh",
+      observed_at: observed_at
+    }
   end
 
   defp candidate_ids(candidates),

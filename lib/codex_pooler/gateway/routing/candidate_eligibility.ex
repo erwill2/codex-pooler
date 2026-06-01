@@ -8,6 +8,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.CandidateEligibility.Quota
   alias CodexPooler.Gateway.Routing.{CircuitState, ModelMetadata}
+  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Repo
   alias CodexPooler.RouteClass
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
@@ -96,7 +97,8 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   @type quota_refresh_plan :: %{
           required(:filter_input) => FilterInput.t(),
           required(:candidate_exclusions) => [map()],
-          required(:refreshable_candidates) => [candidate()]
+          required(:refreshable_candidates) => [candidate()],
+          optional(:route_state) => RouteState.t()
         }
   @type quota_filter_result ::
           {:ok, [candidate()], quota_decision()}
@@ -196,6 +198,9 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   @spec filter_quota_eligible_candidates(FilterInput.t()) :: quota_filter_result()
   defdelegate filter_quota_eligible_candidates(input), to: Quota
 
+  @spec filter_quota_eligible_candidates(FilterInput.t(), RouteState.t()) :: quota_filter_result()
+  defdelegate filter_quota_eligible_candidates(input, route_state), to: Quota
+
   @spec quota_unavailable_error([map()], boolean()) :: {:error, gateway_error()}
   defdelegate quota_unavailable_error(exclusions, refresh_attempted?), to: Quota
 
@@ -213,6 +218,45 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
       Enum.reduce(candidates, {[], []}, fn {assignment, identity} = candidate,
                                            {eligible, excluded} ->
         if CircuitState.eligible?(auth, model, assignment, route_class) do
+          {[candidate | eligible], excluded}
+        else
+          {eligible,
+           [
+             %{
+               pool_upstream_assignment_id: assignment.id,
+               upstream_identity_id: identity.id,
+               reasons: [%{"code" => "routing_circuit_open", "route_class" => route_class}]
+             }
+             | excluded
+           ]}
+        end
+      end)
+
+    case Enum.reverse(eligible) do
+      [] ->
+        {:error,
+         error(
+           503,
+           "no_eligible_backend",
+           "no healthy eligible backend is currently available",
+           "model",
+           %{candidate_exclusions: Enum.reverse(exclusions)}
+         )}
+
+      eligible ->
+        {:ok, eligible}
+    end
+  end
+
+  @spec filter_circuit_eligible_candidates(FilterInput.t(), RouteState.t()) ::
+          {:ok, [candidate()]} | {:error, gateway_error()}
+  def filter_circuit_eligible_candidates(%FilterInput{} = input, %RouteState{} = route_state) do
+    %{candidates: candidates, route_class: route_class} = input
+
+    {eligible, exclusions} =
+      Enum.reduce(candidates, {[], []}, fn {assignment, identity} = candidate,
+                                           {eligible, excluded} ->
+        if RouteState.circuit_eligible?(route_state, assignment.id) do
           {[candidate | eligible], excluded}
         else
           {eligible,

@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
 
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Routing.CandidateEligibility.FilterInput
+  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
 
   @spec filter_quota_eligible_candidates(FilterInput.t()) ::
@@ -18,6 +19,26 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
         {:refreshable_quota,
          %{
            filter_input: input,
+           candidate_exclusions: exclusions,
+           refreshable_candidates: refreshable_candidates
+         }}
+    end
+  end
+
+  @spec filter_quota_eligible_candidates(FilterInput.t(), RouteState.t()) ::
+          CodexPooler.Gateway.Routing.CandidateEligibility.quota_filter_result()
+  def filter_quota_eligible_candidates(%FilterInput{} = input, %RouteState{} = route_state) do
+    %{model: model, candidates: candidates} = input
+
+    case classify_quota_candidates(model, candidates, route_state) do
+      {:ok, candidates, decision} ->
+        {:ok, candidates, decision}
+
+      {:error, exclusions, refreshable_candidates} ->
+        {:refreshable_quota,
+         %{
+           filter_input: input,
+           route_state: route_state,
            candidate_exclusions: exclusions,
            refreshable_candidates: refreshable_candidates
          }}
@@ -43,11 +64,15 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
   end
 
   defp classify_quota_candidates(%Model{} = model, candidates) do
+    classify_quota_candidates(model, candidates, nil)
+  end
+
+  defp classify_quota_candidates(%Model{} = model, candidates, route_state) do
     {precise_candidates, probe_candidates, exclusions, refreshable_candidates} =
       Enum.reduce(candidates, {[], [], [], []}, fn {assignment, identity} = candidate,
                                                    {precise, probes, excluded, refreshable} ->
         identity
-        |> QuotaWindows.routing_quota_eligibility(quota_scope_opts(model))
+        |> routing_quota_eligibility(model, route_state)
         |> add_classified_quota_candidate(
           candidate,
           assignment,
@@ -69,6 +94,16 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
       candidates ->
         {:ok, candidates, quota_decision(candidates, precise_candidates, probe_candidates)}
     end
+  end
+
+  defp routing_quota_eligibility(identity, %Model{} = model, %RouteState{} = route_state) do
+    route_state
+    |> RouteState.quota_windows_for_identity(identity)
+    |> QuotaWindows.routing_quota_eligibility_from_windows(quota_scope_opts(model))
+  end
+
+  defp routing_quota_eligibility(identity, %Model{} = model, _route_state) do
+    QuotaWindows.routing_quota_eligibility(identity, quota_scope_opts(model))
   end
 
   defp add_classified_quota_candidate(
