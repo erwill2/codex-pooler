@@ -198,6 +198,32 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
     end
   end
 
+  @spec list_quota_windows_by_identity_ids([Ecto.UUID.t()]) :: %{
+          optional(Ecto.UUID.t()) => [Quota.AccountQuotaWindow.t()]
+        }
+  def list_quota_windows_by_identity_ids(identity_ids) when is_list(identity_ids) do
+    identity_ids = Enum.filter(Enum.uniq(identity_ids), &is_binary/1)
+
+    windows =
+      if identity_ids == [] do
+        []
+      else
+        Repo.all(
+          from window in Quota.AccountQuotaWindow,
+            where: window.upstream_identity_id in ^identity_ids,
+            order_by: [
+              asc: window.upstream_identity_id,
+              asc: window.quota_key,
+              asc: window.window_kind
+            ]
+        )
+      end
+
+    empty_snapshots = Map.new(identity_ids, &{&1, []})
+
+    Map.merge(empty_snapshots, Enum.group_by(windows, & &1.upstream_identity_id))
+  end
+
   @spec quota_window_selection_data(identity_ref(), keyword()) :: map()
   def quota_window_selection_data(identity_or_id, opts \\ []) do
     windows = list_quota_windows(identity_or_id)
