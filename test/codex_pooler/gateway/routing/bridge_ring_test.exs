@@ -435,6 +435,22 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert quota_first_plan.selected_assignment_id == hd(expected_ids)
     end
 
+    test "quota_first ignores credits when quota headroom ties" do
+      setup = routing_setup(2)
+      [lower_credit, higher_credit] = setup.assignments
+      seed = seed_preferring_assignment([lower_credit.id, higher_credit.id], lower_credit.id)
+
+      prime_account_quota!(setup, lower_credit, Decimal.new("40"), credits: 1)
+      prime_account_quota!(setup, higher_credit, Decimal.new("40"), credits: 500)
+
+      quota_first_plan = plan_for(setup, "quota_first", seed)
+      expected_ids = rendezvous_order_ids(setup.candidates, seed)
+
+      assert candidate_ids(quota_first_plan.candidates) == expected_ids
+      assert quota_first_plan.selected_assignment_id == lower_credit.id
+      assert quota_first_plan.selected_assignment_id == hd(expected_ids)
+    end
+
     test "quota_first gives missing usable quota a zero headroom score" do
       setup = routing_setup(3)
       [unknown_quota, high_headroom, low_headroom] = setup.assignments
@@ -919,15 +935,22 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
     |> Repo.insert!()
   end
 
-  defp prime_account_quota!(setup, assignment, used_percent) do
-    prime_quota_window!(setup, assignment, %{
-      quota_key: "account",
-      window_kind: "primary",
-      window_minutes: 300,
-      quota_scope: "account",
-      quota_family: "account",
-      used_percent: used_percent
-    })
+  defp prime_account_quota!(setup, assignment, used_percent, attrs \\ []) do
+    setup
+    |> prime_quota_window!(
+      assignment,
+      Map.merge(
+        %{
+          quota_key: "account",
+          window_kind: "primary",
+          window_minutes: 300,
+          quota_scope: "account",
+          quota_family: "account",
+          used_percent: used_percent
+        },
+        Map.new(attrs)
+      )
+    )
   end
 
   defp prime_model_quota!(setup, assignment, used_percent, opts \\ []) do
