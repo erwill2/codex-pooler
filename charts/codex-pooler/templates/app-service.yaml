@@ -5,6 +5,7 @@ metadata:
   name: {{ include "codex-pooler.fullname" . }}-app
   labels:
     {{- include "codex-pooler.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app
 spec:
   type: {{ .Values.app.service.type }}
   selector:

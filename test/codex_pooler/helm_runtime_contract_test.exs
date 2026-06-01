@@ -74,10 +74,14 @@ defmodule CodexPooler.HelmRuntimeContractTest do
   test "default chart keeps Phoenix release role env contracts aligned with runtime" do
     rendered = helm_template!()
 
+    app_service = source_doc!(rendered, "codex-pooler/templates/app-service.yaml")
     app = source_doc!(rendered, "codex-pooler/templates/app-deployment.yaml")
     worker = source_doc!(rendered, "codex-pooler/templates/oban-worker-deployment.yaml")
     scheduler = source_doc!(rendered, "codex-pooler/templates/oban-scheduler-deployment.yaml")
     migration = source_doc!(rendered, "codex-pooler/templates/migration-job.yaml")
+
+    assert app_service =~ ~r/labels:\n(?:\s+.+\n)*\s+app.kubernetes.io\/component: app/
+    assert app_service =~ ~r/selector:\n(?:\s+.+\n)*\s+app.kubernetes.io\/component: app/
 
     assert_env_value(app, "PHX_SERVER", ~s("true"))
     assert_env_value(app, "OBAN_MODE", "web")
