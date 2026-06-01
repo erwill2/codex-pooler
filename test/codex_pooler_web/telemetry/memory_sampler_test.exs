@@ -39,6 +39,7 @@ defmodule CodexPoolerWeb.Telemetry.MemorySamplerTest do
     assert log =~ "limit_bytes=100"
     assert log =~ "top_processes="
     assert log =~ "top_message_queues="
+    assert log =~ "current_stacktrace"
   end
 
   test "detaches the VM memory handler on supervised shutdown" do

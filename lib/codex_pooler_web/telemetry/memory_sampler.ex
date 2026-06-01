@@ -145,6 +145,7 @@ defmodule CodexPoolerWeb.Telemetry.MemorySampler do
       :message_queue_len,
       :initial_call,
       :current_function,
+      :current_stacktrace,
       :status,
       :heap_size,
       :total_heap_size,
@@ -166,6 +167,7 @@ defmodule CodexPoolerWeb.Telemetry.MemorySampler do
             status: info_value(info, :status, :unknown) |> safe_atom(),
             initial_call: info_value(info, :initial_call, nil) |> safe_mfa(),
             current_function: info_value(info, :current_function, nil) |> safe_mfa(),
+            current_stacktrace: info_value(info, :current_stacktrace, []) |> safe_stacktrace(),
             registered_name: info_value(info, :registered_name, nil) |> safe_registered_name()
           }
         ]
@@ -314,6 +316,46 @@ defmodule CodexPoolerWeb.Telemetry.MemorySampler do
 
   defp safe_registered_name(name) when is_atom(name), do: Atom.to_string(name)
   defp safe_registered_name(_name), do: "unknown"
+
+  defp safe_stacktrace(stacktrace) when is_list(stacktrace) do
+    stacktrace
+    |> Enum.take(8)
+    |> Enum.map(&safe_stacktrace_entry/1)
+  end
+
+  defp safe_stacktrace(_stacktrace), do: []
+
+  defp safe_stacktrace_entry({module, function, arity, location})
+       when is_atom(module) and is_atom(function) and is_integer(arity) do
+    %{
+      mfa: safe_mfa({module, function, arity}),
+      file: safe_stacktrace_file(location),
+      line: safe_stacktrace_line(location)
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp safe_stacktrace_entry(_entry), do: %{mfa: "unknown"}
+
+  defp safe_stacktrace_file(location) when is_list(location) do
+    case Keyword.get(location, :file) do
+      file when is_binary(file) -> file
+      file when is_list(file) -> List.to_string(file)
+      _file -> nil
+    end
+  end
+
+  defp safe_stacktrace_file(_location), do: nil
+
+  defp safe_stacktrace_line(location) when is_list(location) do
+    case Keyword.get(location, :line) do
+      line when is_integer(line) -> line
+      _line -> nil
+    end
+  end
+
+  defp safe_stacktrace_line(_location), do: nil
 
   defp json!(value), do: Jason.encode!(value)
 
