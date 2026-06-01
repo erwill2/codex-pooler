@@ -8,6 +8,7 @@ defmodule CodexPooler.Application do
     children = [
       CodexPoolerWeb.Telemetry,
       CodexPooler.Repo,
+      CodexPooler.Access.APIKeys.TouchDebounce,
       CodexPooler.Gateway.Transports.Admission,
       {Registry,
        keys: :unique,

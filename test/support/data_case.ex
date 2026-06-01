@@ -16,6 +16,7 @@ defmodule CodexPooler.DataCase do
 
   use ExUnit.CaseTemplate
 
+  alias CodexPooler.Access.APIKeys.TouchDebounce
   alias CodexPooler.Repo
   alias Ecto.Adapters.SQL.Sandbox
 
@@ -42,7 +43,11 @@ defmodule CodexPooler.DataCase do
   """
   def setup_sandbox(tags) do
     pid = Sandbox.start_owner!(Repo, shared: not tags[:async])
-    on_exit(fn -> Sandbox.stop_owner(pid) end)
+
+    on_exit(fn ->
+      TouchDebounce.reset()
+      Sandbox.stop_owner(pid)
+    end)
   end
 
   @doc """

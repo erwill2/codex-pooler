@@ -2,7 +2,7 @@ defmodule CodexPooler.Access.APIKeys.Authentication do
   @moduledoc false
 
   alias CodexPooler.Access.APIKey
-  alias CodexPooler.Access.APIKeys.{Errors, Material}
+  alias CodexPooler.Access.APIKeys.{Errors, Material, TouchDebounce}
   alias CodexPooler.Pools
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
@@ -106,14 +106,7 @@ defmodule CodexPooler.Access.APIKeys.Authentication do
     }
   end
 
-  defp touch_api_key!(%APIKey{} = api_key) do
-    {:ok, touched_key} =
-      api_key
-      |> APIKey.changeset(%{last_used_at: now()})
-      |> Repo.update()
-
-    touched_key
-  end
+  defp touch_api_key!(%APIKey{} = api_key), do: TouchDebounce.touch(api_key, now())
 
   defp ensure_api_key_usable(%APIKey{status: @status_revoked}),
     do: {:error, Errors.access_error(:api_key_revoked, "api key is revoked")}

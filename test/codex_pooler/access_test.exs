@@ -3,6 +3,7 @@ defmodule CodexPooler.AccessTest do
 
   alias CodexPooler.Access
   alias CodexPooler.Access.{APIKey, APIKeyPolicyBinding}
+  alias CodexPooler.Access.APIKeys.TouchDebounce
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Pools
   alias CodexPooler.Repo
@@ -10,6 +11,16 @@ defmodule CodexPooler.AccessTest do
   import Ecto.Query
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
+
+  setup do
+    TouchDebounce.reset()
+
+    on_exit(fn ->
+      TouchDebounce.reset()
+    end)
+
+    :ok
+  end
 
   describe "server-authoritative API key policy APIs" do
     test "selected model mode persists normalized catalog-backed and custom manual identifiers" do
@@ -146,7 +157,7 @@ defmodule CodexPooler.AccessTest do
   end
 
   describe "api key authentication" do
-    test "valid keys resolve the active key and pool and update last_used_at" do
+    test "valid keys resolve the active key and pool and debounce last_used_at persistence" do
       {scope, pool} = owner_scope_and_pool()
 
       assert {:ok, %{api_key: api_key, raw_key: raw_key}} =
@@ -154,13 +165,73 @@ defmodule CodexPooler.AccessTest do
 
       assert is_nil(api_key.last_used_at)
 
-      assert {:ok, auth} = Access.authenticate_api_key(raw_key)
+      {result, update_count} =
+        count_api_key_updates(fn ->
+          assert {:ok, auth} = Access.authenticate_api_key(raw_key)
+          auth
+        end)
 
+      assert update_count == 0
+      auth = result
       assert auth.api_key_id == api_key.id
       assert auth.pool_id == pool.id
       assert auth.key_prefix == api_key.key_prefix
       assert auth.pool.id == pool.id
       assert %DateTime{} = auth.api_key.last_used_at
+      assert is_nil(Repo.get!(APIKey, api_key.id).last_used_at)
+
+      assert :ok = TouchDebounce.flush()
+      assert %DateTime{} = Repo.get!(APIKey, api_key.id).last_used_at
+    end
+
+    test "api key touch debounce flushes at most once per interval per key" do
+      {scope, pool} = owner_scope_and_pool()
+
+      assert TouchDebounce.debounce_interval_ms() == 60_000
+
+      assert {:ok, %{api_key: api_key, raw_key: raw_key}} =
+               Access.create_api_key(scope, pool, %{
+                 display_name: "Debounced key"
+               })
+
+      assert {:ok, first_auth} = Access.authenticate_api_key(raw_key)
+      assert {:ok, second_auth} = Access.authenticate_api_key(raw_key)
+
+      assert DateTime.compare(first_auth.api_key.last_used_at, second_auth.api_key.last_used_at) !=
+               :gt
+
+      {result, update_count} = count_api_key_updates(fn -> TouchDebounce.flush() end)
+
+      assert result == :ok
+      assert update_count == 1
+
+      persisted = Repo.get!(APIKey, api_key.id)
+      assert DateTime.compare(persisted.last_used_at, first_auth.api_key.last_used_at) != :lt
+      assert DateTime.compare(persisted.last_used_at, second_auth.api_key.last_used_at) != :gt
+    end
+
+    test "api key touch flush is monotonic when replicas race" do
+      {scope, pool} = owner_scope_and_pool()
+
+      assert {:ok, %{api_key: api_key}} =
+               Access.create_api_key(scope, pool, %{
+                 display_name: "Raced key"
+               })
+
+      newer = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      older = DateTime.add(newer, -30, :second)
+
+      assert %APIKey{} = TouchDebounce.touch(api_key, newer)
+      assert :ok = TouchDebounce.flush()
+      assert Repo.get!(APIKey, api_key.id).last_used_at == newer
+
+      assert %APIKey{} = TouchDebounce.touch(api_key, older)
+
+      {result, update_count} = count_api_key_updates(fn -> TouchDebounce.flush() end)
+
+      assert result == :ok
+      assert update_count == 1
+      assert Repo.get!(APIKey, api_key.id).last_used_at == newer
     end
 
     test "authorization header helper accepts bearer keys" do
@@ -551,5 +622,40 @@ defmodule CodexPooler.AccessTest do
              })
 
     {scope, pool}
+  end
+
+  defp count_api_key_updates(fun) when is_function(fun, 0) do
+    handler_id = {__MODULE__, :api_key_updates, System.unique_integer([:positive])}
+    parent = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          query = Map.get(metadata, :query, "")
+          source = Map.get(metadata, :source)
+
+          if source == "api_keys" and String.starts_with?(query, "UPDATE") do
+            send(parent, {handler_id, :api_key_update})
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, count_received_api_key_updates(handler_id, 0)}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp count_received_api_key_updates(handler_id, count) do
+    receive do
+      {^handler_id, :api_key_update} -> count_received_api_key_updates(handler_id, count + 1)
+    after
+      0 -> count
+    end
   end
 end
