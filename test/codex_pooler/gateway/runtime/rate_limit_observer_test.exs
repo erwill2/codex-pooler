@@ -4,6 +4,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
   import CodexPooler.PoolerFixtures
 
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
+  alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
@@ -51,6 +52,26 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
       refute identity
              |> QuotaWindows.list_quota_windows()
              |> Enum.any?(&(&1.source == "codex_rate_limit_event"))
+    end
+
+    test "ignores non-rate-limit websocket JSON before quota DB work" do
+      identity = active_upstream_assignment_fixture().identity
+
+      {_result, repo_events} =
+        collect_repo_query_events(fn ->
+          assert :ok =
+                   RateLimitObserver.record_complete_events(
+                     identity,
+                     Jason.encode!(%{
+                       "type" => "response.output_text.delta",
+                       "delta" => "sample"
+                     })
+                   )
+
+          wait_for_rate_limit_event_tasks()
+        end)
+
+      assert repo_events == []
     end
   end
 
@@ -149,6 +170,38 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
         else
           flunk("expected codex.rate_limits persistence tasks to finish")
         end
+    end
+  end
+
+  defp collect_repo_query_events(fun) when is_function(fun, 0) do
+    parent = self()
+    handler_id = {__MODULE__, self(), System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo do
+            send(parent, {handler_id, metadata[:source] || "unknown"})
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_query_events(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_query_events(handler_id, events) do
+    receive do
+      {^handler_id, source} -> drain_repo_query_events(handler_id, [source | events])
+    after
+      0 -> Enum.reverse(events)
     end
   end
 end

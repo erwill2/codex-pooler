@@ -288,8 +288,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
   @spec upsert_quota_windows_from_codex_usage_payload(identity_ref(), term(), DateTime.t()) ::
           {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
   def upsert_quota_windows_from_codex_usage_payload(identity_or_id, payload, synced_at \\ now()) do
-    with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
-         {:ok, windows} <- codex_usage_quota_windows_from_payload(payload, synced_at) do
+    with {:ok, windows} <- codex_usage_quota_windows_from_payload(payload, synced_at),
+         %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id) do
       do_upsert_quota_windows(identity, windows, delete_missing?: false)
     else
       nil ->
@@ -303,8 +303,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
   @spec upsert_quota_windows_from_codex_headers(identity_ref(), term(), DateTime.t()) ::
           {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
   def upsert_quota_windows_from_codex_headers(identity_or_id, headers, synced_at \\ now()) do
-    with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
-         [_ | _] = windows <- quota_windows_from_codex_headers(headers, synced_at) do
+    with [_ | _] = windows <- quota_windows_from_codex_headers(headers, synced_at),
+         %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id) do
       do_upsert_quota_windows(identity, windows, delete_missing?: false)
     else
       nil ->
@@ -318,8 +318,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
   @spec upsert_quota_windows_from_codex_rate_limit_event(identity_ref(), term(), DateTime.t()) ::
           {:ok, [Quota.AccountQuotaWindow.t()]} | {:error, Ecto.Changeset.t() | lifecycle_error()}
   def upsert_quota_windows_from_codex_rate_limit_event(identity_or_id, event, synced_at \\ now()) do
-    with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
-         [_ | _] = windows <- quota_windows_from_codex_rate_limit_event(event, synced_at) do
+    with [_ | _] = windows <- quota_windows_from_codex_rate_limit_event(event, synced_at),
+         %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id) do
       do_upsert_quota_windows(identity, windows, delete_missing?: false)
     else
       nil ->
@@ -337,8 +337,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
         payload,
         synced_at \\ now()
       ) do
-    with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
-         [_ | _] = windows <- quota_windows_from_codex_rate_limit_error(payload, synced_at) do
+    with [_ | _] = windows <- quota_windows_from_codex_rate_limit_error(payload, synced_at),
+         %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id) do
       do_upsert_quota_windows(identity, windows, delete_missing?: false)
     else
       nil ->
@@ -413,6 +413,9 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
   end
 
   defp lifecycle_error(code, message), do: %{code: code, message: message}
+
+  defp normalize_identity(%UpstreamIdentity{status: status} = identity) when is_binary(status),
+    do: identity
 
   defp normalize_identity(%UpstreamIdentity{id: id}), do: Repo.get(UpstreamIdentity, id)
   defp normalize_identity(id) when is_binary(id), do: Repo.get(UpstreamIdentity, id)

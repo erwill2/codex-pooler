@@ -102,10 +102,10 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   defp persist_events_async(_identity, []), do: :ok
 
   defp persist_events_async(%UpstreamIdentity{} = identity, events) do
-    identity_id = identity.id
+    identity_snapshot = %UpstreamIdentity{id: identity.id, status: identity.status}
 
     case Task.Supervisor.start_child(@event_supervisor, fn ->
-           Enum.each(events, &persist_event(identity_id, &1))
+           Enum.each(events, &persist_event(identity_snapshot, &1))
          end) do
       {:ok, _pid} ->
         :ok
@@ -118,16 +118,16 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
       log_failure("rate_limit_event_task", identity_metadata(identity), reason)
   end
 
-  defp persist_event(identity_id, event) do
+  defp persist_event(%UpstreamIdentity{} = identity, event) do
     case QuotaWindows.upsert_quota_windows_from_codex_rate_limit_event(
-           identity_id,
+           identity,
            event
          ) do
       {:ok, _windows} ->
         :ok
 
       {:error, reason} ->
-        log_failure("rate_limit_event", [upstream_identity_id: identity_id], reason)
+        log_failure("rate_limit_event", identity_metadata(identity), reason)
     end
   end
 
@@ -215,7 +215,6 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   defp rate_limit_events_from_json(payload) do
     case Jason.decode(payload) do
       {:ok, %{"type" => "codex.rate_limits"} = event} -> [event]
-      {:ok, %{} = event} -> [event]
       {:ok, _decoded} -> []
       {:error, _reason} -> []
     end
