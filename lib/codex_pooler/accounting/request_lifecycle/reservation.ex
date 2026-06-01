@@ -24,12 +24,15 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
     transport = attr(opts, :transport) || transport_from_payload(payload)
     correlation_id = attr(opts, :correlation_id) || Ecto.UUID.generate()
     pricing = PricingResolution.lookup(model, requested_model, payload, opts, timestamp)
+    effective_model = ReservationPolicy.effective_model(model, requested_model, opts)
+    candidate_policy = ReservationPolicy.effective_policy(api_key, effective_model)
 
     Repo.transaction(fn ->
       policy =
         ReservationPolicy.policy_for_update(
           api_key,
-          ReservationPolicy.effective_model(model, requested_model, opts)
+          effective_model,
+          candidate_policy
         )
 
       {:ok, estimate} = PricingResolution.reservation_estimate(payload, pricing.snapshot, policy)

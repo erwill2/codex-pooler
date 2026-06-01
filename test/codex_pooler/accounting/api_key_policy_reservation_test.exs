@@ -1,6 +1,7 @@
 defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
   use CodexPooler.DataCase, async: false
 
+  alias CodexPooler.Access.APIKeyPolicyBinding
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.LedgerEntry
   alias CodexPooler.Repo
@@ -136,6 +137,64 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
       assert result.settlement.details["estimated_from_reserve"] == true
     end
 
+    test "model policy takes precedence over default policy at reservation time" do
+      setup = accounting_setup()
+
+      update_default_policy!(setup.api_key, %{
+        max_requests_per_minute: 60,
+        max_tokens_per_day: 10_000,
+        max_tokens_per_week: 10_000
+      })
+
+      insert_model_policy!(setup.api_key, setup.model.exposed_model_id, %{
+        max_requests_per_minute: 60,
+        max_tokens_per_day: 511,
+        max_tokens_per_week: 10_000
+      })
+
+      assert {:error, error} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{
+                   "model" => String.upcase(setup.model.exposed_model_id),
+                   "max_output_tokens" => 1
+                 },
+                 %{correlation_id: "corr-model-policy-precedence"}
+               )
+
+      assert error.code == :api_key_policy_limit_exceeded
+      assert error.message =~ "max_tokens_per_day"
+    end
+
+    test "disabled model policy is ignored and falls back to active default policy" do
+      setup = accounting_setup()
+
+      update_default_policy!(setup.api_key, %{
+        max_requests_per_minute: 60,
+        max_tokens_per_day: 10_000,
+        max_tokens_per_week: 10_000
+      })
+
+      insert_model_policy!(setup.api_key, setup.model.exposed_model_id, %{
+        status: "disabled",
+        max_requests_per_minute: 60,
+        max_tokens_per_day: 512,
+        max_tokens_per_week: 10_000
+      })
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{"model" => setup.model.exposed_model_id, "max_output_tokens" => 1},
+                 %{correlation_id: "corr-disabled-model-policy-fallback"}
+               )
+
+      assert reserved.estimate.output_tokens == 512
+      assert reserved.reservation.total_tokens == 512
+    end
+
     test "concurrent token reservations near limit cannot oversubscribe with tiny caps" do
       setup = accounting_setup()
       parent = self()
@@ -221,5 +280,24 @@ defmodule CodexPooler.Accounting.APIKeyPolicyReservationTest do
                :count
              ) == 1
     end
+  end
+
+  defp insert_model_policy!(api_key, model_identifier, attrs) do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %APIKeyPolicyBinding{
+      api_key_id: api_key.id,
+      binding_scope: "model",
+      model_identifier: model_identifier,
+      status: Map.get(attrs, :status, "active"),
+      max_requests_per_minute: Map.get(attrs, :max_requests_per_minute),
+      max_tokens_per_day: Map.get(attrs, :max_tokens_per_day),
+      max_tokens_per_week: Map.get(attrs, :max_tokens_per_week),
+      max_input_tokens_per_request: Map.get(attrs, :max_input_tokens_per_request),
+      max_output_tokens_per_request: Map.get(attrs, :max_output_tokens_per_request),
+      created_at: now,
+      updated_at: now
+    }
+    |> Repo.insert!()
   end
 end

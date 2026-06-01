@@ -13,16 +13,17 @@ defmodule CodexPooler.Accounting.ReservationPolicy do
   @amount_recorded "recorded"
   @usage_known "usage_known"
 
-  @spec policy_for_update(term(), String.t() | nil) :: struct() | nil
-  def policy_for_update(api_key, requested_model) do
-    bindings =
-      Repo.all(
-        from b in APIKeyPolicyBinding,
-          where: b.api_key_id == ^api_key.id and b.status == "active",
-          lock: "FOR UPDATE"
-      )
+  @spec effective_policy(term(), String.t() | nil) :: struct() | nil
+  def effective_policy(api_key, requested_model) do
+    api_key.id
+    |> effective_policy_query(requested_model)
+    |> Repo.one()
+  end
 
-    effective_policy_from_bindings(bindings, requested_model)
+  @spec policy_for_update(term(), String.t() | nil, struct() | nil) :: struct() | nil
+  def policy_for_update(api_key, requested_model, candidate_policy \\ nil) do
+    lock_candidate_policy(api_key, requested_model, candidate_policy) ||
+      lock_effective_policy(api_key, requested_model)
   end
 
   @spec effective_model(Model.t(), String.t() | nil, map()) :: String.t() | nil
@@ -41,16 +42,46 @@ defmodule CodexPooler.Accounting.ReservationPolicy do
     end
   end
 
-  defp effective_policy_from_bindings(bindings, requested_model) do
+  defp effective_policy_query(api_key_id, requested_model) do
     key = String.downcase(String.trim(requested_model || ""))
 
-    Enum.find(
-      bindings,
-      &(String.downcase(to_string(&1.model_identifier || "")) == key and
-          &1.binding_scope == "model")
-    ) ||
-      Enum.find(bindings, &(&1.binding_scope == "default"))
+    from b in APIKeyPolicyBinding,
+      where: b.api_key_id == ^api_key_id and b.status == "active",
+      where:
+        b.binding_scope == "default" or
+          (b.binding_scope == "model" and fragment("lower(?)", b.model_identifier) == ^key),
+      order_by: [desc: b.binding_scope],
+      limit: 1
   end
+
+  defp lock_candidate_policy(_api_key, _requested_model, nil), do: nil
+
+  defp lock_candidate_policy(api_key, requested_model, %APIKeyPolicyBinding{id: id}) do
+    locked_policy =
+      Repo.one(
+        from b in APIKeyPolicyBinding,
+          where: b.id == ^id and b.api_key_id == ^api_key.id and b.status == "active",
+          lock: "FOR UPDATE"
+      )
+
+    if effective_binding?(locked_policy, requested_model), do: locked_policy
+  end
+
+  defp lock_effective_policy(api_key, requested_model) do
+    api_key.id
+    |> effective_policy_query(requested_model)
+    |> then(&Repo.one(from b in &1, lock: "FOR UPDATE"))
+  end
+
+  defp effective_binding?(%APIKeyPolicyBinding{binding_scope: "default"}, _requested_model),
+    do: true
+
+  defp effective_binding?(%APIKeyPolicyBinding{binding_scope: "model"} = binding, requested_model) do
+    String.downcase(to_string(binding.model_identifier || "")) ==
+      String.downcase(String.trim(requested_model || ""))
+  end
+
+  defp effective_binding?(_binding, _requested_model), do: false
 
   defp enforce_window_reservation_limits(api_key, policy, estimate, timestamp) do
     minute_usage = ledger_window_usage(api_key.id, DateTime.add(timestamp, -60, :second))
