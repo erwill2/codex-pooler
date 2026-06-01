@@ -310,11 +310,8 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
 
     assert result["isError"] == true
     assert [%{"type" => "text", "text" => text}] = result["content"]
-    assert text =~ "Invalid tool arguments"
-
-    assert result["structuredContent"] == %{
-             "error" => %{"code" => "invalid_arguments", "message" => "Invalid tool arguments"}
-           }
+    assert text == "invalid_arguments: Invalid tool arguments"
+    refute Map.has_key?(result, "structuredContent")
 
     assert :ok = Redaction.assert_mcp_output_safe!(result)
   end
@@ -371,10 +368,9 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
         assert {:ok, result} = ToolDispatch.call(crashing_tool, %{}, %{auth: auth})
         assert result["isError"] == true
 
-        assert get_in(result, ["structuredContent", "error"]) == %{
-                 "code" => "tool_execution_failed",
-                 "message" => "MCP tool execution failed"
-               }
+        assert [%{"type" => "text", "text" => text}] = result["content"]
+        assert text == "tool_execution_failed: MCP tool execution failed"
+        refute Map.has_key?(result, "structuredContent")
       end)
 
     assert log =~ "mcp tool handler failed"
@@ -414,7 +410,9 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
 
     assert {:ok, result} = ToolDispatch.call(bad_tool, %{}, %{auth: auth})
     assert result["isError"] == true
-    assert get_in(result, ["structuredContent", "error", "code"]) == "invalid_tool_output"
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert text == "invalid_tool_output: MCP tool output failed schema validation"
+    refute Map.has_key?(result, "structuredContent")
   end
 
   test "output schema validation rejects present null values unless explicitly nullable", %{
@@ -448,7 +446,9 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
 
     assert {:ok, result} = ToolDispatch.call(bad_tool, %{}, %{auth: auth})
     assert result["isError"] == true
-    assert get_in(result, ["structuredContent", "error", "code"]) == "invalid_tool_output"
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert text == "invalid_tool_output: MCP tool output failed schema validation"
+    refute Map.has_key?(result, "structuredContent")
 
     nullable_tool =
       put_in(bad_tool.output_schema["properties"]["item"]["type"], ["object", "null"])

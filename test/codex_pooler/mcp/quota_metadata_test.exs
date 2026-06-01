@@ -489,18 +489,20 @@ defmodule CodexPooler.MCP.QuotaMetadataTest do
 
   test "quota tools reject invalid semantic arguments", %{auth: auth} do
     invalid_cases = [
-      %{"status" => "archived"},
-      %{"freshness_status" => "old"},
-      %{"routing_usable" => "true"},
-      %{"plan_family" => "   "}
+      {%{"status" => "archived"}, "invalid_arguments: Invalid status"},
+      {%{"freshness_status" => "old"}, "invalid_arguments: Invalid freshness_status"},
+      {%{"routing_usable" => "true"}, "invalid_arguments: Invalid tool arguments"},
+      {%{"plan_family" => "   "}, "invalid_arguments: Invalid plan_family"}
     ]
 
-    for arguments <- invalid_cases do
+    for {arguments, expected_text} <- invalid_cases do
       assert {:ok, result} =
                ToolDispatch.call("codex_pooler_list_upstream_quotas", arguments, %{auth: auth})
 
       assert result["isError"] == true
-      assert get_in(result, ["structuredContent", "error", "code"]) == "invalid_arguments"
+      assert [%{"type" => "text", "text" => text}] = result["content"]
+      assert text == expected_text
+      refute Map.has_key?(result, "structuredContent")
       assert :ok = Redaction.assert_mcp_output_safe!(result)
     end
   end

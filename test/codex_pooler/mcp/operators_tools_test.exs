@@ -193,7 +193,9 @@ defmodule CodexPooler.MCP.OperatorsToolsTest do
              })
 
     assert result["isError"] == true
-    assert get_in(result, ["structuredContent", "error", "code"]) == "invalid_arguments"
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert text == "invalid_arguments: Invalid tool arguments"
+    refute Map.has_key?(result, "structuredContent")
     assert :ok = Redaction.assert_mcp_output_safe!(result)
   end
 

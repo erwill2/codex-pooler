@@ -628,7 +628,9 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
              )
 
     assert result["isError"] == true
-    assert get_in(result, ["structuredContent", "error", "code"]) == "invalid_arguments"
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert text == "invalid_arguments: Invalid date_from"
+    refute Map.has_key?(result, "structuredContent")
     refute inspect(result) =~ date_sentinel
     refute inspect(result) =~ Redaction.forbidden_sentinel!(:raw_headers)
     assert :ok = Redaction.assert_mcp_output_safe!(result)

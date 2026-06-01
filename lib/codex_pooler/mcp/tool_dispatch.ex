@@ -157,8 +157,7 @@ defmodule CodexPooler.MCP.ToolDispatch do
     code = error |> Map.get(:code, :tool_execution_failed) |> to_string()
 
     %{
-      "content" => [%{"type" => "text", "text" => message}],
-      "structuredContent" => %{"error" => %{"code" => code, "message" => message}},
+      "content" => [%{"type" => "text", "text" => "#{code}: #{message}"}],
       "isError" => true
     }
   end
