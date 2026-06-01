@@ -32,7 +32,7 @@
 
 :root {
   --cp-font-sans: "Roboto Condensed", ui-sans-serif, system-ui, sans-serif;
-  --cp-color-primary: #ff9900;
+  --cp-color-primary: #fe8618;
 
   --sl-font: var(--cp-font-sans);
   --sl-color-accent-low: var(--cp-color-primary);
@@ -57,4 +57,16 @@ header a[href="/"] {
   font-family: var(--cp-font-sans);
   font-weight: 700;
   letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.site-title,
+.site-title:visited {
+  color: var(--cp-color-primary);
+}
+
+.sidebar-content a[aria-current="page"],
+.sidebar-content a[aria-current="page"]:visited {
+  border-color: var(--cp-color-primary);
+  color: #111318;
 }
