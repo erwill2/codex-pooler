@@ -9,6 +9,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   alias CodexPooler.Gateway.Routing.CandidateEligibility.Quota
   alias CodexPooler.Gateway.Routing.{CircuitState, ModelMetadata}
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
+  alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
   alias CodexPooler.RouteClass
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
@@ -89,11 +90,34 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   end
 
   @compact_support_key "supports_compact_responses"
+  @active_model_status "active"
+  @health_excluded [
+    PoolUpstreamAssignment.cooldown_health_status(),
+    PoolUpstreamAssignment.disabled_health_status(),
+    PoolUpstreamAssignment.errored_health_status()
+  ]
 
   @type candidate :: {PoolUpstreamAssignment.t(), UpstreamIdentity.t()}
   @type gateway_error :: Contracts.gateway_error()
   @type quota_decision :: %{optional(String.t()) => term()}
   @type payload :: map()
+  @type pool_ref :: Pool.t() | Model.t() | Ecto.UUID.t()
+  @type model_visibility_hydration :: %{
+          required(:visible_models) => [Model.t()],
+          required(:candidates_by_model_id) => %{optional(Ecto.UUID.t()) => [candidate()]},
+          required(:visible_candidates_by_model_id) => %{optional(Ecto.UUID.t()) => [candidate()]},
+          required(:hydrated_at) => DateTime.t()
+        }
+  @type visible_model_context :: %{
+          required(:requested_model) => String.t(),
+          required(:effective_model) => String.t(),
+          required(:visible_model) => Model.t(),
+          required(:visible_models) => [Model.t()],
+          required(:candidates_by_model_id) => %{optional(Ecto.UUID.t()) => [candidate()]},
+          required(:visible_candidates_by_model_id) => %{optional(Ecto.UUID.t()) => [candidate()]},
+          required(:candidate_snapshots) => [candidate()],
+          required(:hydrated_at) => DateTime.t()
+        }
   @type quota_refresh_plan :: %{
           required(:filter_input) => FilterInput.t(),
           required(:candidate_exclusions) => [map()],
@@ -104,28 +128,82 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
           {:ok, [candidate()], quota_decision()}
           | {:refreshable_quota, quota_refresh_plan()}
 
+  @spec hydrate_model_visibility(pool_ref(), keyword()) :: model_visibility_hydration()
+  def hydrate_model_visibility(pool_or_id, opts \\ []) do
+    timestamp = Keyword.get(opts, :at, DateTime.utc_now() |> DateTime.truncate(:second))
+
+    models =
+      case Keyword.fetch(opts, :models) do
+        {:ok, models} when is_list(models) -> models
+        :error -> list_active_models(pool_id(pool_or_id))
+      end
+
+    candidates = list_visible_candidate_rows(models, timestamp)
+
+    %{}
+    |> Map.put(:visible_candidates_by_model_id, candidates_by_model_id(models, candidates))
+    |> Map.put(:candidates_by_model_id, routable_candidates_by_model_id(models, candidates))
+    |> Map.put(:hydrated_at, timestamp)
+    |> then(fn hydration ->
+      Map.put(hydration, :visible_models, visible_models(models, hydration))
+    end)
+  end
+
+  @spec visible_model_context(pool_ref(), String.t()) :: visible_model_context() | nil
+  def visible_model_context(pool_or_id, requested_model) when is_binary(requested_model) do
+    hydration = hydrate_model_visibility(pool_or_id)
+    requested = String.downcase(String.trim(requested_model))
+
+    case Enum.find(hydration.visible_models, &(String.downcase(&1.exposed_model_id) == requested)) do
+      %Model{} = model ->
+        hydration
+        |> Map.merge(%{
+          requested_model: requested_model,
+          effective_model: requested_model,
+          visible_model: model,
+          candidate_snapshots: Map.get(hydration.candidates_by_model_id, model.id, [])
+        })
+
+      nil ->
+        nil
+    end
+  end
+
+  def visible_model_context(_pool_or_id, _requested_model), do: nil
+
+  @spec policy_visible_models(model_visibility_hydration(), map()) :: [Model.t()]
+  def policy_visible_models(%{visible_models: visible_models}, policy)
+      when is_list(visible_models) do
+    Enum.filter(visible_models, &model_visible_to_policy?(&1, policy))
+  end
+
+  @spec model_source_identity(model_visibility_hydration(), [Model.t()]) ::
+          UpstreamIdentity.t() | nil
+  def model_source_identity(%{} = hydration, models) when is_list(models) do
+    visible_candidates = Map.get(hydration, :visible_candidates_by_model_id, %{})
+
+    models
+    |> Enum.flat_map(&Map.get(visible_candidates, &1.id, []))
+    |> Enum.uniq_by(fn {assignment, _identity} -> assignment.id end)
+    |> Enum.max_by(&model_source_rank/1, fn -> nil end)
+    |> case do
+      {_assignment, %UpstreamIdentity{} = identity} -> identity
+      nil -> nil
+    end
+  end
+
   @spec routable_candidates(Model.t()) ::
           {:ok, [candidate()]} | {:error, gateway_error()}
   def routable_candidates(%Model{} = model) do
-    ids = source_assignment_ids(model)
-    assignment_active_status = PoolUpstreamAssignment.active_status()
-    assignment_active_health_status = PoolUpstreamAssignment.active_health_status()
-    assignment_eligible_status = PoolUpstreamAssignment.eligible_status()
-    identity_active_status = UpstreamIdentity.active_status()
+    model
+    |> hydrate_model_visibility(models: [model])
+    |> routable_candidates(model)
+  end
 
-    candidates =
-      Repo.all(
-        from assignment in PoolUpstreamAssignment,
-          join: identity in UpstreamIdentity,
-          on: identity.id == assignment.upstream_identity_id,
-          where:
-            assignment.id in ^ids and assignment.status == ^assignment_active_status and
-              assignment.eligibility_status == ^assignment_eligible_status and
-              assignment.health_status == ^assignment_active_health_status and
-              identity.status == ^identity_active_status,
-          order_by: [asc: assignment.created_at, asc: assignment.id],
-          select: {assignment, identity}
-      )
+  @spec routable_candidates(model_visibility_hydration() | visible_model_context(), Model.t()) ::
+          {:ok, [candidate()]} | {:error, gateway_error()}
+  def routable_candidates(%{} = hydration, %Model{} = model) do
+    candidates = hydrated_routable_candidates(hydration, model)
 
     if candidates == [],
       do:
@@ -292,6 +370,128 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     payload
     |> Map.get("input")
     |> has_input_image?()
+  end
+
+  defp pool_id(%Pool{id: id}), do: id
+  defp pool_id(%Model{pool_id: id}), do: id
+  defp pool_id(id) when is_binary(id), do: id
+
+  defp list_active_models(pool_id) do
+    Repo.all(
+      from model in Model,
+        where: model.pool_id == ^pool_id and model.status == ^@active_model_status,
+        order_by: [asc: model.exposed_model_id]
+    )
+  end
+
+  defp list_visible_candidate_rows(models, timestamp) when is_list(models) do
+    assignment_ids = models |> Enum.flat_map(&source_assignment_ids/1) |> Enum.uniq()
+
+    if assignment_ids == [] do
+      []
+    else
+      assignment_active_status = PoolUpstreamAssignment.active_status()
+      assignment_eligible_status = PoolUpstreamAssignment.eligible_status()
+      identity_active_status = UpstreamIdentity.active_status()
+
+      Repo.all(
+        from assignment in PoolUpstreamAssignment,
+          join: identity in UpstreamIdentity,
+          on: identity.id == assignment.upstream_identity_id,
+          where:
+            assignment.id in ^assignment_ids and assignment.status == ^assignment_active_status and
+              assignment.eligibility_status == ^assignment_eligible_status and
+              assignment.health_status not in ^@health_excluded and
+              identity.status == ^identity_active_status and
+              (is_nil(assignment.cooldown_until) or assignment.cooldown_until <= ^timestamp),
+          order_by: [asc: assignment.created_at, asc: assignment.id],
+          select: {assignment, identity}
+      )
+    end
+  end
+
+  defp candidates_by_model_id(models, candidates) do
+    Map.new(models, fn %Model{} = model ->
+      source_ids = MapSet.new(source_assignment_ids(model))
+
+      model_candidates =
+        Enum.filter(candidates, fn {assignment, _identity} ->
+          MapSet.member?(source_ids, assignment.id)
+        end)
+
+      {model.id, model_candidates}
+    end)
+  end
+
+  defp routable_candidates_by_model_id(models, candidates) do
+    active_health_status = PoolUpstreamAssignment.active_health_status()
+
+    candidates_by_model_id(models, candidates)
+    |> Map.new(fn {model_id, model_candidates} ->
+      {model_id,
+       Enum.filter(model_candidates, fn {assignment, _identity} ->
+         assignment.health_status == active_health_status
+       end)}
+    end)
+  end
+
+  defp hydrated_routable_candidates(%{} = hydration, %Model{id: id} = model) do
+    candidates_by_model_id = Map.get(hydration, :candidates_by_model_id, %{})
+
+    case Map.fetch(candidates_by_model_id, id) do
+      {:ok, candidates} -> candidates
+      :error -> routable_candidates_by_source_ids(hydration, model)
+    end
+  end
+
+  defp routable_candidates_by_source_ids(%{} = hydration, %Model{} = model) do
+    active_health_status = PoolUpstreamAssignment.active_health_status()
+    source_ids = MapSet.new(source_assignment_ids(model))
+
+    hydration
+    |> Map.get(:visible_candidates_by_model_id, %{})
+    |> Map.values()
+    |> List.flatten()
+    |> Enum.uniq_by(fn {assignment, _identity} -> assignment.id end)
+    |> Enum.filter(fn {assignment, _identity} ->
+      assignment.health_status == active_health_status and
+        MapSet.member?(source_ids, assignment.id)
+    end)
+  end
+
+  defp visible_models(models, %{visible_candidates_by_model_id: visible_candidates}) do
+    Enum.filter(models, fn %Model{} = model ->
+      Map.get(visible_candidates, model.id, []) != []
+    end)
+  end
+
+  defp model_visible_to_policy?(%Model{} = model, policy) do
+    model_allowed_by_policy?(policy, model.exposed_model_id)
+  end
+
+  defp model_allowed_by_policy?(%{allowed_model_identifiers: nil}, _model), do: true
+  defp model_allowed_by_policy?(%{allowed_model_identifiers: []}, _model), do: false
+
+  defp model_allowed_by_policy?(%{allowed_model_identifiers: allowed}, model)
+       when is_binary(model) do
+    normalized = model |> String.trim() |> String.downcase()
+    normalized in allowed
+  end
+
+  defp model_source_rank({%PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity}) do
+    {model_source_plan_rank(identity), assignment.created_at, assignment.id}
+  end
+
+  defp model_source_plan_rank(%UpstreamIdentity{} = identity) do
+    plan = identity.plan_family || identity.plan_label || ""
+
+    cond do
+      plan =~ ~r/enterprise|team/i -> 4
+      plan =~ ~r/pro/i -> 3
+      plan =~ ~r/plus/i -> 2
+      plan =~ ~r/free/i -> 1
+      true -> 0
+    end
   end
 
   defp source_assignment_ids(%Model{} = model) do
