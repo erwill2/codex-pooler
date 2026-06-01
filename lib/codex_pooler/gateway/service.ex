@@ -5,7 +5,6 @@ defmodule CodexPooler.Gateway.Service do
 
   alias CodexPooler.Access
   alias CodexPooler.Accounting
-  alias CodexPooler.Catalog
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Denials
@@ -192,7 +191,7 @@ defmodule CodexPooler.Gateway.Service do
            |> RouteFiltering.filter_candidates(route_state),
          :ok <- SessionContinuity.ensure_unique_turn(request_options),
          {:ok, reserved} <-
-           reserve_and_start_turn(auth, model, payload, endpoint, request_options) do
+           reserve_and_start_turn(auth, model, payload, endpoint, request_options, route_state) do
       dispatch_candidates(
         auth,
         endpoint,
@@ -362,18 +361,33 @@ defmodule CodexPooler.Gateway.Service do
     }
   end
 
-  defp reserve(auth, model, payload, endpoint, %RequestOptions{} = request_options) do
+  defp reserve(
+         auth,
+         model,
+         payload,
+         endpoint,
+         %RequestOptions{} = request_options,
+         %RouteState{} = route_state
+       ) do
     Accounting.reserve(
       auth,
       model,
       payload,
-      AccountingReservation.attrs(auth, payload, endpoint, request_options)
+      AccountingReservation.attrs(auth, payload, endpoint, request_options, route_state)
     )
   end
 
-  defp reserve_and_start_turn(auth, model, payload, endpoint, %RequestOptions{} = request_options) do
+  defp reserve_and_start_turn(
+         auth,
+         model,
+         payload,
+         endpoint,
+         %RequestOptions{} = request_options,
+         %RouteState{} = route_state
+       ) do
     Repo.transaction(fn ->
-      with {:ok, reserved} <- reserve(auth, model, payload, endpoint, request_options),
+      with {:ok, reserved} <-
+             reserve(auth, model, payload, endpoint, request_options, route_state),
            {:ok, reserved} <- SessionContinuity.start_turn(reserved, request_options) do
         reserved
       else
@@ -414,17 +428,8 @@ defmodule CodexPooler.Gateway.Service do
     )
   end
 
-  defp visible_model_context(pool, requested_model) do
-    requested = String.downcase(String.trim(requested_model))
-    visible_models = Catalog.list_visible_models(pool)
-
-    case Enum.find(visible_models, fn model ->
-           String.downcase(model.exposed_model_id) == requested
-         end) do
-      %Model{} = model -> %{visible_model: model, visible_models: visible_models}
-      nil -> nil
-    end
-  end
+  defp visible_model_context(pool, requested_model),
+    do: CandidateEligibility.visible_model_context(pool, requested_model)
 
   defp requested_model(payload) do
     case Map.get(payload, "model") || Map.get(payload, :model) do

@@ -8,6 +8,7 @@ defmodule CodexPooler.Gateway.Metadata do
   alias CodexPooler.Gateway.Denials
   alias CodexPooler.Gateway.Metadata.Accounting, as: MetadataAccounting
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Gateway.Routing.ModelMetadata
 
   @type auth :: Access.auth_context()
@@ -20,12 +21,16 @@ defmodule CodexPooler.Gateway.Metadata do
     endpoint = request_endpoint(request_options, "/backend-api/codex/models")
     request_options = request_options(request_options, endpoint, %{})
 
-    with {:ok, visible_models} <- policy_visible_models(auth, endpoint, request_options),
+    with {:ok, visibility} <- policy_visible_models(auth, endpoint, request_options),
          :ok <-
-           record_metadata_request(auth, endpoint, request_options, visible_models) do
-      pricing_buckets = Catalog.pricing_buckets_by_identifier(visible_models)
+           record_metadata_request(auth, endpoint, request_options, visibility) do
+      pricing_buckets = Catalog.pricing_buckets_by_identifier(visibility.visible_models)
 
-      models = Enum.map(visible_models, &ModelMetadata.codex_model_payload(&1, pricing_buckets))
+      models =
+        Enum.map(
+          visibility.visible_models,
+          &ModelMetadata.codex_model_payload(&1, pricing_buckets)
+        )
 
       {:ok, %{status: 200, headers: json_headers(), body: %{"models" => models}}}
     end
@@ -35,9 +40,9 @@ defmodule CodexPooler.Gateway.Metadata do
   def serve_openai_models(auth, %RequestOptions{} = request_options) do
     request_options = request_options(request_options, "/v1/models", %{})
 
-    with {:ok, visible_models} <- policy_visible_models(auth, "/v1/models", request_options),
-         :ok <- record_metadata_request(auth, "/v1/models", request_options, visible_models) do
-      models = Enum.map(visible_models, &openai_model_payload/1)
+    with {:ok, visibility} <- policy_visible_models(auth, "/v1/models", request_options),
+         :ok <- record_metadata_request(auth, "/v1/models", request_options, visibility) do
+      models = Enum.map(visibility.visible_models, &openai_model_payload/1)
 
       {:ok,
        %{
@@ -52,10 +57,9 @@ defmodule CodexPooler.Gateway.Metadata do
          auth,
          endpoint,
          %RequestOptions{} = request_options,
-         visible_models
+         %{source_identity: source_identity}
        ) do
     request_metadata = request_options.request_metadata
-    source_identity = Catalog.model_source_identity(visible_models)
 
     MetadataAccounting.record_metadata_request(:record_models_metadata_request, auth, %{
       endpoint: endpoint,
@@ -81,26 +85,15 @@ defmodule CodexPooler.Gateway.Metadata do
 
   defp policy_visible_models(auth, endpoint, %RequestOptions{} = request_options) do
     with {:ok, policy} <- normalize_policy_or_log(auth, endpoint, request_options) do
-      models =
-        auth.pool
-        |> Catalog.list_visible_models()
-        |> Enum.filter(&model_visible_to_policy?(&1, policy))
+      hydration = CandidateEligibility.hydrate_model_visibility(auth.pool)
+      visible_models = CandidateEligibility.policy_visible_models(hydration, policy)
 
-      {:ok, models}
+      {:ok,
+       %{
+         visible_models: visible_models,
+         source_identity: CandidateEligibility.model_source_identity(hydration, visible_models)
+       }}
     end
-  end
-
-  defp model_visible_to_policy?(%Model{} = model, policy) do
-    model_allowed_by_policy?(policy, model.exposed_model_id)
-  end
-
-  defp model_allowed_by_policy?(%{allowed_model_identifiers: nil}, _model), do: true
-  defp model_allowed_by_policy?(%{allowed_model_identifiers: []}, _model), do: false
-
-  defp model_allowed_by_policy?(%{allowed_model_identifiers: allowed}, model)
-       when is_binary(model) do
-    normalized = model |> String.trim() |> String.downcase()
-    normalized in allowed
   end
 
   defp normalize_policy_or_log(auth, endpoint, %RequestOptions{} = request_options) do
