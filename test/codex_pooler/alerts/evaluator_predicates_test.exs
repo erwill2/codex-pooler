@@ -7,6 +7,7 @@ defmodule CodexPooler.Alerts.EvaluatorPredicatesTest do
     only: [primary_quota_window_attrs: 1, weekly_quota_window_attrs: 1]
 
   alias CodexPooler.Alerts
+  alias CodexPooler.Alerts.Schemas.AlertRule
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
 
   test "quota target states stay separate for all-assignment predicates" do
@@ -78,6 +79,39 @@ defmodule CodexPooler.Alerts.EvaluatorPredicatesTest do
 
       assert clear_attrs.dedupe_key =~ target_state
     end
+  end
+
+  test "credit-backed probe quota projection keeps a distinct state and reason" do
+    timestamp = now()
+    pool = pool_fixture()
+    %{identity: identity} = upstream_assignment_fixture(pool)
+
+    assert {:ok, [_primary, _weekly]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               primary_quota_window_attrs(%{
+                 used_percent: Decimal.new("20"),
+                 credits: 80,
+                 reset_at: DateTime.add(timestamp, 1, :hour),
+                 observed_at: timestamp
+               }),
+               weekly_quota_window_attrs(%{
+                 used_percent: Decimal.new("100"),
+                 credits: 25,
+                 reset_at: DateTime.add(timestamp, 7, :day),
+                 observed_at: timestamp
+               })
+             ])
+
+    credit_rule = all_assignments_state_rule(pool, "credit_backed_probe")
+    usable_rule = all_assignments_state_rule(pool, "usable")
+
+    assert [%{action: :match, match_attrs: match}] =
+             Alerts.evaluate_rule(credit_rule, at: timestamp)
+
+    assert match.safe_evidence_snapshot["reason_code"] == "credit_backed_probe"
+    assert match.safe_evidence_snapshot["state_counts"] == %{"credit_backed_probe" => 1}
+
+    assert [%{action: :clear}] = Alerts.evaluate_rule(usable_rule, at: timestamp)
   end
 
   test "upstream quota threshold produces upstream-global metadata-only match candidates" do
@@ -157,6 +191,17 @@ defmodule CodexPooler.Alerts.EvaluatorPredicatesTest do
     assert refresh_match.upstream_identity_id == refresh_failed.id
     assert refresh_match.severity == "warning"
     assert refresh_match.safe_evidence_snapshot.reason_code == "refresh_failed"
+  end
+
+  defp all_assignments_state_rule(pool, target_state) do
+    %AlertRule{
+      id: Ecto.UUID.generate(),
+      pool_id: pool.id,
+      scope_type: "pool",
+      rule_kind: "pool_all_assignments_in_state",
+      severity: "warning",
+      target_state: target_state
+    }
   end
 
   defp assert_quota_state_candidate(target_state, windows, timestamp) do

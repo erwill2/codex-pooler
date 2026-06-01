@@ -8,6 +8,7 @@ defmodule CodexPoolerWeb.V1.UsageControllerTest do
 
   alias CodexPooler.Access.APIKeyPolicyBinding
   alias CodexPooler.Accounting.{DailyRollup, Request}
+  alias CodexPooler.Accounting.UsageReadModel.UpstreamUsage
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Usage
   alias CodexPooler.Repo
@@ -249,6 +250,35 @@ defmodule CodexPoolerWeb.V1.UsageControllerTest do
     assert metadata_request.api_key_id == setup.api_key.id
   end
 
+  test "upstream usage selection ranks credit-backed probes between precise and weekly probes" do
+    pool = pool_fixture()
+    now = ~U[2026-06-01 12:00:00Z]
+    %{identity: weekly_identity} = upstream_assignment_fixture(pool)
+    %{identity: credit_identity} = upstream_assignment_fixture(pool)
+
+    insert_usage_windows!(weekly_identity, [
+      weekly_usage_window(now, active_limit: 700, credits: 630, used_percent: Decimal.new("10"))
+    ])
+
+    insert_usage_windows!(credit_identity, [
+      primary_usage_window(now, active_limit: 220, credits: 176, used_percent: Decimal.new("20")),
+      weekly_usage_window(now, active_limit: 1_000, credits: 25, used_percent: Decimal.new("100"))
+    ])
+
+    assert upstream_limit_keys(pool.id, now) == [
+             {"5h", 220, 176},
+             {"7d", 1_000, 25}
+           ]
+
+    %{identity: precise_identity} = upstream_assignment_fixture(pool)
+
+    insert_usage_windows!(precise_identity, [
+      primary_usage_window(now, active_limit: 333, credits: 300, used_percent: Decimal.new("10"))
+    ])
+
+    assert upstream_limit_keys(pool.id, now) == [{"5h", 333, 300}]
+  end
+
   test "GET /v1/usage rejects unsupported filters without side effects", %{conn: conn} do
     setup = active_api_key_fixture()
 
@@ -309,6 +339,60 @@ defmodule CodexPoolerWeb.V1.UsageControllerTest do
       created_at: now,
       updated_at: now
     })
+  end
+
+  defp upstream_limit_keys(pool_id, now) do
+    pool_id
+    |> UpstreamUsage.v1_upstream_limits_for_pool(now, [])
+    |> Enum.map(&{&1.limit_window, &1.max_value, &1.remaining_value})
+  end
+
+  defp insert_usage_windows!(identity, attrs) do
+    assert {:ok, windows} = QuotaWindows.upsert_quota_windows(identity, attrs)
+    windows
+  end
+
+  defp primary_usage_window(now, overrides) do
+    usage_window(
+      now,
+      [
+        quota_key: "account",
+        window_kind: "primary",
+        window_minutes: 300,
+        reset_at: DateTime.add(now, 5, :hour)
+      ],
+      overrides
+    )
+  end
+
+  defp weekly_usage_window(now, overrides) do
+    usage_window(
+      now,
+      [
+        quota_key: "account",
+        window_kind: "secondary",
+        window_minutes: 10_080,
+        reset_at: DateTime.add(now, 7, :day)
+      ],
+      overrides
+    )
+  end
+
+  defp usage_window(now, base, overrides) do
+    base
+    |> Keyword.merge(
+      source: "codex_usage_api",
+      source_precision: "observed",
+      quota_scope: "account",
+      quota_family: "account",
+      freshness_state: "fresh",
+      observed_at: now,
+      last_sync_at: now,
+      merge_precedence: 70,
+      metadata: %{}
+    )
+    |> Keyword.merge(overrides)
+    |> Map.new()
   end
 
   defp upsert_default_policy_binding!(api_key_id, now, attrs) do

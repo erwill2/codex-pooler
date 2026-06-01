@@ -197,6 +197,14 @@ defmodule CodexPooler.Alerts.Evaluator do
   defp quota_state(
          _windows,
          _selection,
+         %{eligible?: true, routing_state: :credit_backed_probe},
+         _timestamp
+       ),
+       do: "credit_backed_probe"
+
+  defp quota_state(
+         _windows,
+         _selection,
          %{eligible?: true, routing_state: :weekly_only_probe},
          _timestamp
        ),
@@ -225,6 +233,9 @@ defmodule CodexPooler.Alerts.Evaluator do
   end
 
   defp quota_reason_codes("usable", _selection, _eligibility, _timestamp), do: ["quota_usable"]
+
+  defp quota_reason_codes("credit_backed_probe", _selection, _eligibility, _timestamp),
+    do: ["credit_backed_probe"]
 
   defp quota_reason_codes("weekly_only", _selection, _eligibility, _timestamp),
     do: ["weekly_only"]

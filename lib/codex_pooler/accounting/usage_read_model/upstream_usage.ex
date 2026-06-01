@@ -176,7 +176,8 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     case QuotaWindows.routing_quota_eligibility_from_windows(windows,
            at: as_of
          ) do
-      %{routing_state: :precise} -> 2
+      %{routing_state: :precise} -> 3
+      %{routing_state: :credit_backed_probe} -> 2
       %{routing_state: :weekly_only_probe} -> 1
       _state -> 0
     end
