@@ -10,6 +10,7 @@ defmodule CodexPooler.Pools.Routing do
   alias CodexPooler.Pools.{Pool, RoutingSettings}
   alias CodexPooler.Repo
 
+  @spec get_routing_settings(Pool.t() | Ecto.UUID.t() | term()) :: RoutingSettings.t() | nil
   def get_routing_settings(%Pool{id: pool_id}), do: get_routing_settings(pool_id)
 
   def get_routing_settings(pool_id) when is_binary(pool_id),
@@ -17,14 +18,22 @@ defmodule CodexPooler.Pools.Routing do
 
   def get_routing_settings(_pool_id), do: nil
 
+  @spec routing_settings_with_defaults(Pool.t() | Ecto.UUID.t() | term()) ::
+          RoutingSettings.t() | nil
+  def routing_settings_with_defaults(%Pool{id: pool_id}),
+    do: routing_settings_with_defaults(pool_id)
+
+  def routing_settings_with_defaults(pool_id) when is_binary(pool_id),
+    do: get_routing_settings(pool_id) || default_routing_settings(pool_id)
+
+  def routing_settings_with_defaults(_pool_id), do: nil
+
   def v1_compatibility_enabled?(%Pool{id: pool_id}), do: v1_compatibility_enabled?(pool_id)
 
   def v1_compatibility_enabled?(pool_id) when is_binary(pool_id) do
-    pool_id
-    |> get_routing_settings()
-    |> case do
+    case routing_settings_with_defaults(pool_id) do
       %RoutingSettings{v1_compatibility_enabled: enabled} -> enabled
-      nil -> default_routing_settings(pool_id).v1_compatibility_enabled
+      nil -> true
     end
   end
 

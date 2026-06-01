@@ -147,6 +147,9 @@ defmodule CodexPooler.Pools do
   @spec get_routing_settings(pool_ref()) :: RoutingSettings.t() | nil
   defdelegate get_routing_settings(pool_or_id), to: Routing
 
+  @spec routing_settings_with_defaults(pool_ref()) :: RoutingSettings.t() | nil
+  defdelegate routing_settings_with_defaults(pool_or_id), to: Routing
+
   @spec v1_compatibility_enabled?(pool_ref()) :: boolean()
   defdelegate v1_compatibility_enabled?(pool_or_id), to: Routing
 

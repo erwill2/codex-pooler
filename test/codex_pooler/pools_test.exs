@@ -155,6 +155,20 @@ defmodule CodexPooler.PoolsTest do
       refute Repo.get(RoutingSettings, pool.id)
 
       assert %RoutingSettings{
+               pool_id: pool_id,
+               routing_strategy: "bridge_ring",
+               bridge_ring_size: 3,
+               sticky_websocket_sessions: true,
+               sticky_http_sessions: false,
+               prompt_cache_affinity_enabled: true,
+               control_plane_analytics_forwarding_enabled: true,
+               v1_compatibility_enabled: true
+             } = Pools.routing_settings_with_defaults(pool)
+
+      assert pool_id == pool.id
+      refute Repo.get(RoutingSettings, pool.id)
+
+      assert %RoutingSettings{
                routing_strategy: "bridge_ring",
                prompt_cache_affinity_enabled: true,
                control_plane_analytics_forwarding_enabled: true,
@@ -180,6 +194,10 @@ defmodule CodexPooler.PoolsTest do
 
       refute Pools.get_routing_settings(routed_pool).prompt_cache_affinity_enabled
       refute Pools.get_routing_settings(routed_pool).control_plane_analytics_forwarding_enabled
+      refute Pools.routing_settings_with_defaults(routed_pool).prompt_cache_affinity_enabled
+
+      refute Pools.routing_settings_with_defaults(routed_pool).control_plane_analytics_forwarding_enabled
+
       refute Pools.v1_compatibility_enabled?(routed_pool)
 
       assert {:ok, %RoutingSettings{} = reenabled_settings} =
