@@ -1,3 +1,6 @@
+ARG DEBIAN_MIRROR=http://debian.mirror.garr.it/debian
+ARG DEBIAN_SECURITY_MIRROR=http://debian.mirror.garr.it/debian-security
+
 FROM node:26.2.0-slim AS assets_deps
 
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false
@@ -9,13 +12,28 @@ RUN npm ci --prefix assets
 
 FROM elixir:1.19.5-otp-28-slim AS builder
 
+ARG DEBIAN_MIRROR
+ARG DEBIAN_SECURITY_MIRROR
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ERL_AFLAGS="+JMsingle true"
 ENV MIX_ENV=prod
 
 WORKDIR /app
 
-RUN apt-get update \
+RUN for file in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+    if [ -f "${file}" ]; then \
+      sed -i \
+        -e "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        -e "s|https://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        -e "s|http://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        -e "s|https://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+        -e "s|https://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+        "${file}"; \
+    fi; \
+  done \
+  && apt-get update \
   && apt-get install -y --no-install-recommends build-essential ca-certificates git \
   && rm -rf /var/lib/apt/lists/*
 
@@ -36,6 +54,9 @@ RUN mix compile \
 
 FROM debian:trixie-slim AS app
 
+ARG DEBIAN_MIRROR
+ARG DEBIAN_SECURITY_MIRROR
+
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/app
 ENV LANG=C.UTF-8
@@ -44,7 +65,19 @@ ENV PORT=4000
 
 WORKDIR /app
 
-RUN apt-get update \
+RUN for file in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+    if [ -f "${file}" ]; then \
+      sed -i \
+        -e "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        -e "s|https://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        -e "s|http://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        -e "s|https://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+        -e "s|https://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
+        "${file}"; \
+    fi; \
+  done \
+  && apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates libncurses6 libstdc++6 openssl \
   && rm -rf /var/lib/apt/lists/* \
   && groupadd --system codex_pooler \
