@@ -21,12 +21,6 @@ defmodule CodexPooler.Admin.ActivityReadModelTest do
     summary = ActivityReadModel.activity_summary_for_pool_ids([pool.id], @started_at, @ended_at)
 
     assert summary.source_counts == %{audit_events: 12, jobs: 0}
-
-    assert ActivityReadModel.activity_source_counts([pool.id], @started_at, @ended_at) == %{
-             audit_events: 12,
-             jobs: 0
-           }
-
     assert length(summary.recent_activity) == 10
     assert Enum.all?(summary.recent_activity, &(&1.type == :audit_event))
 

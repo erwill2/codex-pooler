@@ -36,26 +36,6 @@ defmodule CodexPooler.Admin.ActivityReadModel do
     }
   end
 
-  @spec recent_activity_for_pool_ids([Ecto.UUID.t()], DateTime.t(), DateTime.t()) :: [map()]
-  def recent_activity_for_pool_ids([], _started_at, _ended_at), do: []
-
-  def recent_activity_for_pool_ids(pool_ids, started_at, ended_at) do
-    pool_ids
-    |> audit_events_for(started_at, ended_at)
-    |> recent_activity(jobs_for(pool_ids, started_at, ended_at))
-  end
-
-  @spec activity_source_counts([Ecto.UUID.t()], DateTime.t(), DateTime.t()) ::
-          activity_source_counts()
-  def activity_source_counts([], _started_at, _ended_at), do: %{audit_events: 0, jobs: 0}
-
-  def activity_source_counts(pool_ids, started_at, ended_at) do
-    %{
-      audit_events: source_total(audit_events_for(pool_ids, started_at, ended_at)),
-      jobs: source_total(jobs_for(pool_ids, started_at, ended_at))
-    }
-  end
-
   defp audit_events_for(pool_ids, started_at, ended_at) do
     Repo.all(
       from event in AuditEvent,
