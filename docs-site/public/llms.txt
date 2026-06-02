@@ -1,6 +1,6 @@
 # Codex Pooler Public Docs For Agents
 
-Last reviewed: 2026-06-01
+Last reviewed: 2026-06-02
 
 Canonical docs base: https://docs.codex-pooler.com/
 Canonical llms index: https://docs.codex-pooler.com/llms.txt
@@ -38,13 +38,13 @@ Client base URLs:
 
 Supported route families:
 - /backend-api: Codex backend compatibility route for authenticated Codex clients. Important paths include /backend-api/codex/models, /backend-api/codex/responses, /backend-api/codex/responses/compact, /backend-api/codex/v1/* aliases, /backend-api/files, /backend-api/transcribe, and usage routes such as /backend-api/wham/usage.
-- /v1: narrow OpenAI-compatible /v1 surface for selected SDK routes. Supported examples include /v1/models, /v1/responses, GET /v1/responses for narrow Responses websocket compatibility, /v1/chat/completions, /v1/usage, /v1/files, /v1/audio/transcriptions, /v1/images/generations, and /v1/images/edits.
+- /v1: narrow OpenAI-compatible /v1 surface for selected SDK routes. Supported or translated examples include /v1/models, /v1/responses, GET /v1/responses for narrow Responses websocket compatibility, /v1/chat/completions, /v1/usage, /v1/files metadata and create routes, /v1/audio/transcriptions, /v1/images/generations, and /v1/images/edits.
 - /mcp: root operator MCP endpoint. POST /mcp is metadata-only, read-only Streamable HTTP JSON-RPC. It uses operator-owned MCP bearer tokens, not Pool API keys or browser sessions.
 
 Unsupported boundaries:
 - Codex Pooler does not provide full OpenAI API parity.
 - Unsupported /v1 routes may return deterministic OpenAI-shaped unsupported endpoint errors when explicitly routed.
-- Unsupported /v1 examples include /v1/embeddings, /v1/batches, /v1/moderations, /v1/fine_tuning/jobs, /v1/images/variations, response retrieve, response cancel, and response delete routes.
+- Unsupported /v1 examples include /v1/responses/compact, /v1/files/:file_id/content, DELETE /v1/files/:file_id, /v1/embeddings, /v1/batches, /v1/moderations, /v1/fine_tuning/jobs, /v1/images/variations, response retrieve, response cancel, and response delete routes.
 - /v1/realtime and OpenAI Realtime SDK websocket or session routes are unsupported.
 - GET /v1/responses is narrow Responses websocket compatibility, not /v1/realtime support.
 - POST /backend-api/codex/realtime/calls is a Codex backend control-plane SDP proxy route, not OpenAI Realtime SDK compatibility.

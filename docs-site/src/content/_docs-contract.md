@@ -46,17 +46,20 @@ Allowed public claims:
 - `GET /v1/models`
 - `POST /v1/responses`
 - `GET /v1/responses`, narrow Responses websocket compatibility only
-- `POST /v1/responses/compact`
 - `POST /v1/chat/completions`
 - `GET /v1/usage`
 - `GET /v1/files`
 - `POST /v1/files`
 - `GET /v1/files/:file_id`
-- `GET /v1/files/:file_id/content`, deterministic unsupported content read after ownership checks
-- `DELETE /v1/files/:file_id`, deterministic unsupported delete after ownership checks
 - `POST /v1/audio/transcriptions`
 - `POST /v1/images/generations`
 - `POST /v1/images/edits`
+
+Routed public `/v1` endpoints that must be described as deterministic unsupported behavior:
+
+- `POST /v1/responses/compact`, deterministic unsupported compact route before gateway dispatch
+- `GET /v1/files/:file_id/content`, deterministic unsupported content read after ownership checks
+- `DELETE /v1/files/:file_id`, deterministic unsupported delete after ownership checks
 
 Unsupported public `/v1` routes that may be named as unsupported:
 
