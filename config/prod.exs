@@ -8,6 +8,7 @@ config :codex_pooler, CodexPoolerWeb.Endpoint,
     rewrite_on: [:x_forwarded_host, :x_forwarded_port, :x_forwarded_proto],
     exclude: [
       hosts: ["localhost", "127.0.0.1"],
+      paths: ["/metrics"],
       conn: {CodexPoolerWeb.Plugs.ForwardedSSL, :websocket_over_forwarded_ssl?, []}
     ]
   ]

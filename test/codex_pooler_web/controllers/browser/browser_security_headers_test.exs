@@ -93,6 +93,17 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     refute conn.status == 301
   end
 
+  test "production Plug.SSL allows internal metrics scrapes without redirecting" do
+    opts = Plug.SSL.init(production_force_ssl_options!())
+
+    conn = build_conn(:get, "/metrics")
+
+    conn = Plug.SSL.call(conn, opts)
+
+    refute conn.halted
+    refute conn.status == 301
+  end
+
   test "Plug.SSL still redirects non-websocket forwarded HTTP requests" do
     opts =
       Plug.SSL.init(
@@ -163,4 +174,15 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:codex_pooler, key)
   defp restore_env(key, value), do: Application.put_env(:codex_pooler, key, value)
+
+  defp production_force_ssl_options! do
+    endpoint_config =
+      File.cwd!()
+      |> Path.join("config/prod.exs")
+      |> Config.Reader.read!()
+      |> Keyword.fetch!(:codex_pooler)
+      |> Keyword.fetch!(CodexPoolerWeb.Endpoint)
+
+    Keyword.fetch!(endpoint_config, :force_ssl)
+  end
 end
