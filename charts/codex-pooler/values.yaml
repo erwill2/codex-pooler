@@ -110,10 +110,10 @@ app:
   resources:
     requests:
       cpu: 100m
-      memory: 256Mi
+      memory: 512Mi
     limits:
       cpu: 1000m
-      memory: 1524Mi
+      memory: 768Mi
   nodeSelector: {}
   tolerations: []
   affinity: {}
@@ -140,7 +140,7 @@ oban:
     resources:
       requests:
         cpu: 75m
-        memory: 256Mi
+        memory: 768Mi
       limits:
         cpu: 500m
         memory: 768Mi
@@ -156,11 +156,11 @@ oban:
     terminationGracePeriodSeconds: 75
     resources:
       requests:
-        cpu: 50m
-        memory: 192Mi
+        cpu: 75m
+        memory: 584Mi
       limits:
-        cpu: 450m
-        memory: 384Mi
+        cpu: 500m
+        memory: 584Mi
     nodeSelector: {}
     tolerations: []
     affinity: {}
