@@ -5,7 +5,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Recovery do
 
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.Accounting.RequestLifecycle
-  alias CodexPooler.Gateway.Persistence.SessionReadModel
+  alias CodexPooler.Gateway.Persistence.{CodexTurn, SessionReadModel}
   alias CodexPooler.Repo
 
   @stale_after_seconds 6 * 60 * 60
@@ -77,25 +77,54 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Recovery do
   end
 
   defp release_undispatched_request(%Request{} = request, now) do
-    RequestLifecycle.finalize_reserved_request_failure(request, %{
-      request_status: "failed",
-      response_status_code: 499,
-      last_error_code: @recovery_code,
-      usage_status: "not_applicable",
-      now: now
-    })
+    with {:ok, result} <-
+           RequestLifecycle.finalize_reserved_request_failure(request, %{
+             request_status: "failed",
+             response_status_code: 499,
+             last_error_code: @recovery_code,
+             usage_status: "not_applicable",
+             now: now
+           }) do
+      recover_stale_turn(request, nil, now)
+      {:ok, result}
+    end
   end
 
   defp settle_dispatched_request(%Request{} = request, %Attempt{} = attempt, now) do
-    RequestLifecycle.finalize_request(request, attempt, %{
-      request_status: "failed",
-      attempt_status: "failed",
-      response_status_code: 499,
-      last_error_code: @recovery_code,
-      error_message: "stale reservation recovered after request lifecycle was abandoned",
-      usage: %{status: "usage_unknown", source: @recovery_source},
-      now: now
-    })
+    with {:ok, result} <-
+           RequestLifecycle.finalize_request(request, attempt, %{
+             request_status: "failed",
+             attempt_status: "failed",
+             response_status_code: 499,
+             last_error_code: @recovery_code,
+             error_message: "stale reservation recovered after request lifecycle was abandoned",
+             usage: %{status: "usage_unknown", source: @recovery_source},
+             now: now
+           }) do
+      recover_stale_turn(request, attempt, now)
+      {:ok, result}
+    end
+  end
+
+  defp recover_stale_turn(%Request{id: request_id}, attempt, now) do
+    final_attempt_id = attempt && attempt.id
+
+    CodexTurn
+    |> where(
+      [turn],
+      turn.request_id == ^request_id and turn.status == ^CodexTurn.in_progress_status()
+    )
+    |> Repo.update_all(
+      set: [
+        status: CodexTurn.interrupted_status(),
+        error_code: @recovery_code,
+        final_attempt_id: final_attempt_id,
+        completed_at: now,
+        updated_at: now
+      ]
+    )
+
+    :ok
   end
 
   defp initial_summary do

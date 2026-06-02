@@ -111,9 +111,13 @@ defmodule CodexPooler.Gateway.Persistence.SessionReadModel do
       from turn in CodexTurn,
         join: session in CodexSession,
         on: session.id == turn.codex_session_id,
+        left_join: lease in BridgeOwnerLease,
+        on:
+          lease.codex_session_id == session.id and
+            lease.status == ^@owner_lease_active and lease.expires_at > ^now,
         where:
           turn.request_id == ^request_id and turn.status == ^CodexTurn.in_progress_status() and
-            (is_nil(session.owner_lease_expires_at) or session.owner_lease_expires_at > ^now)
+            (session.owner_lease_expires_at > ^now or not is_nil(lease.id))
     )
   end
 

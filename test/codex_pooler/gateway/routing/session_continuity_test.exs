@@ -6,7 +6,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
   alias CodexPooler.Access
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession}
+  alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession, CodexTurn}
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
   alias CodexPooler.Repo
@@ -108,6 +108,131 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
     end
   end
 
+  describe "filter_codex_session_assignment/3" do
+    test "soft-pins fresh proxy stream sessions without hard continuity anchors" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+      opts = streaming_request_options_with_session(session)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      candidates = [setup.other_candidate, setup.pinned_candidate]
+
+      assert {:ok, filtered} =
+               SessionContinuity.filter_codex_session_assignment(candidates, opts, model)
+
+      assert candidate_assignment_ids(filtered) == [
+               setup.pinned.assignment.id,
+               setup.other.assignment.id
+             ]
+    end
+
+    test "keeps fallback candidates when a fresh proxy stream pinned assignment is absent" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+      opts = streaming_request_options_with_session(session)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert {:ok, [other_candidate]} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert other_candidate == setup.other_candidate
+    end
+
+    test "hard-pins proxy stream continuations with previous_response_id" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+
+      opts =
+        session
+        |> streaming_request_options_with_session()
+        |> RequestOptions.put_continuity(previous_response_id: "resp_strong_anchor")
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert {:error, error} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert_session_assignment_unavailable(error)
+    end
+
+    test "hard-pins proxy stream continuations with accepted turn state" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+
+      opts =
+        session
+        |> streaming_request_options_with_session()
+        |> RequestOptions.put_continuity(accepted_turn_state: "turn_strong_anchor")
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert {:error, error} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert_session_assignment_unavailable(error)
+    end
+
+    test "hard-pins proxy stream sessions after a same-model successful turn" do
+      setup = active_pinned_assignment_setup()
+      api_key = active_api_key_fixture(setup.pool)
+      session = codex_session_fixture(setup, setup.pinned.assignment, api_key.api_key)
+      opts = streaming_request_options_with_session(session)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      succeeded_codex_turn_fixture(setup, session, api_key.api_key, model.exposed_model_id)
+
+      assert {:error, error} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert_session_assignment_unavailable(error)
+    end
+
+    test "does not hard-pin proxy stream sessions from a different helper model success" do
+      setup = active_pinned_assignment_setup()
+      api_key = active_api_key_fixture(setup.pool)
+      session = codex_session_fixture(setup, setup.pinned.assignment, api_key.api_key)
+      opts = streaming_request_options_with_session(session)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      succeeded_codex_turn_fixture(setup, session, api_key.api_key, "gpt-5.4-mini")
+
+      assert {:ok, [other_candidate]} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert other_candidate == setup.other_candidate
+    end
+  end
+
   describe "PreDispatch.prepare/5" do
     test "previous_response_id alias can recover the pinned reauth classification without a live owner lease" do
       setup = pinned_assignment_setup()
@@ -139,6 +264,41 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       assert Repo.aggregate(Request, :count) == 0
       assert Repo.aggregate(Attempt, :count) == 0
     end
+
+    test "keeps fresh proxy stream fallback candidates after attaching codex session" do
+      setup = active_pinned_assignment_setup()
+      api_key = active_api_key_fixture(setup.pool)
+      {:ok, auth} = Access.authenticate_authorization_header(api_key.authorization)
+      session = codex_session_fixture(setup, setup.pinned.assignment, api_key.api_key)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      payload = %{"model" => model.exposed_model_id, "input" => "hello", "stream" => true}
+
+      opts =
+        %{api_key_policy: auth.api_key}
+        |> RequestOptions.build(@endpoint, payload)
+        |> RequestOptions.put_continuity(codex_session: session)
+
+      assert {:ok, %{candidates: candidates}} =
+               PreDispatch.prepare(auth, @endpoint, payload, opts, model)
+
+      assert candidate_assignment_ids(candidates) == [
+               setup.pinned.assignment.id,
+               setup.other.assignment.id
+             ]
+    end
+  end
+
+  defp active_pinned_assignment_setup do
+    pinned_assignment_setup(
+      identity_status: "active",
+      identity_metadata: %{},
+      health_status: "active",
+      eligibility_status: "eligible",
+      assignment_status: "active"
+    )
   end
 
   defp pinned_assignment_setup(attrs \\ []) do
@@ -160,6 +320,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       pool: pool,
       pinned: pinned,
       other: other,
+      pinned_candidate: {pinned.assignment, pinned.identity},
       other_candidate: {other.assignment, other.identity}
     }
   end
@@ -195,6 +356,47 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
     %{}
     |> RequestOptions.build(@endpoint, %{"model" => "gpt-5.5", "input" => "hello"})
     |> RequestOptions.put_continuity(codex_session: session)
+  end
+
+  defp streaming_request_options_with_session(%CodexSession{} = session) do
+    %{}
+    |> RequestOptions.build(@endpoint, %{
+      "model" => "gpt-5.5",
+      "input" => "hello",
+      "stream" => true
+    })
+    |> RequestOptions.put_continuity(codex_session: session)
+  end
+
+  defp succeeded_codex_turn_fixture(setup, %CodexSession{} = session, api_key, requested_model) do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    request =
+      request_fixture(%{pool: setup.pool, api_key: api_key}, %{
+        requested_model: requested_model,
+        transport: "http_sse",
+        status: "succeeded",
+        usage_status: "usage_known",
+        response_status_code: 200,
+        completed_at: now
+      })
+
+    %CodexTurn{
+      codex_session_id: session.id,
+      request_id: request.id,
+      turn_sequence: 1,
+      transport_kind: "http_sse",
+      status: "succeeded",
+      started_at: now,
+      completed_at: now,
+      created_at: now,
+      updated_at: now
+    }
+    |> Repo.insert!()
+  end
+
+  defp candidate_assignment_ids(candidates) do
+    Enum.map(candidates, fn {assignment, _identity} -> assignment.id end)
   end
 
   defp register_previous_response_alias!(%CodexSession{} = session, api_key, previous_response_id) do

@@ -4,14 +4,16 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
   import Ecto.Query
 
   alias CodexPooler.Accounting.Request
+  alias CodexPooler.Catalog.Model
   alias CodexPooler.Files
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Payloads.ContinuityPayload
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession}
+  alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession, CodexTurn}
   alias CodexPooler.Gateway.Persistence.SessionContinuity, as: ContinuityStore
   alias CodexPooler.Gateway.Routing.BridgeRing
   alias CodexPooler.Repo
+  alias CodexPooler.RouteClass
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   @type auth :: CodexPooler.Access.auth_context()
@@ -154,6 +156,26 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
 
   def filter_file_affinity(candidates, %RequestOptions{}), do: {:ok, candidates}
 
+  @spec filter_codex_session_assignment([BridgeRing.candidate()], RequestOptions.t(), Model.t()) ::
+          {:ok, [BridgeRing.candidate()]} | {:error, gateway_error()}
+  def filter_codex_session_assignment(
+        candidates,
+        %RequestOptions{
+          continuity: %{codex_session: %CodexSession{pool_upstream_assignment_id: assignment_id}}
+        } = request_options,
+        %Model{} = model
+      )
+      when is_binary(assignment_id) do
+    if hard_pin_codex_session_assignment?(request_options, model) do
+      filter_codex_session_assignment(candidates, request_options)
+    else
+      {:ok, prefer_codex_session_assignment(candidates, assignment_id)}
+    end
+  end
+
+  def filter_codex_session_assignment(candidates, %RequestOptions{} = request_options, %Model{}),
+    do: filter_codex_session_assignment(candidates, request_options)
+
   @spec filter_codex_session_assignment([BridgeRing.candidate()], RequestOptions.t()) ::
           {:ok, [BridgeRing.candidate()]} | {:error, gateway_error()}
   def filter_codex_session_assignment(
@@ -174,6 +196,72 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
   end
 
   def filter_codex_session_assignment(candidates, %RequestOptions{}), do: {:ok, candidates}
+
+  @spec hard_pin_codex_session_assignment?(RequestOptions.t(), Model.t()) :: boolean()
+  defp hard_pin_codex_session_assignment?(%RequestOptions{} = request_options, %Model{} = model) do
+    RequestOptions.route_class(request_options) != RouteClass.proxy_stream() or
+      continuity_anchor?(request_options) or
+      file_affinity?(request_options) or
+      same_model_successful_turn?(request_options, model)
+  end
+
+  @spec continuity_anchor?(RequestOptions.t()) :: boolean()
+  defp continuity_anchor?(%RequestOptions{continuity: continuity}) do
+    [
+      continuity.accepted_turn_state,
+      continuity.previous_response_id,
+      continuity.session_header
+    ]
+    |> Enum.any?(&is_binary(clean_string(&1)))
+  end
+
+  @spec file_affinity?(RequestOptions.t()) :: boolean()
+  defp file_affinity?(%RequestOptions{routing: %{file_affinity_assignment_id: assignment_id}}),
+    do: is_binary(clean_string(assignment_id))
+
+  @spec same_model_successful_turn?(RequestOptions.t(), Model.t()) :: boolean()
+  defp same_model_successful_turn?(
+         %RequestOptions{continuity: %{codex_session: %CodexSession{id: session_id}}} =
+           request_options,
+         %Model{} = model
+       )
+       when is_binary(session_id) do
+    case requested_model_identifier(request_options, model) do
+      requested_model when is_binary(requested_model) ->
+        Repo.exists?(
+          from turn in CodexTurn,
+            join: request in Request,
+            on: request.id == turn.request_id,
+            where:
+              turn.codex_session_id == ^session_id and
+                turn.status == ^CodexTurn.succeeded_status() and
+                request.status == "succeeded" and
+                request.requested_model == ^requested_model
+        )
+
+      nil ->
+        false
+    end
+  end
+
+  defp same_model_successful_turn?(%RequestOptions{}, %Model{}), do: false
+
+  @spec requested_model_identifier(RequestOptions.t(), Model.t()) :: String.t() | nil
+  defp requested_model_identifier(
+         %RequestOptions{routing: %{requested_model: requested_model}},
+         %Model{exposed_model_id: exposed_model_id}
+       ) do
+    clean_string(requested_model) || clean_string(exposed_model_id)
+  end
+
+  @spec prefer_codex_session_assignment([BridgeRing.candidate()], Ecto.UUID.t() | String.t()) ::
+          [BridgeRing.candidate()]
+  defp prefer_codex_session_assignment(candidates, assignment_id) do
+    {pinned, fallback} =
+      Enum.split_with(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end)
+
+    pinned ++ fallback
+  end
 
   @spec pinned_session_assignment_unavailable_error(Ecto.UUID.t() | String.t()) :: gateway_error()
   defp pinned_session_assignment_unavailable_error(assignment_id) do

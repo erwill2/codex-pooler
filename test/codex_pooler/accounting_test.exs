@@ -430,6 +430,71 @@ defmodule CodexPooler.AccountingTest do
              |> Enum.map(& &1.entry_kind) == ["reservation"]
     end
 
+    test "recovers stale in-progress codex turns when no owner lease is active" do
+      setup = accounting_setup()
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      stale_admitted_at = DateTime.add(now, -7, :hour)
+
+      assert {:ok, reserved} =
+               Accounting.reserve(
+                 setup.auth,
+                 setup.model,
+                 %{
+                   "model" => setup.model.exposed_model_id,
+                   "stream" => true,
+                   "max_output_tokens" => 10
+                 },
+                 %{correlation_id: "corr-stale-turn-no-owner", now: stale_admitted_at}
+               )
+
+      assert {:ok, attempt} =
+               Accounting.create_attempt(reserved.request, setup.assignment, %{
+                 now: stale_admitted_at
+               })
+
+      session =
+        %CodexSession{
+          pool_id: setup.pool.id,
+          api_key_id: setup.api_key.id,
+          session_key: "session-#{System.unique_integer([:positive])}",
+          pool_upstream_assignment_id: setup.assignment.id,
+          status: "active",
+          created_at: stale_admitted_at,
+          updated_at: stale_admitted_at
+        }
+        |> Repo.insert!()
+
+      turn =
+        %CodexTurn{
+          codex_session_id: session.id,
+          request_id: reserved.request.id,
+          turn_sequence: 1,
+          transport_kind: "http_sse",
+          status: "in_progress",
+          final_attempt_id: attempt.id,
+          started_at: stale_admitted_at,
+          created_at: stale_admitted_at,
+          updated_at: stale_admitted_at
+        }
+        |> Repo.insert!()
+
+      assert {:ok, %{stale_reservations_released: 0, stale_reservations_settled: 1}} =
+               Accounting.recover_stale_reservations(now)
+
+      assert Repo.get!(CodexPooler.Accounting.Request, reserved.request.id).last_error_code ==
+               "stale_reservation_recovered"
+
+      assert Repo.reload!(attempt).status == "failed"
+
+      assert %CodexTurn{
+               status: "interrupted",
+               error_code: "stale_reservation_recovered",
+               final_attempt_id: attempt_id
+             } = Repo.reload!(turn)
+
+      assert attempt_id == attempt.id
+    end
+
     test "skips already finalized reservations during stale recovery" do
       setup = accounting_setup()
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
