@@ -1,5 +1,11 @@
 defmodule CodexPoolerWeb.TelemetryTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
+
+  setup do
+    original_oban_mode = System.get_env("OBAN_MODE")
+
+    on_exit(fn -> restore_env("OBAN_MODE", original_oban_mode) end)
+  end
 
   test "starts telemetry poller with default VM measurements enabled" do
     assert {:ok, {_supervisor, children}} = CodexPoolerWeb.Telemetry.init(:ok)
@@ -8,6 +14,26 @@ defmodule CodexPoolerWeb.TelemetryTest do
              id: :telemetry_poller,
              start: {:telemetry_poller, :start_link, [[period: 10_000]]}
            } = Enum.find(children, &(&1.id == :telemetry_poller))
+  end
+
+  test "starts prometheus reporter for HTTP-serving roles" do
+    for role <- [nil, "web", "all"] do
+      set_oban_mode(role)
+
+      assert :prometheus_metrics in telemetry_child_ids()
+    end
+  end
+
+  test "skips prometheus reporter for worker and scheduler roles" do
+    for role <- ~w(worker scheduler) do
+      System.put_env("OBAN_MODE", role)
+
+      child_ids = telemetry_child_ids()
+
+      assert CodexPoolerWeb.Telemetry.MemorySampler in child_ids
+      assert :telemetry_poller in child_ids
+      refute :prometheus_metrics in child_ids
+    end
   end
 
   test "exports BEAM memory category and process count Prometheus metrics" do
@@ -267,4 +293,16 @@ defmodule CodexPoolerWeb.TelemetryTest do
   defp metric_name(metric) do
     Enum.map_join(metric.name, ".", &to_string/1)
   end
+
+  defp telemetry_child_ids do
+    {:ok, {_supervisor, children}} = CodexPoolerWeb.Telemetry.init(:ok)
+
+    Enum.map(children, & &1.id)
+  end
+
+  defp set_oban_mode(nil), do: System.delete_env("OBAN_MODE")
+  defp set_oban_mode(role), do: System.put_env("OBAN_MODE", role)
+
+  defp restore_env(key, nil), do: System.delete_env(key)
+  defp restore_env(key, value), do: System.put_env(key, value)
 end

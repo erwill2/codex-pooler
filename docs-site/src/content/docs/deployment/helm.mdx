@@ -96,7 +96,7 @@ The migration hook runs database migrations and imports the vendored OpenAI pric
 
 ## Metrics collection
 
-The app role exposes Prometheus metrics on `/metrics` through the same HTTP service as `/healthz` and `/readyz`. Worker, scheduler, and migration pods don't expose the Phoenix endpoint, so app-level metrics such as BEAM memory, request rate, route latency, gateway admission, stream-buffer pressure, and Ecto query pressure are scraped from app pods only.
+The app role exposes Prometheus metrics on `/metrics` through the same HTTP service as `/healthz` and `/readyz`. Worker, scheduler, and migration pods don't expose the Phoenix endpoint, so app-level metrics such as BEAM memory, request rate, route latency, gateway admission, stream-buffer pressure, and Ecto query pressure are scraped from app pods only. Worker and scheduler roles still run the memory sampler and VM telemetry poller, but they don't start the Prometheus reporter because unswept histogram samples are drained only by a `/metrics` scrape.
 
 If you run Prometheus Operator, enable the chart `ServiceMonitor`:
 

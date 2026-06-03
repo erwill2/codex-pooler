@@ -19,6 +19,7 @@ defmodule CodexPoolerWeb.Telemetry do
   @admin_stats_scopes ~w(selected_pool all_visible_pools)
   @admin_stats_reload_stages ~w(scheduled coalesced cancelled executed)
   @admin_stats_build_outcomes ~w(ok error)
+  @prometheus_reporter_disabled_oban_modes ~w(worker scheduler)
   @repo_source_pattern ~r/\A[a-zA-Z0-9_.-]+\z/
   @safe_route_pattern ~r/\A[a-zA-Z0-9_.*:\/{}-]+\z/
   @safe_tag_pattern ~r/\A[a-zA-Z0-9_.:-]+\z/
@@ -44,7 +45,7 @@ defmodule CodexPoolerWeb.Telemetry do
         perf_probe_child(),
         CodexPoolerWeb.Telemetry.MemorySampler,
         {:telemetry_poller, period: 10_000},
-        {TelemetryMetricsPrometheus.Core, metrics: prometheus_metrics()}
+        prometheus_reporter_child()
       ]
       |> Enum.reject(&is_nil/1)
 
@@ -375,6 +376,18 @@ defmodule CodexPoolerWeb.Telemetry do
 
   defp perf_probe_child do
     if GatewayPerfProbe.enabled?(), do: GatewayPerfProbe
+  end
+
+  @spec prometheus_reporter_child() :: {module(), keyword()} | nil
+  defp prometheus_reporter_child do
+    if prometheus_reporter_enabled?() do
+      {TelemetryMetricsPrometheus.Core, metrics: prometheus_metrics()}
+    end
+  end
+
+  @spec prometheus_reporter_enabled?() :: boolean()
+  defp prometheus_reporter_enabled? do
+    System.get_env("OBAN_MODE") not in @prometheus_reporter_disabled_oban_modes
   end
 
   @spec repo_query_tag_values(map()) :: repo_query_tags()
