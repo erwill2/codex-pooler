@@ -1,5 +1,5 @@
-ARG DEBIAN_MIRROR=http://ftp.de.debian.org/debian
-ARG DEBIAN_SECURITY_MIRROR=http://ftp.de.debian.org/debian-security
+ARG DEBIAN_MIRROR=
+ARG DEBIAN_SECURITY_MIRROR=
 
 FROM node:26.3.0-slim AS assets_deps
 
@@ -22,12 +22,16 @@ ENV MIX_ENV=prod
 WORKDIR /app
 
 RUN for file in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
-    if [ -f "${file}" ]; then \
+    if [ -f "${file}" ] && [ -n "${DEBIAN_SECURITY_MIRROR}" ]; then \
       sed -i \
         -e "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
         -e "s|https://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
         -e "s|http://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
         -e "s|https://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        "${file}"; \
+    fi; \
+    if [ -f "${file}" ] && [ -n "${DEBIAN_MIRROR}" ]; then \
+      sed -i \
         -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
         -e "s|https://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
         "${file}"; \
@@ -66,12 +70,16 @@ ENV PORT=4000
 WORKDIR /app
 
 RUN for file in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
-    if [ -f "${file}" ]; then \
+    if [ -f "${file}" ] && [ -n "${DEBIAN_SECURITY_MIRROR}" ]; then \
       sed -i \
         -e "s|http://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
         -e "s|https://deb.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
         -e "s|http://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
         -e "s|https://security.debian.org/debian-security|${DEBIAN_SECURITY_MIRROR}|g" \
+        "${file}"; \
+    fi; \
+    if [ -f "${file}" ] && [ -n "${DEBIAN_MIRROR}" ]; then \
+      sed -i \
         -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
         -e "s|https://deb.debian.org/debian|${DEBIAN_MIRROR}|g" \
         "${file}"; \
