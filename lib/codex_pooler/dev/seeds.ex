@@ -1009,25 +1009,173 @@ defmodule CodexPooler.Dev.Seeds do
     |> Enum.map(&Repo.insert!(struct(AuditEvent, &1)))
   end
 
-  defp seed_jobs!(pool, [assignment | _], [identity | _], [api_key | _]) do
-    jobs = [
-      {CodexPooler.Jobs.AccountReconciliationWorker, "completed",
-       %{"pool_id" => pool.id, "pool_upstream_assignment_id" => assignment.id}},
-      {CodexPooler.Jobs.AccountReconciliationWorker, "cancelled",
-       %{"pool_id" => pool.id, "pool_upstream_assignment_id" => assignment.id}},
-      {CodexPooler.Jobs.TokenRefreshWorker, "scheduled",
-       %{"upstream_identity_id" => identity.id}},
-      {CodexPooler.Jobs.DailyRollupRebuildWorker, "discarded",
-       %{"api_key_id" => api_key.id, "rollup_date" => Date.to_iso8601(Date.utc_today())}}
-    ]
+  defp seed_jobs!(pool, assignments, identities, [api_key | _]) do
+    [primary_assignment, ready_assignment, exhausted_assignment, cooldown_assignment | _] =
+      assignments
 
-    Enum.map(jobs, fn {worker, state, args} ->
+    [primary_identity, ready_identity, exhausted_identity, plus_identity | _] = identities
+    rollup_date = Date.utc_today() |> Date.add(-1) |> Date.to_iso8601()
+
+    [
+      seed_job!(
+        CodexPooler.Jobs.AccountReconciliationWorker,
+        %{"pool_id" => pool.id, "pool_upstream_assignment_id" => primary_assignment.id},
+        state: "discarded",
+        attempt: 3,
+        max_attempts: 3,
+        inserted_at: minutes_ago(120),
+        attempted_at: minutes_ago(118),
+        discarded_at: minutes_ago(116),
+        errors: [job_error(3, "RuntimeError", "account reconciliation quota probe unavailable")]
+      ),
+      seed_job!(
+        CodexPooler.Jobs.AccountReconciliationWorker,
+        %{"pool_id" => pool.id, "pool_upstream_assignment_id" => primary_assignment.id},
+        state: "discarded",
+        attempt: 2,
+        max_attempts: 3,
+        inserted_at: minutes_ago(110),
+        attempted_at: minutes_ago(108),
+        discarded_at: minutes_ago(106),
+        errors: [job_error(2, "RuntimeError", "account reconciliation usage refresh unavailable")]
+      ),
+      seed_job!(
+        CodexPooler.Jobs.DailyRollupRebuildWorker,
+        %{"api_key_id" => api_key.id, "rollup_date" => rollup_date},
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 1,
+        inserted_at: minutes_ago(95),
+        attempted_at: minutes_ago(94),
+        discarded_at: minutes_ago(93),
+        errors: [job_error(1, "RuntimeError", "daily rollup source window missing")]
+      ),
+      seed_job!(
+        CodexPooler.Jobs.TokenRefreshWorker,
+        %{"upstream_identity_id" => primary_identity.id},
+        state: "retryable",
+        attempt: 4,
+        max_attempts: 8,
+        inserted_at: minutes_ago(80),
+        attempted_at: minutes_ago(78),
+        scheduled_at: minutes_from_now(15),
+        errors: [
+          job_error(4, "RuntimeError", "token refresh provider returned temporary failure")
+        ]
+      ),
+      seed_job!(
+        CodexPooler.Jobs.TokenRefreshWorker,
+        %{"upstream_identity_id" => ready_identity.id},
+        state: "retryable",
+        attempt: 2,
+        max_attempts: 8,
+        inserted_at: minutes_ago(76),
+        attempted_at: minutes_ago(75),
+        scheduled_at: minutes_from_now(25),
+        errors: [job_error(2, "RuntimeError", "token refresh provider rate limited")]
+      ),
+      seed_job!(
+        CodexPooler.Jobs.TokenRefreshWorker,
+        %{"upstream_identity_id" => exhausted_identity.id},
+        state: "retryable",
+        attempt: 1,
+        max_attempts: 8,
+        inserted_at: minutes_ago(70),
+        attempted_at: minutes_ago(69),
+        scheduled_at: minutes_from_now(35),
+        errors: [job_error(1, "RuntimeError", "token refresh waiting for provider recovery")]
+      ),
+      seed_job!(
+        CodexPooler.Jobs.RuntimeStateCleanupWorker,
+        %{},
+        state: "executing",
+        attempt: 1,
+        max_attempts: 3,
+        inserted_at: minutes_ago(65),
+        attempted_at: minutes_ago(45)
+      ),
+      seed_job!(
+        CodexPooler.Jobs.DailyRollupRebuildWorker,
+        %{
+          "api_key_id" => api_key.id,
+          "rollup_date" => Date.utc_today() |> Date.add(-2) |> Date.to_iso8601()
+        },
+        state: "executing",
+        attempt: 1,
+        max_attempts: 3,
+        inserted_at: minutes_ago(70),
+        attempted_at: minutes_ago(40)
+      ),
+      seed_job!(
+        CodexPooler.Jobs.CatalogSyncWorker,
+        %{"pool_id" => pool.id},
+        state: "available",
+        inserted_at: minutes_ago(50),
+        scheduled_at: minutes_ago(25)
+      ),
+      seed_job!(
+        CodexPooler.Jobs.AccountReconciliationWorker,
+        %{"pool_id" => pool.id, "pool_upstream_assignment_id" => ready_assignment.id},
+        state: "available",
+        inserted_at: minutes_ago(48),
+        scheduled_at: minutes_ago(18)
+      ),
+      seed_job!(
+        CodexPooler.Jobs.AccountReconciliationWorker,
+        %{"pool_id" => pool.id, "pool_upstream_assignment_id" => exhausted_assignment.id},
+        state: "available",
+        inserted_at: minutes_ago(44),
+        scheduled_at: minutes_ago(12)
+      ),
+      seed_job!(
+        CodexPooler.Jobs.TokenRefreshWorker,
+        %{"upstream_identity_id" => plus_identity.id},
+        state: "scheduled",
+        inserted_at: minutes_ago(5),
+        scheduled_at: minutes_from_now(60)
+      ),
+      seed_job!(
+        CodexPooler.Jobs.AccountReconciliationWorker,
+        %{"pool_id" => pool.id, "pool_upstream_assignment_id" => cooldown_assignment.id},
+        state: "completed",
+        attempt: 1,
+        max_attempts: 3,
+        inserted_at: minutes_ago(35),
+        attempted_at: minutes_ago(34),
+        completed_at: minutes_ago(33)
+      ),
+      seed_job!(
+        CodexPooler.Jobs.RuntimeStateCleanupWorker,
+        %{},
+        state: "completed",
+        inserted_at: minutes_ago(30),
+        attempted_at: minutes_ago(29),
+        completed_at: minutes_ago(28)
+      ),
+      seed_job!(
+        CodexPooler.Jobs.AccountReconciliationWorker,
+        %{"pool_id" => pool.id, "pool_upstream_assignment_id" => primary_assignment.id},
+        state: "cancelled",
+        inserted_at: minutes_ago(25),
+        cancelled_at: minutes_ago(24)
+      )
+    ]
+  end
+
+  defp seed_job!(worker, args, attrs) do
+    base_job =
       args
-      |> worker.new(meta: %{"dev_seed" => @seed_key}, scheduled_at: minutes_from_now(1_440))
-      |> Oban.insert!()
-      |> Ecto.Changeset.change(job_state_attrs(state))
-      |> Repo.update!()
-    end)
+      |> worker.new(job_options(attrs))
+      |> Ecto.Changeset.apply_changes()
+
+    base_job
+    |> Map.merge(job_attrs(attrs))
+    |> Map.put(:queue, "dev_seed_jobs")
+    |> Repo.insert!()
+  end
+
+  defp job_options(_attrs) do
+    [meta: %{"dev_seed" => @seed_key}, scheduled_at: minutes_from_now(1_440)]
   end
 
   defp user_attrs(spec, timestamp) do
@@ -1228,14 +1376,31 @@ defmodule CodexPooler.Dev.Seeds do
     }
   end
 
-  defp job_state_attrs("completed"), do: %{state: "completed", completed_at: minutes_ago(5)}
-  defp job_state_attrs("cancelled"), do: %{state: "cancelled", cancelled_at: minutes_ago(3)}
-  defp job_state_attrs("discarded"), do: %{state: "discarded", discarded_at: minutes_ago(4)}
+  defp job_attrs(attrs) do
+    attrs
+    |> Keyword.take([
+      :state,
+      :attempt,
+      :max_attempts,
+      :inserted_at,
+      :scheduled_at,
+      :attempted_at,
+      :completed_at,
+      :discarded_at,
+      :cancelled_at,
+      :errors
+    ])
+    |> Map.new()
+  end
 
-  defp job_state_attrs("scheduled"),
-    do: %{state: "scheduled", scheduled_at: minutes_from_now(1_440)}
-
-  defp job_state_attrs(state), do: %{state: state}
+  defp job_error(attempt, kind, message) do
+    %{
+      "attempt" => attempt,
+      "kind" => kind,
+      "error" => message,
+      "at" => DateTime.to_iso8601(now())
+    }
+  end
 
   defp attempt_status("succeeded"), do: "succeeded"
   defp attempt_status("failed"), do: "failed"

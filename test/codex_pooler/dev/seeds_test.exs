@@ -372,15 +372,34 @@ defmodule CodexPooler.Dev.SeedsTest do
     seeded_jobs =
       Repo.all(from job in Oban.Job, where: job.meta["dev_seed"] == "codex_pooler_dev_seed")
 
-    assert Enum.map(seeded_jobs, & &1.state) |> Enum.sort() == [
-             "cancelled",
-             "completed",
-             "discarded",
-             "scheduled"
-           ]
+    assert Enum.frequencies_by(seeded_jobs, & &1.state) == %{
+             "available" => 3,
+             "cancelled" => 1,
+             "completed" => 2,
+             "discarded" => 3,
+             "executing" => 2,
+             "retryable" => 3,
+             "scheduled" => 1
+           }
 
-    scheduled_job = Enum.find(seeded_jobs, &(&1.state == "scheduled"))
-    assert DateTime.compare(scheduled_job.scheduled_at, DateTime.utc_now()) == :gt
+    assert seeded_jobs
+           |> Enum.map(& &1.worker)
+           |> Enum.uniq()
+           |> Enum.sort() ==
+             [
+               "CodexPooler.Jobs.AccountReconciliationWorker",
+               "CodexPooler.Jobs.CatalogSyncWorker",
+               "CodexPooler.Jobs.DailyRollupRebuildWorker",
+               "CodexPooler.Jobs.RuntimeStateCleanupWorker",
+               "CodexPooler.Jobs.TokenRefreshWorker"
+             ]
+
+    future_scheduled_job =
+      Enum.find(seeded_jobs, fn job ->
+        job.state == "scheduled" and DateTime.compare(job.scheduled_at, DateTime.utc_now()) == :gt
+      end)
+
+    assert future_scheduled_job
   end
 
   defp statuses_for(schema) do

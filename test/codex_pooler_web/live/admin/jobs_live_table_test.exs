@@ -35,11 +35,15 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     assert has_element?(view, "#admin-jobs-worker-grid")
     assert has_element?(view, worker_card_selector(:catalog_sync), "Awaiting first run")
     assert has_element?(view, worker_card_selector(:token_refresh), "No observed run")
-    assert has_element?(view, "#admin-jobs-empty-state", "No jobs recorded")
-    refute has_element?(view, "#admin-jobs-table")
+    assert has_element?(view, "#admin-jobs-explorer")
+    assert has_element?(view, "#admin-jobs-explorer-total", "0 jobs")
+    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 0 of 0")
+    assert has_element?(view, "#admin-jobs-empty-state", "No jobs match these filters")
+    refute has_element?(view, "#admin-jobs-explorer-table")
+    refute has_element?(view, "#admin-jobs-explorer-mobile")
   end
 
-  test "worker cards use worker-specific history beyond the recent global slice", %{conn: conn} do
+  test "worker cards use worker-specific history beyond the explorer page slice", %{conn: conn} do
     catalog_job =
       insert_job(
         1,
@@ -126,11 +130,75 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
         {job, label}
       end
 
-    {:ok, view, _html} = live(conn, ~p"/admin/jobs")
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs?show_completed=true")
 
     for {job, label} <- jobs do
       assert has_element?(view, state_icon_selector(job, label))
     end
+  end
+
+  test "explorer hides completed jobs by default and includes them explicitly", %{conn: conn} do
+    completed_job =
+      insert_job(1,
+        state: "completed",
+        inserted_at: ~U[2026-05-04 12:00:00Z],
+        completed_at: ~U[2026-05-04 12:01:00Z]
+      )
+
+    available_job = insert_job(2, state: "available", inserted_at: ~U[2026-05-04 12:02:00Z])
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs")
+
+    assert has_element?(view, "#admin-jobs-explorer")
+    assert has_element?(view, "#admin-jobs-explorer-total", "1 job")
+    assert has_element?(view, "#admin-jobs-explorer-desktop #job-#{available_job.id}")
+    assert has_element?(view, "#admin-jobs-explorer-mobile #job-card-#{available_job.id}")
+    refute has_element?(view, "#job-#{completed_job.id}")
+    refute has_element?(view, "#job-card-#{completed_job.id}")
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs?show_completed=true")
+
+    assert has_element?(view, "#admin-jobs-explorer-total", "2 jobs")
+    assert has_element?(view, "#admin-jobs-explorer-desktop #job-#{completed_job.id}")
+    assert has_element?(view, "#admin-jobs-explorer-mobile #job-card-#{completed_job.id}")
+  end
+
+  test "explorer paginates globally with stable desktop and mobile selectors", %{conn: conn} do
+    base_time = ~U[2026-05-04 12:00:00Z]
+
+    jobs =
+      for index <- 1..55 do
+        insert_job(index,
+          state: "available",
+          inserted_at: DateTime.add(base_time, index, :second)
+        )
+      end
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs")
+    rendered = render(view)
+
+    assert has_element?(view, "#admin-jobs-explorer")
+    assert has_element?(view, "#admin-jobs-explorer-total", "55 jobs")
+    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 1-50 of 55")
+    assert has_element?(view, "#admin-jobs-explorer-pagination", "Page 1 of 2")
+    assert has_element?(view, "#admin-jobs-explorer-pagination-prev[aria-disabled='true']")
+    assert has_element?(view, "#admin-jobs-explorer-pagination-next[href='/admin/jobs?page=2']")
+    assert count_occurrences(rendered, ~s(<tr id="job-)) == 50
+    assert count_occurrences(rendered, ~s(<article id="job-card-)) == 50
+    assert has_element?(view, "#admin-jobs-explorer-desktop #job-#{List.last(jobs).id}")
+    assert has_element?(view, "#admin-jobs-explorer-mobile #job-card-#{List.last(jobs).id}")
+    refute has_element?(view, "#job-#{List.first(jobs).id}")
+    refute has_element?(view, "#job-card-#{List.first(jobs).id}")
+
+    render_click(element(view, "#admin-jobs-explorer-pagination-next"))
+    assert_patch(view, ~p"/admin/jobs?page=2")
+
+    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 51-55 of 55")
+    assert has_element?(view, "#admin-jobs-explorer-pagination", "Page 2 of 2")
+    assert has_element?(view, "#admin-jobs-explorer-pagination-prev[href='/admin/jobs']")
+    assert has_element?(view, "#admin-jobs-explorer-pagination-next[aria-disabled='true']")
+    assert has_element?(view, "#admin-jobs-explorer-desktop #job-#{List.first(jobs).id}")
+    assert has_element?(view, "#admin-jobs-explorer-mobile #job-card-#{List.first(jobs).id}")
   end
 
   test "does not render job mutation controls", %{conn: conn} do
@@ -138,8 +206,10 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
 
     for label <- ["Retry", "Cancel", "Discard", "Delete"] do
-      refute has_element?(view, "button", label)
-      refute has_element?(view, "a", label)
+      refute has_element?(view, "#admin-jobs-explorer [data-role='job-row'] button", label)
+      refute has_element?(view, "#admin-jobs-explorer [data-role='job-row'] a", label)
+      refute has_element?(view, "#admin-jobs-explorer [data-role='job-card'] button", label)
+      refute has_element?(view, "#admin-jobs-explorer [data-role='job-card'] a", label)
     end
   end
 

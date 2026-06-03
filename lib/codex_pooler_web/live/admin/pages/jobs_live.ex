@@ -1,37 +1,112 @@
 defmodule CodexPoolerWeb.Admin.JobsLive do
   use CodexPoolerWeb, :admin_live_view
 
-  import CodexPoolerWeb.Admin.JobsPresentation
+  import CodexPoolerWeb.Admin.JobsPresentation, only: [worker_cards: 1]
 
   alias CodexPooler.Events
   alias CodexPooler.Pools
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.JobDetailDrawer
+  alias CodexPoolerWeb.Admin.JobExplorer
+  alias CodexPoolerWeb.Admin.JobFilterForm
+  alias CodexPoolerWeb.Admin.JobFilters
+  alias CodexPoolerWeb.Admin.JobOverview
   alias CodexPoolerWeb.Admin.JobsReadModel
   alias CodexPoolerWeb.Admin.JobWorkerCards
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
 
   @jobs_reload_debounce_ms 1_000
   @jobs_fallback_refresh_ms 5_000
-  @recent_jobs_limit 15
 
   @impl true
   def mount(_params, _session, socket) do
+    empty_page_state = JobsReadModel.load(nil)
+
     socket =
-      assign(socket,
+      socket
+      |> assign(
         page_title: "Jobs",
         owner_authorized?: Pools.owner?(socket.assigns.current_scope),
-        jobs: [],
-        worker_cards: worker_cards(%{}),
-        recent_jobs: [],
         jobs_reload_timer: nil,
         subscribed_pool_ids: MapSet.new()
       )
+      |> assign_page_state(empty_page_state, %{})
 
     if socket.assigns.owner_authorized? do
-      {:ok, socket |> refresh_jobs() |> maybe_start_connected_refresh()}
+      {:ok, maybe_start_connected_refresh(socket)}
     else
       {:ok, socket}
     end
+  end
+
+  @impl true
+  def handle_params(params, _uri, socket) do
+    socket =
+      socket
+      |> load_jobs_page(params)
+      |> maybe_clear_missing_selected_job()
+
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_event("filter", %{"filters" => filter_params}, socket) do
+    {:noreply,
+     push_patch(socket, to: ~p"/admin/jobs?#{JobFilterForm.query_params(filter_params)}")}
+  end
+
+  def handle_event("select_attention_filter", %{"attention" => attention}, socket) do
+    {:noreply, patch_filter(socket, "attention", attention)}
+  end
+
+  def handle_event("select_state_filter", %{"state" => state}, socket) do
+    {:noreply, patch_filter(socket, "state", state)}
+  end
+
+  def handle_event("select_worker_filter", %{"worker" => worker}, socket) do
+    {:noreply, patch_filter(socket, "worker", worker)}
+  end
+
+  def handle_event("select_queue_filter", %{"queue" => queue}, socket) do
+    {:noreply, patch_filter(socket, "queue", queue)}
+  end
+
+  def handle_event("select_target_kind_filter", %{"target-kind" => target_kind}, socket) do
+    socket =
+      if target_kind == "" do
+        patch_filters(socket, %{"target_kind" => "", "target_id" => ""})
+      else
+        patch_filter(socket, "target_kind", target_kind)
+      end
+
+    {:noreply, socket}
+  end
+
+  def handle_event("select_show_completed_filter", %{"show-completed" => show_completed}, socket) do
+    {:noreply, patch_filter(socket, "show_completed", show_completed)}
+  end
+
+  def handle_event("clear_filters", _params, socket) do
+    {:noreply,
+     push_patch(socket,
+       to:
+         ~p"/admin/jobs?#{JobFilterForm.clear_filter_query_params(socket.assigns.current_params)}"
+     )}
+  end
+
+  def handle_event("open_job", %{"job-id" => job_id}, socket) do
+    {:noreply,
+     push_patch(socket,
+       to:
+         ~p"/admin/jobs?#{JobFilterForm.open_job_query_params(socket.assigns.current_params, job_id)}"
+     )}
+  end
+
+  def handle_event("close_job", _params, socket) do
+    {:noreply,
+     push_patch(socket,
+       to: ~p"/admin/jobs?#{JobFilterForm.close_job_query_params(socket.assigns.current_params)}"
+     )}
   end
 
   @impl true
@@ -61,128 +136,84 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
       active_nav={:jobs}
       alert_notification_center={@alert_notification_center}
     >
-      <section id="admin-jobs-page" class="grid min-w-0 gap-6">
-        <AdminComponents.page_header
-          id="admin-jobs-page-header"
-          title="System Jobs"
-          description="Monitor background work and quickly check whether jobs are queued, running, completed, or need attention."
+      <div id="job-detail-drawer-root" class="drawer drawer-end">
+        <input
+          id="job-detail-drawer"
+          type="checkbox"
+          class="drawer-toggle"
+          checked={@selected_job != nil}
         />
 
-        <AdminComponents.empty_state
-          :if={!@owner_authorized?}
-          id="admin-jobs-owner-denied"
-          title="System jobs require owner access"
-          description="Only instance owners can inspect global background job state."
-          icon="hero-lock-closed"
-        />
+        <div class="drawer-content min-w-0">
+          <section id="admin-jobs-page" class="grid min-w-0 gap-6">
+            <AdminComponents.page_header
+              id="admin-jobs-page-header"
+              title="System Jobs"
+              description="Monitor background work and quickly check whether jobs are queued, running, completed, or need attention."
+            />
 
-        <div :if={@owner_authorized?} id="admin-jobs-worker-grid" class="grid gap-4 xl:grid-cols-2">
-          <JobWorkerCards.job_worker_card :for={card <- @worker_cards} card={card} />
+            <AdminComponents.empty_state
+              :if={!@owner_authorized?}
+              id="admin-jobs-owner-denied"
+              title="System jobs require owner access"
+              description="Only instance owners can inspect global background job state."
+              icon="hero-lock-closed"
+            />
+
+            <JobOverview.jobs_overview
+              :if={@owner_authorized?}
+              overview={@overview}
+              hotspots={@hotspots}
+            />
+
+            <JobFilters.job_filters
+              :if={@owner_authorized?}
+              filter_form={@filter_form}
+              filters={@filters}
+              filter_options={@filter_options}
+              filter_errors={@filter_errors}
+            />
+
+            <JobExplorer.jobs_explorer
+              :if={@owner_authorized?}
+              explorer={@explorer}
+              current_params={@current_params}
+            />
+
+            <div
+              :if={@owner_authorized?}
+              id="admin-jobs-worker-grid"
+              class="grid gap-4 xl:grid-cols-2"
+            >
+              <JobWorkerCards.job_worker_card :for={card <- @worker_cards} card={card} />
+            </div>
+          </section>
         </div>
 
-        <.recent_jobs_surface :if={@owner_authorized?} recent_jobs={@recent_jobs} />
-      </section>
+        <JobDetailDrawer.job_detail_drawer selected_job={@selected_job} />
+      </div>
     </AdminComponents.admin_shell>
     """
   end
 
-  defp recent_jobs_surface(assigns) do
-    ~H"""
-    <AdminComponents.admin_surface
-      id="admin-jobs-surface"
-      title="Recent activity"
-      description="Newest background job records, capped for quick scanning."
-    >
-      <AdminComponents.empty_state
-        :if={@recent_jobs == []}
-        id="admin-jobs-empty-state"
-        title="No jobs recorded"
-        description="Background work has not produced any visible job state metadata yet."
-        icon="hero-queue-list"
-      />
-
-      <ul :if={@recent_jobs != []} id="admin-jobs-recent-activity" class="divide-y divide-base-300">
-        <.recent_job_item :for={job <- @recent_jobs} job={job} />
-      </ul>
-    </AdminComponents.admin_surface>
-    """
+  defp maybe_clear_missing_selected_job(socket) do
+    if (socket.assigns.owner_authorized? and socket.assigns.filters.job_id) &&
+         is_nil(socket.assigns.selected_job) do
+      push_patch(socket,
+        to: ~p"/admin/jobs?#{JobFilterForm.close_job_query_params(socket.assigns.current_params)}"
+      )
+    else
+      socket
+    end
   end
 
-  defp recent_job_item(assigns) do
-    ~H"""
-    <li
-      id={"job-#{@job.id}"}
-      class="grid gap-3 px-4 py-4 text-sm transition-colors hover:bg-base-200/60 lg:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)_auto]"
-    >
-      <div class="flex min-w-0 items-start gap-3">
-        <span
-          data-role="state-icon"
-          title={job_state_label(@job.state)}
-          aria-label={"State: #{job_state_label(@job.state)}"}
-          class="mt-0.5 shrink-0"
-        >
-          <.icon name={job_state_icon(@job.state)} class={job_state_icon_class(@job.state)} />
-        </span>
-        <div class="grid min-w-0 gap-1">
-          <span
-            data-role="worker"
-            class="truncate text-xs font-semibold text-base-content/80"
-            title={@job.worker || "not recorded"}
-          >
-            {@job.worker || "not recorded"}
-          </span>
-          <details
-            :if={failure = job_failure_summary(@job)}
-            data-role="failure-details"
-            class="group text-xs text-base-content/70"
-          >
-            <summary class="cursor-pointer list-none text-error marker:hidden hover:underline">
-              <span class="inline-flex items-center gap-1">
-                <.icon name="hero-exclamation-triangle" class="size-3.5" />
-                <span>{failure.title}</span>
-              </span>
-            </summary>
-            <p data-role="failure-message" class="mt-1 leading-relaxed text-base-content/70">
-              {failure.message}
-            </p>
-          </details>
-        </div>
-      </div>
+  defp patch_filter(socket, field, value) do
+    patch_filters(socket, %{field => value})
+  end
 
-      <div class="min-w-0 text-xs text-base-content/70">
-        <div :if={target = job_target(@job)} data-role="job-target" class="grid gap-1 leading-tight">
-          <span
-            data-role="target-primary"
-            class="truncate font-medium text-base-content/80"
-            title={target.primary_title}
-          >
-            {target.primary}
-          </span>
-          <span
-            :if={target.secondary}
-            data-role="target-secondary"
-            class="truncate text-base-content/60"
-            title={target.secondary_title}
-          >
-            {target.secondary}
-          </span>
-        </div>
-        <span :if={!job_target(@job)} data-role="job-target-empty">-</span>
-      </div>
-
-      <div class="grid gap-1 text-xs text-base-content/60 lg:min-w-72">
-        <span class="font-semibold tabular-nums text-base-content/80">
-          {format_attempts(@job)}
-        </span>
-        <span data-role="inserted-at">{timestamp_line("Inserted", @job.inserted_at)}</span>
-        <span data-role="scheduled-at">{timestamp_line("Scheduled", @job.scheduled_at)}</span>
-        <span data-role="attempted-at">{timestamp_line("Attempted", @job.attempted_at)}</span>
-        <span data-role="completed-at">{timestamp_line("Completed", @job.completed_at)}</span>
-        <span data-role="discarded-at">{timestamp_line("Discarded", @job.discarded_at)}</span>
-        <span data-role="cancelled-at">{timestamp_line("Cancelled", @job.cancelled_at)}</span>
-      </div>
-    </li>
-    """
+  defp patch_filters(socket, updates) do
+    params = Map.merge(socket.assigns.form_values, updates)
+    push_patch(socket, to: ~p"/admin/jobs?#{JobFilterForm.query_params(params)}")
   end
 
   defp maybe_start_connected_refresh(socket) do
@@ -196,20 +227,44 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
 
   defp refresh_jobs(socket) do
     if socket.assigns.owner_authorized? do
-      page_state = JobsReadModel.load(socket.assigns.current_scope, limit: @recent_jobs_limit)
-
       socket
       |> cancel_jobs_reload_timer()
-      |> assign(
-        jobs: page_state.recent_jobs,
-        worker_cards: worker_cards(page_state.worker_jobs_by_group),
-        recent_jobs: page_state.recent_jobs,
-        jobs_reload_timer: nil
-      )
+      |> assign(:jobs_reload_timer, nil)
+      |> load_jobs_page(socket.assigns.current_params)
       |> reconcile_pool_subscriptions()
     else
       socket
     end
+  end
+
+  defp load_jobs_page(socket, params) do
+    params = jobs_params(socket, params)
+
+    socket.assigns.current_scope
+    |> JobsReadModel.load(params: params)
+    |> then(&assign_page_state(socket, &1, params))
+  end
+
+  defp assign_page_state(socket, page_state, params) do
+    assign(socket,
+      current_params: params,
+      overview: page_state.overview,
+      hotspots: page_state.hotspots,
+      explorer: page_state.explorer,
+      filters: page_state.filters,
+      form_values: page_state.form_values,
+      filter_options: page_state.filter_options,
+      filter_form: JobFilterForm.filter_form(page_state.form_values, page_state.filter_warnings),
+      filter_warnings: page_state.filter_warnings,
+      filter_errors: page_state.filter_warnings,
+      selected_job: page_state.selected_job,
+      jobs: page_state.explorer.items,
+      worker_cards: worker_cards(page_state.worker_jobs_by_group)
+    )
+  end
+
+  defp jobs_params(socket, params) do
+    if socket.assigns.owner_authorized?, do: params, else: %{}
   end
 
   defp reconcile_pool_subscriptions(socket) do

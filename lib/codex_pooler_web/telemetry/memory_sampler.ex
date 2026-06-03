@@ -381,25 +381,29 @@ defmodule CodexPoolerWeb.Telemetry.MemorySampler do
   end
 
   defp read_cgroup_stat(path) do
-    with {:ok, stat} <- File.read(path) do
-      stat
-      |> String.split("\n", trim: true)
-      |> Enum.reduce(%{}, fn line, acc ->
-        case String.split(line, ~r/\s+/, parts: 2, trim: true) do
-          [key, value] ->
-            with {:ok, key} <- Map.fetch(@cgroup_stat_key_map, key),
-                 {integer, ""} when integer >= 0 <- Integer.parse(value) do
-              Map.put(acc, key, integer)
-            else
-              _ignored -> acc
-            end
-
-          _other ->
-            acc
-        end
-      end)
-    else
+    case File.read(path) do
+      {:ok, stat} -> parse_cgroup_stat(stat)
       _error -> nil
+    end
+  end
+
+  defp parse_cgroup_stat(stat) do
+    stat
+    |> String.split("\n", trim: true)
+    |> Enum.reduce(%{}, &put_cgroup_stat_line/2)
+  end
+
+  defp put_cgroup_stat_line(line, acc) do
+    case String.split(line, ~r/\s+/, parts: 2, trim: true) do
+      [key, value] -> put_cgroup_stat_value(acc, key, value)
+      _other -> acc
+    end
+  end
+
+  defp put_cgroup_stat_value(acc, key, value) do
+    case {Map.fetch(@cgroup_stat_key_map, key), Integer.parse(value)} do
+      {{:ok, key}, {integer, ""}} when integer >= 0 -> Map.put(acc, key, integer)
+      _ignored -> acc
     end
   end
 

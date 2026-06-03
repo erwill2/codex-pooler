@@ -28,7 +28,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
         completed_at: nil
       )
 
-    {:ok, view, _html} = live(conn, ~p"/admin/jobs")
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs?show_completed=true")
 
     assert has_element?(view, state_icon_selector(job, "Available"))
     refute has_element?(view, state_icon_selector(job, "Completed"))
@@ -57,13 +57,13 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
     refute has_element?(view, "#job-#{job.id}", DateTime.to_iso8601(updated_job.completed_at))
   end
 
-  test "limits recent jobs table to 15 rows", %{conn: conn} do
+  test "limits explorer rows to the first 50-row page", %{conn: conn} do
     base_time = ~U[2026-05-04 16:00:00Z]
 
     jobs =
-      for index <- 1..16 do
+      for index <- 1..51 do
         insert_job(index,
-          state: "completed",
+          state: "available",
           inserted_at: DateTime.add(base_time, index, :second)
         )
       end
@@ -71,7 +71,10 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
     rendered = render(view)
 
-    assert count_occurrences(rendered, ~s(<li id="job-)) == 15
+    assert count_occurrences(rendered, ~s(<tr id="job-)) == 50
+    assert count_occurrences(rendered, ~s(<article id="job-card-)) == 50
+    assert has_element?(view, "#admin-jobs-explorer-total", "51 jobs")
+    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 1-50 of 51")
     assert has_element?(view, "#job-#{List.last(jobs).id}")
     refute has_element?(view, "#job-#{List.first(jobs).id}")
   end
@@ -79,7 +82,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
   test "internal fallback refresh message loads jobs inserted after render", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
 
-    assert has_element?(view, "#admin-jobs-empty-state", "No jobs recorded")
+    assert has_element?(view, "#admin-jobs-empty-state", "No jobs match these filters")
 
     job =
       insert_job(
@@ -92,6 +95,36 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
     _ = :sys.get_state(view.pid)
     assert has_element?(view, state_icon_selector(job, "Available"))
     refute has_element?(view, "#admin-jobs-empty-state")
+  end
+
+  test "refreshes preserve URL-backed filters and selected job state", %{conn: conn} do
+    selected_job =
+      insert_job(
+        1,
+        state: "available",
+        inserted_at: ~U[2026-05-04 14:00:00Z]
+      )
+
+    hidden_job =
+      insert_job(
+        2,
+        state: "completed",
+        inserted_at: ~U[2026-05-04 14:01:00Z],
+        completed_at: ~U[2026-05-04 14:02:00Z]
+      )
+
+    {:ok, view, _html} =
+      live(conn, ~p"/admin/jobs?state=available&job_id=#{selected_job.id}&page=1")
+
+    assert_url_backed_available_selection(view, selected_job, hidden_job)
+
+    send(view.pid, :refresh_jobs)
+    _ = :sys.get_state(view.pid)
+    assert_url_backed_available_selection(view, selected_job, hidden_job)
+
+    send(view.pid, :fallback_refresh_jobs)
+    _ = :sys.get_state(view.pid)
+    assert_url_backed_available_selection(view, selected_job, hidden_job)
   end
 
   test "unknown and deleted job status events do not crash", %{conn: conn, scope: scope} do
@@ -179,6 +212,30 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
       |> Repo.delete_all()
 
     :ok
+  end
+
+  defp assert_url_backed_available_selection(view, selected_job, hidden_job) do
+    state = :sys.get_state(view.pid)
+    assigns = state.socket.assigns
+
+    assert assigns.current_params == %{
+             "job_id" => Integer.to_string(selected_job.id),
+             "page" => "1",
+             "state" => "available"
+           }
+
+    assert assigns.filters.state == "available"
+    assert assigns.filters.job_id == selected_job.id
+    assert assigns.form_values["state"] == "available"
+    assert assigns.form_values["job_id"] == Integer.to_string(selected_job.id)
+    assert assigns.filter_warnings == []
+    assert assigns.filter_errors == []
+    assert assigns.selected_job.id == selected_job.id
+    assert Enum.map(assigns.explorer.items, & &1.id) == [selected_job.id]
+    assert assigns.explorer.total == 1
+    assert is_map(assigns.overview)
+    assert is_map(assigns.hotspots)
+    assert Enum.all?(assigns.explorer.items, &(&1.id != hidden_job.id))
   end
 
   defp unique_slug(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"

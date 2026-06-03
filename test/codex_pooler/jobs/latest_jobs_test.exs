@@ -328,7 +328,9 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
 
       assert Enum.all?(results, &safe_job_shape?/1)
       assert Enum.find(results, &(&1.state == "scheduled")).scheduled_at
-      assert Enum.find(results, &(&1.state == "completed")).completed_at
+      assert Enum.find(results, &(&1.state == "retryable")).attention_state == :retry_pressure
+      assert Enum.find(results, &(&1.state == "discarded")).attention_state == :active_failure
+      assert Enum.find(results, &(&1.state == "completed")).attention_state == :healthy_context
       assert Enum.find(results, &(&1.state == "discarded")).discarded_at
       assert Enum.find(results, &(&1.state == "cancelled")).cancelled_at
     end
@@ -402,6 +404,7 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
       :target,
       :inserted_at,
       :attempt,
+      :attention_state,
       :scheduled_at,
       :attempted_at,
       :completed_at,

@@ -21,6 +21,11 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
   end
 
   @spec job_failure_summary(map()) :: map() | nil
+  def job_failure_summary(%{failure_summary: %{title: title, message: message}})
+      when is_binary(title) and is_binary(message) do
+    %{title: title, message: message}
+  end
+
   def job_failure_summary(%{errors: [latest_error | _errors]}) when is_map(latest_error) do
     %{
       title: failure_title(latest_error),
