@@ -171,7 +171,7 @@ defmodule CodexPoolerWeb.Router do
   defp put_secure_browser_headers(conn, _baseline_headers) do
     Phoenix.Controller.put_secure_browser_headers(
       conn,
-      CodexPoolerWeb.BrowserSecurity.secure_headers()
+      CodexPoolerWeb.BrowserSecurity.secure_headers(conn)
     )
   end
 end

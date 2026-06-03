@@ -67,17 +67,11 @@ defmodule CodexPoolerWeb.Endpoint do
   def multipart_parser_length, do: @multipart_parser_length
 
   def maybe_live_reloader(conn, opts) do
-    if codex_desktop_browser?(conn) do
+    if CodexPoolerWeb.BrowserSecurity.codex_desktop_browser?(conn) do
       conn
     else
       Module.concat(Phoenix, LiveReloader).call(conn, opts)
     end
-  end
-
-  defp codex_desktop_browser?(conn) do
-    conn
-    |> Plug.Conn.get_req_header("user-agent")
-    |> Enum.any?(&(String.contains?(&1, " Codex/") and String.contains?(&1, " Electron/")))
   end
 
   def request_log_level(%Plug.Conn{path_info: [path]}) when path in ["healthz", "readyz"],

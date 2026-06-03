@@ -5,6 +5,8 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
   alias CodexPooler.InstanceSettings.Settings
   alias CodexPooler.Repo
 
+  @codex_desktop_user_agent "Mozilla/5.0 Codex/26.519.81530 Chrome/148.0.7778.97 Electron/42.1.0 Safari/537.36"
+
   setup do
     previous_csp_sources = Application.get_env(:codex_pooler, :browser_csp_extra_sources)
     previous_dev_features_enabled = Application.get_env(:codex_pooler, :dev_features_enabled)
@@ -49,6 +51,50 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     refute csp =~ "https://bad.example.com"
     refute csp =~ "frame-ancestors *"
     refute csp =~ "http://localhost:8400"
+  end
+
+  test "local Codex Desktop browser CSP allows annotation script injection", %{conn: conn} do
+    conn =
+      conn
+      |> local_host()
+      |> put_req_header("user-agent", @codex_desktop_user_agent)
+      |> get(~p"/login")
+
+    assert [csp] = get_resp_header(conn, "content-security-policy")
+    directives = csp_directives(csp)
+
+    assert directives["script-src"] == "'self' 'unsafe-inline' 'unsafe-eval' blob:"
+  end
+
+  test "Codex Desktop browser CSP annotation allowances stay local-only", %{conn: conn} do
+    conn =
+      conn
+      |> remote_host()
+      |> put_req_header("user-agent", @codex_desktop_user_agent)
+      |> get(~p"/login")
+
+    assert [csp] = get_resp_header(conn, "content-security-policy")
+    directives = csp_directives(csp)
+
+    refute directives["script-src"] =~ "'unsafe-eval'"
+    refute directives["script-src"] =~ "blob:"
+  end
+
+  test "Codex Desktop browser CSP annotation allowances reject spoofed localhost hosts", %{
+    conn: conn
+  } do
+    conn =
+      conn
+      |> local_host()
+      |> remote_ip()
+      |> put_req_header("user-agent", @codex_desktop_user_agent)
+      |> get(~p"/login")
+
+    assert [csp] = get_resp_header(conn, "content-security-policy")
+    directives = csp_directives(csp)
+
+    refute directives["script-src"] =~ "'unsafe-eval'"
+    refute directives["script-src"] =~ "blob:"
   end
 
   test "local Impeccable helper CSP stays disabled when persisted setting is true but dev features are off",
@@ -174,6 +220,18 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:codex_pooler, key)
   defp restore_env(key, value), do: Application.put_env(:codex_pooler, key, value)
+
+  defp local_host(conn) do
+    %{conn | host: "localhost"}
+  end
+
+  defp remote_host(conn) do
+    %{conn | host: "codex-pooler.example.com"}
+  end
+
+  defp remote_ip(conn) do
+    %{conn | remote_ip: {203, 0, 113, 10}}
+  end
 
   defp production_force_ssl_options! do
     endpoint_config =
