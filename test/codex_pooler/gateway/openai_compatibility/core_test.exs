@@ -16,6 +16,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   test "supported field matrix covers endpoint families" do
     assert "model" in Matrix.supported_fields(:responses)
     assert "messages" in Matrix.supported_fields(:chat)
+    assert "input" in Matrix.supported_fields(:chat)
+    assert "instructions" in Matrix.supported_fields(:chat)
     assert "purpose" in Matrix.supported_fields(:files)
     assert "file" in Matrix.supported_fields(:audio)
     assert "input_fidelity" in Matrix.supported_fields(:images)
@@ -116,6 +118,168 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
            ]
   end
 
+  describe "Task 2 Responses additional_tools input item compatibility" do
+    @tag :responses_coercion
+    test "Responses preserves request-shaped additional_tools input items without executable tool merging" do
+      additional_tool =
+        flat_function_tool(
+          "lookup_additional_fixture",
+          %{"type" => "object", "properties" => %{}},
+          nil
+        )
+
+      additional_tools_item = %{
+        "type" => "additional_tools",
+        "role" => "developer",
+        "tools" => [additional_tool]
+      }
+
+      assert {:ok, result} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [
+                   %{"role" => "user", "content" => "synthetic input"},
+                   additional_tools_item
+                 ]
+               })
+
+      assert result.payload["input"] == [
+               %{
+                 "type" => "message",
+                 "role" => "user",
+                 "content" => [%{"type" => "input_text", "text" => "synthetic input"}]
+               },
+               additional_tools_item
+             ]
+
+      refute Map.has_key?(result.payload, "tools")
+      refute Map.has_key?(result.payload, "tool_choice")
+    end
+
+    @tag :responses_coercion
+    test "Responses accepts empty additional_tools lists and optional ids" do
+      valid_items = [
+        %{"type" => "additional_tools", "role" => "developer", "tools" => []},
+        %{
+          "type" => "additional_tools",
+          "role" => "developer",
+          "tools" => [],
+          "id" => "at_fixture"
+        }
+      ]
+
+      Enum.each(valid_items, fn item ->
+        assert {:ok, result} =
+                 Responses.coerce(%{"model" => "gpt-fixture-text", "input" => [item]})
+
+        assert result.payload["input"] == [item]
+      end)
+    end
+
+    @tag :unsupported_fields
+    test "additional_tools input items do not satisfy top-level tool_choice" do
+      additional_tools_item = %{
+        "type" => "additional_tools",
+        "role" => "developer",
+        "tools" => [
+          flat_function_tool(
+            "lookup_additional_fixture",
+            %{"type" => "object", "properties" => %{}},
+            nil
+          )
+        ]
+      }
+
+      for coerce <- [&Responses.coerce/1, &Chat.coerce/1] do
+        assert {:error, reason} =
+                 coerce.(%{
+                   "model" => "gpt-fixture-text",
+                   "input" => [additional_tools_item],
+                   "tool_choice" => %{"type" => "function", "name" => "lookup_additional_fixture"}
+                 })
+
+        assert reason == %{
+                 status: 400,
+                 code: "invalid_request",
+                 message: "tool_choice references unknown function tool",
+                 param: "tool_choice"
+               }
+      end
+    end
+
+    @tag :unsupported_fields
+    test "Responses rejects top-level additional_tools" do
+      assert {:error, reason} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => "synthetic input",
+                 "additional_tools" => []
+               })
+
+      assert reason == %{
+               status: 400,
+               code: "unsupported_parameter",
+               message: "Unsupported parameter: additional_tools",
+               param: "additional_tools"
+             }
+    end
+
+    @tag :unsupported_fields
+    test "Responses rejects malformed and output-shaped additional_tools input items" do
+      invalid_items = [
+        %{"type" => "additional_tools", "tools" => []},
+        %{"type" => "additional_tools", "role" => "assistant", "tools" => []},
+        %{"type" => "additional_tools", "role" => "system", "tools" => []},
+        %{"type" => "additional_tools", "role" => "developer", "tools" => %{}},
+        %{"type" => "additional_tools", "role" => "developer"},
+        %{"type" => "additional_tools", "role" => "developer", "tools" => [], "id" => ""},
+        %{
+          "type" => "additional_tools",
+          "role" => "developer",
+          "tools" => [],
+          "id" => "   "
+        },
+        %{"type" => "additional_tools", "role" => "developer", "tools" => [], "id" => 123},
+        %{
+          "type" => "additional_tools",
+          "role" => "developer",
+          "tools" => [],
+          "output" => []
+        },
+        %{
+          "type" => "additional_tools",
+          "role" => "developer",
+          "tools" => [],
+          "status" => "completed"
+        },
+        %{
+          "type" => "additional_tools",
+          "role" => "developer",
+          "tools" => [],
+          "summary" => []
+        },
+        %{
+          "type" => "additional_tools",
+          "role" => "developer",
+          "tools" => [],
+          "content" => []
+        },
+        %{
+          "type" => "additional_tools",
+          "id" => "at_output_fixture",
+          "role" => "assistant",
+          "tools" => [],
+          "status" => "completed"
+        }
+      ]
+
+      Enum.each(invalid_items, fn item ->
+        assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+                 Responses.coerce(%{"model" => "gpt-fixture-text", "input" => [item]})
+      end)
+    end
+  end
+
   @tag :responses_coercion
   test "Chat payloads coerce through a Responses-compatible intermediate" do
     payload = %{
@@ -210,6 +374,91 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert result.payload["reasoning"] == %{"effort" => "low"}
     assert result.payload["service_tier"] == "priority"
     assert result.payload["text"]["verbosity"] == "high"
+  end
+
+  @tag :responses_coercion
+  test "Chat falls back to Responses-shaped input when messages are absent" do
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "instructions" => "Use synthetic fixture instructions",
+      "input" => [%{"role" => "user", "content" => "synthetic fallback input"}],
+      "tools" => [
+        flat_function_tool("lookup_fixture", %{"type" => "object", "properties" => %{}}, nil)
+      ],
+      "tool_choice" => "auto"
+    }
+
+    assert {:ok, result} = Chat.coerce(payload, collect_openai_response_stream: true)
+
+    assert result.payload["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [%{"type" => "input_text", "text" => "synthetic fallback input"}]
+             }
+           ]
+
+    assert result.payload["instructions"] == "Use synthetic fixture instructions"
+    assert result.payload["tools"] == payload["tools"]
+    assert result.payload["tool_choice"] == "auto"
+    assert result.payload["stream"] == true
+    assert result.payload["store"] == false
+  end
+
+  @tag :responses_coercion
+  test "Chat falls back to Responses-shaped input when messages are empty" do
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "messages" => [],
+      "input" => "synthetic fallback input"
+    }
+
+    assert {:ok, result} = Chat.coerce(payload)
+
+    assert result.payload["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [%{"type" => "input_text", "text" => "synthetic fallback input"}]
+             }
+           ]
+
+    assert result.payload["instructions"] == ""
+  end
+
+  @tag :responses_coercion
+  test "Chat keeps non-empty messages authoritative over conflicting input" do
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "messages" => [%{"role" => "user", "content" => "synthetic message input"}],
+      "input" => "synthetic conflicting fallback input"
+    }
+
+    assert {:ok, result} = Chat.coerce(payload)
+
+    assert result.payload["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [%{"type" => "input_text", "text" => "synthetic message input"}]
+             }
+           ]
+  end
+
+  @tag :unsupported_fields
+  test "Chat still rejects empty messages when no fallback input is present" do
+    assert {:error, reason} =
+             Chat.coerce(%{
+               "model" => "gpt-fixture-text",
+               "messages" => []
+             })
+
+    assert reason == %{
+             status: 400,
+             code: "invalid_request",
+             message: "messages must be a non-empty array",
+             param: "messages"
+           }
   end
 
   @tag :responses_coercion
@@ -324,6 +573,37 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                  field => unsupported_value(field)
                })
     end
+  end
+
+  @tag :unsupported_fields
+  test "Chat does not support top-level additional_tools on fallback or messages paths" do
+    invalid_payloads = [
+      %{
+        "model" => "gpt-fixture-text",
+        "input" => "synthetic fallback input",
+        "additional_tools" => [
+          %{"type" => "function", "name" => "lookup_fixture", "parameters" => %{}}
+        ]
+      },
+      %{
+        "model" => "gpt-fixture-text",
+        "messages" => [%{"role" => "user", "content" => "synthetic message input"}],
+        "additional_tools" => [
+          %{"type" => "function", "name" => "lookup_fixture", "parameters" => %{}}
+        ]
+      }
+    ]
+
+    Enum.each(invalid_payloads, fn payload ->
+      assert {:error, reason} = Chat.coerce(payload)
+
+      assert reason == %{
+               status: 400,
+               code: "unsupported_parameter",
+               message: "Unsupported parameter: additional_tools",
+               param: "additional_tools"
+             }
+    end)
   end
 
   @tag :unsupported_fields

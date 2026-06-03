@@ -308,6 +308,144 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert [_attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
   end
 
+  test "POST /v1/chat/completions falls back to Responses input and preserves additional tools",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_chat_fallback_input",
+          "status" => "completed",
+          "output" => [
+            %{
+              "type" => "message",
+              "content" => [%{"type" => "output_text", "text" => "fallback answer"}]
+            }
+          ],
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    additional_tools_item = additional_tools_item()
+
+    absent_messages_conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/chat/completions", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{"role" => "user", "content" => "synthetic chat fallback input"},
+          additional_tools_item
+        ]
+      })
+
+    empty_messages_conn =
+      build_conn()
+      |> auth(setup)
+      |> post("/v1/chat/completions", %{
+        "model" => setup.model.exposed_model_id,
+        "messages" => [],
+        "input" => "synthetic empty-message fallback input"
+      })
+
+    assert %{"id" => "resp_chat_fallback_input", "object" => "chat.completion"} =
+             json_response(absent_messages_conn, 200)
+
+    assert %{"id" => "resp_chat_fallback_input", "object" => "chat.completion"} =
+             json_response(empty_messages_conn, 200)
+
+    assert [absent_messages_request, empty_messages_request] = FakeUpstream.requests(upstream)
+
+    assert absent_messages_request.path == "/backend-api/codex/responses"
+    assert absent_messages_request.json["stream"] == true
+    assert absent_messages_request.json["store"] == false
+    refute Map.has_key?(absent_messages_request.json, "tools")
+    refute Map.has_key?(absent_messages_request.json, "tool_choice")
+
+    assert absent_messages_request.json["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [
+                 %{"type" => "input_text", "text" => "synthetic chat fallback input"}
+               ]
+             },
+             additional_tools_item
+           ]
+
+    assert empty_messages_request.path == "/backend-api/codex/responses"
+
+    assert empty_messages_request.json["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [
+                 %{"type" => "input_text", "text" => "synthetic empty-message fallback input"}
+               ]
+             }
+           ]
+
+    requests = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert length(requests) == 2
+    assert Enum.all?(requests, &(&1.status == "succeeded"))
+    assert Enum.all?(requests, &(&1.endpoint == "/backend-api/codex/responses"))
+    assert Repo.aggregate(Attempt, :count) == 2
+
+    metadata_text = inspect(Enum.map(requests, & &1.request_metadata))
+    refute metadata_text =~ "synthetic chat fallback input"
+    refute metadata_text =~ "synthetic empty-message fallback input"
+    refute metadata_text =~ "lookup_additional_fixture"
+  end
+
+  test "POST /v1/chat/completions rejects malformed fallback input before dispatch", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    invalid_cases = [
+      {%{"messages" => []}, "invalid_request", "messages", "messages must be a non-empty array"},
+      {%{
+         "input" => [
+           %{
+             "type" => "additional_tools",
+             "role" => "assistant",
+             "tools" => [],
+             "status" => "completed"
+           }
+         ]
+       }, "invalid_request", "input", nil},
+      {%{"input" => "synthetic fallback input", "additional_tools" => []},
+       "unsupported_parameter", "additional_tools", "Unsupported parameter: additional_tools"}
+    ]
+
+    Enum.each(invalid_cases, fn {payload_update, expected_code, expected_param, expected_message} ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/v1/chat/completions",
+          Map.put(payload_update, "model", setup.model.exposed_model_id)
+        )
+
+      assert %{"error" => error} = json_response(response, 400)
+      assert error["code"] == expected_code
+      assert error["param"] == expected_param
+
+      if expected_message do
+        assert error["message"] == expected_message
+      end
+
+      refute response.resp_body =~ "synthetic fallback input"
+      refute response.resp_body =~ "completed"
+    end)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
   @tag :unsupported_logprobs
   test "POST /v1/chat/completions rejects unsupported logprobs before dispatch", %{conn: conn} do
     upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
@@ -573,6 +711,20 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
           "properties" => %{"query" => %{"type" => "string"}}
         }
       }
+    }
+  end
+
+  defp additional_tools_item do
+    %{
+      "type" => "additional_tools",
+      "role" => "developer",
+      "tools" => [
+        %{
+          "type" => "function",
+          "name" => "lookup_additional_fixture",
+          "parameters" => %{"type" => "object", "properties" => %{}}
+        }
+      ]
     }
   end
 

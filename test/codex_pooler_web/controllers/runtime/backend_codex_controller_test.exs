@@ -847,6 +847,57 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert request.status == "succeeded"
   end
 
+  test "POST /backend-api/codex/v1/responses preserves request-shaped additional_tools input items",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_backend_v1_additional_tools",
+          "object" => "response",
+          "status" => "completed",
+          "output" => [],
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    additional_tools_item = additional_tools_item()
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{"role" => "user", "content" => "synthetic alias response input"},
+          additional_tools_item
+        ]
+      })
+
+    assert %{"id" => "resp_backend_v1_additional_tools"} = json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    refute Map.has_key?(captured.json, "tools")
+    refute Map.has_key?(captured.json, "tool_choice")
+
+    assert captured.json["input"] == [
+             %{"role" => "user", "content" => "synthetic alias response input"},
+             additional_tools_item
+           ]
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.status == "succeeded"
+
+    metadata_text = inspect(request.request_metadata)
+    refute metadata_text =~ "synthetic alias response input"
+    refute metadata_text =~ "lookup_additional_fixture"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+  end
+
   test "POST /backend-api/codex/responses forwards only approved lineage metadata headers",
        %{conn: conn} do
     upstream =
@@ -1094,6 +1145,77 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.endpoint == "/backend-api/codex/responses"
     assert request.status == "succeeded"
+  end
+
+  test "POST /backend-api/codex/v1/chat/completions falls back to input without executable tool merging",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_backend_v1_chat_fallback",
+          "status" => "completed",
+          "output" => [
+            %{
+              "type" => "message",
+              "content" => [%{"type" => "output_text", "text" => "fallback alias answer"}]
+            }
+          ],
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    additional_tools_item = additional_tools_item()
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/v1/chat/completions", %{
+        "model" => setup.model.exposed_model_id,
+        "messages" => [],
+        "input" => [
+          %{"role" => "user", "content" => "synthetic alias chat fallback input"},
+          additional_tools_item
+        ]
+      })
+
+    assert %{
+             "id" => "resp_backend_v1_chat_fallback",
+             "object" => "chat.completion",
+             "choices" => [
+               %{
+                 "message" => %{"role" => "assistant", "content" => "fallback alias answer"},
+                 "finish_reason" => "stop"
+               }
+             ]
+           } = json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    refute Map.has_key?(captured.json, "tools")
+    refute Map.has_key?(captured.json, "tool_choice")
+
+    assert captured.json["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [
+                 %{"type" => "input_text", "text" => "synthetic alias chat fallback input"}
+               ]
+             },
+             additional_tools_item
+           ]
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.status == "succeeded"
+
+    metadata_text = inspect(request.request_metadata)
+    refute metadata_text =~ "synthetic alias chat fallback input"
+    refute metadata_text =~ "lookup_additional_fixture"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
   end
 
   test "POST /backend-api/codex/responses omits neutral service tiers at the upstream boundary",
@@ -7834,6 +7956,20 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       compaction_target_window_id: compaction_target_window_id,
       compaction_strategy: compaction_strategy,
       compaction_trigger: compaction_trigger
+    }
+  end
+
+  defp additional_tools_item do
+    %{
+      "type" => "additional_tools",
+      "role" => "developer",
+      "tools" => [
+        %{
+          "type" => "function",
+          "name" => "lookup_additional_fixture",
+          "parameters" => %{"type" => "object", "properties" => %{}}
+        }
+      ]
     }
   end
 

@@ -99,6 +99,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
     end
   end
 
+  defp normalize_input_item(%{"type" => "additional_tools"} = item), do: {:ok, item}
+
   defp normalize_input_item(%{"content" => content} = item) when is_binary(content) do
     item =
       item
@@ -152,6 +154,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
 
   def validate_input(_payload), do: :ok
 
+  defp validate_input_item(%{"type" => "additional_tools"} = item, _payload),
+    do: validate_additional_tools_item(item)
+
   defp validate_input_item(%{"role" => "assistant"} = item, _payload),
     do: validate_assistant_replay_item(item)
 
@@ -204,6 +209,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
   end
 
   defp validate_input_item(_item, _payload),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_additional_tools_item(item) do
+    with :ok <- validate_exact_item_keys(item, ["type", "role", "tools", "id"]),
+         :ok <- validate_additional_tools_role(Map.get(item, "role")),
+         :ok <- validate_additional_tools_tools(Map.get(item, "tools")) do
+      validate_optional_id(item)
+    end
+  end
+
+  defp validate_additional_tools_role("developer"), do: :ok
+
+  defp validate_additional_tools_role(_role),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_additional_tools_tools(tools) when is_list(tools), do: :ok
+
+  defp validate_additional_tools_tools(_tools),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp validate_item_reference(%{"id" => id} = item, payload) when is_binary(id) do

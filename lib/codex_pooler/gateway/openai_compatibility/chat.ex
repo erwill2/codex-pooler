@@ -1,7 +1,7 @@
 defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   @moduledoc false
 
-  alias CodexPooler.Gateway.OpenAICompatibility.{Error, Responses, Validation}
+  alias CodexPooler.Gateway.OpenAICompatibility.{Error, Matrix, Responses, Validation}
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
   @reasoning_efforts ~w(none minimal low medium high xhigh)
@@ -47,8 +47,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
          :ok <- validate_stream_options(payload),
          :ok <- validate_token_limits(payload),
          :ok <- validate_verbosity(payload),
-         {:ok, messages} <- messages(payload),
-         {:ok, response_payload} <- response_payload(payload, messages) do
+         {:ok, response_payload} <- response_payload(payload) do
       {:ok, %{chat_payload: payload, response_payload: response_payload}}
     end
   end
@@ -188,7 +187,43 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
 
   defp valid_message?(_message), do: false
 
-  defp response_payload(payload, messages) do
+  defp response_payload(%{"messages" => messages} = payload)
+       when is_list(messages) and messages != [] do
+    with {:ok, messages} <- messages(payload) do
+      response_payload_from_messages(payload, messages)
+    end
+  end
+
+  defp response_payload(%{"messages" => []} = payload) do
+    fallback_response_payload(
+      payload,
+      Error.invalid_request("messages must be a non-empty array", "messages")
+    )
+  end
+
+  defp response_payload(%{"messages" => _messages} = payload) do
+    with {:ok, _messages} <- messages(payload) do
+      fallback_response_payload(
+        payload,
+        Error.invalid_request("messages is required", "messages")
+      )
+    end
+  end
+
+  defp response_payload(payload) do
+    fallback_response_payload(payload, Error.invalid_request("messages is required", "messages"))
+  end
+
+  defp fallback_response_payload(%{"input" => _input} = payload, _messages_error) do
+    payload
+    |> Map.take(Matrix.forwarded_fields(:responses))
+    |> Map.put_new("instructions", "")
+    |> then(&{:ok, &1})
+  end
+
+  defp fallback_response_payload(_payload, messages_error), do: {:error, messages_error}
+
+  defp response_payload_from_messages(payload, messages) do
     base = %{
       "model" => payload["model"],
       "input" => Enum.map(messages, &message_to_input_item/1)

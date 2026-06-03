@@ -136,12 +136,53 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       responses_chat = CompatibilityMatrix.by_slug!(:responses_chat)
       unsupported_upstream_fields = CompatibilityMatrix.by_slug!(:unsupported_upstream_fields)
 
-      assert responses_chat.contract =~ "reject known locally unsupported SDK controls"
+      assert responses_chat.contract =~ "SDK-control rejection"
       assert unsupported_upstream_fields.current == :rejected_or_stripped_by_scope
       assert unsupported_upstream_fields.contract =~ "rejects known SDK request controls"
 
       assert unsupported_upstream_fields.contract =~
                "strips backend-only upstream-unsupported controls"
+    end
+
+    test "documents narrow chat input fallback and non-executable additional_tools" do
+      responses_chat = CompatibilityMatrix.by_slug!(:responses_chat)
+      responses_fixture = CompatibilityMatrix.fixture!(:responses_chat)
+      v1_fixture = CompatibilityMatrix.fixture!(:v1_supported_surface)
+
+      assert responses_chat.contract =~ "messages when present"
+      assert responses_chat.contract =~ "top-level input only when messages is absent or empty"
+
+      assert responses_chat.contract =~
+               "omitted fallback instructions defaulting to a blank string"
+
+      assert responses_chat.contract =~ "request-shaped additional_tools input items"
+      assert responses_chat.contract =~ "non-executable input"
+      assert responses_chat.contract =~ "never merged into executable tools"
+      assert responses_chat.contract =~ "never used to satisfy tool_choice"
+      refute responses_chat.contract =~ "Responses-to-chat parity"
+      refute responses_chat.contract =~ "top-level additional_tools"
+
+      expected_chat_fallback = %{
+        messages_precedence: "non_empty_messages",
+        fallback_when: ["messages_absent", "messages_empty"],
+        fallback_source: "input",
+        default_instructions: "blank_string"
+      }
+
+      expected_additional_tools = %{
+        shape: "request_input_item",
+        required: ["type", "role", "tools"],
+        optional: ["id"],
+        role: "developer",
+        executable: false,
+        merges_into_tools: false,
+        satisfies_tool_choice: false
+      }
+
+      assert responses_fixture.chat_input_fallback == expected_chat_fallback
+      assert v1_fixture.chat_input_fallback == expected_chat_fallback
+      assert responses_fixture.additional_tools_input_item == expected_additional_tools
+      assert v1_fixture.additional_tools_input_item == expected_additional_tools
     end
 
     test "documents v1 supported surface as authenticated OpenAI compatibility" do
@@ -166,6 +207,8 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert feature.contract =~ "without forwarding session-id or x-session-affinity upstream"
       assert feature.contract =~ "pinned /v1/responses continuations"
       assert feature.contract =~ "restart_with_full_context recovery guidance"
+      assert feature.contract =~ "chat input fallback"
+      assert feature.contract =~ "Responses additional_tools support narrow and non-executable"
       refute feature.contract =~ "metadata"
 
       assert fixture.auth == "required_bearer_api_key"
@@ -312,6 +355,8 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
              ]
 
       assert feature.contract =~ "explicit authenticated backend routes"
+      assert feature.contract =~ "chat alias fallback limited to top-level input"
+      assert feature.contract =~ "messages is absent or empty"
       assert fixture.auth == "required_bearer_api_key"
       assert fixture.default_enabled == true
 
@@ -321,6 +366,12 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                "/backend-api/codex/v1/responses/compact",
                "/backend-api/codex/v1/chat/completions"
              ]
+
+      assert fixture.chat_input_fallback == %{
+               messages_precedence: "non_empty_messages",
+               fallback_when: ["messages_absent", "messages_empty"],
+               fallback_source: "input"
+             }
     end
 
     test "keeps prompt cache routing input limited to the exact POST route contract" do

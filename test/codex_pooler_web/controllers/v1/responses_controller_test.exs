@@ -765,6 +765,104 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert attempt.status == "succeeded"
   end
 
+  test "POST /v1/responses preserves request-shaped additional_tools input items", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_additional_tools",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    additional_tools_item = additional_tools_item()
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{"role" => "user", "content" => "synthetic response input"},
+          additional_tools_item
+        ]
+      })
+
+    assert %{"id" => "resp_v1_additional_tools", "object" => "response"} =
+             json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["stream"] == true
+    assert captured.json["store"] == false
+    refute Map.has_key?(captured.json, "tools")
+    refute Map.has_key?(captured.json, "tool_choice")
+
+    assert captured.json["input"] == [
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [%{"type" => "input_text", "text" => "synthetic response input"}]
+             },
+             additional_tools_item
+           ]
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.endpoint == "/backend-api/codex/responses"
+
+    assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+             "/v1/responses"
+
+    metadata_text = inspect(request.request_metadata)
+    refute metadata_text =~ "synthetic response input"
+    refute metadata_text =~ "lookup_additional_fixture"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+  end
+
+  test "POST /v1/responses rejects malformed additional_tools input items before dispatch", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    invalid_items = [
+      %{"type" => "additional_tools", "tools" => []},
+      %{"type" => "additional_tools", "role" => "assistant", "tools" => []},
+      %{
+        "type" => "additional_tools",
+        "role" => "developer",
+        "tools" => [],
+        "status" => "completed"
+      }
+    ]
+
+    Enum.each(invalid_items, fn invalid_item ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => [invalid_item]
+        })
+
+      assert %{"error" => error} = json_response(response, 400)
+      assert error["code"] == "invalid_request"
+      assert error["param"] == "input"
+      refute response.resp_body =~ "completed"
+    end)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
   test "POST /v1/responses non-streaming marks visible upstream output once", %{conn: conn} do
     upstream =
       start_upstream(
@@ -2935,6 +3033,20 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         "query" => "synthetic release notes",
         "queries" => ["synthetic release notes", "synthetic changelog"]
       }
+    }
+  end
+
+  defp additional_tools_item do
+    %{
+      "type" => "additional_tools",
+      "role" => "developer",
+      "tools" => [
+        %{
+          "type" => "function",
+          "name" => "lookup_additional_fixture",
+          "parameters" => %{"type" => "object", "properties" => %{}}
+        }
+      ]
     }
   end
 

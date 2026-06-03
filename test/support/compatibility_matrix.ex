@@ -75,7 +75,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :responses_chat,
       contract:
-        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path, keep safe OpenAI Responses fields like text, store, include, parallel_tool_calls, prompt_cache_key, and metadata, consume prompt_cache_key only as typed transient routing-locality input on allowlisted POST routes, reject known locally unsupported SDK controls, and strip backend-only unsupported controls before dispatch"
+        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path; chat completions use messages when present and fall back to top-level input only when messages is absent or empty, with omitted fallback instructions defaulting to a blank string; request-shaped additional_tools input items are preserved as non-executable input, never merged into executable tools, and never used to satisfy tool_choice; safe OpenAI Responses fields, prompt-cache locality, SDK-control rejection, and backend-only control stripping stay scope-specific"
     },
     %{
       slug: :backend_v1_alias_surface,
@@ -92,7 +92,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :backend_v1_alias_surface,
       contract:
-        "backend /backend-api/codex/v1 aliases are explicit authenticated backend routes for models, responses, websocket responses, compact, and chat completions, preserve generic backend API-key auth, proxy to the canonical backend gateway paths, and allow prompt-cache routing locality only on POST responses and chat completions aliases"
+        "backend /backend-api/codex/v1 aliases are explicit authenticated backend routes for models, responses, websocket responses, compact, and chat completions, preserve generic backend API-key auth, proxy to the canonical backend gateway paths, allow prompt-cache routing locality only on POST responses and chat completions aliases, and keep the chat alias fallback limited to top-level input only when messages is absent or empty"
     },
     %{
       slug: :websocket_continuity,
@@ -258,7 +258,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :v1_supported_surface,
       contract:
-        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, include narrow GET /v1/responses Responses websocket compatibility only, exclude broad /v1/realtime routes, consume continuity headers using the documented local precedence without forwarding session-id or x-session-affinity upstream, fail closed for pinned /v1/responses continuations whose upstream account needs revoked-refresh-token reauthentication with the shared restart_with_full_context recovery guidance, and allow prompt-cache routing locality only on POST responses and chat completions"
+        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, include narrow GET /v1/responses Responses websocket compatibility only, exclude broad /v1/realtime routes, consume continuity headers using the documented local precedence without forwarding session-id or x-session-affinity upstream, fail closed for pinned /v1/responses continuations whose upstream account needs revoked-refresh-token reauthentication with the shared restart_with_full_context recovery guidance, allow prompt-cache routing locality only on POST responses and chat completions, and keep chat input fallback plus Responses additional_tools support narrow and non-executable"
     },
     %{
       slug: :v1_unsupported_public_surface,
@@ -314,6 +314,21 @@ defmodule CodexPooler.CompatibilityMatrix do
         privacy: "raw_key_not_persisted",
         provider_cache_evidence: "upstream_cached_input_tokens_only"
       },
+      chat_input_fallback: %{
+        messages_precedence: "non_empty_messages",
+        fallback_when: ["messages_absent", "messages_empty"],
+        fallback_source: "input",
+        default_instructions: "blank_string"
+      },
+      additional_tools_input_item: %{
+        shape: "request_input_item",
+        required: ["type", "role", "tools"],
+        optional: ["id"],
+        role: "developer",
+        executable: false,
+        merges_into_tools: false,
+        satisfies_tool_choice: false
+      },
       json: %{
         "model" => "gpt-fixture-text",
         "input" => "synthetic text request",
@@ -337,6 +352,11 @@ defmodule CodexPooler.CompatibilityMatrix do
         "/backend-api/codex/v1/responses/compact",
         "/backend-api/codex/v1/chat/completions"
       ],
+      chat_input_fallback: %{
+        messages_precedence: "non_empty_messages",
+        fallback_when: ["messages_absent", "messages_empty"],
+        fallback_source: "input"
+      },
       json: %{
         "model" => "gpt-fixture-text",
         "input" => "synthetic alias surface request"
@@ -448,6 +468,21 @@ defmodule CodexPooler.CompatibilityMatrix do
       ],
       websocket_route: %{method: :get, path: "/v1/responses"},
       websocket_contract: "narrow_responses_websocket_only",
+      chat_input_fallback: %{
+        messages_precedence: "non_empty_messages",
+        fallback_when: ["messages_absent", "messages_empty"],
+        fallback_source: "input",
+        default_instructions: "blank_string"
+      },
+      additional_tools_input_item: %{
+        shape: "request_input_item",
+        required: ["type", "role", "tools"],
+        optional: ["id"],
+        role: "developer",
+        executable: false,
+        merges_into_tools: false,
+        satisfies_tool_choice: false
+      },
       continuity_precedence: [
         "x-codex-session-id",
         "session-id",
