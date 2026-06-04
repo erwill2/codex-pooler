@@ -134,6 +134,7 @@ defmodule CodexPooler.Upstreams.Import do
             |> put_imported_token_refresh_metadata(identity.metadata, timestamp)
             |> then(&Map.merge(identity.metadata || %{}, &1))
           end)
+          |> Map.put(:account_label, identity.account_label)
 
         with {:ok, active_identity} <- activate_identity_with_plan(identity, attrs) do
           {:ok, :existing, active_identity}

@@ -296,8 +296,10 @@ defmodule CodexPooler.Access.InviteOnboarding do
 
   defp activate_verified_identity(identity, invite, method, info) do
     attrs =
-      Map.put(
-        verified_identity_attrs(identity, info),
+      identity
+      |> verified_identity_attrs(info)
+      |> Map.put(:account_label, identity.account_label)
+      |> Map.put(
         :metadata,
         identity.metadata
         |> complete_onboarding_metadata(invite, method)

@@ -2271,7 +2271,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     })
 
     refute has_element?(view, "#auth-json-import-dialog")
-    assert has_element?(view, "#upstream-cockpit-header", "cockpit-actions-replaced@example.com")
+    assert has_element?(view, "#upstream-cockpit-header", "Renamed Cockpit Codex")
     assert Repo.get!(UpstreamIdentity, identity.id).status == "active"
 
     view |> element("#cockpit-pause-upstream-account-#{identity.id}") |> render_click()
@@ -2318,7 +2318,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     |> render_submit(%{
       "upstream_delete" => %{
         "id" => identity.id,
-        "confirmation_label" => "cockpit-actions-replaced@example.com"
+        "confirmation_label" => "Renamed Cockpit Codex"
       }
     })
 

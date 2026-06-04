@@ -690,6 +690,57 @@ defmodule CodexPooler.UpstreamsTest do
       refute inspect(event) =~ auth_json
     end
 
+    test "reimporting an existing account preserves the operator label" do
+      scope = fixture_owner_scope()
+
+      {:ok, pool} =
+        Pools.create_pool(scope, %{slug: "auth-json-reimport", name: "auth.json Reimport"})
+
+      access_token = jwt_token(%{"exp" => future_unix()})
+      account_id = "acct_reimport_label_#{System.unique_integer([:positive])}"
+      account_email = "reimport-label-#{System.unique_integer([:positive])}@example.com"
+
+      id_token =
+        jwt_token(%{
+          "email" => account_email,
+          "https://api.openai.com/auth" => %{
+            "chatgpt_account_id" => account_id,
+            "chatgpt_user_id" => "user_reimport_label",
+            "chatgpt_plan_type" => "pro"
+          }
+        })
+
+      auth_json =
+        auth_json_fixture(account_id: account_id, access_token: access_token, id_token: id_token)
+
+      assert {:ok, %{status: :created, identity: identity, assignment: assignment}} =
+               Upstreams.import_codex_auth_json(scope, pool, auth_json)
+
+      assert identity.account_label == account_email
+
+      assert {:ok, renamed_identity} =
+               IdentityLifecycle.update_upstream_identity(identity, %{account_label: "codex01"})
+
+      assert renamed_identity.account_label == "codex01"
+
+      assert {:ok,
+              %{
+                status: :existing,
+                identity: reimported_identity,
+                assignment: reimported_assignment
+              }} =
+               Upstreams.import_codex_auth_json(scope, pool, auth_json)
+
+      assert reimported_identity.id == identity.id
+      assert reimported_identity.account_label == "codex01"
+      assert reimported_identity.account_email == account_email
+      assert reimported_identity.metadata["account_email"] == account_email
+      assert reimported_assignment.id == assignment.id
+      assert reimported_assignment.assignment_label == "codex01"
+
+      assert Repo.get!(UpstreamIdentity, identity.id).account_label == "codex01"
+    end
+
     test "auth parsers prefer nested workspace claims over conflicting top-level claims" do
       id_token =
         jwt_token(%{

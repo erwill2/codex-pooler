@@ -404,6 +404,11 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
 
     assert_receive {Events, %{topics: ["upstreams"], reason: "upstream_account_onboarded"}}
 
+    assert {:ok, first_identity} =
+             first_completed.identity
+             |> Ecto.Changeset.change(account_label: "codex01")
+             |> Repo.update()
+
     scope =
       Scope.for_user(Repo.get!(CodexPooler.Accounts.User, pool.created_by_user_id), [
         "instance_owner"
@@ -422,6 +427,8 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert second_completed.identity.id == first_completed.identity.id
     assert second_completed.assignment.id == first_completed.assignment.id
     assert second_completed.identity.account_email == "codex-user@example.com"
+    assert second_completed.identity.account_label == "codex01"
+    assert Repo.get!(UpstreamIdentity, first_identity.id).account_label == "codex01"
 
     assert Repo.aggregate(UpstreamIdentity, :count) == 1
     assert Repo.aggregate(PoolUpstreamAssignment, :count) == 1
