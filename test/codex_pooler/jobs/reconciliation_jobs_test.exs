@@ -14,6 +14,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
+  alias CodexPooler.Upstreams.Auth.TokenRefresh
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
@@ -351,6 +352,26 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
                    reason: "operator_pause"
                  }
                )
+
+      assert %{success: 1, discard: 0} = Oban.drain_queue(queue: :jobs)
+
+      completed_job = Repo.get!(Oban.Job, job.id)
+      assert completed_job.state == "completed"
+      assert completed_job.errors == []
+
+      assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      assert is_nil(assignment.metadata["quota_priming"])
+      assert is_nil(assignment.metadata["last_reconciliation"])
+    end
+
+    test "skips already queued account reconciliation jobs when upstream account requires reauth" do
+      {pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, job} = Jobs.enqueue_account_reconciliation(pool, assignment)
+
+      assert {:ok, %{status: :reauth_required, retryable?: false}} =
+               TokenRefresh.refresh_access_token(identity, trigger_kind: "scheduled")
 
       assert %{success: 1, discard: 0} = Oban.drain_queue(queue: :jobs)
 

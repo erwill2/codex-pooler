@@ -66,7 +66,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert state.socket.assigns.subscribed_pool_ids == MapSet.new()
   end
 
-  test "renders overview metrics and hotspots before row-level activity", %{conn: conn} do
+  test "renders overview metrics and worker cards before row-level activity", %{conn: conn} do
     now = DateTime.utc_now()
     pool = pool_fixture(%{name: "Operations Pool", slug: "operations-pool"})
 
@@ -150,13 +150,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert has_element?(view, "#admin-jobs-overview-retry-pressure", "1")
     assert has_element?(view, "#admin-jobs-overview-backlog-pressure", "1")
 
-    assert has_element?(view, "#admin-jobs-hotspots")
-    assert has_element?(view, "#admin-jobs-hotspot-workers", "TokenRefresh")
-    assert has_element?(view, "#admin-jobs-hotspot-workers", "3")
-    assert has_element?(view, "#admin-jobs-hotspot-queues", "jobs")
-    assert has_element?(view, "#admin-jobs-hotspot-pools", "Operations Pool")
-    assert has_element?(view, "#admin-jobs-hotspot-accounts", "Dominant upstream")
-    assert has_element?(view, "#admin-jobs-hotspot-targets", "Dominant assignment")
+    refute has_element?(view, "#admin-jobs-hotspots")
 
     rendered = render(view)
     assert String.contains?(rendered, "id=\"admin-jobs-overview\"")
@@ -173,7 +167,10 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert :binary.match(rendered, "id=\"admin-jobs-overview\"") <
              :binary.match(rendered, "id=\"admin-jobs-explorer\"")
 
-    assert :binary.match(rendered, "id=\"admin-jobs-explorer\"") <
+    assert :binary.match(rendered, "id=\"admin-jobs-worker-grid\"") <
+             :binary.match(rendered, "id=\"admin-jobs-explorer\"")
+
+    assert :binary.match(rendered, "id=\"job-filter-form\"") <
              :binary.match(rendered, "id=\"admin-jobs-worker-grid\"")
 
     assert has_element?(view, "#job-#{active_failure_a.id}")
@@ -202,7 +199,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert has_element?(view, "#admin-jobs-overview-stuck-executing", "0")
     assert has_element?(view, "#admin-jobs-overview-retry-pressure", "0")
     assert has_element?(view, "#admin-jobs-overview-backlog-pressure", "0")
-    assert has_element?(view, "#admin-jobs-hotspots", "No actionable concentration")
+    refute has_element?(view, "#admin-jobs-hotspots")
     assert has_element?(view, "#admin-jobs-explorer")
     assert has_element?(view, "#admin-jobs-empty-state", "No jobs match these filters")
   end
@@ -234,15 +231,52 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert has_element?(view, "#admin-jobs-page-header", "System Jobs")
     assert has_element?(view, "#admin-jobs-page-header", "Monitor background work")
     assert has_element?(view, "#admin-jobs-worker-grid")
+    assert has_element?(view, "#admin-jobs-worker-grid.items-start")
     assert has_element?(view, worker_card_selector(:runtime_cleanup), "Runtime cleanup")
     assert has_element?(view, "#{worker_card_selector(:runtime_cleanup)} .hero-sparkles")
     assert has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "Completed")
-    assert has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "Last success")
-    assert has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "10:02:00 UTC")
-    assert has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "Next run")
-    assert has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "2/5")
+
+    assert has_element?(
+             view,
+             "#{worker_card_selector(:runtime_cleanup)}",
+             "Expired state cleanup"
+           )
+
+    assert has_element?(
+             view,
+             "#{worker_card_selector(:runtime_cleanup)} [data-role='worker-schedule-facts']"
+           )
+
+    assert has_element?(
+             view,
+             "#{worker_card_selector(:runtime_cleanup)} [data-role='next-run-group']",
+             "Next run"
+           )
+
+    assert has_element?(
+             view,
+             "#{worker_card_selector(:runtime_cleanup)} [data-role='last-run']",
+             "10:02:00 UTC"
+           )
+
+    assert has_element?(
+             view,
+             "#{worker_card_selector(:runtime_cleanup)} [data-role='attempts']",
+             "2/5"
+           )
+
+    refute has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "Last success")
+    refute has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "Last failure")
     assert has_element?(view, "#{worker_card_selector(:catalog_sync)}", "Catalog sync")
+    assert has_element?(view, "#{worker_card_selector(:catalog_sync)}", "Model catalog refresh")
     assert has_element?(view, "#{worker_card_selector(:catalog_sync)}", "Awaiting first run")
+
+    rendered = render(view)
+    refute rendered =~ "Per-pool model catalog refreshes and scheduled fan-out"
+    refute rendered =~ "OpenAI pricing JSON catalog refreshes for request-log cost reporting"
+    refute rendered =~ "Quota, health, token, and catalog checks for upstream assignments"
+    refute rendered =~ "Persisted alert rule evaluation and incident lifecycle updates"
+    refute rendered =~ "Expired files, sessions, runtime state, and stale reconciliation cleanup"
 
     assert has_element?(view, "#admin-jobs-explorer")
     assert has_element?(view, "#admin-jobs-explorer-total", "1 job")
@@ -261,10 +295,9 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
              "RuntimeStateCleanupWorker"
            )
 
-    assert has_element?(view, "#job-#{job.id}", "2026-05-04")
-    assert has_element?(view, "#job-#{job.id}", "10:00:00 UTC")
-    assert has_element?(view, "#job-#{job.id}", "10:01:00 UTC")
-    assert has_element?(view, "#job-#{job.id}", "10:02:00 UTC")
+    assert has_element?(view, "#job-#{job.id} [data-role='job-event-label']", "Completed")
+    assert has_element?(view, "#job-#{job.id} [data-role='job-event-time']", "2026-05-04")
+    assert has_element?(view, "#job-#{job.id} [data-role='job-event-time']", "10:02:00 UTC")
     refute has_element?(view, "#job-#{job.id}", DateTime.to_iso8601(job.inserted_at))
     refute has_element?(view, "#job-#{job.id}", DateTime.to_iso8601(job.attempted_at))
     refute has_element?(view, "#job-#{job.id}", DateTime.to_iso8601(job.completed_at))
@@ -309,23 +342,27 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     assert has_element?(
              view,
-             "#job-#{completed_job.id} [data-role='inserted-at']",
-             "Inserted 2026-05-04 12:00"
+             "#job-#{completed_job.id} [data-role='job-event-label']",
+             "Completed"
            )
 
     assert has_element?(
              view,
-             "#job-#{completed_job.id} [data-role='attempted-at']",
-             "Attempted 2026-05-04 12:01"
+             "#job-#{completed_job.id} [data-role='job-event-time']",
+             "2026-05-04 12:02"
            )
 
     assert has_element?(
              view,
-             "#job-#{completed_job.id} [data-role='completed-at']",
-             "Completed 2026-05-04 12:02"
+             "#{worker_card_selector(:runtime_cleanup)} [data-role='last-run']",
+             "2026-05-04 12:02"
            )
 
-    assert has_element?(view, worker_card_selector(:runtime_cleanup), "2026-05-04 12:02")
+    refute has_element?(
+             view,
+             "#{worker_card_selector(:runtime_cleanup)} [data-role='last-run']",
+             "UTC"
+           )
 
     assert has_element?(
              view,
@@ -355,7 +392,6 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert %{items: [%{id: job_id}], total: 1, limit: 50, offset: 0} = page_state.explorer
     assert job_id == job.id
     assert is_map(page_state.overview)
-    assert is_map(page_state.hotspots)
     assert page_state.filters.show_completed == false
     assert page_state.form_values["show_completed"] == "false"
     assert page_state.filter_warnings == []
@@ -468,6 +504,11 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     assert has_element?(
              view,
+             "#job-filter-form [data-role='filter-fields'][data-layout='single-row']"
+           )
+
+    assert has_element?(
+             view,
              "#job-attention-filter [data-role='attention-filter-trigger']",
              "Any attention"
            )
@@ -539,7 +580,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
            )
 
     assert has_element?(view, "#filters_show_completed[value='false']")
-    assert has_element?(view, "#job-filter-clear")
+    refute has_element?(view, "#job-filter-clear")
 
     render_click(
       element(view, "#job-state-filter [data-role='state-filter-option'][data-state='retryable']")

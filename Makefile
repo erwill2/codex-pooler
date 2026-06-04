@@ -7,14 +7,14 @@ POSTGRES_WAIT_ATTEMPTS ?= 30
 DEV_PID := tmp/dev-server.pid
 DEV_LOG := tmp/dev-server.log
 DEV_COMPOSE := docker compose -f docker-compose.dev.yml
-DEV_SECRET_ENV := set -a; [ ! -f .env ] || . <(grep -E '^(CODEX_POOLER_UPSTREAM_SECRET_KEY|CODEX_POOLER_UPSTREAM_SECRET_KEY_VERSION)=' .env); set +a;
+DEV_SECRET_ENV := if [ -f .env ]; then while IFS= read -r line; do case "$$line" in CODEX_POOLER_UPSTREAM_SECRET_KEY=*|CODEX_POOLER_UPSTREAM_SECRET_KEY_VERSION=*) export "$$line";; esac; done < .env; fi;
 
 .PHONY: dev dev-db dev-migrate dev-pricing dev-stop dev-status dev-logs precommit smoke
 
 dev: dev-db dev-migrate dev-pricing dev-stop
 	@mkdir -p tmp
 	@echo "starting Phoenix dev server on http://localhost:$(PORT)"
-	@$(DEV_SECRET_ENV) PORT=$(PORT) POSTGRES_PORT=$(POSTGRES_PORT) mix phx.server > $(DEV_LOG) 2>&1 & echo $$! > $(DEV_PID)
+	@$(DEV_SECRET_ENV) PORT=$(PORT) POSTGRES_PORT=$(POSTGRES_PORT) nohup mix phx.server > $(DEV_LOG) 2>&1 < /dev/null & echo $$! > $(DEV_PID)
 	@sleep 2
 	@$(MAKE) --no-print-directory dev-status
 

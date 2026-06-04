@@ -9,6 +9,9 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
   alias CodexPoolerWeb.DateTimeDisplay
   alias Oban.Cron.Expression
 
+  @visible_active_marker_limit 8
+  @visible_failure_marker_limit 3
+
   @spec worker_cards(map(), DateTimeDisplay.preferences(), DateTime.t()) :: [map()]
   def worker_cards(jobs_by_group, datetime_preferences, now \\ DateTime.utc_now()) do
     Enum.map(worker_groups(), fn group ->
@@ -81,6 +84,9 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
     failure_job = summary.latest_failure
     state = worker_card_state(group, summary, latest_job)
     next_run = next_run_summary(group, summary.pending, datetime_preferences, now)
+    active_markers = activity_markers(summary.active)
+    failure_markers = failure_markers(summary.unresolved_failures)
+    latest_unresolved_failure = List.first(summary.unresolved_failures)
 
     %{
       id: group.id,
@@ -97,13 +103,25 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
       next_run_title: next_run.title,
       cadence_label: next_run.cadence_label,
       attempts: if(latest_job, do: format_attempts(latest_job), else: "0/-"),
-      active_markers: activity_markers(summary.active),
-      failure_markers: failure_markers(summary.unresolved_failures),
+      active_markers: active_markers,
+      failure_markers: failure_markers,
+      visible_active_markers: Enum.take(active_markers, @visible_active_marker_limit),
+      active_marker_overflow_count:
+        marker_overflow_count(active_markers, @visible_active_marker_limit),
+      visible_failure_markers: Enum.take(failure_markers, @visible_failure_marker_limit),
+      failure_marker_overflow_count:
+        marker_overflow_count(failure_markers, @visible_failure_marker_limit),
+      latest_failure: latest_failure_summary(latest_unresolved_failure),
       activity_label: activity_label(summary.active, summary.unresolved_failures),
       last_seen_at: job_event_timestamp(latest_job),
       last_success_at: job_event_timestamp(success_job),
       last_failure_at: job_event_timestamp(failure_job)
     }
+  end
+
+  defp marker_overflow_count(markers, limit) do
+    count = length(markers)
+    if count > limit, do: count - limit, else: 0
   end
 
   defp worker_label(worker) do
@@ -224,7 +242,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
         worker_label: worker_label(job.worker || "not recorded"),
         target_label: marker_target_label(target),
         title: marker_title(job, target),
-        avatar_url: marker_avatar_url(target),
+        avatar_email: marker_avatar_email(target),
         glyph: marker_glyph(target)
       }
     end)
@@ -240,7 +258,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
         worker_label: worker_label(job.worker || "not recorded"),
         target_label: marker_target_label(target),
         title: marker_title(job, target),
-        avatar_url: marker_avatar_url(target),
+        avatar_email: marker_avatar_email(target),
         glyph: marker_glyph(target),
         failure: job_failure_summary(job),
         failed_at: job_event_timestamp(job),
@@ -248,6 +266,26 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
       }
     end)
     |> Enum.reject(&is_nil(&1.failure))
+  end
+
+  defp latest_failure_summary(nil), do: nil
+
+  defp latest_failure_summary(job) do
+    case job_failure_summary(job) do
+      %{title: title, message: message} ->
+        target = job_target(job)
+
+        %{
+          title: title,
+          message: message,
+          target_label: marker_target_label(target),
+          failed_at: job_event_timestamp(job),
+          attempts: format_attempts(job)
+        }
+
+      nil ->
+        nil
+    end
   end
 
   defp marker_target_label(%{primary: primary}) when is_binary(primary), do: primary
@@ -261,13 +299,8 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
 
   defp marker_glyph(_target), do: "S"
 
-  defp marker_avatar_url(%{primary: primary}) do
-    if email = AvatarComponents.email_identity(primary) do
-      AvatarComponents.gravatar_url(email, size: 64)
-    end
-  end
-
-  defp marker_avatar_url(_target), do: nil
+  defp marker_avatar_email(%{primary: primary}), do: AvatarComponents.email_identity(primary)
+  defp marker_avatar_email(_target), do: nil
 
   defp marker_glyph_from_label(label) do
     label = String.trim(label)
@@ -331,6 +364,15 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
     |> Enum.join(" · ")
   end
 
+  defp failure_title(%{"error" => message} = error) when is_binary(message) do
+    [failure_attempt(error), operator_failure_title(message) || failure_kind(error)]
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> "Failure detail"
+      parts -> Enum.join(parts, " · ")
+    end
+  end
+
   defp failure_title(error) do
     [failure_attempt(error), failure_kind(error)]
     |> Enum.reject(&is_nil/1)
@@ -351,6 +393,8 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
     message
     |> String.replace(~r/[\r\n\t]+/, " ")
     |> redact_failure_secrets()
+    |> unwrap_oban_failure_message()
+    |> operator_failure_message()
     |> String.trim()
     |> truncate_failure_message()
     |> case do
@@ -369,6 +413,88 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
       ~r/(?i)\b(authorization|cookie|set-cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|password|prompt|secret|token)\b\s*[:=]\s*[^,;\s]+/,
       "[redacted]"
     )
+  end
+
+  defp unwrap_oban_failure_message(message) do
+    cond do
+      match = Regex.run(~r/failed with \{:error, "([^"]+)"\}/, message) ->
+        [_full, inner] = match
+        inner
+
+      match = Regex.run(~r/failed with \{:error, %\{[^}]*message: "([^"]+)"/, message) ->
+        [_full, inner] = match
+        inner
+
+      oban_discard_failure?(message) ->
+        "The job stopped without additional diagnostics."
+
+      true ->
+        message
+    end
+  end
+
+  defp operator_failure_title(message) do
+    code = message |> unwrap_oban_failure_message() |> reconciliation_failure_code()
+    code = code || oban_map_failure_code(message)
+
+    cond do
+      oban_discard_failure?(message) ->
+        "Run discarded"
+
+      code == "quota_refresh_auth_unavailable" ->
+        "Quota refresh blocked"
+
+      code == "quota_refresh_unavailable" ->
+        "Quota unavailable"
+
+      code == "quota_refresh_failed" ->
+        "Quota refresh failed"
+
+      is_binary(code) ->
+        humanize_failure_code(code)
+
+      true ->
+        nil
+    end
+  end
+
+  defp operator_failure_message(message) do
+    case reconciliation_failure_code(message) do
+      "quota_refresh_auth_unavailable" ->
+        "Quota refresh needs account reauthentication."
+
+      "quota_refresh_unavailable" ->
+        "Quota data was not available from the upstream account."
+
+      "quota_refresh_failed" ->
+        "Quota refresh failed for the upstream account."
+
+      code when is_binary(code) ->
+        "Account reconciliation needs attention: #{humanize_failure_code(code)}."
+
+      nil ->
+        message
+    end
+  end
+
+  defp reconciliation_failure_code("account reconciliation partial: " <> code),
+    do: String.trim(code)
+
+  defp reconciliation_failure_code(_message), do: nil
+
+  defp oban_map_failure_code(message) do
+    case Regex.run(~r/failed with \{:error, %\{[^}]*code: :([a-z0-9_]+)/, message) do
+      [_full, code] -> code
+      _no_match -> nil
+    end
+  end
+
+  defp oban_discard_failure?(message), do: Regex.match?(~r/failed with :discard\b/, message)
+
+  defp humanize_failure_code(code) do
+    code
+    |> String.replace("_", " ")
+    |> String.capitalize()
   end
 
   defp truncate_failure_message(message) when byte_size(message) > 240,

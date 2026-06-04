@@ -17,20 +17,19 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
   @stale_after_seconds 25 * 60
   @successful_partial_codes ~w(catalog_sync_failed catalog_sync_in_progress)
   @paused UpstreamIdentity.paused_status()
+  @reauth_required UpstreamIdentity.reauth_required_status()
   @assignment_paused PoolUpstreamAssignment.paused_status()
+  @assignment_reauth_required PoolUpstreamAssignment.reauth_required_status()
 
   @type orchestration_result :: {:ok, map()} | {:error, term()}
 
   @spec run(term(), term(), term()) :: orchestration_result()
   def run(pool_id, assignment_id, trigger_kind) do
-    if paused_reconciliation_target?(pool_id, assignment_id) do
+    if reason = skipped_reconciliation_target(pool_id, assignment_id) do
       result = %{
         status: :skipped,
         trigger_kind: trigger_kind,
-        reason: %{
-          code: :upstream_account_paused,
-          message: "paused upstream accounts are skipped by account reconciliation"
-        }
+        reason: reason
       }
 
       broadcast_job_result(pool_id, "account_reconciliation", {:ok, result})
@@ -181,7 +180,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
     })
   end
 
-  defp paused_reconciliation_target?(pool_id, assignment_id)
+  defp skipped_reconciliation_target(pool_id, assignment_id)
        when is_binary(pool_id) and is_binary(assignment_id) do
     case Repo.one(
            from assignment in PoolUpstreamAssignment,
@@ -191,13 +190,38 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
              limit: 1,
              select: {assignment.status, identity.status}
          ) do
-      {@assignment_paused, _identity_status} -> true
-      {_assignment_status, @paused} -> true
-      _other -> false
+      {@assignment_paused, _identity_status} ->
+        skipped_reconciliation_reason(
+          :upstream_account_paused,
+          "paused upstream accounts are skipped by account reconciliation"
+        )
+
+      {_assignment_status, @paused} ->
+        skipped_reconciliation_reason(
+          :upstream_account_paused,
+          "paused upstream accounts are skipped by account reconciliation"
+        )
+
+      {@assignment_reauth_required, _identity_status} ->
+        skipped_reconciliation_reason(
+          :upstream_account_reauth_required,
+          "upstream accounts requiring reauthentication are skipped by account reconciliation"
+        )
+
+      {_assignment_status, @reauth_required} ->
+        skipped_reconciliation_reason(
+          :upstream_account_reauth_required,
+          "upstream accounts requiring reauthentication are skipped by account reconciliation"
+        )
+
+      _other ->
+        nil
     end
   end
 
-  defp paused_reconciliation_target?(_pool_id, _assignment_id), do: false
+  defp skipped_reconciliation_target(_pool_id, _assignment_id), do: nil
+
+  defp skipped_reconciliation_reason(code, message), do: %{code: code, message: message}
 
   defp broadcast_job_result(pool_id, worker, {:ok, %{status: status}}) do
     Events.broadcast_job_status(pool_id, "job_status_updated", %{

@@ -21,8 +21,6 @@ defmodule CodexPooler.Jobs.ReadModel do
   @explorer_page_size 50
   @completed_state "completed"
   @overview_action_buckets [:active_failure, :retry_pressure, :stuck_executing, :backlog_pressure]
-  @hotspot_limit 5
-  @hotspot_target_limit 6
 
   @type job_summary :: map()
   @type explorer_job_summary :: map()
@@ -61,39 +59,6 @@ defmodule CodexPooler.Jobs.ReadModel do
             required(:backlog_pressure) => overview_bucket()
           },
           required(:completed_context) => overview_bucket()
-        }
-  @type hotspot_count :: %{
-          required(:count) => pos_integer(),
-          required(:label) => String.t()
-        }
-  @type worker_hotspot :: %{
-          required(:worker) => String.t(),
-          required(:label) => String.t(),
-          required(:count) => pos_integer()
-        }
-  @type queue_hotspot :: %{
-          required(:queue) => String.t(),
-          required(:label) => String.t(),
-          required(:count) => pos_integer()
-        }
-  @type identified_hotspot :: %{
-          required(:id) => String.t(),
-          required(:label) => String.t(),
-          required(:count) => pos_integer()
-        }
-  @type target_hotspot :: %{
-          required(:kind) => atom(),
-          required(:id) => String.t() | nil,
-          required(:label) => String.t(),
-          required(:count) => pos_integer()
-        }
-  @type jobs_hotspots :: %{
-          required(:actionable_count) => non_neg_integer(),
-          required(:workers) => [worker_hotspot()],
-          required(:queues) => [queue_hotspot()],
-          required(:pools) => [identified_hotspot()],
-          required(:accounts) => [identified_hotspot()],
-          required(:targets) => [target_hotspot()]
         }
   @type worker_job_summary :: %{
           latest: job_summary() | nil,
@@ -145,6 +110,7 @@ defmodule CodexPooler.Jobs.ReadModel do
     query =
       Oban.Job
       |> apply_explorer_filters(filters)
+      |> maybe_filter_resolved_failure_visibility(filters)
 
     if filters.attention do
       attention_filtered_explorer_page(query, filters.attention, limit, offset, opts)
@@ -195,34 +161,6 @@ defmodule CodexPooler.Jobs.ReadModel do
   end
 
   def jobs_overview(_scope, _filters, _opts), do: empty_jobs_overview()
-
-  @spec jobs_hotspots(scope_ref(), explorer_filters(), keyword()) :: jobs_hotspots()
-  def jobs_hotspots(scope, filters, opts \\ [])
-
-  def jobs_hotspots(%Scope{} = scope, filters, opts) do
-    if Pools.owner?(scope),
-      do: jobs_hotspots(:system, filters, opts),
-      else: empty_jobs_hotspots()
-  end
-
-  def jobs_hotspots(:system, filters, opts) do
-    filters = normalize_explorer_filters(filters)
-    now = attention_now(opts)
-
-    {:ok, hotspots} =
-      Repo.transaction(fn ->
-        Oban.Job
-        |> apply_overview_filters(filters)
-        |> job_explorer_metadata_query()
-        |> Repo.stream()
-        |> Enum.reduce(empty_jobs_hotspots_accumulator(), &collect_hotspot_job(&1, &2, now))
-        |> finalize_jobs_hotspots()
-      end)
-
-    hotspots
-  end
-
-  def jobs_hotspots(_scope, _filters, _opts), do: empty_jobs_hotspots()
 
   @spec worker_job_summary(scope_ref(), [String.t()]) :: worker_job_summary()
   def worker_job_summary(scope, workers)
@@ -332,10 +270,31 @@ defmodule CodexPooler.Jobs.ReadModel do
         queryable |> latest_worker_job_query(states: failure_states()) |> Repo.one(),
       pending: queryable |> next_pending_worker_job_query() |> Repo.one(),
       active: queryable |> active_worker_jobs_query() |> Repo.all(),
-      unresolved_failures: queryable |> unresolved_failure_worker_jobs_query() |> Repo.all()
+      unresolved_failures:
+        queryable
+        |> unresolved_failure_worker_jobs_query()
+        |> Repo.all()
+        |> reject_reauth_required_reconciliation_failures()
     }
     |> with_worker_summary_attention()
   end
+
+  defp reject_reauth_required_reconciliation_failures(jobs) do
+    Enum.reject(jobs, &reauth_required_reconciliation_failure?/1)
+  end
+
+  defp reauth_required_reconciliation_failure?(%{worker: worker, target: target})
+       when is_map(target) do
+    worker == worker_name(AccountReconciliationWorker) and reauth_required_target?(target)
+  end
+
+  defp reauth_required_reconciliation_failure?(_job), do: false
+
+  defp reauth_required_target?(%{assignment_status: "reauth_required"}), do: true
+
+  defp reauth_required_target?(%{assignment_identity_status: "reauth_required"}), do: true
+
+  defp reauth_required_target?(_target), do: false
 
   defp with_worker_summary_attention(summary) do
     now = DateTime.utc_now()
@@ -506,6 +465,22 @@ defmodule CodexPooler.Jobs.ReadModel do
     |> maybe_filter_explorer_target(filters.target_kind, filters.target_id)
   end
 
+  defp maybe_filter_resolved_failure_visibility(queryable, %{attention: attention})
+       when attention in ["active_failure", "retry_pressure", "cancelled"] do
+    exclude_resolved_failure_jobs_query(queryable)
+  end
+
+  defp maybe_filter_resolved_failure_visibility(queryable, %{state: state})
+       when is_binary(state),
+       do: queryable
+
+  defp maybe_filter_resolved_failure_visibility(queryable, %{show_completed: true}),
+    do: queryable
+
+  defp maybe_filter_resolved_failure_visibility(queryable, _filters) do
+    exclude_resolved_failure_jobs_query(queryable)
+  end
+
   defp maybe_filter_explorer_completed_visibility(queryable, %{show_completed: true}),
     do: queryable
 
@@ -584,33 +559,46 @@ defmodule CodexPooler.Jobs.ReadModel do
 
   defp empty_overview_bucket, do: %{count: 0, newest: nil}
 
-  defp empty_jobs_hotspots do
-    %{
-      actionable_count: 0,
-      workers: [],
-      queues: [],
-      pools: [],
-      accounts: [],
-      targets: []
-    }
-  end
-
-  defp empty_jobs_hotspots_accumulator do
-    empty_jobs_hotspots()
-    |> Map.merge(%{
-      workers: %{},
-      queues: %{},
-      pools: %{},
-      accounts: %{},
-      targets: %{}
-    })
-  end
-
   defp apply_overview_filters(queryable, filters) do
     queryable
     |> maybe_filter_explorer_worker(filters.worker)
     |> maybe_filter_explorer_queue(filters.queue)
     |> maybe_filter_explorer_target(filters.target_kind, filters.target_id)
+    |> exclude_resolved_failure_jobs_query()
+  end
+
+  defp exclude_resolved_failure_jobs_query(queryable) do
+    from job in queryable,
+      where:
+        job.state not in ^failure_states() or
+          fragment(
+            """
+            NOT EXISTS (
+              SELECT 1
+              FROM oban_jobs resolved
+              WHERE resolved.worker = ?
+                AND resolved.state = 'completed'
+                AND (
+                  resolved.inserted_at > ?
+                  OR (resolved.inserted_at = ? AND resolved.id > ?)
+                )
+                AND COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
+                AND COALESCE(resolved.args->>'pool_upstream_assignment_id', '') = COALESCE(?->>'pool_upstream_assignment_id', '')
+                AND COALESCE(resolved.args->>'upstream_identity_id', '') = COALESCE(?->>'upstream_identity_id', '')
+                AND COALESCE(resolved.args->>'api_key_id', '') = COALESCE(?->>'api_key_id', '')
+                AND COALESCE(resolved.args->>'rollup_date', '') = COALESCE(?->>'rollup_date', '')
+            )
+            """,
+            job.worker,
+            job.inserted_at,
+            job.inserted_at,
+            job.id,
+            job.args,
+            job.args,
+            job.args,
+            job.args,
+            job.args
+          )
   end
 
   defp collect_overview_job(job, overview, now) do
@@ -665,161 +653,6 @@ defmodule CodexPooler.Jobs.ReadModel do
   defp finalize_jobs_overview(overview) do
     %{overview | status: :healthy, empty?: false, healthy?: true}
   end
-
-  defp collect_hotspot_job(job, hotspots, now) do
-    job = HealthPolicy.put_attention(job, now: now)
-
-    if job.attention_state in @overview_action_buckets do
-      hotspots
-      |> Map.update!(:actionable_count, &(&1 + 1))
-      |> collect_hotspot(:workers, worker_hotspot_entry(job))
-      |> collect_hotspot(:queues, queue_hotspot_entry(job))
-      |> collect_hotspot(:pools, pool_hotspot_entry(job.target))
-      |> collect_hotspot(:accounts, account_hotspot_entry(job.target))
-      |> collect_hotspot(:targets, target_hotspot_entry(job.target))
-    else
-      hotspots
-    end
-  end
-
-  defp collect_hotspot(hotspots, _collection, nil), do: hotspots
-
-  defp collect_hotspot(hotspots, collection, {key, entry}) do
-    updated_collection =
-      hotspots
-      |> Map.fetch!(collection)
-      |> Map.update(
-        key,
-        Map.put(entry, :count, 1),
-        &Map.update!(&1, :count, fn count -> count + 1 end)
-      )
-
-    Map.put(hotspots, collection, updated_collection)
-  end
-
-  defp finalize_jobs_hotspots(hotspots) do
-    %{
-      actionable_count: hotspots.actionable_count,
-      workers: ranked_hotspots(hotspots.workers),
-      queues: ranked_hotspots(hotspots.queues),
-      pools: ranked_hotspots(hotspots.pools),
-      accounts: ranked_hotspots(hotspots.accounts),
-      targets: ranked_hotspots(hotspots.targets, @hotspot_target_limit)
-    }
-  end
-
-  defp ranked_hotspots(entries, limit \\ @hotspot_limit) do
-    entries
-    |> Map.values()
-    |> Enum.sort_by(&hotspot_sort_key/1)
-    |> Enum.take(limit)
-  end
-
-  defp hotspot_sort_key(entry) do
-    {-entry.count, Map.get(entry, :label, ""), Map.get(entry, :kind, :none),
-     Map.get(entry, :id, "")}
-  end
-
-  defp worker_hotspot_entry(%{worker: worker}) when is_binary(worker) and worker != "" do
-    {worker, %{worker: worker, label: worker_label(worker)}}
-  end
-
-  defp worker_hotspot_entry(_job), do: nil
-
-  defp queue_hotspot_entry(job) do
-    case Map.get(job, :queue) do
-      queue when is_binary(queue) and queue != "" -> {queue, %{queue: queue, label: queue}}
-      _missing_queue -> nil
-    end
-  end
-
-  defp pool_hotspot_entry(%{pool_id: pool_id} = target)
-       when is_binary(pool_id) and pool_id != "" do
-    {pool_id, %{id: pool_id, label: present_string(target.pool_name) || "Pool unavailable"}}
-  end
-
-  defp pool_hotspot_entry(_target), do: nil
-
-  defp account_hotspot_entry(target) do
-    case account_target(target) do
-      {account_id, label} -> {account_id, %{id: account_id, label: label}}
-      nil -> nil
-    end
-  end
-
-  defp target_hotspot_entry(%{assignment_id: assignment_id} = target)
-       when is_binary(assignment_id) and assignment_id != "" do
-    {
-      {:assignment, assignment_id},
-      %{
-        kind: :assignment,
-        id: assignment_id,
-        label: present_string(target.assignment_label) || "Assignment unavailable"
-      }
-    }
-  end
-
-  defp target_hotspot_entry(target) do
-    case account_target(target) do
-      {account_id, label} ->
-        {{:upstream_identity, account_id},
-         %{kind: :upstream_identity, id: account_id, label: label}}
-
-      nil ->
-        non_account_target_hotspot_entry(target)
-    end
-  end
-
-  defp non_account_target_hotspot_entry(%{pool_id: pool_id} = target)
-       when is_binary(pool_id) and pool_id != "" do
-    {{:pool, pool_id},
-     %{kind: :pool, id: pool_id, label: present_string(target.pool_name) || "Pool unavailable"}}
-  end
-
-  defp non_account_target_hotspot_entry(%{api_key_id: api_key_id} = target)
-       when is_binary(api_key_id) and api_key_id != "" do
-    label =
-      present_string(target.api_key_label) ||
-        present_string(target.api_key_prefix) ||
-        "API key unavailable"
-
-    {{:api_key, api_key_id}, %{kind: :api_key, id: api_key_id, label: label}}
-  end
-
-  defp non_account_target_hotspot_entry(%{rollup_date: rollup_date})
-       when is_binary(rollup_date) and rollup_date != "" do
-    {{:rollup_date, rollup_date},
-     %{kind: :rollup_date, id: rollup_date, label: "Rollup date #{rollup_date}"}}
-  end
-
-  defp non_account_target_hotspot_entry(_target) do
-    {:system, %{kind: :system, id: nil, label: "System job"}}
-  end
-
-  defp account_target(%{assignment_identity_id: account_id} = target)
-       when is_binary(account_id) and account_id != "" do
-    {account_id, present_string(target.assignment_identity_label) || "Account unavailable"}
-  end
-
-  defp account_target(%{upstream_identity_id: account_id} = target)
-       when is_binary(account_id) and account_id != "" do
-    {account_id, present_string(target.direct_identity_label) || "Account unavailable"}
-  end
-
-  defp account_target(_target), do: nil
-
-  defp worker_label(worker) do
-    worker
-    |> String.replace_prefix("CodexPooler.Jobs.", "")
-    |> String.replace_suffix("Worker", "")
-  end
-
-  defp present_string(value) when is_binary(value) do
-    value = String.trim(value)
-    if value == "", do: nil, else: value
-  end
-
-  defp present_string(_value), do: nil
 
   defp attention_filtered_explorer_page(queryable, attention, limit, offset, opts) do
     now = attention_now(opts)
@@ -968,6 +801,15 @@ defmodule CodexPooler.Jobs.ReadModel do
     }
   end
 
+  defp failure_title(%{"error" => message} = error) when is_binary(message) do
+    [failure_attempt(error), operator_failure_title(message) || failure_kind(error)]
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> "Failure detail"
+      parts -> Enum.join(parts, " · ")
+    end
+  end
+
   defp failure_title(error) do
     [failure_attempt(error), failure_kind(error)]
     |> Enum.reject(&is_nil/1)
@@ -988,6 +830,8 @@ defmodule CodexPooler.Jobs.ReadModel do
     message
     |> String.replace(~r/[\r\n\t]+/, " ")
     |> redact_failure_secrets()
+    |> unwrap_oban_failure_message()
+    |> operator_failure_message()
     |> String.trim()
     |> truncate_failure_message()
     |> case do
@@ -1006,6 +850,88 @@ defmodule CodexPooler.Jobs.ReadModel do
       ~r/(?i)\b(authorization|cookie|set-cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|password|prompt|secret|token)\b\s*[:=]\s*[^,;\s]+/,
       "[redacted]"
     )
+  end
+
+  defp unwrap_oban_failure_message(message) do
+    cond do
+      match = Regex.run(~r/failed with \{:error, "([^"]+)"\}/, message) ->
+        [_full, inner] = match
+        inner
+
+      match = Regex.run(~r/failed with \{:error, %\{[^}]*message: "([^"]+)"/, message) ->
+        [_full, inner] = match
+        inner
+
+      oban_discard_failure?(message) ->
+        "The job stopped without additional diagnostics."
+
+      true ->
+        message
+    end
+  end
+
+  defp operator_failure_title(message) do
+    code = message |> unwrap_oban_failure_message() |> reconciliation_failure_code()
+    code = code || oban_map_failure_code(message)
+
+    cond do
+      oban_discard_failure?(message) ->
+        "Run discarded"
+
+      code == "quota_refresh_auth_unavailable" ->
+        "Quota refresh blocked"
+
+      code == "quota_refresh_unavailable" ->
+        "Quota unavailable"
+
+      code == "quota_refresh_failed" ->
+        "Quota refresh failed"
+
+      is_binary(code) ->
+        humanize_failure_code(code)
+
+      true ->
+        nil
+    end
+  end
+
+  defp operator_failure_message(message) do
+    case reconciliation_failure_code(message) do
+      "quota_refresh_auth_unavailable" ->
+        "Quota refresh needs account reauthentication."
+
+      "quota_refresh_unavailable" ->
+        "Quota data was not available from the upstream account."
+
+      "quota_refresh_failed" ->
+        "Quota refresh failed for the upstream account."
+
+      code when is_binary(code) ->
+        "Account reconciliation needs attention: #{humanize_failure_code(code)}."
+
+      nil ->
+        message
+    end
+  end
+
+  defp reconciliation_failure_code("account reconciliation partial: " <> code),
+    do: String.trim(code)
+
+  defp reconciliation_failure_code(_message), do: nil
+
+  defp oban_map_failure_code(message) do
+    case Regex.run(~r/failed with \{:error, %\{[^}]*code: :([a-z0-9_]+)/, message) do
+      [_full, code] -> code
+      _no_match -> nil
+    end
+  end
+
+  defp oban_discard_failure?(message), do: Regex.match?(~r/failed with :discard\b/, message)
+
+  defp humanize_failure_code(code) do
+    code
+    |> String.replace("_", " ")
+    |> String.capitalize()
   end
 
   defp truncate_failure_message(message) when byte_size(message) > 240,

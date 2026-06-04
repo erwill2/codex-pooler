@@ -163,6 +163,40 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     assert has_element?(view, "#admin-jobs-explorer-mobile #job-card-#{completed_job.id}")
   end
 
+  test "desktop explorer rows use compact one-event summaries", %{conn: conn} do
+    job =
+      insert_job(1,
+        state: "discarded",
+        attempt: 2,
+        max_attempts: 5,
+        inserted_at: ~U[2026-05-04 10:00:00Z],
+        attempted_at: ~U[2026-05-04 10:01:00Z],
+        discarded_at: ~U[2026-05-04 10:02:00Z],
+        errors: [
+          %{
+            "attempt" => 2,
+            "kind" => "RuntimeError",
+            "error" => "pool reconciliation timeout"
+          }
+        ]
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs?state=discarded")
+    row = "#admin-jobs-explorer-desktop #job-#{job.id}"
+
+    assert has_element?(view, "#{row}[data-density='compact']")
+    assert has_element?(view, "#{row} [data-role='state-label']", "Discarded")
+    assert has_element?(view, "#{row} [data-role='worker']", "RuntimeStateCleanupWorker")
+    assert has_element?(view, "#{row} [data-role='job-meta']", "##{job.id}")
+    assert has_element?(view, "#{row} [data-role='job-event-label']", "Discarded")
+    assert has_element?(view, "#{row} [data-role='job-event-time']", "2026-05-04 10:02:00 UTC")
+    assert has_element?(view, "#{row} [data-role='failure-title']", "Attempt 2 · RuntimeError")
+
+    refute has_element?(view, "#{row} [data-role='inserted-at']")
+    refute has_element?(view, "#{row} [data-role='attempted-at']")
+    refute has_element?(view, "#{row} [data-role='discarded-at']")
+  end
+
   test "explorer paginates globally with stable desktop and mobile selectors", %{conn: conn} do
     base_time = ~U[2026-05-04 12:00:00Z]
 

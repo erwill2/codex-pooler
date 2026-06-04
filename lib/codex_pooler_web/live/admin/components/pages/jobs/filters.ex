@@ -25,6 +25,7 @@ defmodule CodexPoolerWeb.Admin.JobFilters do
       phx-change="filter"
       phx-submit="filter"
       mobile_single_column
+      single_row
       advanced_open={advanced_filters_open?(@filters)}
       autocomplete="off"
     >
@@ -117,15 +118,6 @@ defmodule CodexPoolerWeb.Admin.JobFilters do
         />
         <.target_id_filter value={@filters.target_id || ""} />
       </:advanced>
-
-      <:actions>
-        <AdminComponents.action_button
-          id="job-filter-clear"
-          icon="hero-x-mark"
-          label="Clear filters"
-          phx-click="clear_filters"
-        />
-      </:actions>
     </AdminComponents.filter_form>
 
     <div

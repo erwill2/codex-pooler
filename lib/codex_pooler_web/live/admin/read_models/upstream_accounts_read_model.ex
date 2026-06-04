@@ -636,15 +636,34 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
   defp refresh_status_label(identity) do
     identity
-    |> TokenRefresh.token_refresh_status()
+    |> current_token_refresh_status()
     |> Map.get("status", "not run")
   end
 
   defp token_refresh_label(identity, datetime_preferences) do
     identity
-    |> TokenRefresh.token_refresh_status()
+    |> current_token_refresh_status()
     |> token_refresh_label_from_metadata(datetime_preferences)
   end
+
+  defp current_token_refresh_status(%{status: identity_status} = identity) do
+    metadata = TokenRefresh.token_refresh_status(identity)
+
+    if stale_reauth_required_token_refresh?(metadata, identity_status) do
+      %{}
+    else
+      metadata
+    end
+  end
+
+  defp stale_reauth_required_token_refresh?(
+         %{"status" => "reauth_required"},
+         identity_status
+       )
+       when identity_status != "reauth_required",
+       do: true
+
+  defp stale_reauth_required_token_refresh?(_metadata, _identity_status), do: false
 
   defp token_refresh_label_from_metadata(
          %{"status" => "succeeded"} = metadata,
@@ -757,7 +776,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
   defp token_refresh_reason(identity) do
     identity
-    |> TokenRefresh.token_refresh_status()
+    |> current_token_refresh_status()
     |> Map.get("reason", %{})
   end
 

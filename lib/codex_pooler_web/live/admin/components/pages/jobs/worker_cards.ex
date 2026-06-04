@@ -5,6 +5,8 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
 
   import CodexPoolerWeb.Admin.JobsPresentation
 
+  alias CodexPoolerWeb.Admin.AvatarComponents
+
   attr :card, :map, required: true
   attr :datetime_preferences, :map, required: true
 
@@ -16,31 +18,32 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
     >
       <.job_worker_card_header card={@card} />
 
-      <%= if @card.key == :account_reconciliation do %>
-        <.account_reconciliation_activity card={@card} datetime_preferences={@datetime_preferences} />
-      <% else %>
-        <.worker_activity_strip card={@card} />
-        <.job_failure_dialog
-          :for={marker <- @card.failure_markers}
-          marker={marker}
-          datetime_preferences={@datetime_preferences}
-        />
-        <.worker_schedule_facts card={@card} datetime_preferences={@datetime_preferences} />
-      <% end %>
+      <.worker_activity_strip card={@card} />
+      <.job_failure_dialog
+        :for={marker <- @card.visible_failure_markers}
+        marker={marker}
+        datetime_preferences={@datetime_preferences}
+      />
+      <.worker_latest_failure
+        :if={@card.latest_failure}
+        card={@card}
+        datetime_preferences={@datetime_preferences}
+      />
+      <.worker_schedule_facts card={@card} datetime_preferences={@datetime_preferences} />
     </article>
     """
   end
 
   defp job_worker_card_header(assigns) do
     ~H"""
-    <header class="grid min-w-0 gap-4 px-5 pb-4 pt-5 sm:grid-cols-[minmax(0,1fr)_auto]">
-      <div class="flex min-w-0 items-start gap-3">
-        <span class="grid size-10 shrink-0 place-items-center rounded-box border border-base-300 bg-base-200 text-base-content/70">
-          <.icon name={@card.icon} class="size-5" />
+    <header class="grid min-w-0 gap-3 px-4 pb-3 pt-4 sm:grid-cols-[minmax(0,1fr)_auto]">
+      <div class="flex min-w-0 items-start gap-2.5">
+        <span class="grid size-9 shrink-0 place-items-center rounded-box border border-base-300 bg-base-200 text-base-content/70">
+          <.icon name={@card.icon} class="size-4" />
         </span>
-        <div class="grid min-w-0 gap-1">
+        <div class="grid min-w-0 gap-0.5">
           <h2 class="truncate text-base font-semibold text-base-content">{@card.title}</h2>
-          <p class="text-sm leading-6 text-base-content/60">{@card.description}</p>
+          <p class="text-xs leading-5 text-base-content/60">{@card.description}</p>
         </div>
       </div>
 
@@ -67,111 +70,6 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
     """
   end
 
-  attr :card, :map, required: true
-  attr :datetime_preferences, :map, required: true
-
-  defp account_reconciliation_activity(assigns) do
-    ~H"""
-    <section class="job-target-board" data-role="worker-activity-strip">
-      <div class="target-band">
-        <div class="target-copy">
-          <span class="target-kicker">Live targets</span>
-          <strong class="target-title">Account fan-out slots are always visible</strong>
-          <span class="target-subcopy">
-            Empty slots stay reserved until workers claim upstream assignments.
-          </span>
-        </div>
-        <div class="target-stack" aria-label="Account reconciliation targets">
-          <span
-            :for={marker <- @card.active_markers}
-            id={"job-activity-#{marker.id}"}
-            class="target-avatar"
-            data-live
-            data-role="active-worker-marker"
-            title={marker.title}
-            aria-label={marker.title}
-            data-has-image={marker.avatar_url && "true"}
-          >
-            <img
-              :if={marker.avatar_url}
-              src={marker.avatar_url}
-              alt=""
-              loading="lazy"
-              referrerpolicy="no-referrer"
-              aria-hidden="true"
-            />
-            <span :if={!marker.avatar_url} data-role="target-initial">{marker.glyph}</span>
-          </span>
-          <button
-            :for={marker <- @card.failure_markers}
-            id={"job-failure-#{marker.id}"}
-            type="button"
-            class="target-avatar"
-            data-failed
-            data-role="failed-worker-marker"
-            title={marker.title}
-            aria-label={marker.title}
-            onclick={"document.getElementById('job-failure-dialog-#{marker.id}').showModal()"}
-            data-has-image={marker.avatar_url && "true"}
-          >
-            <img
-              :if={marker.avatar_url}
-              src={marker.avatar_url}
-              alt=""
-              loading="lazy"
-              referrerpolicy="no-referrer"
-              aria-hidden="true"
-            />
-            <span :if={!marker.avatar_url} data-role="target-initial">{marker.glyph}</span>
-          </button>
-          <span
-            :for={slot <- 1..3}
-            :if={@card.active_markers == [] and @card.failure_markers == []}
-            class="target-avatar"
-            title={"Reserved target slot #{slot}"}
-          >
-            <.icon name="hero-user-circle" class="size-4" />
-          </span>
-        </div>
-      </div>
-
-      <.job_failure_dialog
-        :for={marker <- @card.failure_markers}
-        marker={marker}
-        datetime_preferences={@datetime_preferences}
-      />
-
-      <div class="target-schedule">
-        <div class="next-run">
-          <span class="target-label">Next run</span>
-          <strong data-role="next-run" title={@card.next_run_title}>
-            {@card.next_run}
-          </strong>
-          <span class="target-subcopy">{@card.cadence_label}</span>
-        </div>
-        <dl class="run-facts">
-          <div class="run-fact">
-            <dt class="target-label">Last run</dt>
-            <dd>{format_job_timestamp(@card.last_seen_at, @datetime_preferences)}</dd>
-          </div>
-          <div class="run-fact">
-            <dt class="target-label">Last success</dt>
-            <dd>{format_job_timestamp(@card.last_success_at, @datetime_preferences)}</dd>
-          </div>
-          <div class="run-fact">
-            <dt class="target-label">Last failure</dt>
-            <dd>{format_job_timestamp(@card.last_failure_at, @datetime_preferences)}</dd>
-          </div>
-          <div class="run-fact">
-            <dt class="target-label">Attempts</dt>
-            <dd>{@card.attempts}</dd>
-          </div>
-        </dl>
-      </div>
-    </section>
-    """
-  end
-
   defp worker_activity_strip(assigns) do
     ~H"""
     <section
@@ -184,54 +82,113 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
 
         <div class="flex min-w-0 flex-wrap items-center gap-1.5">
           <span
-            :for={marker <- @card.active_markers}
+            :for={marker <- @card.visible_active_markers}
             id={"job-activity-#{marker.id}"}
             data-role="active-worker-marker"
             aria-label={marker.title}
             title={marker.title}
+            data-has-avatar={marker.avatar_email && "true"}
             class="relative grid size-8 shrink-0 place-items-center overflow-hidden rounded-full border border-info/50 bg-info/10 text-[0.6875rem] font-semibold leading-none text-info shadow-sm"
           >
-            <img
-              :if={marker.avatar_url}
-              src={marker.avatar_url}
-              alt=""
-              class="size-full rounded-full object-cover"
-              loading="lazy"
-              referrerpolicy="no-referrer"
-              aria-hidden="true"
+            <AvatarComponents.gravatar
+              :if={marker.avatar_email}
+              id={"job-activity-avatar-#{marker.id}"}
+              email={marker.avatar_email}
+              label={marker.target_label}
+              size={64}
+              class="pointer-events-none"
+              image_class="size-8 rounded-full ring-0"
             />
-            <span :if={!marker.avatar_url} data-role="target-initial">{marker.glyph}</span>
+            <span :if={!marker.avatar_email} data-role="target-initial">{marker.glyph}</span>
             <span
               data-role="target-live-indicator"
               class="absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full bg-info ring-2 ring-base-100 motion-safe:animate-pulse"
             />
           </span>
+          <span
+            :if={@card.active_marker_overflow_count > 0}
+            data-role="active-worker-overflow"
+            title={"#{@card.active_marker_overflow_count} more running targets"}
+            class="grid size-8 shrink-0 place-items-center rounded-full border border-info/30 bg-info/5 text-[0.6875rem] font-semibold text-info"
+          >
+            +{@card.active_marker_overflow_count}
+          </span>
 
           <button
-            :for={marker <- @card.failure_markers}
+            :for={marker <- @card.visible_failure_markers}
             id={"job-failure-#{marker.id}"}
             type="button"
             data-role="failed-worker-marker"
             aria-label={marker.title}
             title={marker.title}
+            data-has-avatar={marker.avatar_email && "true"}
             class="relative grid size-8 shrink-0 place-items-center overflow-hidden rounded-full border border-error/60 bg-error/10 text-[0.6875rem] font-semibold leading-none text-error shadow-sm transition-colors hover:bg-error/15 focus:outline-none focus:ring-2 focus:ring-error/40"
             onclick={"document.getElementById('job-failure-dialog-#{marker.id}').showModal()"}
           >
-            <img
-              :if={marker.avatar_url}
-              src={marker.avatar_url}
-              alt=""
-              class="size-full rounded-full object-cover"
-              loading="lazy"
-              referrerpolicy="no-referrer"
-              aria-hidden="true"
+            <AvatarComponents.gravatar
+              :if={marker.avatar_email}
+              id={"job-failure-avatar-#{marker.id}"}
+              email={marker.avatar_email}
+              label={marker.target_label}
+              size={64}
+              class="pointer-events-none"
+              image_class="size-8 rounded-full ring-0"
             />
-            <span :if={!marker.avatar_url} data-role="target-initial">{marker.glyph}</span>
+            <span :if={!marker.avatar_email} data-role="target-initial">{marker.glyph}</span>
             <span class="absolute -bottom-0.5 -right-0.5 grid size-3.5 place-items-center rounded-full bg-error text-error-content ring-2 ring-base-100">
               <.icon name="hero-exclamation-triangle" class="size-2.5" />
             </span>
           </button>
+          <span
+            :if={@card.failure_marker_overflow_count > 0}
+            data-role="failed-worker-overflow"
+            title={"#{@card.failure_marker_overflow_count} more failed targets"}
+            class="grid size-8 shrink-0 place-items-center rounded-full border border-error/40 bg-error/5 text-[0.6875rem] font-semibold text-error"
+          >
+            +{@card.failure_marker_overflow_count}
+          </span>
         </div>
+      </div>
+    </section>
+    """
+  end
+
+  attr :card, :map, required: true
+  attr :datetime_preferences, :map, required: true
+
+  defp worker_latest_failure(assigns) do
+    ~H"""
+    <section
+      data-role="worker-latest-failure"
+      class="border-t border-error/20 bg-error/5 px-4 py-3 text-sm"
+    >
+      <div class="grid gap-3">
+        <div class="min-w-0">
+          <p class="text-xs font-semibold uppercase text-error">Latest failure</p>
+          <p class="mt-1 truncate font-semibold text-base-content">
+            {@card.latest_failure.target_label}
+          </p>
+          <p data-role="latest-failure-message" class="mt-1 leading-6 text-base-content/70">
+            {@card.latest_failure.message}
+          </p>
+        </div>
+        <dl
+          data-role="latest-failure-meta"
+          class="grid grid-cols-2 gap-3 text-xs text-base-content/60 sm:max-w-sm"
+        >
+          <div>
+            <dt>When</dt>
+            <dd class="font-semibold tabular-nums text-base-content">
+              {format_job_timestamp(@card.latest_failure.failed_at, @datetime_preferences)}
+            </dd>
+          </div>
+          <div>
+            <dt>Attempts</dt>
+            <dd class="font-semibold tabular-nums text-base-content">
+              {@card.latest_failure.attempts}
+            </dd>
+          </div>
+        </dl>
       </div>
     </section>
     """
@@ -285,45 +242,37 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
 
   defp worker_schedule_facts(assigns) do
     ~H"""
-    <section class="grid gap-4 border-t border-base-300 px-5 py-4 md:grid-cols-[minmax(8rem,0.8fr)_minmax(0,1.2fr)]">
-      <div class="grid content-start gap-1">
+    <section
+      data-role="worker-schedule-facts"
+      data-density="compact"
+      class="grid gap-3 border-t border-base-300 px-4 py-3 sm:grid-cols-[minmax(7rem,0.65fr)_minmax(0,1fr)] sm:items-start"
+    >
+      <div data-role="next-run-group" class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
         <span class="text-xs text-base-content/50">Next run</span>
         <strong
           data-role="next-run"
-          class="text-lg font-semibold leading-tight text-base-content"
+          class="text-base font-semibold leading-tight text-base-content"
           title={@card.next_run_title}
         >
           {@card.next_run}
         </strong>
         <span
           :if={@card.cadence_label != @card.next_run}
-          class="truncate text-xs text-base-content/50"
+          class="text-xs text-base-content/50"
           title={@card.cadence_label}
         >
           {@card.cadence_label}
         </span>
       </div>
 
-      <dl class="grid grid-cols-2 gap-x-5 gap-y-3 text-xs sm:grid-cols-4">
-        <div class="grid min-w-0 gap-1">
+      <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+        <div data-role="last-run" class="grid min-w-0 gap-0.5">
           <dt class="text-base-content/50">Last run</dt>
           <dd class="font-semibold tabular-nums text-base-content">
             {format_job_timestamp(@card.last_seen_at, @datetime_preferences)}
           </dd>
         </div>
-        <div class="grid min-w-0 gap-1">
-          <dt class="text-base-content/50">Last success</dt>
-          <dd class="font-semibold tabular-nums text-base-content">
-            {format_job_timestamp(@card.last_success_at, @datetime_preferences)}
-          </dd>
-        </div>
-        <div class="grid min-w-0 gap-1">
-          <dt class="text-base-content/50">Last failure</dt>
-          <dd class="font-semibold tabular-nums text-base-content">
-            {format_job_timestamp(@card.last_failure_at, @datetime_preferences)}
-          </dd>
-        </div>
-        <div class="grid min-w-0 gap-1">
+        <div data-role="attempts" class="grid min-w-0 gap-0.5">
           <dt class="text-base-content/50">Attempts</dt>
           <dd class="font-semibold tabular-nums text-base-content">{@card.attempts}</dd>
         </div>

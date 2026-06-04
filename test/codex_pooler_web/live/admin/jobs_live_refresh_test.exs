@@ -234,7 +234,6 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
     assert Enum.map(assigns.explorer.items, & &1.id) == [selected_job.id]
     assert assigns.explorer.total == 1
     assert is_map(assigns.overview)
-    assert is_map(assigns.hotspots)
     assert Enum.all?(assigns.explorer.items, &(&1.id != hidden_job.id))
   end
 

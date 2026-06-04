@@ -181,8 +181,6 @@ defmodule CodexPoolerWeb.Admin.JobFilterFormTest do
              "page" => "2",
              "state" => "retryable"
            }
-
-    assert JobFilterForm.clear_filter_query_params(base_params) == %{"job_id" => "7"}
   end
 
   test "selected option helpers fall back to the any option" do

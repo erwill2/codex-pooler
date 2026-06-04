@@ -100,14 +100,6 @@ defmodule CodexPoolerWeb.Admin.JobFilterForm do
     |> Map.delete("job_id")
   end
 
-  @spec clear_filter_query_params(map()) :: map()
-  def clear_filter_query_params(params) when is_map(params) do
-    case normalized_positive_integer(Map.get(params, "job_id")) do
-      nil -> %{}
-      job_id -> %{"job_id" => Integer.to_string(job_id)}
-    end
-  end
-
   @spec filter_form(form_values(), [filter_error()]) :: Phoenix.HTML.Form.t()
   def filter_form(form_values, errors \\ []) do
     to_form(form_values, as: :filters, errors: form_errors(errors))

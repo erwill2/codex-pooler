@@ -63,7 +63,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
 
     assert %{
              overview: overview,
-             hotspots: hotspots,
              explorer: explorer,
              filters: filters,
              form_values: form_values,
@@ -75,7 +74,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert selected_id == selected_job.id
     assert overview.status == :attention_required
     assert overview.total == 1
-    assert hotspots.actionable_count == 1
     assert explorer == %{items: [projection.selected_job], total: 1, limit: 50, offset: 0}
     assert filters.worker == worker_name(TokenRefreshWorker)
     assert filters.queue == "jobs"
@@ -117,6 +115,48 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert projection.explorer.items == []
     assert projection.selected_job == nil
     assert projection.filters.job_id == hidden_completed_job.id
+  end
+
+  test "default projection excludes discarded jobs resolved by a later target success" do
+    resolved_target_id = Ecto.UUID.generate()
+    unresolved_target_id = Ecto.UUID.generate()
+
+    resolved_failure =
+      insert_job(1,
+        worker: TokenRefreshWorker,
+        state: "discarded",
+        inserted_at: ~U[2026-06-02 10:00:00Z],
+        discarded_at: ~U[2026-06-02 10:01:00Z],
+        args: %{"upstream_identity_id" => resolved_target_id}
+      )
+
+    insert_job(2,
+      worker: TokenRefreshWorker,
+      state: "completed",
+      inserted_at: ~U[2026-06-02 10:05:00Z],
+      completed_at: ~U[2026-06-02 10:06:00Z],
+      args: %{"upstream_identity_id" => resolved_target_id}
+    )
+
+    unresolved_failure =
+      insert_job(3,
+        worker: TokenRefreshWorker,
+        state: "discarded",
+        inserted_at: ~U[2026-06-02 10:10:00Z],
+        discarded_at: ~U[2026-06-02 10:11:00Z],
+        args: %{"upstream_identity_id" => unresolved_target_id}
+      )
+
+    projection =
+      JobsReadModel.load(:system,
+        params: %{},
+        now: ~U[2026-06-02 10:30:00Z]
+      )
+
+    assert projection.overview.actionable_count == 1
+    assert projection.overview.buckets.active_failure.count == 1
+    assert Enum.map(projection.explorer.items, & &1.id) == [unresolved_failure.id]
+    refute Enum.any?(projection.explorer.items, &(&1.id == resolved_failure.id))
   end
 
   test "keeps invalid URL filter warnings while applying safe defaults" do
@@ -163,7 +203,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
 
     assert projection.overview.empty?
     assert projection.overview.total == 0
-    assert projection.hotspots.actionable_count == 0
     assert projection.explorer == %{items: [], total: 0, limit: 50, offset: 0}
     assert projection.selected_job == nil
     refute Map.has_key?(projection, :recent_jobs)

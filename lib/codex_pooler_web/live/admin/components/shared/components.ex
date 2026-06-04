@@ -255,6 +255,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :advanced_open, :boolean, default: false
   attr :compact, :boolean, default: false
   attr :mobile_single_column, :boolean, default: false
+  attr :single_row, :boolean, default: false
   attr :rest, :global, include: ~w(phx-change phx-submit phx-target method action autocomplete)
 
   slot :inner_block, required: true
@@ -270,7 +271,11 @@ defmodule CodexPoolerWeb.Admin.Components do
       {@rest}
     >
       <div class={filter_form_layout_class(@compact)}>
-        <div class={filter_fields_class(@compact, @mobile_single_column)}>
+        <div
+          class={filter_fields_class(@compact, @mobile_single_column, @single_row)}
+          data-role="filter-fields"
+          data-layout={if(@single_row, do: "single-row")}
+        >
           {render_slot(@inner_block)}
         </div>
         <div
@@ -614,15 +619,19 @@ defmodule CodexPoolerWeb.Admin.Components do
   defp metric_icon_class(_tone),
     do: "grid size-10 place-items-center rounded-box bg-base-200 text-base-content/60"
 
-  defp filter_fields_class(true, _mobile_single_column) do
+  defp filter_fields_class(true, _mobile_single_column, _single_row) do
     "grid min-w-0 flex-1 grid-cols-1 items-end gap-2 sm:grid-cols-[minmax(14rem,1fr)_12rem] [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.input]:h-8 [&_.label]:sr-only [&_.select]:h-8 [&_.select]:select-sm"
   end
 
-  defp filter_fields_class(false, true) do
+  defp filter_fields_class(false, _mobile_single_column, true) do
+    "grid grid-cols-1 items-end gap-2 sm:grid-cols-2 lg:grid-cols-5 [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.label]:mb-0.5 [&_.label]:px-1 [&_.label]:text-[0.65rem] [&_.label]:font-semibold [&_.label]:uppercase [&_.label]:tracking-wide [&_.label]:text-base-content/45 [&_.select]:select-sm"
+  end
+
+  defp filter_fields_class(false, true, false) do
     "grid grid-cols-1 items-end gap-2 sm:grid-cols-2 lg:grid-cols-4 [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.label]:mb-0.5 [&_.label]:px-1 [&_.label]:text-[0.65rem] [&_.label]:font-semibold [&_.label]:uppercase [&_.label]:tracking-wide [&_.label]:text-base-content/45 [&_.select]:select-sm"
   end
 
-  defp filter_fields_class(false, false) do
+  defp filter_fields_class(false, false, false) do
     "grid grid-cols-2 items-end gap-2 lg:grid-cols-4 [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.label]:mb-0.5 [&_.label]:px-1 [&_.label]:text-[0.65rem] [&_.label]:font-semibold [&_.label]:uppercase [&_.label]:tracking-wide [&_.label]:text-base-content/45 [&_.select]:select-sm"
   end
 

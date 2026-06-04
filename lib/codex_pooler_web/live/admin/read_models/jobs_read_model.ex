@@ -31,7 +31,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
   @type load_opts :: keyword() | map()
   @type page_state :: %{
           required(:overview) => ReadModel.jobs_overview(),
-          required(:hotspots) => ReadModel.jobs_hotspots(),
           required(:explorer) => ReadModel.explorer_page(),
           required(:filters) => JobFilterForm.filters(),
           required(:form_values) => JobFilterForm.form_values(),
@@ -67,9 +66,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
     overview =
       scope |> ReadModel.jobs_overview(explorer_filters, read_opts) |> sanitize_projection()
 
-    hotspots =
-      scope |> ReadModel.jobs_hotspots(explorer_filters, read_opts) |> sanitize_projection()
-
     explorer =
       scope |> ReadModel.list_explorer_jobs(explorer_filters, read_opts) |> sanitize_projection()
 
@@ -77,7 +73,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
 
     %{
       overview: overview,
-      hotspots: hotspots,
       explorer: explorer,
       filters: filters,
       form_values: form_values,
@@ -94,7 +89,6 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
 
     %{
       overview: ReadModel.jobs_overview(nil, explorer_filters),
-      hotspots: ReadModel.jobs_hotspots(nil, explorer_filters),
       explorer: ReadModel.list_explorer_jobs(nil, explorer_filters),
       filters: filters,
       form_values: form_values,
@@ -166,6 +160,15 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
     }
   end
 
+  defp failure_title(%{"error" => message} = error) when is_binary(message) do
+    [failure_attempt(error), operator_failure_title(message) || failure_kind(error)]
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> "Failure detail"
+      parts -> Enum.join(parts, " · ")
+    end
+  end
+
   defp failure_title(error) do
     [failure_attempt(error), failure_kind(error)]
     |> Enum.reject(&is_nil/1)
@@ -186,6 +189,8 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
     message
     |> String.replace(~r/[\r\n\t]+/, " ")
     |> redact_failure_secrets()
+    |> unwrap_oban_failure_message()
+    |> operator_failure_message()
     |> String.trim()
     |> truncate_failure_message()
     |> case do
@@ -204,6 +209,88 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
       ~r/(?i)\b(authorization|cookie|set-cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|password|prompt|secret|token)\b\s*[:=]\s*[^,;\s]+/,
       "[redacted]"
     )
+  end
+
+  defp unwrap_oban_failure_message(message) do
+    cond do
+      match = Regex.run(~r/failed with \{:error, "([^"]+)"\}/, message) ->
+        [_full, inner] = match
+        inner
+
+      match = Regex.run(~r/failed with \{:error, %\{[^}]*message: "([^"]+)"/, message) ->
+        [_full, inner] = match
+        inner
+
+      oban_discard_failure?(message) ->
+        "The job stopped without additional diagnostics."
+
+      true ->
+        message
+    end
+  end
+
+  defp operator_failure_title(message) do
+    code = message |> unwrap_oban_failure_message() |> reconciliation_failure_code()
+    code = code || oban_map_failure_code(message)
+
+    cond do
+      oban_discard_failure?(message) ->
+        "Run discarded"
+
+      code == "quota_refresh_auth_unavailable" ->
+        "Quota refresh blocked"
+
+      code == "quota_refresh_unavailable" ->
+        "Quota unavailable"
+
+      code == "quota_refresh_failed" ->
+        "Quota refresh failed"
+
+      is_binary(code) ->
+        humanize_failure_code(code)
+
+      true ->
+        nil
+    end
+  end
+
+  defp operator_failure_message(message) do
+    case reconciliation_failure_code(message) do
+      "quota_refresh_auth_unavailable" ->
+        "Quota refresh needs account reauthentication."
+
+      "quota_refresh_unavailable" ->
+        "Quota data was not available from the upstream account."
+
+      "quota_refresh_failed" ->
+        "Quota refresh failed for the upstream account."
+
+      code when is_binary(code) ->
+        "Account reconciliation needs attention: #{humanize_failure_code(code)}."
+
+      nil ->
+        message
+    end
+  end
+
+  defp reconciliation_failure_code("account reconciliation partial: " <> code),
+    do: String.trim(code)
+
+  defp reconciliation_failure_code(_message), do: nil
+
+  defp oban_map_failure_code(message) do
+    case Regex.run(~r/failed with \{:error, %\{[^}]*code: :([a-z0-9_]+)/, message) do
+      [_full, code] -> code
+      _no_match -> nil
+    end
+  end
+
+  defp oban_discard_failure?(message), do: Regex.match?(~r/failed with :discard\b/, message)
+
+  defp humanize_failure_code(code) do
+    code
+    |> String.replace("_", " ")
+    |> String.capitalize()
   end
 
   defp truncate_failure_message(message) when byte_size(message) > 240,

@@ -2637,6 +2637,35 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, warning_selector, "Reinvite account")
   end
 
+  test "active accounts ignore stale reauthentication token refresh metadata", %{scope: scope} do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "stale-token-refresh", name: "Stale Token Refresh"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Recovered Account",
+        identity_status: "active",
+        identity_metadata: %{
+          "token_refresh" => %{
+            "status" => "reauth_required",
+            "reason" => %{
+              "code" => "refresh_token_revoked",
+              "message" => "Refresh token was revoked or expired"
+            }
+          }
+        }
+      })
+
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+
+    assert account.identity.id == identity.id
+    assert account.reauth_required? == false
+    assert account.refresh_status == "not run"
+    assert account.token_refresh_label == "token refresh not run"
+    assert account.reauth_reason_code == nil
+    assert account.reauth_reason_message == nil
+  end
+
   defp blocked_auth_metadata(status) do
     %{
       "access_token_expires_at" =>

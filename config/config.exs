@@ -22,7 +22,7 @@ jobs_schedule = [
     key: :catalog_sync,
     id: "catalog-sync",
     title: "Catalog sync",
-    description: "Per-pool model catalog refreshes and scheduled fan-out",
+    description: "Model catalog refresh",
     icon: "hero-rectangle-stack",
     workers: [
       CodexPooler.Jobs.CatalogSyncWorker,
@@ -35,7 +35,7 @@ jobs_schedule = [
     key: :pricing_import,
     id: "pricing-import",
     title: "Pricing import",
-    description: "OpenAI pricing JSON catalog refreshes for request-log cost reporting",
+    description: "Pricing data refresh",
     icon: "hero-currency-dollar",
     workers: [CodexPooler.Jobs.PricingImportWorker],
     scheduled_worker: CodexPooler.Jobs.PricingImportWorker,
@@ -45,7 +45,7 @@ jobs_schedule = [
     key: :account_reconciliation,
     id: "account-reconciliation",
     title: "Account reconciliation",
-    description: "Quota, health, token, and catalog checks for upstream assignments",
+    description: "Upstream account checks",
     icon: "hero-arrow-path-rounded-square",
     workers: [
       CodexPooler.Jobs.AccountReconciliationWorker,
@@ -58,7 +58,7 @@ jobs_schedule = [
     key: :alert_evaluation,
     id: "alert-evaluation",
     title: "Alert evaluation",
-    description: "Persisted alert rule evaluation and incident lifecycle updates",
+    description: "Alert rule checks",
     icon: "hero-bell-alert",
     workers: [
       CodexPooler.Jobs.AlertEvaluationWorker,
@@ -71,7 +71,7 @@ jobs_schedule = [
     key: :token_refresh,
     id: "token-refresh",
     title: "Token refresh",
-    description: "Encrypted upstream access-token renewal",
+    description: "Access-token renewal",
     icon: "hero-key",
     workers: [CodexPooler.Jobs.TokenRefreshWorker],
     cadence: %{label: "On demand", cron: nil}
@@ -80,7 +80,7 @@ jobs_schedule = [
     key: :daily_rollup_rebuild,
     id: "daily-rollup-rebuild",
     title: "Daily rollup rebuild",
-    description: "Accounting rollup recomputation and daily scheduler",
+    description: "Usage rollup rebuild",
     icon: "hero-chart-bar-square",
     workers: [
       CodexPooler.Jobs.DailyRollupRebuildWorker,
@@ -93,7 +93,7 @@ jobs_schedule = [
     key: :runtime_cleanup,
     id: "runtime-cleanup",
     title: "Runtime cleanup",
-    description: "Expired files, sessions, runtime state, and stale reconciliation cleanup",
+    description: "Expired state cleanup",
     icon: "hero-sparkles",
     workers: [CodexPooler.Jobs.RuntimeStateCleanupWorker],
     scheduled_worker: CodexPooler.Jobs.RuntimeStateCleanupWorker,

@@ -50,17 +50,21 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
         data-role="explorer-desktop"
         class="hidden overflow-x-auto lg:block"
       >
-        <table id="admin-jobs-explorer-table" class="table table-zebra table-sm w-full align-top">
+        <table
+          id="admin-jobs-explorer-table"
+          class="w-full min-w-[980px] table-fixed border-collapse text-xs"
+        >
           <thead>
-            <tr class="text-xs uppercase tracking-wide text-base-content/60">
-              <th class="w-72">Job</th>
-              <th>Target</th>
-              <th class="w-32">Attempts</th>
-              <th class="w-72">Timeline</th>
-              <th class="w-64">Failure</th>
+            <tr class="border-b border-base-300 bg-base-200/40 text-left text-[0.68rem] font-semibold uppercase tracking-wide text-base-content/55">
+              <th class="w-[28%] px-3 py-2">Job</th>
+              <th class="w-[12%] px-3 py-2">State</th>
+              <th class="w-[22%] px-3 py-2">Target</th>
+              <th class="w-[20%] px-3 py-2">Last event</th>
+              <th class="w-[8%] px-3 py-2">Attempts</th>
+              <th class="w-[10%] px-3 py-2">Failure</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody class="divide-y divide-base-300/70">
             <.job_table_row
               :for={job <- @explorer.items}
               job={job}
@@ -122,24 +126,31 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
     <tr
       id={"job-#{@job.id}"}
       data-role="job-row"
+      data-density="compact"
       data-job-id={@job.id}
       phx-click="open_job"
       phx-value-job-id={@job.id}
-      class="cursor-pointer align-top transition-colors hover:bg-base-200/60"
+      class="h-11 cursor-pointer align-middle transition-colors hover:bg-base-200/60"
     >
-      <td>
-        <.job_identity job={@job} />
+      <td class="min-w-0 px-3 py-1.5">
+        <.job_compact_identity job={@job} />
       </td>
-      <td>
+      <td class="px-3 py-1.5">
+        <.job_state job={@job} />
+      </td>
+      <td class="min-w-0 px-3 py-1.5">
         <.job_target_summary job={@job} />
       </td>
-      <td class="font-mono text-xs tabular-nums text-base-content/80" data-role="attempts">
+      <td class="px-3 py-1.5">
+        <.job_event job={@job} datetime_preferences={@datetime_preferences} />
+      </td>
+      <td
+        class="px-3 py-1.5 font-mono text-[0.72rem] tabular-nums text-base-content/75"
+        data-role="attempts"
+      >
         {format_attempts(@job)}
       </td>
-      <td>
-        <.job_timeline job={@job} datetime_preferences={@datetime_preferences} />
-      </td>
-      <td>
+      <td class="min-w-0 px-3 py-1.5">
         <.job_failure job={@job} />
       </td>
     </tr>
@@ -168,6 +179,49 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
       <.job_timeline job={@job} datetime_preferences={@datetime_preferences} />
       <.job_failure job={@job} />
     </article>
+    """
+  end
+
+  attr :job, :map, required: true
+
+  defp job_compact_identity(assigns) do
+    ~H"""
+    <div class="grid min-w-0 gap-0.5">
+      <span
+        data-role="worker"
+        class="truncate text-[0.82rem] font-semibold leading-tight text-base-content"
+        title={safe_text(@job.worker)}
+      >
+        {safe_text(@job.worker)}
+      </span>
+      <span
+        data-role="job-meta"
+        class="truncate text-[0.68rem] leading-tight text-base-content/50"
+        title={"Job ##{@job.id} · Queue #{safe_text(@job.queue)}"}
+      >
+        #{@job.id} · <span data-role="queue">Queue {safe_text(@job.queue)}</span>
+      </span>
+    </div>
+    """
+  end
+
+  attr :job, :map, required: true
+
+  defp job_state(assigns) do
+    ~H"""
+    <div class="flex min-w-0 items-center gap-1.5">
+      <span
+        data-role="state-icon"
+        title={job_state_label(@job.state)}
+        aria-label={"State: #{job_state_label(@job.state)}"}
+        class="shrink-0"
+      >
+        <.icon name={job_state_icon(@job.state)} class={job_state_icon_class(@job.state)} />
+      </span>
+      <span data-role="state-label" class={job_state_badge_class(@job.state)}>
+        {job_state_label(@job.state)}
+      </span>
+    </div>
     """
   end
 
@@ -211,11 +265,15 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
 
   defp job_target_summary(assigns) do
     ~H"""
-    <div class="min-w-0 text-xs text-base-content/70">
-      <div :if={target = job_target(@job)} data-role="job-target" class="grid gap-1 leading-tight">
+    <div class="min-w-0 text-[0.72rem] text-base-content/70">
+      <div
+        :if={target = job_target(@job)}
+        data-role="job-target"
+        class="flex min-w-0 items-baseline gap-1 leading-tight"
+      >
         <span
           data-role="target-primary"
-          class="truncate font-medium text-base-content/80"
+          class="min-w-0 truncate font-medium text-base-content/80"
           title={target.primary_title}
         >
           {target.primary}
@@ -223,13 +281,38 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
         <span
           :if={target.secondary}
           data-role="target-secondary"
-          class="truncate text-base-content/60"
+          class="hidden min-w-0 truncate text-base-content/55 xl:inline"
           title={target.secondary_title}
         >
-          {target.secondary}
+          · {target.secondary}
         </span>
       </div>
       <span :if={!job_target(@job)} data-role="job-target-empty">-</span>
+    </div>
+    """
+  end
+
+  attr :job, :map, required: true
+  attr :datetime_preferences, :map, required: true
+
+  defp job_event(assigns) do
+    assigns = assign(assigns, event: job_event_summary(assigns.job, assigns.datetime_preferences))
+
+    ~H"""
+    <div data-role="job-event" class="grid min-w-0 gap-0.5">
+      <span
+        data-role="job-event-label"
+        class="text-[0.66rem] font-semibold uppercase leading-tight text-base-content/45"
+      >
+        {@event.label}
+      </span>
+      <span
+        data-role="job-event-time"
+        class="truncate font-mono text-[0.72rem] leading-tight tabular-nums text-base-content/70"
+        title={@event.timestamp}
+      >
+        {@event.timestamp}
+      </span>
     </div>
     """
   end
@@ -266,25 +349,22 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
 
   defp job_failure(assigns) do
     ~H"""
-    <details
+    <div
       :if={failure = job_failure_summary(@job)}
       data-role="failure-details"
-      class="group text-xs text-base-content/70"
+      class="flex min-w-0 items-center gap-1 text-[0.72rem] leading-tight text-error"
+      title={failure.message}
     >
-      <summary class="cursor-pointer list-none text-error marker:hidden hover:underline">
-        <span class="inline-flex items-center gap-1">
-          <.icon name="hero-exclamation-triangle" class="size-3.5" />
-          <span>{failure.title}</span>
-        </span>
-      </summary>
-      <p data-role="failure-message" class="mt-1 leading-relaxed text-base-content/70">
+      <.icon name="hero-exclamation-triangle" class="size-3.5 shrink-0" />
+      <span data-role="failure-title" class="min-w-0 truncate">{failure.title}</span>
+      <span data-role="failure-message" class="sr-only">
         {failure.message}
-      </p>
-    </details>
+      </span>
+    </div>
     <span
       :if={!job_failure_summary(@job)}
       data-role="failure-empty"
-      class="text-xs text-base-content/45"
+      class="text-[0.72rem] text-base-content/45"
     >
       -
     </span>
@@ -341,6 +421,67 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
     first = offset + 1
     last = min(offset + limit, total)
     "Showing #{first}-#{last} of #{total}"
+  end
+
+  defp job_event_summary(job, datetime_preferences) do
+    job
+    |> job_event_candidates()
+    |> Enum.find(fn {_label, value} -> match?(%DateTime{}, value) end)
+    |> case do
+      {label, %DateTime{} = datetime} ->
+        %{label: label, timestamp: format_job_timestamp(datetime, datetime_preferences)}
+
+      nil ->
+        %{label: "Observed", timestamp: "-"}
+    end
+  end
+
+  defp job_event_candidates(%{state: "completed"} = job) do
+    [
+      {"Completed", job.completed_at},
+      {"Attempted", job.attempted_at},
+      {"Inserted", job.inserted_at}
+    ]
+  end
+
+  defp job_event_candidates(%{state: "discarded"} = job) do
+    [
+      {"Discarded", job.discarded_at},
+      {"Attempted", job.attempted_at},
+      {"Inserted", job.inserted_at}
+    ]
+  end
+
+  defp job_event_candidates(%{state: "cancelled"} = job) do
+    [
+      {"Cancelled", job.cancelled_at},
+      {"Attempted", job.attempted_at},
+      {"Inserted", job.inserted_at}
+    ]
+  end
+
+  defp job_event_candidates(%{state: state} = job) when state in ["scheduled", "retryable"] do
+    [
+      {"Scheduled", job.scheduled_at},
+      {"Attempted", job.attempted_at},
+      {"Inserted", job.inserted_at}
+    ]
+  end
+
+  defp job_event_candidates(%{state: "executing"} = job) do
+    [
+      {"Attempted", job.attempted_at},
+      {"Scheduled", job.scheduled_at},
+      {"Inserted", job.inserted_at}
+    ]
+  end
+
+  defp job_event_candidates(job) do
+    [
+      {"Scheduled", job.scheduled_at},
+      {"Attempted", job.attempted_at},
+      {"Inserted", job.inserted_at}
+    ]
   end
 
   defp page_query_params(current_params, page) do

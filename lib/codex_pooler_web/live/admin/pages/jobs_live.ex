@@ -91,14 +91,6 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
     {:noreply, patch_filter(socket, "show_completed", show_completed)}
   end
 
-  def handle_event("clear_filters", _params, socket) do
-    {:noreply,
-     push_patch(socket,
-       to:
-         ~p"/admin/jobs?#{JobFilterForm.clear_filter_query_params(socket.assigns.current_params)}"
-     )}
-  end
-
   def handle_event("open_job", %{"job-id" => job_id}, socket) do
     {:noreply,
      push_patch(socket,
@@ -168,7 +160,6 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
             <JobOverview.jobs_overview
               :if={@owner_authorized?}
               overview={@overview}
-              hotspots={@hotspots}
             />
 
             <JobFilters.job_filters
@@ -179,17 +170,10 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
               filter_errors={@filter_errors}
             />
 
-            <JobExplorer.jobs_explorer
-              :if={@owner_authorized?}
-              explorer={@explorer}
-              current_params={@current_params}
-              datetime_preferences={@datetime_preferences}
-            />
-
             <div
               :if={@owner_authorized?}
               id="admin-jobs-worker-grid"
-              class="grid gap-4 xl:grid-cols-2"
+              class="grid items-start gap-4 xl:grid-cols-2"
             >
               <JobWorkerCards.job_worker_card
                 :for={card <- @worker_cards}
@@ -197,6 +181,13 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
                 datetime_preferences={@datetime_preferences}
               />
             </div>
+
+            <JobExplorer.jobs_explorer
+              :if={@owner_authorized?}
+              explorer={@explorer}
+              current_params={@current_params}
+              datetime_preferences={@datetime_preferences}
+            />
           </section>
         </div>
 
@@ -262,7 +253,6 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
     assign(socket,
       current_params: params,
       overview: page_state.overview,
-      hotspots: page_state.hotspots,
       explorer: page_state.explorer,
       filters: page_state.filters,
       form_values: page_state.form_values,

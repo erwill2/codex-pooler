@@ -40,47 +40,11 @@ defmodule CodexPoolerWeb.Admin.JobOverview do
     }
   ]
 
-  @hotspot_groups [
-    %{
-      key: :workers,
-      id: "admin-jobs-hotspot-workers",
-      title: "Workers",
-      empty: "No worker concentration"
-    },
-    %{
-      key: :queues,
-      id: "admin-jobs-hotspot-queues",
-      title: "Queues",
-      empty: "No queue concentration"
-    },
-    %{
-      key: :pools,
-      id: "admin-jobs-hotspot-pools",
-      title: "Pools",
-      empty: "No pool concentration"
-    },
-    %{
-      key: :accounts,
-      id: "admin-jobs-hotspot-accounts",
-      title: "Accounts",
-      empty: "No account concentration"
-    },
-    %{
-      key: :targets,
-      id: "admin-jobs-hotspot-targets",
-      title: "Targets",
-      empty: "No target concentration"
-    }
-  ]
-
   attr :overview, :map, required: true
-  attr :hotspots, :map, required: true
 
   def jobs_overview(assigns) do
     assigns =
-      assigns
-      |> assign(:action_buckets, @action_buckets)
-      |> assign(:hotspot_groups, @hotspot_groups)
+      assign(assigns, :action_buckets, @action_buckets)
 
     ~H"""
     <div class="grid min-w-0 gap-4">
@@ -137,67 +101,7 @@ defmodule CodexPoolerWeb.Admin.JobOverview do
           compact_mobile={true}
         />
       </AdminComponents.metric_strip>
-
-      <AdminComponents.admin_surface
-        id="admin-jobs-hotspots"
-        title="Action hotspots"
-        description="Concentrated actionable jobs by worker, queue, pool, account, and target."
-        count={actionable_count_label(@hotspots.actionable_count)}
-      >
-        <div
-          :if={@hotspots.actionable_count == 0}
-          id="admin-jobs-hotspots-healthy"
-          class="grid gap-2 p-4 text-sm text-base-content/70"
-        >
-          <p class="font-semibold text-success">No actionable concentration</p>
-          <p>Workers, queues, pools, accounts, and targets are quiet.</p>
-        </div>
-
-        <div
-          :if={@hotspots.actionable_count > 0}
-          class="grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-5"
-        >
-          <.hotspot_group
-            :for={group <- @hotspot_groups}
-            id={group.id}
-            title={group.title}
-            empty_label={group.empty}
-            items={Map.get(@hotspots, group.key, [])}
-          />
-        </div>
-      </AdminComponents.admin_surface>
     </div>
-    """
-  end
-
-  attr :id, :string, required: true
-  attr :title, :string, required: true
-  attr :empty_label, :string, required: true
-  attr :items, :list, required: true
-
-  defp hotspot_group(assigns) do
-    ~H"""
-    <section
-      id={@id}
-      class="grid min-w-0 content-start gap-2 rounded-box border border-base-300 bg-base-200/35 p-3"
-    >
-      <h3 class="text-sm font-semibold text-base-content">{@title}</h3>
-      <p :if={@items == []} class="text-xs text-base-content/60">{@empty_label}</p>
-      <ol :if={@items != []} class="grid gap-1.5">
-        <li
-          :for={{item, index} <- Enum.with_index(@items)}
-          id={"#{@id}-item-#{index + 1}"}
-          class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-box border border-base-300 bg-base-100 px-2.5 py-2"
-        >
-          <span class="truncate text-xs font-medium text-base-content/75" title={item.label}>
-            {item.label}
-          </span>
-          <span class="font-mono text-xs font-semibold tabular-nums text-base-content">
-            {item.count}
-          </span>
-        </li>
-      </ol>
-    </section>
     """
   end
 
@@ -235,8 +139,6 @@ defmodule CodexPoolerWeb.Admin.JobOverview do
   defp overview_bucket_tone(overview, bucket) do
     if overview_bucket_count(overview, bucket.key) > 0, do: bucket.tone, else: :neutral
   end
-
-  defp actionable_count_label(count), do: pluralize_count(count, "actionable", "actionable")
 
   defp pluralize_count(1, singular, _plural), do: "1 #{singular}"
   defp pluralize_count(count, _singular, plural), do: "#{count} #{plural}"
