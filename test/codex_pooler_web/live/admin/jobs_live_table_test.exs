@@ -101,12 +101,12 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
 
-    assert has_element?(view, state_icon_selector(job, "Suspended"))
+    assert has_element?(view, state_label_selector(job), "Suspended")
     assert has_element?(view, "#job-#{job.id}", "-")
     refute has_element?(view, "#job-#{job.id}", "not recorded")
   end
 
-  test "represents known job states with row icons", %{conn: conn} do
+  test "represents known job states with row text", %{conn: conn} do
     base_time = ~U[2026-05-04 12:00:00Z]
 
     expected_states = [
@@ -133,7 +133,8 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs?show_completed=true")
 
     for {job, label} <- jobs do
-      assert has_element?(view, state_icon_selector(job, label))
+      assert has_element?(view, state_label_selector(job), label)
+      refute has_element?(view, "#job-#{job.id} [data-role='state-icon']")
     end
   end
 
@@ -212,8 +213,18 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     rendered = render(view)
 
     assert has_element?(view, "#admin-jobs-explorer")
+    assert rendered =~ ~s(id="admin-jobs-explorer" class="grid min-w-0 gap-3")
+    assert rendered =~ ~s(id="admin-jobs-explorer-table" class="table table-sm admin-log-table)
     assert has_element?(view, "#admin-jobs-explorer-total", "55 jobs")
     assert has_element?(view, "#admin-jobs-explorer-range", "Showing 1-20 of 55")
+    refute has_element?(view, "#admin-jobs-explorer-table th", "State")
+
+    assert has_element?(
+             view,
+             "#admin-jobs-explorer-pagination #admin-jobs-explorer-range",
+             "Showing 1-20 of 55"
+           )
+
     assert has_element?(view, "#admin-jobs-explorer-pagination", "Page 1 of 3")
     assert has_element?(view, "#admin-jobs-explorer-pagination-prev[aria-disabled='true']")
     assert has_element?(view, "#admin-jobs-explorer-pagination-next[href='/admin/jobs?page=2']")
@@ -282,9 +293,8 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     Repo.get!(Oban.Job, job.id)
   end
 
-  defp state_icon_selector(job, label) do
-    "#job-#{job.id} [data-role='state-icon'][aria-label='State: #{label}']"
-  end
+  defp state_label_selector(job),
+    do: "#job-#{job.id} [data-role='state-label']:not([class*='bg-'])"
 
   defp worker_card_selector(worker_group) do
     "#job-worker-card-#{String.replace(Atom.to_string(worker_group), "_", "-")}"

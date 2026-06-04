@@ -16,25 +16,24 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
     assigns = assign(assigns, pagination(assigns.explorer))
 
     ~H"""
-    <AdminComponents.admin_surface
+    <section
       id="admin-jobs-explorer"
-      title="Jobs explorer"
-      description="Global background job records from the current filters. Completed jobs stay hidden unless the visibility filter includes them."
-      count={explorer_total(@explorer)}
+      class="grid min-w-0 gap-3"
     >
-      <:toolbar>
-        <div
-          id="admin-jobs-explorer-summary"
-          class="flex flex-wrap items-center justify-between gap-3 text-sm text-base-content/70"
-        >
-          <p id="admin-jobs-explorer-total" data-role="explorer-total" class="font-medium">
-            {explorer_total(@explorer)}
-          </p>
-          <p id="admin-jobs-explorer-range" data-role="explorer-range" class="tabular-nums">
-            {explorer_range(@explorer)}
-          </p>
-        </div>
-      </:toolbar>
+      <header class="sr-only">
+        <h2>Jobs explorer</h2>
+        <p>
+          Global background job records from the current filters. Completed jobs stay hidden unless the visibility filter includes them.
+        </p>
+      </header>
+
+      <p
+        id="admin-jobs-explorer-total"
+        data-role="explorer-total"
+        class="sr-only"
+      >
+        {explorer_total(@explorer)}
+      </p>
 
       <AdminComponents.empty_state
         :if={@explorer.items == []}
@@ -48,23 +47,32 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
         :if={@explorer.items != []}
         id="admin-jobs-explorer-desktop"
         data-role="explorer-desktop"
-        class="hidden overflow-x-auto lg:block"
+        class="hidden overflow-x-auto rounded-box border border-base-300 bg-base-100 shadow-sm lg:block"
       >
         <table
           id="admin-jobs-explorer-table"
-          class="w-full min-w-[980px] table-fixed border-collapse text-xs"
+          class="table table-sm admin-log-table min-w-[72rem]"
         >
+          <colgroup>
+            <col style="width: 24rem;" />
+            <col style="width: 18rem;" />
+            <col style="width: 13rem;" />
+            <col style="width: 5rem;" />
+            <col style="width: 14rem;" />
+          </colgroup>
+          <caption class="sr-only">
+            Jobs explorer, {explorer_total(@explorer)}
+          </caption>
           <thead>
-            <tr class="border-b border-base-300 bg-base-200/40 text-left text-[0.68rem] font-semibold uppercase tracking-wide text-base-content/55">
-              <th class="w-[28%] px-3 py-2">Job</th>
-              <th class="w-[12%] px-3 py-2">State</th>
-              <th class="w-[22%] px-3 py-2">Target</th>
-              <th class="w-[20%] px-3 py-2">Last event</th>
-              <th class="w-[8%] px-3 py-2">Attempts</th>
-              <th class="w-[10%] px-3 py-2">Failure</th>
+            <tr>
+              <th class="whitespace-nowrap">Job</th>
+              <th class="whitespace-nowrap">Target</th>
+              <th class="whitespace-nowrap">Last event</th>
+              <th class="whitespace-nowrap">Attempts</th>
+              <th class="whitespace-nowrap">Failure</th>
             </tr>
           </thead>
-          <tbody class="divide-y divide-base-300/70">
+          <tbody>
             <.job_table_row
               :for={job <- @explorer.items}
               job={job}
@@ -78,7 +86,7 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
         :if={@explorer.items != []}
         id="admin-jobs-explorer-mobile"
         data-role="explorer-mobile"
-        class="grid gap-3 p-3 lg:hidden"
+        class="grid gap-3 lg:hidden"
       >
         <.job_card
           :for={job <- @explorer.items}
@@ -87,14 +95,21 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
         />
       </div>
 
-      <:footer>
+      <footer class="border-t border-base-300/70 py-3">
         <nav
           id="admin-jobs-explorer-pagination"
-          class="flex flex-wrap items-center justify-between gap-3 text-sm"
+          class="grid gap-3 text-sm sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center"
           aria-label="Jobs explorer pagination"
         >
           <p data-role="pagination-status" class="text-base-content/60">
             Page {@current_page} of {@total_pages}
+          </p>
+          <p
+            id="admin-jobs-explorer-range"
+            data-role="explorer-range"
+            class="text-center tabular-nums text-base-content/70"
+          >
+            {explorer_range(@explorer)}
           </p>
           <div class="join">
             <.pagination_link
@@ -113,8 +128,8 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
             />
           </div>
         </nav>
-      </:footer>
-    </AdminComponents.admin_surface>
+      </footer>
+    </section>
     """
   end
 
@@ -130,27 +145,24 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
       data-job-id={@job.id}
       phx-click="open_job"
       phx-value-job-id={@job.id}
-      class="h-11 cursor-pointer align-middle transition-colors hover:bg-base-200/60"
+      class="cursor-pointer transition-colors hover:bg-base-200/80"
     >
-      <td class="min-w-0 px-3 py-1.5">
+      <td class="min-w-0 align-middle">
         <.job_compact_identity job={@job} />
       </td>
-      <td class="px-3 py-1.5">
-        <.job_state job={@job} />
-      </td>
-      <td class="min-w-0 px-3 py-1.5">
+      <td class="min-w-0 align-middle">
         <.job_target_summary job={@job} />
       </td>
-      <td class="px-3 py-1.5">
+      <td class="whitespace-nowrap align-middle text-base-content/70">
         <.job_event job={@job} datetime_preferences={@datetime_preferences} />
       </td>
       <td
-        class="px-3 py-1.5 font-mono text-[0.72rem] tabular-nums text-base-content/75"
+        class="align-middle font-mono tabular-nums text-base-content/75"
         data-role="attempts"
       >
         {format_attempts(@job)}
       </td>
-      <td class="min-w-0 px-3 py-1.5">
+      <td class="min-w-0 align-middle">
         <.job_failure job={@job} />
       </td>
     </tr>
@@ -196,30 +208,16 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
       </span>
       <span
         data-role="job-meta"
-        class="truncate text-[0.68rem] leading-tight text-base-content/50"
-        title={"Job ##{@job.id} · Queue #{safe_text(@job.queue)}"}
+        class="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-0.5 leading-tight text-base-content/50"
+        title={"Job ##{@job.id} · Queue #{safe_text(@job.queue)} · #{job_state_label(@job.state)}"}
       >
-        #{@job.id} · <span data-role="queue">Queue {safe_text(@job.queue)}</span>
-      </span>
-    </div>
-    """
-  end
-
-  attr :job, :map, required: true
-
-  defp job_state(assigns) do
-    ~H"""
-    <div class="flex min-w-0 items-center gap-1.5">
-      <span
-        data-role="state-icon"
-        title={job_state_label(@job.state)}
-        aria-label={"State: #{job_state_label(@job.state)}"}
-        class="shrink-0"
-      >
-        <.icon name={job_state_icon(@job.state)} class={job_state_icon_class(@job.state)} />
-      </span>
-      <span data-role="state-label" class={job_state_badge_class(@job.state)}>
-        {job_state_label(@job.state)}
+        <span class="shrink-0">#{@job.id}</span>
+        <span aria-hidden="true">·</span>
+        <span data-role="queue" class="shrink-0">Queue {safe_text(@job.queue)}</span>
+        <span aria-hidden="true">·</span>
+        <span data-role="state-label" class={job_state_text_class(@job.state)}>
+          {job_state_label(@job.state)}
+        </span>
       </span>
     </div>
     """
@@ -265,11 +263,11 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
 
   defp job_target_summary(assigns) do
     ~H"""
-    <div class="min-w-0 text-[0.72rem] text-base-content/70">
+    <div class="min-w-0 text-base-content/70">
       <div
         :if={target = job_target(@job)}
         data-role="job-target"
-        class="flex min-w-0 items-baseline gap-1 leading-tight"
+        class="grid min-w-0 gap-0.5 leading-tight"
       >
         <span
           data-role="target-primary"
@@ -281,10 +279,10 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
         <span
           :if={target.secondary}
           data-role="target-secondary"
-          class="hidden min-w-0 truncate text-base-content/55 xl:inline"
+          class="min-w-0 truncate text-base-content/55"
           title={target.secondary_title}
         >
-          · {target.secondary}
+          {target.secondary}
         </span>
       </div>
       <span :if={!job_target(@job)} data-role="job-target-empty">-</span>
@@ -302,13 +300,13 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
     <div data-role="job-event" class="grid min-w-0 gap-0.5">
       <span
         data-role="job-event-label"
-        class="text-[0.66rem] font-semibold uppercase leading-tight text-base-content/45"
+        class="font-semibold uppercase leading-tight text-base-content/45"
       >
         {@event.label}
       </span>
       <span
         data-role="job-event-time"
-        class="truncate font-mono text-[0.72rem] leading-tight tabular-nums text-base-content/70"
+        class="truncate font-mono leading-tight tabular-nums text-base-content/70"
         title={@event.timestamp}
       >
         {@event.timestamp}
@@ -421,6 +419,15 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
     first = offset + 1
     last = min(offset + limit, total)
     "Showing #{first}-#{last} of #{total}"
+  end
+
+  defp job_state_text_class(state) do
+    state
+    |> job_state_badge_class()
+    |> String.split()
+    |> Enum.filter(&String.starts_with?(&1, "text-"))
+    |> Enum.concat(["font-semibold"])
+    |> Enum.join(" ")
   end
 
   defp job_event_summary(job, datetime_preferences) do

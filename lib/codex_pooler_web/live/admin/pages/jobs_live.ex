@@ -159,7 +159,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
             <div
               :if={@owner_authorized?}
               id="admin-jobs-worker-grid"
-              class="grid items-start gap-4 xl:grid-cols-2"
+              class="grid items-start gap-4 xl:grid-cols-2 2xl:grid-cols-3"
             >
               <JobWorkerCards.job_worker_card
                 :for={card <- @worker_cards}

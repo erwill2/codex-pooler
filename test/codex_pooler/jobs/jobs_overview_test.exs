@@ -24,7 +24,8 @@ defmodule CodexPooler.Jobs.JobsOverviewTest do
         insert_overview_job(1,
           state: "discarded",
           inserted_at: ~U[2026-06-02 10:00:00Z],
-          discarded_at: ~U[2026-06-02 10:01:00Z]
+          discarded_at: ~U[2026-06-02 10:01:00Z],
+          args: %{"upstream_identity_id" => "00000000-0000-0000-0000-000000000101"}
         )
 
       newest_failure =
@@ -33,6 +34,7 @@ defmodule CodexPooler.Jobs.JobsOverviewTest do
           inserted_at: ~U[2026-06-02 10:05:00Z],
           discarded_at: ~U[2026-06-02 10:06:00Z],
           args: %{
+            "upstream_identity_id" => "00000000-0000-0000-0000-000000000101",
             "token" => "secret-token-123",
             "prompt" => "raw-prompt-text",
             "request_body" => "request-body-json",

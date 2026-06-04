@@ -30,8 +30,8 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/jobs?show_completed=true")
 
-    assert has_element?(view, state_icon_selector(job, "Available"))
-    refute has_element?(view, state_icon_selector(job, "Completed"))
+    assert has_element?(view, state_label_selector(job), "Available")
+    refute has_element?(view, state_label_selector(job), "Completed")
 
     updated_job =
       update_job(job,
@@ -47,11 +47,11 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
 
     state = :sys.get_state(view.pid)
     assert is_reference(state.socket.assigns.jobs_reload_timer)
-    assert has_element?(view, state_icon_selector(job, "Available"))
+    assert has_element?(view, state_label_selector(job), "Available")
 
     send(view.pid, :refresh_jobs)
     _ = :sys.get_state(view.pid)
-    assert has_element?(view, state_icon_selector(job, "Completed"))
+    assert has_element?(view, state_label_selector(job), "Completed")
     assert has_element?(view, "#job-#{job.id}", "2026-05-04")
     assert has_element?(view, "#job-#{job.id}", "13:01:00 UTC")
     refute has_element?(view, "#job-#{job.id}", DateTime.to_iso8601(updated_job.completed_at))
@@ -93,7 +93,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
 
     send(view.pid, :fallback_refresh_jobs)
     _ = :sys.get_state(view.pid)
-    assert has_element?(view, state_icon_selector(job, "Available"))
+    assert has_element?(view, state_label_selector(job), "Available")
     refute has_element?(view, "#admin-jobs-empty-state")
   end
 
@@ -135,7 +135,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
     monitor_ref = Process.monitor(view.pid)
 
-    assert has_element?(view, state_icon_selector(job, "Available"))
+    assert has_element?(view, state_label_selector(job), "Available")
 
     delete_job(job)
 
@@ -239,9 +239,8 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
 
   defp unique_slug(prefix), do: "#{prefix}-#{System.unique_integer([:positive])}"
 
-  defp state_icon_selector(job, label) do
-    "#job-#{job.id} [data-role='state-icon'][aria-label='State: #{label}']"
-  end
+  defp state_label_selector(job),
+    do: "#job-#{job.id} [data-role='state-label']:not([class*='bg-'])"
 
   defp count_occurrences(source, pattern) do
     source

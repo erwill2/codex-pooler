@@ -6,6 +6,7 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
   import CodexPoolerWeb.Admin.JobsPresentation
 
   alias CodexPoolerWeb.Admin.AvatarComponents
+  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
 
   attr :card, :map, required: true
   attr :datetime_preferences, :map, required: true
@@ -49,12 +50,12 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
 
       <div class="flex flex-wrap items-start gap-2 sm:justify-end">
         <span
-          data-role="state-icon"
+          data-role="worker-state-badge"
           title={@card.state_label}
           aria-label={"State: #{@card.state_label}"}
           class={[
-            "inline-flex shrink-0 items-center gap-2 rounded-box border px-2.5 py-1 text-xs font-semibold",
-            job_state_badge_class(@card.state)
+            worker_state_badge_class(@card.state),
+            "shrink-0 gap-1.5 whitespace-nowrap"
           ]}
         >
           <span
@@ -250,42 +251,73 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
     <section
       data-role="worker-schedule-facts"
       data-density="compact"
-      class="grid gap-3 border-t border-base-300 px-4 py-3 sm:grid-cols-[minmax(7rem,0.65fr)_minmax(0,1fr)] sm:items-start"
+      class="border-t border-base-300 bg-base-200/20 px-4 py-2.5"
     >
-      <div data-role="next-run-group" class="grid min-w-0 gap-0.5">
-        <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-          <span class="text-xs text-base-content/50">Next run</span>
-          <strong
-            data-role="next-run"
-            class="text-base font-semibold leading-tight text-base-content"
-            title={@card.next_run_title}
-          >
-            {@card.next_run}
-          </strong>
+      <dl
+        data-role="worker-schedule-grid"
+        class="grid min-w-0 grid-cols-3 divide-x divide-base-300/70 text-xs leading-5"
+      >
+        <div data-role="next-run-group" class="min-w-0 pr-3">
+          <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
+            Next run
+          </dt>
+          <dd class="truncate text-base-content/60">
+            <strong
+              data-role="next-run"
+              class="font-semibold tabular-nums text-base-content"
+              title={@card.next_run_title}
+            >
+              {@card.next_run}
+            </strong>
+          </dd>
         </div>
-        <span
-          :if={@card.cadence_label != @card.next_run}
-          data-role="cadence-label"
-          class="text-xs leading-none text-base-content/50"
-          title={@card.cadence_label}
-        >
-          {@card.cadence_label}
-        </span>
-      </div>
-
-      <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-        <div data-role="last-run" class="grid min-w-0 gap-0.5">
-          <dt class="text-base-content/50">Last run</dt>
-          <dd class="font-semibold tabular-nums text-base-content">
+        <div data-role="last-run" class="min-w-0 px-3">
+          <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
+            Last run
+          </dt>
+          <dd class="truncate font-semibold tabular-nums text-base-content">
             {format_job_timestamp(@card.last_seen_at, @datetime_preferences)}
           </dd>
         </div>
-        <div data-role="attempts" class="grid min-w-0 gap-0.5">
-          <dt class="text-base-content/50">Attempts</dt>
-          <dd class="font-semibold tabular-nums text-base-content">{@card.attempts}</dd>
+        <div data-role="schedule" class="min-w-0 pl-3">
+          <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
+            Schedule
+          </dt>
+          <dd
+            :if={@card.cadence_label == @card.next_run}
+            data-role="cadence-label"
+            class="truncate font-semibold text-base-content"
+            title={@card.cadence_label}
+          >
+            On demand
+          </dd>
+          <dd
+            :if={@card.cadence_label != @card.next_run}
+            data-role="cadence-label"
+            class="truncate text-base-content/60"
+            title={@card.cadence_label}
+          >
+            {@card.cadence_label}
+          </dd>
         </div>
       </dl>
     </section>
     """
+  end
+
+  defp worker_state_badge_class(state) do
+    state
+    |> worker_state_tone()
+    |> AdminBadges.metadata_chip_class()
+  end
+
+  defp worker_state_tone(state) do
+    case to_string(state || "") do
+      state when state in ["completed", "succeeded"] -> :success
+      state when state in ["executing", "available", "scheduled"] -> :info
+      state when state in ["retryable", "cancelled", "awaiting_first_run"] -> :warning
+      state when state in ["discarded", "failed"] -> :error
+      _state -> :neutral
+    end
   end
 end

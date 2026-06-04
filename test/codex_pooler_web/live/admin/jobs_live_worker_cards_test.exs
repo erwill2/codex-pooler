@@ -142,13 +142,31 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
+             "#{card} [data-role='worker-state-badge'].rounded-full",
+             "Completed"
+           )
+
+    refute has_element?(view, "#{card} [data-role='state-icon']")
+
+    assert has_element?(
+             view,
              "#{card} [data-role='worker-schedule-facts'][data-density='compact']"
            )
 
     assert has_element?(view, "#{card} [data-role='next-run-group']", "Next run")
-    assert has_element?(view, "#{card} [data-role='cadence-label']", "Every 15 min")
     assert has_element?(view, "#{card} [data-role='last-run']", "2026-05-04 10:02:00 UTC")
-    assert has_element?(view, "#{card} [data-role='attempts']", "2/5")
+    assert has_element?(view, "#{card} [data-role='schedule']", "Schedule")
+
+    assert has_element?(
+             view,
+             "#{card} [data-role='schedule'] [data-role='cadence-label']",
+             "Every 15 min"
+           )
+
+    refute has_element?(
+             view,
+             "#{card} [data-role='worker-schedule-facts'] [data-role='attempts']"
+           )
 
     refute has_element?(view, "#{card}", "Last success")
     refute has_element?(view, "#{card}", "Last failure")
@@ -156,6 +174,10 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     refute has_element?(view, "#{card} [data-role='last-failure']")
 
     rendered = render(view)
+
+    assert rendered =~ "border-success/20 bg-success/10"
+    assert rendered =~ ~s(data-role="worker-schedule-grid")
+
     assert rendered =~ "Model catalog refresh"
     assert rendered =~ "Pricing data refresh"
     assert rendered =~ "Upstream account checks"
