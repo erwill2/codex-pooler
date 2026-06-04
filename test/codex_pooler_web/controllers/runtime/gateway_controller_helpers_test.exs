@@ -51,6 +51,23 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpersTest do
              GatewayControllerHelpers.authenticate_v1(conn)
   end
 
+  test "request_opts keeps session header provenance bounded by local compatibility header" do
+    conn =
+      Phoenix.ConnTest.build_conn(:post, "/backend-api/codex/responses")
+      |> put_req_header("x-session-affinity", " affinity-local ")
+
+    assert %{session_header: "affinity-local", session_header_source: "x-session-affinity"} =
+             GatewayControllerHelpers.request_opts(conn)
+
+    conn =
+      Phoenix.ConnTest.build_conn(:post, "/backend-api/codex/responses")
+      |> put_req_header("session-id", " local-session ")
+      |> put_req_header("x-session-affinity", "affinity-local")
+
+    assert %{session_header: "local-session", session_header_source: "session-id"} =
+             GatewayControllerHelpers.request_opts(conn)
+  end
+
   test "send_error renders pinned continuation recovery header and body fields", %{conn: conn} do
     conn =
       GatewayControllerHelpers.send_error(

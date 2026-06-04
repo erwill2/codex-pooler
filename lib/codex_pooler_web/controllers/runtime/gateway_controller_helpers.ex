@@ -97,13 +97,16 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpers do
 
   @spec request_opts(conn()) :: request_opts()
   def request_opts(conn) do
+    {session_header_source, session_header} = session_header(conn)
+
     %{
       request_id: request_id(conn),
       client_request_id: client_request_id(conn),
       idempotency_key: get_req_header(conn, "idempotency-key") |> List.first(),
       accepted_turn_state: accepted_turn_state(conn),
       previous_response_id: previous_response_id(conn),
-      session_header: session_header(conn),
+      session_header: session_header,
+      session_header_source: session_header_source,
       user_agent: get_req_header(conn, "user-agent") |> List.first(),
       request_content_type: get_req_header(conn, "content-type") |> List.first(),
       forwarded_headers: forwarded_headers(conn),
@@ -210,11 +213,11 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpers do
       "session_id",
       "x-codex-conversation-id"
     ]
-    |> Enum.find_value(fn header ->
-      conn
-      |> get_req_header(header)
-      |> List.first()
-      |> blank_to_nil()
+    |> Enum.find_value({nil, nil}, fn header ->
+      case conn |> get_req_header(header) |> List.first() |> blank_to_nil() do
+        nil -> false
+        value -> {header, value}
+      end
     end)
   end
 

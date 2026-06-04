@@ -101,7 +101,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
          {:ok, request_options} <-
            SessionContinuity.attach_codex_session(auth, payload, request_options),
          {:ok, candidates} <-
-           SessionContinuity.filter_codex_session_assignment(candidates, request_options, model) do
+           SessionContinuity.apply_codex_session_assignment(candidates, request_options, model) do
       route_state =
         route_state
         |> RouteState.put_candidates(candidates)

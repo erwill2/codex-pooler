@@ -80,7 +80,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.WebSocket do
     websocket_frame_headers = Map.get(finalization, :websocket_frame_headers, %{})
     metadata_headers = headers ++ Map.to_list(websocket_frame_headers)
 
-    with :ok <- Streaming.record_health_failure(upstream_code, upstream_code, context) do
+    with :ok <- Streaming.record_terminal_health_failure(upstream_code, metadata_headers, context) do
       case AttemptSettlement.finalize_partial_stream_failure(
              reserved.request,
              attempt,

@@ -56,6 +56,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   @websocket_responses_endpoint "/backend-api/codex/responses"
 
+  @session_header_sources ~w(x-codex-session-id session-id x-session-affinity session_id x-codex-conversation-id)
+
   @prompt_cache_key_routes [
     "/v1/responses",
     "/v1/chat/completions",
@@ -121,6 +123,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :routing_attempt_metadata,
     :routing_circuit_state,
     :session_header,
+    :session_header_source,
     :session_key,
     :timeout,
     :transport,
@@ -448,6 +451,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       previous_response_id: Map.get(opts, :previous_response_id),
       response_id: Map.get(opts, :response_id),
       session_header: Map.get(opts, :session_header),
+      session_header_source:
+        normalized_session_header_source(Map.get(opts, :session_header_source)),
       session_key: Map.get(opts, :session_key),
       conversation_key: Map.get(opts, :conversation_key),
       owner_instance_id: Map.get(opts, :owner_instance_id),
@@ -630,6 +635,22 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   defp normalized_prompt_cache_key(_value), do: nil
 
+  defp normalized_session_header_source(value) when is_atom(value) do
+    value
+    |> Atom.to_string()
+    |> normalized_session_header_source()
+  end
+
+  defp normalized_session_header_source(value) when is_binary(value) do
+    value = value |> String.trim() |> String.downcase()
+
+    if value in @session_header_sources do
+      value
+    end
+  end
+
+  defp normalized_session_header_source(_value), do: nil
+
   defp openai_surface(%OpenAICompatibility{source_endpoint: endpoint}) when is_binary(endpoint),
     do: "openai_v1"
 
@@ -646,6 +667,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     updates
     |> normalize_update(:bridge_owner_lease_ttl_seconds, &optional_positive_integer/1)
     |> normalize_update(:reconnect_window_seconds, &optional_non_negative_integer/1)
+    |> normalize_update(:session_header_source, &normalized_session_header_source/1)
   end
 
   defp normalize_transport_updates(updates) do

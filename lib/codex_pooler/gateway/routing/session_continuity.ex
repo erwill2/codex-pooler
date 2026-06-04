@@ -9,11 +9,11 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Payloads.ContinuityPayload
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Payloads.RequestOptions.Transport
   alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession, CodexTurn}
   alias CodexPooler.Gateway.Persistence.SessionContinuity, as: ContinuityStore
   alias CodexPooler.Gateway.Routing.BridgeRing
   alias CodexPooler.Repo
-  alias CodexPooler.RouteClass
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   @type auth :: CodexPooler.Access.auth_context()
@@ -26,10 +26,12 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
           {:ok, RequestOptions.t()} | {:error, gateway_error()}
   def attach_codex_session(
         _auth,
-        _payload,
+        payload,
         %RequestOptions{continuity: %{codex_session: %CodexSession{id: session_id}}} =
           request_options
       ) do
+    request_options = ContinuityPayload.put_previous_response_id(request_options, payload)
+
     case Repo.get(CodexSession, session_id) do
       %CodexSession{} = session ->
         {:ok, RequestOptions.put_continuity(request_options, codex_session: session)}
@@ -156,9 +158,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
 
   def filter_file_affinity(candidates, %RequestOptions{}), do: {:ok, candidates}
 
-  @spec filter_codex_session_assignment([BridgeRing.candidate()], RequestOptions.t(), Model.t()) ::
+  @spec apply_codex_session_assignment([BridgeRing.candidate()], RequestOptions.t(), Model.t()) ::
           {:ok, [BridgeRing.candidate()]} | {:error, gateway_error()}
-  def filter_codex_session_assignment(
+  def apply_codex_session_assignment(
         candidates,
         %RequestOptions{
           continuity: %{codex_session: %CodexSession{pool_upstream_assignment_id: assignment_id}}
@@ -173,8 +175,17 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
     end
   end
 
-  def filter_codex_session_assignment(candidates, %RequestOptions{} = request_options, %Model{}),
+  def apply_codex_session_assignment(candidates, %RequestOptions{} = request_options, %Model{}),
     do: filter_codex_session_assignment(candidates, request_options)
+
+  @spec filter_codex_session_assignment([BridgeRing.candidate()], RequestOptions.t(), Model.t()) ::
+          {:ok, [BridgeRing.candidate()]} | {:error, gateway_error()}
+  def filter_codex_session_assignment(
+        candidates,
+        %RequestOptions{} = request_options,
+        %Model{} = model
+      ),
+      do: apply_codex_session_assignment(candidates, request_options, model)
 
   @spec filter_codex_session_assignment([BridgeRing.candidate()], RequestOptions.t()) ::
           {:ok, [BridgeRing.candidate()]} | {:error, gateway_error()}
@@ -197,27 +208,91 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
 
   def filter_codex_session_assignment(candidates, %RequestOptions{}), do: {:ok, candidates}
 
+  @type pin_mode :: :hard | :soft
+  @type pin_reason ::
+          :previous_response_id
+          | :file_affinity
+          | :live_upstream_websocket
+          | :local_session_header
+          | :accepted_turn_state
+          | :same_model_successful_turn
+          | :codex_session_assignment
+
   @spec hard_pin_codex_session_assignment?(RequestOptions.t(), Model.t()) :: boolean()
   defp hard_pin_codex_session_assignment?(%RequestOptions{} = request_options, %Model{} = model) do
-    RequestOptions.route_class(request_options) != RouteClass.proxy_stream() or
-      continuity_anchor?(request_options) or
-      file_affinity?(request_options) or
-      same_model_successful_turn?(request_options, model)
+    match?({:hard, _reason}, classify_codex_session_pin(request_options, model))
   end
 
-  @spec continuity_anchor?(RequestOptions.t()) :: boolean()
-  defp continuity_anchor?(%RequestOptions{continuity: continuity}) do
-    [
-      continuity.accepted_turn_state,
-      continuity.previous_response_id,
-      continuity.session_header
-    ]
-    |> Enum.any?(&is_binary(clean_string(&1)))
+  @spec classify_codex_session_pin(RequestOptions.t(), Model.t()) :: {pin_mode(), pin_reason()}
+  defp classify_codex_session_pin(%RequestOptions{} = request_options, %Model{} = model) do
+    cond do
+      previous_response_id?(request_options) ->
+        {:hard, :previous_response_id}
+
+      file_affinity?(request_options) ->
+        {:hard, :file_affinity}
+
+      live_upstream_websocket_continuity?(request_options) ->
+        {:hard, :live_upstream_websocket}
+
+      local_session_header?(request_options) ->
+        {:soft, :local_session_header}
+
+      accepted_turn_state?(request_options) ->
+        {:soft, :accepted_turn_state}
+
+      same_model_successful_turn?(request_options, model) ->
+        {:soft, :same_model_successful_turn}
+
+      true ->
+        {:soft, :codex_session_assignment}
+    end
+  end
+
+  @spec previous_response_id?(RequestOptions.t()) :: boolean()
+  defp previous_response_id?(%RequestOptions{
+         continuity: %{previous_response_id: previous_response_id}
+       }),
+       do: is_binary(clean_string(previous_response_id))
+
+  @spec accepted_turn_state?(RequestOptions.t()) :: boolean()
+  defp accepted_turn_state?(%RequestOptions{
+         continuity: %{accepted_turn_state: accepted_turn_state}
+       }),
+       do: is_binary(clean_string(accepted_turn_state))
+
+  @spec local_session_header?(RequestOptions.t()) :: boolean()
+  defp local_session_header?(%RequestOptions{continuity: continuity}) do
+    is_binary(clean_string(continuity.session_header)) and
+      is_binary(clean_string(continuity.session_header_source))
   end
 
   @spec file_affinity?(RequestOptions.t()) :: boolean()
   defp file_affinity?(%RequestOptions{routing: %{file_affinity_assignment_id: assignment_id}}),
     do: is_binary(clean_string(assignment_id))
+
+  @spec live_upstream_websocket_continuity?(RequestOptions.t()) :: boolean()
+  defp live_upstream_websocket_continuity?(%RequestOptions{transport: transport}) do
+    live_direct_upstream_websocket?(transport.upstream_websocket_session) or
+      live_owner_forwarded_websocket?(transport)
+  end
+
+  @spec live_direct_upstream_websocket?(term()) :: boolean()
+  defp live_direct_upstream_websocket?(pid), do: is_pid(pid)
+
+  @spec live_owner_forwarded_websocket?(Transport.t()) :: boolean()
+  defp live_owner_forwarded_websocket?(transport) do
+    transport.websocket_owner_forwarding_enabled? == true and
+      match?(%CodexSession{}, transport.websocket_owner_session) and
+      is_binary(clean_string(transport.websocket_owner_lease_token)) and
+      websocket_owner_downstream?(transport.websocket_owner_downstream)
+  end
+
+  @spec websocket_owner_downstream?(term()) :: boolean()
+  defp websocket_owner_downstream?(%{pid: pid, correlation_id: correlation_id}),
+    do: is_pid(pid) and is_binary(clean_string(correlation_id))
+
+  defp websocket_owner_downstream?(_downstream), do: false
 
   @spec same_model_successful_turn?(RequestOptions.t(), Model.t()) :: boolean()
   defp same_model_successful_turn?(

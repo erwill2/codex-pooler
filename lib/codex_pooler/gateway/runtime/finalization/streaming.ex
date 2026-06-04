@@ -15,6 +15,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
 
   alias CodexPooler.Gateway.Runtime.Routing.RouteLifecycle
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Quotas.Evidence.CodexParsers.RateLimitReachedType
 
   @type callbacks :: %{
           required(:register_continuity) => (term(), term(), term() -> term()),
@@ -111,7 +112,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
 
     health_code = failure.upstream_code || code
 
-    with :ok <- record_health_failure(health_code, health_code, context) do
+    with :ok <- record_terminal_health_failure(health_code, response.headers, context) do
       AttemptSettlement.finalize_partial_stream_failure(
         context.reserved.request,
         context.attempt,
@@ -137,7 +138,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     code = error_code(reason)
     terminal_failure = terminal_failure_reason(reason)
 
-    with :ok <- record_stream_failure_health(reason, code, terminal_failure, context) do
+    with :ok <-
+           record_stream_failure_health(reason, code, terminal_failure, response.headers, context) do
       AttemptSettlement.finalize_partial_stream_failure(
         context.reserved.request,
         context.attempt,
@@ -183,13 +185,27 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     route_failure(context, code)
   end
 
-  defp record_stream_failure_health(reason, code, nil, context) do
+  @spec record_terminal_health_failure(term(), term(), DispatchContext.t()) :: health_result()
+  def record_terminal_health_failure(code, headers, %DispatchContext{} = context)
+      when is_binary(code) do
+    if health_neutral_terminal_failure?(code, headers) do
+      :ok
+    else
+      record_health_failure(code, code, context)
+    end
+  end
+
+  def record_terminal_health_failure(code, _headers, %DispatchContext{} = context) do
+    record_health_failure(code, code, context)
+  end
+
+  defp record_stream_failure_health(reason, code, nil, _headers, context) do
     record_health_failure(reason, code, context)
   end
 
-  defp record_stream_failure_health(_reason, code, terminal_failure, context) do
+  defp record_stream_failure_health(_reason, code, terminal_failure, headers, context) do
     health_code = terminal_failure.upstream_code || code
-    record_health_failure(health_code, health_code, context)
+    record_terminal_health_failure(health_code, headers, context)
   end
 
   defp route_failure(%DispatchContext{} = context, code) do
@@ -211,7 +227,21 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
       "unsupported_input_image_format",
       "unsupported_parameter",
       "unsupported_value",
-      "usage_limit_exceeded"
+      "usage_limit_exceeded",
+      "usage_limit_reached"
+    ]
+  end
+
+  defp health_neutral_terminal_failure?(code, headers) do
+    health_neutral_error_code?(code) or
+      workspace_usage_limit_reached?(code) or
+      workspace_usage_limit_reached?(RateLimitReachedType.parse_header(headers))
+  end
+
+  defp workspace_usage_limit_reached?(code) do
+    code in [
+      "workspace_member_usage_limit_reached",
+      "workspace_owner_usage_limit_reached"
     ]
   end
 

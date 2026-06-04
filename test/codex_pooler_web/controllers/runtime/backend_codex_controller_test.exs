@@ -4565,48 +4565,29 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     previous_response_id = "resp_pinned_reauth_#{System.unique_integer([:positive])}"
     register_previous_response_anchor!(auth, setup.assignment, previous_response_id)
 
-    turn_state = "turn-pinned-reauth-#{System.unique_integer([:positive])}"
-    register_turn_state_anchor!(auth, setup.assignment, turn_state)
-
-    local_header_cases =
-      for header <- [
-            "x-codex-session-id",
-            "session-id",
-            "x-session-affinity",
-            "session_id",
-            "x-codex-conversation-id"
-          ] do
-        value = "#{header}-pinned-reauth-#{System.unique_integer([:positive])}"
-        register_session_header_anchor!(auth, setup.assignment, value)
-        {"local #{header}", [{header, value}], %{"input" => visible_input}}
-      end
-
-    anchored_cases =
-      [
-        {"body previous_response_id", [],
-         %{
-           "previous_response_id" => previous_response_id,
-           "input" => visible_input
-         }},
-        {"header previous response", [{"x-codex-previous-response-id", previous_response_id}],
-         %{"input" => visible_input}},
-        {"accepted turn state", [{"x-codex-turn-state", turn_state}],
-         %{"input" => visible_input}},
-        {"tool result continuation", [],
-         %{
-           "previous_response_id" => previous_response_id,
-           "input" => [
-             %{
-               "type" => "future_tool_call_output",
-               "call_id" => "future_call_pinned_reauth",
-               "result" => %{
-                 "type" => "text",
-                 "text" => "visible future tool result must not persist"
-               }
+    anchored_cases = [
+      {"body previous_response_id", [],
+       %{
+         "previous_response_id" => previous_response_id,
+         "input" => visible_input
+       }},
+      {"header previous response", [{"x-codex-previous-response-id", previous_response_id}],
+       %{"input" => visible_input}},
+      {"tool result continuation", [],
+       %{
+         "previous_response_id" => previous_response_id,
+         "input" => [
+           %{
+             "type" => "future_tool_call_output",
+             "call_id" => "future_call_pinned_reauth",
+             "result" => %{
+               "type" => "text",
+               "text" => "visible future tool result must not persist"
              }
-           ]
-         }}
-      ] ++ local_header_cases
+           }
+         ]
+       }}
+    ]
 
     for {{label, headers, payload}, index} <- Enum.with_index(anchored_cases) do
       conn = post_backend_response(setup, headers, payload)
@@ -5904,6 +5885,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert attempt.response_metadata["rate_limit_reached_type"] ==
              "workspace_owner_usage_limit_reached"
 
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+
     metadata_text = inspect({request.request_metadata, attempt.response_metadata})
     assert metadata_text =~ "workspace_owner_usage_limit_reached"
     refute metadata_text =~ "resp_usage_limit_terminal"
@@ -5912,6 +5896,45 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute metadata_text =~ "cookie"
     refute metadata_text =~ "upstream-token"
     refute metadata_text =~ "auth.json"
+  end
+
+  test "SSE usage-limit-reached terminal failure stays health-neutral without retry" do
+    first_upstream =
+      FakeUpstream.sse_stream(
+        [
+          {"response.failed",
+           %{
+             "type" => "response.failed",
+             "response" => %{
+               "id" => "resp_usage_limit_reached_terminal",
+               "status" => "failed",
+               "error" => %{"code" => "usage_limit_reached"},
+               "usage" => %{"input_tokens" => 3, "output_tokens" => 1, "total_tokens" => 4}
+             }
+           }}
+        ],
+        done: false
+      )
+
+    {setup, failing_upstream, fallback_upstream} = stream_retry_setup(first_upstream)
+
+    execute_backend_stream!(setup, "usage-limit-reached-terminal")
+
+    assert FakeUpstream.count(failing_upstream) == 1
+    assert FakeUpstream.count(fallback_upstream) == 0
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "http_sse"
+    assert request.status == "failed"
+    assert request.retry_count == 0
+    assert request.last_error_code == "usage_limit_reached"
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == "usage_limit_reached"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
   end
 
   test "SSE downstream closed chunk is logged as client disconnect" do
@@ -6161,7 +6184,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
              }
            }}
         ],
-        done: false
+        done: false,
+        headers: [{"x-codex-rate-limit-reached-type", "workspace_member_usage_limit_reached"}]
       )
 
     {setup, failing_upstream, fallback_upstream} = stream_retry_setup(first_mode)
@@ -6196,6 +6220,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert FakeUpstream.count(failing_upstream) == 1
     assert FakeUpstream.count(fallback_upstream) == 0
     assert_stream_terminal_failure!(setup, "rate_limit_exceeded")
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+
+    assert attempt.response_metadata["rate_limit_reached_type"] ==
+             "workspace_member_usage_limit_reached"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
   end
 
   test "SSE previous response miss after partial output is masked without retrying" do
@@ -7620,6 +7652,418 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
              ]
   end
 
+  test "POST /backend-api/codex/responses keeps local session pin soft when pinned quota is exhausted",
+       %{conn: conn} do
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_soft_pinned_quota_fallback",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    pinned_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_exhausted_soft_pin_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(fallback_upstream)
+
+    pinned =
+      gateway_upstream(setup.pool, pinned_upstream, "upstream-token-soft-pinned", compact?: false)
+
+    prime_exhausted_routing_quota!(pinned.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [pinned.assignment, setup.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    session_header = "soft-quota-session-#{System.unique_integer([:positive])}"
+    session = register_session_header_anchor!(auth, pinned.assignment, session_header)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> put_req_header("session-id", session_header)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "soft pinned quota fallback",
+        "stream" => true
+      })
+
+    assert %{"id" => "resp_soft_pinned_quota_fallback"} = json_response(conn, 200)
+    assert FakeUpstream.count(pinned_upstream) == 0
+    assert FakeUpstream.count(fallback_upstream) == 1
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.transport == "http_sse"
+    assert request.request_metadata["codex_session_id"] == session.id
+    assert request.request_metadata["codex_session_key"] == session_header
+    assert get_in(request.request_metadata, ["quota_decision", "eligible_candidate_count"]) == 1
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.pool_upstream_assignment_id == setup.assignment.id
+  end
+
+  test "POST /backend-api/codex/responses keeps local session pin soft for non-streaming fallback",
+       %{conn: conn} do
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_soft_pinned_non_streaming_quota_fallback",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    pinned_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_exhausted_non_streaming_soft_pin_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(fallback_upstream)
+
+    pinned =
+      gateway_upstream(setup.pool, pinned_upstream, "upstream-token-soft-pinned-json",
+        compact?: false
+      )
+
+    prime_exhausted_routing_quota!(pinned.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [pinned.assignment, setup.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    session_header = "soft-json-quota-session-#{System.unique_integer([:positive])}"
+    session = register_session_header_anchor!(auth, pinned.assignment, session_header)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> put_req_header("session-id", session_header)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "non-streaming soft pinned quota fallback"
+      })
+
+    assert %{"id" => "resp_soft_pinned_non_streaming_quota_fallback"} =
+             json_response(conn, 200)
+
+    assert FakeUpstream.count(pinned_upstream) == 0
+    assert FakeUpstream.count(fallback_upstream) == 1
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.transport == "http_json"
+    assert request.request_metadata["codex_session_id"] == session.id
+    assert request.request_metadata["codex_session_key"] == session_header
+    assert get_in(request.request_metadata, ["quota_decision", "eligible_candidate_count"]) == 1
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.pool_upstream_assignment_id == setup.assignment.id
+
+    metadata_text = inspect({request.request_metadata, attempt.response_metadata})
+    refute metadata_text =~ "non-streaming soft pinned quota fallback"
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ "upstream-token-soft-pinned-json"
+  end
+
+  test "POST /backend-api/codex/responses keeps previous_response_id hard pinned when pinned quota is exhausted",
+       %{conn: conn} do
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_hard_anchor_fallback_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    pinned_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_exhausted_hard_pin_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(fallback_upstream)
+
+    pinned =
+      gateway_upstream(setup.pool, pinned_upstream, "upstream-token-hard-pinned", compact?: false)
+
+    prime_exhausted_routing_quota!(pinned.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [pinned.assignment, setup.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    previous_response_id = "resp_hard_quota_anchor_#{System.unique_integer([:positive])}"
+    register_previous_response_anchor!(auth, pinned.assignment, previous_response_id)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "hard pinned quota rejection",
+        "previous_response_id" => previous_response_id
+      })
+
+    assert %{"error" => %{"code" => "quota_exhausted"}} = json_response(conn, 503)
+    assert FakeUpstream.count(pinned_upstream) == 0
+    assert FakeUpstream.count(fallback_upstream) == 0
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "rejected"
+    assert request.last_error_code == "quota_exhausted"
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  test "POST /backend-api/codex/responses keeps file affinity hard pinned when quota is exhausted",
+       %{conn: conn} do
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_file_affinity_fallback_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    pinned_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_exhausted_file_affinity_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(fallback_upstream)
+
+    pinned =
+      gateway_upstream(setup.pool, pinned_upstream, "upstream-token-file-affinity-exhausted",
+        compact?: false
+      )
+
+    prime_exhausted_routing_quota!(pinned.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [pinned.assignment, setup.assignment])
+      )
+
+    file_id =
+      response_affinity_file_fixture(setup, pinned.assignment, pinned.identity,
+        file_id: "file_exhausted_quota_affinity_#{System.unique_integer([:positive])}",
+        filename: "exhausted-quota-affinity.txt",
+        byte_size: 23,
+        status: "uploaded",
+        finalize_status: "succeeded"
+      ).file_id
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [%{"type" => "input_file", "file_id" => file_id}]
+      })
+
+    assert %{"error" => %{"code" => "quota_exhausted"}} = json_response(conn, 503)
+    assert FakeUpstream.count(pinned_upstream) == 0
+    assert FakeUpstream.count(fallback_upstream) == 0
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "rejected"
+    assert request.last_error_code == "quota_exhausted"
+    assert Repo.aggregate(Attempt, :count) == 0
+
+    metadata_text = inspect(request.request_metadata)
+    refute metadata_text =~ file_id
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ "upstream-token-file-affinity-exhausted"
+  end
+
+  test "POST /backend-api/codex/responses refreshes hard previous-response stale quota before rejection",
+       %{conn: conn} do
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    exhausted_quota_response = %{
+      "rate_limit" => %{
+        "primary_window" => %{
+          "used_percent" => 100,
+          "limit_window_seconds" => 18_000,
+          "reset_at" => DateTime.to_iso8601(reset_at)
+        }
+      }
+    }
+
+    pinned_upstream =
+      start_upstream({:path_json, %{"/api/codex/usage" => {200, exhausted_quota_response}}})
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_previous_anchor_fallback_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(fallback_upstream)
+
+    pinned =
+      gateway_upstream(setup.pool, pinned_upstream, "upstream-token-previous-anchor-stale",
+        compact?: false
+      )
+
+    prime_stale_routing_quota!(pinned.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [pinned.assignment, setup.assignment])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    previous_response_id = "resp_stale_quota_anchor_#{System.unique_integer([:positive])}"
+    register_previous_response_anchor!(auth, pinned.assignment, previous_response_id)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "hard previous-response quota rejection",
+        "previous_response_id" => previous_response_id
+      })
+
+    assert %{"error" => %{"code" => "quota_evidence_unavailable"}} = json_response(conn, 503)
+    assert [%{path: "/api/codex/usage"}] = FakeUpstream.requests(pinned_upstream)
+    assert FakeUpstream.requests(fallback_upstream) == []
+    assert Repo.aggregate(Attempt, :count) == 0
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "rejected"
+    assert request.last_error_code == "quota_evidence_unavailable"
+  end
+
+  test "POST /backend-api/codex/responses refreshes hard file-affinity stale quota before fallback candidates",
+       %{conn: conn} do
+    reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
+
+    stale_quota_response = %{
+      "rate_limit" => %{
+        "primary_window" => %{
+          "used_percent" => 12,
+          "limit_window_seconds" => 18_000,
+          "reset_at" => DateTime.to_iso8601(reset_at)
+        }
+      }
+    }
+
+    pinned_upstream =
+      start_upstream(
+        {:path_json,
+         %{
+           "/api/codex/usage" => {200, stale_quota_response},
+           "/backend-api/codex/responses" =>
+             {200,
+              %{
+                "id" => "resp_file_affinity_refreshed_quota",
+                "object" => "response",
+                "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+              }}
+         }}
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_file_affinity_fallback_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(fallback_upstream)
+
+    pinned =
+      gateway_upstream(setup.pool, pinned_upstream, "upstream-token-file-affinity-stale",
+        compact?: false
+      )
+
+    prime_stale_routing_quota!(pinned.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [pinned.assignment, setup.assignment])
+      )
+
+    file_id =
+      response_affinity_file_fixture(setup, pinned.assignment, pinned.identity,
+        file_id: "file_stale_quota_affinity_#{System.unique_integer([:positive])}",
+        filename: "stale-quota-affinity.txt",
+        byte_size: 21,
+        status: "uploaded",
+        finalize_status: "succeeded"
+      ).file_id
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [%{"type" => "input_file", "file_id" => file_id}]
+      })
+
+    assert %{"id" => "resp_file_affinity_refreshed_quota"} = json_response(conn, 200)
+    assert FakeUpstream.requests(fallback_upstream) == []
+
+    assert [usage_request, response_request] = FakeUpstream.requests(pinned_upstream)
+    assert usage_request.path == "/api/codex/usage"
+    assert response_request.path == "/backend-api/codex/responses"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert get_in(request.request_metadata, ["quota_decision", "refreshed_stale_quota"]) == true
+
+    assert get_in(request.request_metadata, ["routing", "selected_bridge_candidate_id"]) ==
+             pinned.assignment.id
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+    assert attempt.pool_upstream_assignment_id == pinned.assignment.id
+  end
+
   test "POST /backend-api/codex/responses excludes exhausted stale and resetless quota candidates from routing",
        %{conn: conn} do
     precise_upstream =
@@ -7712,6 +8156,79 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert get_in(request.request_metadata, ["quota_decision", "eligible_candidate_count"]) == 1
   end
 
+  test "POST /backend-api/codex/responses returns deterministic quota_exhausted when all candidates are exhausted",
+       %{conn: conn} do
+    first_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_first_exhausted_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    second_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_second_exhausted_should_not_run",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(first_upstream, quota?: false)
+
+    second =
+      gateway_upstream(setup.pool, second_upstream, "upstream-token-second-exhausted",
+        compact?: false
+      )
+
+    prime_exhausted_routing_quota!(setup.identity)
+    prime_exhausted_routing_quota!(second.identity)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, second.assignment])
+      )
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "all exhausted quota rejection"
+      })
+
+    response = json_response(conn, 503)
+
+    assert %{"error" => %{"code" => "quota_exhausted", "message" => message}} = response
+    assert message == "upstream quota is exhausted until its reset time"
+    assert FakeUpstream.count(first_upstream) == 0
+    assert FakeUpstream.count(second_upstream) == 0
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "rejected"
+    assert request.last_error_code == "quota_exhausted"
+    assert Repo.aggregate(Attempt, :count) == 0
+
+    reason_codes =
+      request.request_metadata["candidate_exclusions"]
+      |> Enum.map(fn exclusion -> exclusion["reasons"] |> hd() |> Map.fetch!("reason_codes") end)
+      |> Enum.sort()
+
+    assert reason_codes == [["exhausted"], ["exhausted"]]
+
+    metadata_text = inspect({response, request.request_metadata})
+    refute metadata_text =~ "all exhausted quota rejection"
+    refute metadata_text =~ setup.authorization
+    refute metadata_text =~ "upstream-token-second-exhausted"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+  end
+
   test "POST /backend-api/codex/responses returns metadata-only 503 details when all quota candidates are excluded",
        %{conn: conn} do
     exhausted_upstream =
@@ -7802,6 +8319,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute metadata_text =~ setup.authorization
     refute metadata_text =~ "upstream-token-stale"
     refute metadata_text =~ "upstream-token-resetless"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
   end
 
   defp seed_with_assignment_order(assignment_ids) do
@@ -8192,11 +8712,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
              )
 
     session
-  end
-
-  defp register_turn_state_anchor!(auth, assignment, turn_state) do
-    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: turn_state})
-    pin_session_to_assignment!(session, assignment)
   end
 
   defp register_session_header_anchor!(auth, assignment, session_header) do

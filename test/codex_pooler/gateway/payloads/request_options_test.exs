@@ -52,6 +52,38 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.transport.route_class == "proxy_websocket"
     end
 
+    test "keeps local alias provenance separate from live websocket continuity" do
+      options =
+        %{
+          session_header: "local-session",
+          session_header_source: "X-Session-Affinity",
+          upstream_websocket_session: self(),
+          websocket_owner_forwarding_enabled?: true,
+          websocket_owner_session: %{id: "owner-session"},
+          websocket_owner_lease_token: "lease-token",
+          websocket_owner_downstream: %{pid: self(), correlation_id: "corr"},
+          websocket_owner_downstream_epoch: 2
+        }
+        |> RequestOptions.from_conn_metadata("/backend-api/codex/responses", %{
+          "model" => "example-model",
+          "stream" => true
+        })
+
+      assert options.continuity.session_header == "local-session"
+      assert options.continuity.session_header_source == "x-session-affinity"
+      assert options.transport.upstream_websocket_session == self()
+      assert options.transport.websocket_owner_forwarding_enabled?
+      assert options.transport.websocket_owner_session == %{id: "owner-session"}
+
+      assert options.transport.websocket_owner_downstream == %{
+               pid: self(),
+               correlation_id: "corr"
+             }
+
+      assert options.transport.websocket_owner_downstream_epoch == 2
+      assert options.extra == %{}
+    end
+
     test "for_file_bridge applies narrow route and bridge updates" do
       options =
         RequestOptions.for_file_bridge(
@@ -140,6 +172,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.transport.websocket_writer == writer
       assert options.transport.upstream_websocket_session == self()
       assert options.continuity.session_key == "session-key"
+      assert options.continuity.session_header_source == nil
       assert options.continuity.conversation_key == "conversation-key"
       assert options.continuity.owner_instance_id == "node-a"
       assert options.continuity.bridge_owner_lease_ttl_seconds == 120
@@ -349,6 +382,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
             routing_attempt_metadata: %{"rank" => 1},
             routing_circuit_state: %{state: "closed"},
             session_header: "session-header",
+            session_header_source: "session-id",
             session_key: "session-key",
             timeout: 16,
             transport: "websocket",
@@ -373,7 +407,31 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
         )
 
       assert options.continuity.authenticated_owner_attach
+      assert options.continuity.session_header_source == "session-id"
       assert options.extra == %{unknown_fixture: true}
+    end
+
+    test "normalizes session header provenance to the compatibility allowlist" do
+      assert %{continuity: %{session_header_source: "session-id"}} =
+               RequestOptions.build(
+                 %{session_header: "local-session", session_header_source: "Session-ID"},
+                 "/backend-api/codex/responses",
+                 %{"model" => "example-model"}
+               )
+
+      assert %{continuity: %{session_header_source: "x-session-affinity"}} =
+               RequestOptions.build(
+                 %{session_header: "affinity", session_header_source: :"x-session-affinity"},
+                 "/backend-api/codex/responses",
+                 %{"model" => "example-model"}
+               )
+
+      assert %{continuity: %{session_header_source: nil}} =
+               RequestOptions.build(
+                 %{session_header: "local-session", session_header_source: "x-unsafe-header"},
+                 "/backend-api/codex/responses",
+                 %{"model" => "example-model"}
+               )
     end
 
     test "uses operational settings for upstream timeout defaults" do

@@ -202,11 +202,6 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     session
   end
 
-  defp register_turn_state_anchor!(auth, assignment, turn_state) do
-    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: turn_state})
-    pin_session_to_assignment!(session, assignment)
-  end
-
   defp register_session_header_anchor!(auth, assignment, session_header) do
     {:ok, session} = Gateway.start_codex_session(auth, %{session_header: session_header})
     pin_session_to_assignment!(session, assignment)
@@ -1454,29 +1449,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     previous_response_id = "resp_v1_pinned_reauth_#{System.unique_integer([:positive])}"
     register_previous_response_anchor!(auth, setup.assignment, previous_response_id)
 
-    turn_state = "turn-v1-pinned-reauth-#{System.unique_integer([:positive])}"
-    register_turn_state_anchor!(auth, setup.assignment, turn_state)
-
-    local_header_cases =
-      for header <- [
-            "x-codex-session-id",
-            "session-id",
-            "x-session-affinity",
-            "session_id",
-            "x-codex-conversation-id"
-          ] do
-        value = "#{header}-v1-pinned-reauth-#{System.unique_integer([:positive])}"
-        register_session_header_anchor!(auth, setup.assignment, value)
-        {"local #{header}", [{header, value}], %{}}
-      end
-
-    anchored_cases =
-      [
-        {"body previous_response_id", [], %{"previous_response_id" => previous_response_id}},
-        {"header previous response", [{"x-codex-previous-response-id", previous_response_id}],
-         %{}},
-        {"accepted turn state", [{"x-codex-turn-state", turn_state}], %{}}
-      ] ++ local_header_cases
+    anchored_cases = [
+      {"body previous_response_id", [], %{"previous_response_id" => previous_response_id}},
+      {"header previous response", [{"x-codex-previous-response-id", previous_response_id}], %{}}
+    ]
 
     for {{label, headers, payload_updates}, index} <- Enum.with_index(anchored_cases) do
       payload =

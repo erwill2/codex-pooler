@@ -146,6 +146,60 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       assert other_candidate == setup.other_candidate
     end
 
+    test "keeps fallback candidates for non-stream requests without hard anchors" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+      opts = request_options_with_session(session)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert {:ok, [other_candidate]} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert other_candidate == setup.other_candidate
+    end
+
+    for session_header_source <- [
+          "x-codex-session-id",
+          "session-id",
+          "x-session-affinity",
+          "session_id",
+          "x-codex-conversation-id"
+        ] do
+      test "soft-pins local continuity header #{session_header_source}" do
+        setup = active_pinned_assignment_setup()
+        session = codex_session_fixture(setup, setup.pinned.assignment)
+
+        opts =
+          session
+          |> streaming_request_options_with_session()
+          |> RequestOptions.put_continuity(
+            session_header: "local-session-alias",
+            session_header_source: unquote(session_header_source)
+          )
+
+        model =
+          model_for_assignments(setup.pool, [
+            setup.pinned.assignment.id,
+            setup.other.assignment.id
+          ])
+
+        assert {:ok, [other_candidate]} =
+                 SessionContinuity.filter_codex_session_assignment(
+                   [setup.other_candidate],
+                   opts,
+                   model
+                 )
+
+        assert other_candidate == setup.other_candidate
+      end
+    end
+
     test "hard-pins proxy stream continuations with previous_response_id" do
       setup = active_pinned_assignment_setup()
       session = codex_session_fixture(setup, setup.pinned.assignment)
@@ -168,14 +222,37 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       assert_session_assignment_unavailable(error)
     end
 
-    test "hard-pins proxy stream continuations with accepted turn state" do
+    test "soft-pins proxy stream continuations with bare accepted turn state" do
       setup = active_pinned_assignment_setup()
       session = codex_session_fixture(setup, setup.pinned.assignment)
 
       opts =
         session
         |> streaming_request_options_with_session()
-        |> RequestOptions.put_continuity(accepted_turn_state: "turn_strong_anchor")
+        |> RequestOptions.put_continuity(accepted_turn_state: "turn_soft_anchor")
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert {:ok, [other_candidate]} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert other_candidate == setup.other_candidate
+    end
+
+    test "hard-pins accepted turn state backed by a live upstream websocket session" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+
+      opts =
+        session
+        |> streaming_request_options_with_session()
+        |> RequestOptions.put_continuity(accepted_turn_state: "turn_live_websocket")
+        |> RequestOptions.put_transport(upstream_websocket_session: self())
 
       model =
         model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
@@ -190,7 +267,110 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       assert_session_assignment_unavailable(error)
     end
 
-    test "hard-pins proxy stream sessions after a same-model successful turn" do
+    test "hard-pins accepted turn state backed by upstream websocket owner forwarding" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+
+      opts =
+        session
+        |> streaming_request_options_with_session()
+        |> RequestOptions.put_continuity(accepted_turn_state: "turn_owner_websocket")
+        |> RequestOptions.put_transport(
+          websocket_owner_forwarding_enabled?: true,
+          websocket_owner_session: session,
+          websocket_owner_lease_token: "lease-token",
+          websocket_owner_downstream: %{pid: self(), correlation_id: "safe-correlation"}
+        )
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert {:error, error} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert_session_assignment_unavailable(error)
+    end
+
+    test "keeps owner-forwarded websocket continuity soft without complete live owner state" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+
+      base_opts =
+        session
+        |> streaming_request_options_with_session()
+        |> RequestOptions.put_continuity(accepted_turn_state: "turn_owner_incomplete_websocket")
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      incomplete_transport_states = [
+        [
+          websocket_owner_forwarding_enabled?: false,
+          websocket_owner_session: session,
+          websocket_owner_lease_token: "lease-token",
+          websocket_owner_downstream: %{pid: self(), correlation_id: "safe-correlation"}
+        ],
+        [
+          websocket_owner_forwarding_enabled?: true,
+          websocket_owner_session: %{id: session.id},
+          websocket_owner_lease_token: "lease-token",
+          websocket_owner_downstream: %{pid: self(), correlation_id: "safe-correlation"}
+        ],
+        [
+          websocket_owner_forwarding_enabled?: true,
+          websocket_owner_session: session,
+          websocket_owner_lease_token: nil,
+          websocket_owner_downstream: %{pid: self(), correlation_id: "safe-correlation"}
+        ],
+        [
+          websocket_owner_forwarding_enabled?: true,
+          websocket_owner_session: session,
+          websocket_owner_lease_token: "lease-token",
+          websocket_owner_downstream: %{correlation_id: "safe-correlation"}
+        ]
+      ]
+
+      for transport_updates <- incomplete_transport_states do
+        opts = RequestOptions.put_transport(base_opts, transport_updates)
+
+        assert {:ok, [other_candidate]} =
+                 SessionContinuity.filter_codex_session_assignment(
+                   [setup.other_candidate],
+                   opts,
+                   model
+                 )
+
+        assert other_candidate == setup.other_candidate
+      end
+    end
+
+    test "hard-pins proxy stream continuations with file affinity" do
+      setup = active_pinned_assignment_setup()
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+
+      opts =
+        session
+        |> streaming_request_options_with_session()
+        |> RequestOptions.put_routing(file_affinity_assignment_id: setup.pinned.assignment.id)
+
+      model =
+        model_for_assignments(setup.pool, [setup.pinned.assignment.id, setup.other.assignment.id])
+
+      assert {:error, error} =
+               SessionContinuity.filter_codex_session_assignment(
+                 [setup.other_candidate],
+                 opts,
+                 model
+               )
+
+      assert_session_assignment_unavailable(error)
+    end
+
+    test "soft-pins proxy stream sessions after a same-model successful turn" do
       setup = active_pinned_assignment_setup()
       api_key = active_api_key_fixture(setup.pool)
       session = codex_session_fixture(setup, setup.pinned.assignment, api_key.api_key)
@@ -201,14 +381,14 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
 
       succeeded_codex_turn_fixture(setup, session, api_key.api_key, model.exposed_model_id)
 
-      assert {:error, error} =
+      assert {:ok, [other_candidate]} =
                SessionContinuity.filter_codex_session_assignment(
                  [setup.other_candidate],
                  opts,
                  model
                )
 
-      assert_session_assignment_unavailable(error)
+      assert other_candidate == setup.other_candidate
     end
 
     test "does not hard-pin proxy stream sessions from a different helper model success" do
