@@ -41,8 +41,8 @@ defmodule CodexPooler.Jobs.JobsExplorerTest do
 
       first_page = ReadModel.list_explorer_jobs(:system, filters(%{}), now: base_time)
 
-      assert %{total: 55, limit: 50, offset: 0, items: first_items} = first_page
-      assert length(first_items) == 50
+      assert %{total: 55, limit: 20, offset: 0, items: first_items} = first_page
+      assert length(first_items) == 20
       assert Enum.map(first_items, & &1.id) |> Enum.take(2) == [newer_tie.id, older_tie.id]
       refute Enum.any?(first_items, &(&1.id == completed_job.id))
       assert Enum.all?(first_items, &safe_explorer_job_shape?/1)
@@ -50,8 +50,8 @@ defmodule CodexPooler.Jobs.JobsExplorerTest do
       second_page =
         ReadModel.list_explorer_jobs(:system, filters(%{"page" => "2"}), now: base_time)
 
-      assert %{total: 55, limit: 50, offset: 50, items: second_items} = second_page
-      assert length(second_items) == 5
+      assert %{total: 55, limit: 20, offset: 20, items: second_items} = second_page
+      assert length(second_items) == 20
       refute Enum.any?(second_items, &(&1.id == completed_job.id))
     end
 
@@ -200,7 +200,7 @@ defmodule CodexPooler.Jobs.JobsExplorerTest do
         ]
       )
 
-      assert %{items: [result], total: 1, limit: 50, offset: 0} =
+      assert %{items: [result], total: 1, limit: 20, offset: 0} =
                ReadModel.list_explorer_jobs(:system, filters(%{}))
 
       assert safe_explorer_job_shape?(result)

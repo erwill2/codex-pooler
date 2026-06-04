@@ -213,12 +213,12 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
 
     assert has_element?(view, "#admin-jobs-explorer")
     assert has_element?(view, "#admin-jobs-explorer-total", "55 jobs")
-    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 1-50 of 55")
-    assert has_element?(view, "#admin-jobs-explorer-pagination", "Page 1 of 2")
+    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 1-20 of 55")
+    assert has_element?(view, "#admin-jobs-explorer-pagination", "Page 1 of 3")
     assert has_element?(view, "#admin-jobs-explorer-pagination-prev[aria-disabled='true']")
     assert has_element?(view, "#admin-jobs-explorer-pagination-next[href='/admin/jobs?page=2']")
-    assert count_occurrences(rendered, ~s(<tr id="job-)) == 50
-    assert count_occurrences(rendered, ~s(<article id="job-card-)) == 50
+    assert count_occurrences(rendered, ~s(<tr id="job-)) == 20
+    assert count_occurrences(rendered, ~s(<article id="job-card-)) == 20
     assert has_element?(view, "#admin-jobs-explorer-desktop #job-#{List.last(jobs).id}")
     assert has_element?(view, "#admin-jobs-explorer-mobile #job-card-#{List.last(jobs).id}")
     refute has_element?(view, "#job-#{List.first(jobs).id}")
@@ -227,12 +227,12 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     render_click(element(view, "#admin-jobs-explorer-pagination-next"))
     assert_patch(view, ~p"/admin/jobs?page=2")
 
-    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 51-55 of 55")
-    assert has_element?(view, "#admin-jobs-explorer-pagination", "Page 2 of 2")
+    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 21-40 of 55")
+    assert has_element?(view, "#admin-jobs-explorer-pagination", "Page 2 of 3")
     assert has_element?(view, "#admin-jobs-explorer-pagination-prev[href='/admin/jobs']")
-    assert has_element?(view, "#admin-jobs-explorer-pagination-next[aria-disabled='true']")
-    assert has_element?(view, "#admin-jobs-explorer-desktop #job-#{List.first(jobs).id}")
-    assert has_element?(view, "#admin-jobs-explorer-mobile #job-card-#{List.first(jobs).id}")
+    assert has_element?(view, "#admin-jobs-explorer-pagination-next[href='/admin/jobs?page=3']")
+    refute has_element?(view, "#admin-jobs-explorer-desktop #job-#{List.first(jobs).id}")
+    refute has_element?(view, "#admin-jobs-explorer-mobile #job-card-#{List.first(jobs).id}")
   end
 
   test "does not render job mutation controls", %{conn: conn} do

@@ -57,7 +57,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
     refute has_element?(view, "#job-#{job.id}", DateTime.to_iso8601(updated_job.completed_at))
   end
 
-  test "limits explorer rows to the first 50-row page", %{conn: conn} do
+  test "limits explorer rows to the first 20-row page", %{conn: conn} do
     base_time = ~U[2026-05-04 16:00:00Z]
 
     jobs =
@@ -71,10 +71,10 @@ defmodule CodexPoolerWeb.Admin.JobsLiveRefreshTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
     rendered = render(view)
 
-    assert count_occurrences(rendered, ~s(<tr id="job-)) == 50
-    assert count_occurrences(rendered, ~s(<article id="job-card-)) == 50
+    assert count_occurrences(rendered, ~s(<tr id="job-)) == 20
+    assert count_occurrences(rendered, ~s(<article id="job-card-)) == 20
     assert has_element?(view, "#admin-jobs-explorer-total", "51 jobs")
-    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 1-50 of 51")
+    assert has_element?(view, "#admin-jobs-explorer-range", "Showing 1-20 of 51")
     assert has_element?(view, "#job-#{List.last(jobs).id}")
     refute has_element?(view, "#job-#{List.first(jobs).id}")
   end

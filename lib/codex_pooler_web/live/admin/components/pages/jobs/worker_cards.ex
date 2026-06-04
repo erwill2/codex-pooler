@@ -163,32 +163,37 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
       class="border-t border-error/20 bg-error/5 px-4 py-3 text-sm"
     >
       <div class="grid gap-3">
-        <div class="min-w-0">
-          <p class="text-xs font-semibold uppercase text-error">Latest failure</p>
-          <p class="mt-1 truncate font-semibold text-base-content">
-            {@card.latest_failure.target_label}
-          </p>
-          <p data-role="latest-failure-message" class="mt-1 leading-6 text-base-content/70">
-            {@card.latest_failure.message}
-          </p>
-        </div>
-        <dl
-          data-role="latest-failure-meta"
-          class="grid grid-cols-2 gap-3 text-xs text-base-content/60 sm:max-w-sm"
+        <div
+          data-role="latest-failure-summary"
+          class="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start"
         >
-          <div>
-            <dt>When</dt>
-            <dd class="font-semibold tabular-nums text-base-content">
-              {format_job_timestamp(@card.latest_failure.failed_at, @datetime_preferences)}
-            </dd>
+          <div class="min-w-0">
+            <p class="text-xs font-semibold uppercase text-error">Latest failure</p>
+            <p class="mt-1 truncate font-semibold text-base-content">
+              {@card.latest_failure.target_label}
+            </p>
           </div>
-          <div>
-            <dt>Attempts</dt>
-            <dd class="font-semibold tabular-nums text-base-content">
-              {@card.latest_failure.attempts}
-            </dd>
-          </div>
-        </dl>
+          <dl
+            data-role="latest-failure-meta"
+            class="grid grid-cols-2 gap-3 text-xs text-base-content/60 sm:min-w-44"
+          >
+            <div>
+              <dt>When</dt>
+              <dd class="font-semibold tabular-nums text-base-content">
+                {format_job_timestamp(@card.latest_failure.failed_at, @datetime_preferences)}
+              </dd>
+            </div>
+            <div>
+              <dt>Attempts</dt>
+              <dd class="font-semibold tabular-nums text-base-content">
+                {@card.latest_failure.attempts}
+              </dd>
+            </div>
+          </dl>
+        </div>
+        <p data-role="latest-failure-message" class="leading-6 text-base-content/70">
+          {@card.latest_failure.message}
+        </p>
       </div>
     </section>
     """
@@ -247,18 +252,21 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
       data-density="compact"
       class="grid gap-3 border-t border-base-300 px-4 py-3 sm:grid-cols-[minmax(7rem,0.65fr)_minmax(0,1fr)] sm:items-start"
     >
-      <div data-role="next-run-group" class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-        <span class="text-xs text-base-content/50">Next run</span>
-        <strong
-          data-role="next-run"
-          class="text-base font-semibold leading-tight text-base-content"
-          title={@card.next_run_title}
-        >
-          {@card.next_run}
-        </strong>
+      <div data-role="next-run-group" class="grid min-w-0 gap-0.5">
+        <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <span class="text-xs text-base-content/50">Next run</span>
+          <strong
+            data-role="next-run"
+            class="text-base font-semibold leading-tight text-base-content"
+            title={@card.next_run_title}
+          >
+            {@card.next_run}
+          </strong>
+        </div>
         <span
           :if={@card.cadence_label != @card.next_run}
-          class="text-xs text-base-content/50"
+          data-role="cadence-label"
+          class="text-xs leading-none text-base-content/50"
           title={@card.cadence_label}
         >
           {@card.cadence_label}

@@ -18,7 +18,7 @@ defmodule CodexPooler.Jobs.ReadModel do
 
   @admin_jobs_default_limit 15
   @admin_jobs_max_limit 50
-  @explorer_page_size 50
+  @explorer_page_size 20
   @completed_state "completed"
   @overview_action_buckets [:active_failure, :retry_pressure, :stuck_executing, :backlog_pressure]
 

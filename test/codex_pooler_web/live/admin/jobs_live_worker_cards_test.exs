@@ -146,6 +146,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
            )
 
     assert has_element?(view, "#{card} [data-role='next-run-group']", "Next run")
+    assert has_element?(view, "#{card} [data-role='cadence-label']", "Every 15 min")
     assert has_element?(view, "#{card} [data-role='last-run']", "2026-05-04 10:02:00 UTC")
     assert has_element?(view, "#{card} [data-role='attempts']", "2/5")
 
@@ -598,11 +599,15 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
-             "#{card} [data-role='latest-failure-message']",
+             "#{card} [data-role='worker-latest-failure'] > div > [data-role='latest-failure-message']",
              "The job stopped without additional diagnostics."
            )
 
-    assert has_element?(view, "#{card} [data-role='latest-failure-meta']")
+    assert has_element?(
+             view,
+             "#{card} [data-role='latest-failure-summary'] [data-role='latest-failure-meta']"
+           )
+
     refute has_element?(view, "#{card} [data-role='latest-failure-message'].line-clamp-2")
 
     assert has_element?(

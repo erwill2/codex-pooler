@@ -74,7 +74,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert selected_id == selected_job.id
     assert overview.status == :attention_required
     assert overview.total == 1
-    assert explorer == %{items: [projection.selected_job], total: 1, limit: 50, offset: 0}
+    assert explorer == %{items: [projection.selected_job], total: 1, limit: 20, offset: 0}
     assert filters.worker == worker_name(TokenRefreshWorker)
     assert filters.queue == "jobs"
     assert filters.job_id == selected_job.id
@@ -203,7 +203,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
 
     assert projection.overview.empty?
     assert projection.overview.total == 0
-    assert projection.explorer == %{items: [], total: 0, limit: 50, offset: 0}
+    assert projection.explorer == %{items: [], total: 0, limit: 20, offset: 0}
     assert projection.selected_job == nil
     refute Map.has_key?(projection, :recent_jobs)
     assert projection.filter_warnings == []

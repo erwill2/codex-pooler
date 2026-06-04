@@ -142,36 +142,29 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
 
-    assert has_element?(view, "#admin-jobs-overview")
-    assert has_element?(view, "#admin-jobs-health-summary", "Attention required")
-    assert has_element?(view, "#admin-jobs-health-summary", "5 actionable jobs")
-    assert has_element?(view, "#admin-jobs-overview-active-failure", "2")
-    assert has_element?(view, "#admin-jobs-overview-stuck-executing", "1")
-    assert has_element?(view, "#admin-jobs-overview-retry-pressure", "1")
-    assert has_element?(view, "#admin-jobs-overview-backlog-pressure", "1")
+    refute has_element?(view, "#admin-jobs-overview")
+    refute has_element?(view, "#admin-jobs-health-summary")
+    refute has_element?(view, "#admin-jobs-overview-active-failure")
+    refute has_element?(view, "#admin-jobs-overview-stuck-executing")
+    refute has_element?(view, "#admin-jobs-overview-retry-pressure")
+    refute has_element?(view, "#admin-jobs-overview-backlog-pressure")
 
     refute has_element?(view, "#admin-jobs-hotspots")
 
     rendered = render(view)
-    assert String.contains?(rendered, "id=\"admin-jobs-overview\"")
     assert String.contains?(rendered, "id=\"job-filter-form\"")
     assert String.contains?(rendered, "id=\"admin-jobs-worker-grid\"")
     assert String.contains?(rendered, "id=\"admin-jobs-explorer\"")
+    refute rendered =~ "System job health"
 
-    assert :binary.match(rendered, "id=\"admin-jobs-overview\"") <
+    assert :binary.match(rendered, "id=\"admin-jobs-worker-grid\"") <
              :binary.match(rendered, "id=\"job-filter-form\"")
 
     assert :binary.match(rendered, "id=\"job-filter-form\"") <
              :binary.match(rendered, "id=\"admin-jobs-explorer\"")
 
-    assert :binary.match(rendered, "id=\"admin-jobs-overview\"") <
-             :binary.match(rendered, "id=\"admin-jobs-explorer\"")
-
     assert :binary.match(rendered, "id=\"admin-jobs-worker-grid\"") <
              :binary.match(rendered, "id=\"admin-jobs-explorer\"")
-
-    assert :binary.match(rendered, "id=\"job-filter-form\"") <
-             :binary.match(rendered, "id=\"admin-jobs-worker-grid\"")
 
     assert has_element?(view, "#job-#{active_failure_a.id}")
     refute rendered =~ "secret-token-overview"
@@ -192,13 +185,8 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
 
-    assert has_element?(view, "#admin-jobs-overview")
-    assert has_element?(view, "#admin-jobs-health-summary", "Healthy")
-    assert has_element?(view, "#admin-jobs-health-summary", "No actionable jobs")
-    assert has_element?(view, "#admin-jobs-overview-active-failure", "0")
-    assert has_element?(view, "#admin-jobs-overview-stuck-executing", "0")
-    assert has_element?(view, "#admin-jobs-overview-retry-pressure", "0")
-    assert has_element?(view, "#admin-jobs-overview-backlog-pressure", "0")
+    refute has_element?(view, "#admin-jobs-overview")
+    refute has_element?(view, "#admin-jobs-health-summary")
     refute has_element?(view, "#admin-jobs-hotspots")
     assert has_element?(view, "#admin-jobs-explorer")
     assert has_element?(view, "#admin-jobs-empty-state", "No jobs match these filters")
@@ -389,7 +377,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
 
     page_state = JobsReadModel.load(:system)
 
-    assert %{items: [%{id: job_id}], total: 1, limit: 50, offset: 0} = page_state.explorer
+    assert %{items: [%{id: job_id}], total: 1, limit: 20, offset: 0} = page_state.explorer
     assert job_id == job.id
     assert is_map(page_state.overview)
     assert page_state.filters.show_completed == false

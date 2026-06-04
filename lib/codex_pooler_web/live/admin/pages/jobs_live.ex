@@ -10,7 +10,6 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
   alias CodexPoolerWeb.Admin.JobExplorer
   alias CodexPoolerWeb.Admin.JobFilterForm
   alias CodexPoolerWeb.Admin.JobFilters
-  alias CodexPoolerWeb.Admin.JobOverview
   alias CodexPoolerWeb.Admin.JobsReadModel
   alias CodexPoolerWeb.Admin.JobWorkerCards
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
@@ -157,19 +156,6 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
               icon="hero-lock-closed"
             />
 
-            <JobOverview.jobs_overview
-              :if={@owner_authorized?}
-              overview={@overview}
-            />
-
-            <JobFilters.job_filters
-              :if={@owner_authorized?}
-              filter_form={@filter_form}
-              filters={@filters}
-              filter_options={@filter_options}
-              filter_errors={@filter_errors}
-            />
-
             <div
               :if={@owner_authorized?}
               id="admin-jobs-worker-grid"
@@ -181,6 +167,14 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
                 datetime_preferences={@datetime_preferences}
               />
             </div>
+
+            <JobFilters.job_filters
+              :if={@owner_authorized?}
+              filter_form={@filter_form}
+              filters={@filters}
+              filter_options={@filter_options}
+              filter_errors={@filter_errors}
+            />
 
             <JobExplorer.jobs_explorer
               :if={@owner_authorized?}
