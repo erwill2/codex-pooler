@@ -89,22 +89,28 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
             aria-label={marker.title}
             title={marker.title}
             data-has-avatar={marker.avatar_email && "true"}
-            class="relative grid size-8 shrink-0 place-items-center overflow-hidden rounded-full border border-info/50 bg-info/10 text-[0.6875rem] font-semibold leading-none text-info shadow-sm"
+            class={[
+              "avatar avatar-online relative size-8 shrink-0 rounded-full text-[0.6875rem] font-semibold leading-none shadow-sm",
+              !marker.avatar_email && "avatar-placeholder"
+            ]}
           >
-            <AvatarComponents.gravatar
-              :if={marker.avatar_email}
-              id={"job-activity-avatar-#{marker.id}"}
-              email={marker.avatar_email}
-              label={marker.target_label}
-              size={64}
-              class="pointer-events-none"
-              image_class="size-8 rounded-full ring-0"
-            />
-            <span :if={!marker.avatar_email} data-role="target-initial">{marker.glyph}</span>
-            <span
-              data-role="target-live-indicator"
-              class="absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full bg-info ring-2 ring-base-100 motion-safe:animate-pulse"
-            />
+            <div class="size-8 rounded-full ring-1 ring-base-300">
+              <img
+                :if={marker.avatar_email}
+                src={AvatarComponents.gravatar_url(marker.avatar_email, size: 64)}
+                alt=""
+                loading="lazy"
+                referrerpolicy="no-referrer"
+                aria-hidden="true"
+              />
+              <span
+                :if={!marker.avatar_email}
+                data-role="target-initial"
+                class="grid size-full place-items-center rounded-full bg-info/10 text-info"
+              >
+                {marker.glyph}
+              </span>
+            </div>
           </span>
           <span
             :if={@card.active_marker_overflow_count > 0}
@@ -123,22 +129,29 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
             aria-label={marker.title}
             title={marker.title}
             data-has-avatar={marker.avatar_email && "true"}
-            class="relative grid size-8 shrink-0 place-items-center overflow-hidden rounded-full border border-error/60 bg-error/10 text-[0.6875rem] font-semibold leading-none text-error shadow-sm transition-colors hover:bg-error/15 focus:outline-none focus:ring-2 focus:ring-error/40"
+            class={[
+              "avatar avatar-offline relative size-8 shrink-0 rounded-full text-[0.6875rem] font-semibold leading-none shadow-sm transition-opacity hover:opacity-80 focus:outline-none focus:ring-2 focus:ring-error/40",
+              !marker.avatar_email && "avatar-placeholder"
+            ]}
             onclick={"document.getElementById('job-failure-dialog-#{marker.id}').showModal()"}
           >
-            <AvatarComponents.gravatar
-              :if={marker.avatar_email}
-              id={"job-failure-avatar-#{marker.id}"}
-              email={marker.avatar_email}
-              label={marker.target_label}
-              size={64}
-              class="pointer-events-none"
-              image_class="size-8 rounded-full ring-0"
-            />
-            <span :if={!marker.avatar_email} data-role="target-initial">{marker.glyph}</span>
-            <span class="absolute -bottom-0.5 -right-0.5 grid size-3.5 place-items-center rounded-full bg-error text-error-content ring-2 ring-base-100">
-              <.icon name="hero-exclamation-triangle" class="size-2.5" />
-            </span>
+            <div class="size-8 rounded-full ring-1 ring-error/40">
+              <img
+                :if={marker.avatar_email}
+                src={AvatarComponents.gravatar_url(marker.avatar_email, size: 64)}
+                alt=""
+                loading="lazy"
+                referrerpolicy="no-referrer"
+                aria-hidden="true"
+              />
+              <span
+                :if={!marker.avatar_email}
+                data-role="target-initial"
+                class="grid size-full place-items-center rounded-full bg-error/10 text-error"
+              >
+                {marker.glyph}
+              </span>
+            </div>
           </button>
           <span
             :if={@card.failure_marker_overflow_count > 0}
@@ -262,20 +275,20 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
             Next run
           </dt>
           <dd class="truncate text-base-content/60">
-            <strong
+            <span
               data-role="next-run"
-              class="font-semibold tabular-nums text-base-content"
+              class="tabular-nums"
               title={@card.next_run_title}
             >
               {@card.next_run}
-            </strong>
+            </span>
           </dd>
         </div>
         <div data-role="last-run" class="min-w-0 px-3">
           <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
             Last run
           </dt>
-          <dd class="truncate font-semibold tabular-nums text-base-content">
+          <dd class="truncate tabular-nums text-base-content/60">
             {format_job_timestamp(@card.last_seen_at, @datetime_preferences)}
           </dd>
         </div>
@@ -286,7 +299,7 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
           <dd
             :if={@card.cadence_label == @card.next_run}
             data-role="cadence-label"
-            class="truncate font-semibold text-base-content"
+            class="truncate text-base-content/60"
             title={@card.cadence_label}
           >
             On demand

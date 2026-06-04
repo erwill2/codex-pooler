@@ -155,6 +155,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(view, "#{card} [data-role='next-run-group']", "Next run")
     assert has_element?(view, "#{card} [data-role='last-run']", "2026-05-04 10:02:00 UTC")
+    refute has_element?(view, "#{card} [data-role='last-run'] dd.font-semibold")
     assert has_element?(view, "#{card} [data-role='schedule']", "Schedule")
 
     assert has_element?(
@@ -257,12 +258,12 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
-             "#{card} #job-activity-#{first_job.id}[data-has-avatar='true'] .avatar img[src='#{AvatarComponents.gravatar_url("codex01@example.com", size: 64)}']"
+             "#{card} #job-activity-#{first_job.id}[data-has-avatar='true'].avatar.avatar-online img[src='#{AvatarComponents.gravatar_url("codex01@example.com", size: 64)}']"
            )
 
     assert has_element?(
              view,
-             "#{card} #job-activity-#{second_job.id}[data-has-avatar='true'] .avatar img[src='#{AvatarComponents.gravatar_url("codex02@example.com", size: 64)}']"
+             "#{card} #job-activity-#{second_job.id}[data-has-avatar='true'].avatar.avatar-online img[src='#{AvatarComponents.gravatar_url("codex02@example.com", size: 64)}']"
            )
 
     refute has_element?(view, "#{card} #job-activity-#{first_job.id} > img")
@@ -272,13 +273,18 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
              "#{card} #job-activity-#{first_job.id} [data-role='target-initial']"
            )
 
+    refute has_element?(
+             view,
+             "#{card} #job-activity-#{first_job.id} [data-role='target-live-indicator']"
+           )
+
     refute has_element?(view, "#{card} [data-role='worker-activity-strip'] .loading-spinner")
     refute has_element?(view, "#{card} #job-activity-#{first_job.id}", "AccountReconciliation")
     refute has_element?(view, "#{card} #job-activity-#{first_job.id}", "codex01@example.com")
     refute has_element?(view, "#{card} #job-activity-#{second_job.id}", "codex02@example.com")
   end
 
-  test "account reconciliation failure markers use the shared avatar component", %{conn: conn} do
+  test "account reconciliation failure markers use operator avatar status styling", %{conn: conn} do
     pool = pool_fixture(%{name: "Failure Avatar Pool", slug: "failure-avatar-pool"})
 
     %{assignment: assignment} =
@@ -314,9 +320,10 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
-             "#{card} #job-failure-#{job.id}[data-has-avatar='true'] .avatar img[src='#{AvatarComponents.gravatar_url("failed-account@example.com", size: 64)}']"
+             "#{card} #job-failure-#{job.id}[data-has-avatar='true'].avatar.avatar-offline img[src='#{AvatarComponents.gravatar_url("failed-account@example.com", size: 64)}']"
            )
 
+    refute has_element?(view, "#{card} #job-failure-#{job.id} .hero-exclamation-triangle")
     refute has_element?(view, "#{card} #job-failure-#{job.id} > img")
   end
 

@@ -191,6 +191,8 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     assert has_element?(view, "#{row} [data-role='job-meta']", "##{job.id}")
     assert has_element?(view, "#{row} [data-role='job-event-label']", "Discarded")
     assert has_element?(view, "#{row} [data-role='job-event-time']", "2026-05-04 10:02:00 UTC")
+    refute has_element?(view, "#{row} [data-role='job-event-time'].font-mono")
+    refute has_element?(view, "#{row} [data-role='attempts'].font-mono")
     assert has_element?(view, "#{row} [data-role='failure-title']", "Attempt 2 · RuntimeError")
 
     refute has_element?(view, "#{row} [data-role='inserted-at']")

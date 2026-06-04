@@ -157,7 +157,7 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
         <.job_event job={@job} datetime_preferences={@datetime_preferences} />
       </td>
       <td
-        class="align-middle font-mono tabular-nums text-base-content/75"
+        class="align-middle tabular-nums text-base-content/75"
         data-role="attempts"
       >
         {format_attempts(@job)}
@@ -186,7 +186,7 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
       <.job_target_summary job={@job} />
       <div class="flex flex-wrap items-center gap-2 text-xs text-base-content/60">
         <span class="font-semibold text-base-content/80">Attempts</span>
-        <span data-role="attempts" class="font-mono tabular-nums">{format_attempts(@job)}</span>
+        <span data-role="attempts" class="tabular-nums">{format_attempts(@job)}</span>
       </div>
       <.job_timeline job={@job} datetime_preferences={@datetime_preferences} />
       <.job_failure job={@job} />
@@ -306,7 +306,7 @@ defmodule CodexPoolerWeb.Admin.JobExplorer do
       </span>
       <span
         data-role="job-event-time"
-        class="truncate font-mono leading-tight tabular-nums text-base-content/70"
+        class="truncate leading-tight tabular-nums text-base-content/70"
         title={@event.timestamp}
       >
         {@event.timestamp}
