@@ -108,6 +108,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
       terminal_event?(type) ->
         terminal_stream_chunk(decoded, sync_response_state(state, decoded))
 
+      moderation = moderation_metadata(decoded) ->
+        moderation_stream_chunk(moderation, sync_response_state(state, decoded))
+
       true ->
         {[], state}
     end
@@ -188,6 +191,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
        usage_stream_chunk(response, state),
        "data: [DONE]\n\n"
      ], state}
+  end
+
+  defp moderation_stream_chunk(moderation, state) do
+    payload = %{
+      "id" => state.id,
+      "object" => "chat.completion.chunk",
+      "created" => state.created,
+      "model" => state.model,
+      "choices" => [],
+      "moderation" => moderation
+    }
+
+    {["data: ", Jason.encode!(payload), "\n\n"], state}
   end
 
   defp chat_sse_chunk(delta, finish_reason, state) do
@@ -360,6 +376,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
       true -> "stop"
     end
   end
+
+  defp moderation_metadata(%{"moderation" => %{} = moderation}), do: moderation
+  defp moderation_metadata(_decoded), do: nil
 
   defp response_map(%{"response" => %{} = response}), do: response
   defp response_map(%{} = decoded), do: decoded

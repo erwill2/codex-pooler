@@ -25,10 +25,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
   test "supported field matrix tracks current SDK top-level request fields" do
     openai_chat_fields =
-      ~w(audio frequency_penalty function_call functions logit_bias logprobs max_completion_tokens max_tokens messages metadata modalities model n parallel_tool_calls prediction presence_penalty prompt_cache_key prompt_cache_retention reasoning_effort response_format safety_identifier seed service_tier stop store stream stream_options temperature tool_choice tools top_logprobs top_p user verbosity web_search_options)
+      ~w(audio frequency_penalty function_call functions logit_bias logprobs max_completion_tokens max_tokens messages metadata modalities model moderation n parallel_tool_calls prediction presence_penalty prompt_cache_key prompt_cache_retention reasoning_effort response_format safety_identifier seed service_tier stop store stream stream_options temperature tool_choice tools top_logprobs top_p user verbosity web_search_options)
 
     openai_responses_fields =
-      ~w(background context_management conversation include input instructions max_output_tokens metadata model parallel_tool_calls previous_response_id prompt prompt_cache_key prompt_cache_retention reasoning safety_identifier service_tier store stream stream_options temperature text tool_choice tools top_logprobs top_p truncation user)
+      ~w(background context_management conversation include input instructions max_output_tokens metadata model moderation parallel_tool_calls previous_response_id prompt prompt_cache_key prompt_cache_retention reasoning safety_identifier service_tier store stream stream_options temperature text tool_choice tools top_logprobs top_p truncation user)
 
     assert MapSet.subset?(
              MapSet.new(openai_chat_fields),
@@ -55,7 +55,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         }
       ],
       "tool_choice" => "auto",
-      "reasoning" => %{"effort" => "minimal"},
+      "moderation" => %{"model" => "omni-moderation-latest"},
+      "reasoning" => %{"effort" => "focused", "context" => "all_turns"},
       "text" => %{
         "format" => %{
           "type" => "json_schema",
@@ -80,6 +81,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert result.endpoint == "/backend-api/codex/responses"
     assert result.payload["model"] == "gpt-fixture-text"
     assert result.payload["tools"] == payload["tools"]
+    assert result.payload["moderation"] == %{"model" => "omni-moderation-latest"}
+    assert result.payload["reasoning"] == %{"effort" => "focused", "context" => "all_turns"}
     assert result.payload["stream"] == true
     assert result.payload["store"] == false
 
@@ -334,9 +337,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       "messages" => [%{"role" => "user", "content" => "Synthetic user"}],
       "max_completion_tokens" => 123,
       "metadata" => %{"fixture" => "true"},
+      "moderation" => %{"model" => "omni-moderation-latest"},
       "prompt_cache_key" => "fixture-cache-key",
       "prompt_cache_retention" => "24h",
-      "reasoning_effort" => "low",
+      "reasoning_effort" => "focused",
       "safety_identifier" => "fixture-safety-id",
       "service_tier" => "priority",
       "temperature" => 0.2,
@@ -347,11 +351,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert {:ok, result} = Chat.coerce(payload, collect_openai_response_stream: true)
     assert result.payload["max_output_tokens"] == 123
     assert result.payload["metadata"] == %{"fixture" => "true"}
+    assert result.payload["moderation"] == %{"model" => "omni-moderation-latest"}
     assert result.payload["prompt_cache_key"] == "fixture-cache-key"
     assert result.payload["prompt_cache_retention"] == "24h"
     assert result.request_options.routing.prompt_cache_key == "fixture-cache-key"
     refute Map.has_key?(result.request_options.extra, "prompt_cache_key")
-    assert result.payload["reasoning"] == %{"effort" => "low"}
+    assert result.payload["reasoning"] == %{"effort" => "focused"}
     assert result.payload["safety_identifier"] == "fixture-safety-id"
     assert result.payload["service_tier"] == "priority"
     assert result.payload["temperature"] == 0.2
@@ -624,6 +629,36 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   end
 
   @tag :unsupported_fields
+  test "moderation and reasoning context accept only narrow supported shapes" do
+    invalid_payloads = [
+      {%{"moderation" => %{}}, "moderation.model"},
+      {%{"moderation" => %{"model" => " "}}, "moderation.model"},
+      {%{"moderation" => %{"model" => "omni-moderation-latest", "extra" => true}},
+       "moderation.extra"},
+      {%{"moderation" => "omni-moderation-latest"}, "moderation"},
+      {%{"reasoning" => %{"context" => "recent_turns"}}, "reasoning.context"},
+      {%{"reasoning" => %{"effort" => " "}}, "reasoning.effort"}
+    ]
+
+    Enum.each(invalid_payloads, fn {payload, expected_param} ->
+      assert {:error, %{status: 400, code: "invalid_request", param: ^expected_param}} =
+               Responses.coerce(
+                 Map.merge(
+                   %{"model" => "gpt-fixture-text", "input" => "synthetic input"},
+                   payload
+                 )
+               )
+    end)
+
+    assert {:error, %{status: 400, code: "invalid_request", param: "moderation.model"}} =
+             Chat.coerce(%{
+               "model" => "gpt-fixture-text",
+               "messages" => [%{"role" => "user", "content" => "synthetic"}],
+               "moderation" => %{"model" => " "}
+             })
+  end
+
+  @tag :unsupported_fields
   test "token limit fields require positive integers before forwarding" do
     for {field, value} <- [{"max_tokens", "128"}, {"max_completion_tokens", 0}] do
       assert {:error, %{status: 400, code: "invalid_request", param: ^field}} =
@@ -649,6 +684,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       "input" => "synthetic input",
       "max_output_tokens" => 321,
       "metadata" => %{"fixture" => "true"},
+      "moderation" => %{"model" => "omni-moderation-latest"},
       "prompt_cache_key" => "fixture-cache-key",
       "prompt_cache_retention" => "24h",
       "safety_identifier" => "fixture-safety-id",
@@ -800,6 +836,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
             "id" => "fc_fixture_call",
             "call_id" => "call_fixture",
             "name" => "lookup_fixture",
+            "namespace" => "browser.search",
             "arguments" => "{\"value\":\"sample\"}"
           },
           %{
@@ -829,6 +866,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                Enum.at(coerced["input"], 3)
 
       assert Enum.map(output, & &1["type"]) == ["input_text", "input_image"]
+      assert Enum.at(coerced["input"], 2)["namespace"] == "browser.search"
     end
 
     test "opencode ordinary replay accepts idless encrypted reasoning and assistant phase" do
@@ -1006,6 +1044,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "name" => "lookup_fixture",
           "arguments" => "{}",
           "status" => "completed"
+        },
+        %{
+          "type" => "function_call",
+          "call_id" => "call_fixture",
+          "name" => "lookup_fixture",
+          "arguments" => "{}",
+          "namespace" => " "
         },
         %{
           "type" => "function_call_output",
@@ -1922,7 +1967,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     end
 
     test "Responses accepts explicit reasoning effort and summary variants" do
-      for effort <- ["minimal", "low", "medium", "high", "xhigh"],
+      for effort <- ["minimal", "low", "medium", "high", "xhigh", "max", "focused"],
           summary <- ["auto", "concise", "detailed"] do
         payload = %{
           "model" => "gpt-fixture-text",
@@ -1937,7 +1982,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
     test "Responses rejects unsupported reasoning shapes deterministically" do
       invalid_reasoning_payloads = [
-        {%{"effort" => "extreme"}, "reasoning.effort"},
         {%{"summary" => "verbose"}, "reasoning.summary"},
         {%{"effort" => "low", "unsupported" => true}, "reasoning.unsupported"},
         {"low", "reasoning"},

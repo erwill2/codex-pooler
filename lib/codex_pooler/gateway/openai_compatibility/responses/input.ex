@@ -375,9 +375,18 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
          %{"call_id" => call_id, "name" => name, "arguments" => arguments} = item
        )
        when is_binary(call_id) and is_binary(name) and is_binary(arguments) do
-    with :ok <- validate_exact_item_keys(item, ["type", "call_id", "name", "arguments", "id"]),
+    with :ok <-
+           validate_exact_item_keys(item, [
+             "type",
+             "call_id",
+             "name",
+             "arguments",
+             "id",
+             "namespace"
+           ]),
          :ok <- validate_nonblank(call_id),
-         :ok <- validate_nonblank(name) do
+         :ok <- validate_nonblank(name),
+         :ok <- validate_optional_namespace(item) do
       validate_optional_id(item)
     end
   end
@@ -435,6 +444,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp validate_optional_id(_item), do: :ok
+
+  defp validate_optional_namespace(%{"namespace" => namespace}) when is_binary(namespace),
+    do: validate_nonblank(namespace)
+
+  defp validate_optional_namespace(%{"namespace" => _namespace}),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_optional_namespace(_item), do: :ok
 
   defp validate_nonblank(value) when is_binary(value) do
     if String.trim(value) == "" do

@@ -23,6 +23,7 @@
     "assistant_message_placeholder": "sample-assistant-message",
     "reasoning_placeholder": "sample-reasoning-id",
     "tool_call_placeholder": "sample-tool-call",
+    "namespace_placeholder": "browser.search",
     "image_url_placeholder": "https://example.com/sample.png"
   },
   "structural_summary": {
@@ -31,6 +32,7 @@
     "assistant_output_text_replay": true,
     "reasoning_summary_replay": true,
     "function_call_replay": true,
+    "function_call_namespace_replay": true,
     "structured_function_call_output": true,
     "raw_payload_stored": false,
     "placeholder_values_only": true,

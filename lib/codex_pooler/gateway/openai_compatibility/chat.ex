@@ -4,7 +4,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   alias CodexPooler.Gateway.OpenAICompatibility.{Error, Matrix, Responses, Validation}
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
-  @reasoning_efforts ~w(none minimal low medium high xhigh)
   @locally_unsupported_fields ~w(audio frequency_penalty logit_bias logprobs modalities n prediction presence_penalty seed stop top_logprobs user web_search_options)
   @service_tiers ~w(auto default flex priority scale ultrafast)
   @verbosity_values ~w(low medium high)
@@ -90,9 +89,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   end
 
   defp validate_reasoning_effort(%{"reasoning_effort" => effort}) when is_binary(effort) do
-    effort = normalize_enum(effort)
-
-    if effort in @reasoning_efforts,
+    if String.trim(effort) != "",
       do: :ok,
       else:
         {:error, Error.invalid_request("reasoning_effort is not supported", "reasoning_effort")}
@@ -234,6 +231,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
       |> maybe_put_tool_choice(payload)
       |> maybe_put(payload, "parallel_tool_calls")
       |> maybe_put(payload, "metadata")
+      |> maybe_put(payload, "moderation")
       |> maybe_put(payload, "prompt_cache_key")
       |> maybe_put(payload, "prompt_cache_retention")
       |> maybe_put(payload, "safety_identifier")

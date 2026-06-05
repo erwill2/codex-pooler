@@ -46,8 +46,8 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
       "slug" => model.exposed_model_id,
       "display_name" => model.display_name,
       "description" => metadata["description"] || model.display_name,
-      "default_reasoning_level" => if(model.supports_reasoning, do: "medium"),
-      "supported_reasoning_levels" => supported_reasoning_levels(model),
+      "default_reasoning_level" => default_reasoning_level(model, metadata),
+      "supported_reasoning_levels" => supported_reasoning_levels(model, metadata),
       "shell_type" => "shell_command",
       "visibility" => "list",
       "priority" => int_metadata(metadata, "priority", 0),
@@ -92,12 +92,36 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
       "supports_responses" => model.supports_responses,
       "supports_streaming" => model.supports_streaming,
       "supports_tools" => model.supports_tools,
-      "supports_reasoning" => model.supports_reasoning
+      "supports_reasoning" => model.supports_reasoning,
+      "use_responses_lite" => bool_metadata(metadata, "use_responses_lite")
     }
   end
 
-  @spec supported_reasoning_levels(Model.t()) :: [map()]
-  def supported_reasoning_levels(%Model{supports_reasoning: true}) do
+  @spec default_reasoning_level(Model.t(), metadata()) :: String.t() | nil
+  def default_reasoning_level(%Model{supports_reasoning: true}, metadata) do
+    string_metadata(metadata, "default_reasoning_level") ||
+      metadata
+      |> reasoning_level_values()
+      |> List.first()
+      |> case do
+        nil -> "medium"
+        level -> level
+      end
+  end
+
+  def default_reasoning_level(%Model{}, _metadata), do: nil
+
+  @spec supported_reasoning_levels(Model.t(), metadata()) :: [map()]
+  def supported_reasoning_levels(%Model{supports_reasoning: true}, metadata) do
+    case reasoning_level_values(metadata) do
+      [] -> fallback_reasoning_levels()
+      levels -> Enum.map(levels, &%{"effort" => &1, "description" => &1})
+    end
+  end
+
+  def supported_reasoning_levels(%Model{}, _metadata), do: []
+
+  defp fallback_reasoning_levels do
     [
       %{"effort" => "low", "description" => "low"},
       %{"effort" => "medium", "description" => "medium"},
@@ -106,7 +130,29 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
     ]
   end
 
-  def supported_reasoning_levels(%Model{}), do: []
+  defp reasoning_level_values(metadata) do
+    metadata
+    |> metadata_values(["supported_reasoning_levels", "reasoning_efforts"])
+    |> Enum.map(&reasoning_level_value/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp reasoning_level_value(%{"effort" => effort}) when is_binary(effort),
+    do: clean_reasoning_level(effort)
+
+  defp reasoning_level_value(%{effort: effort}) when is_binary(effort),
+    do: clean_reasoning_level(effort)
+
+  defp reasoning_level_value(value) when is_binary(value), do: clean_reasoning_level(value)
+  defp reasoning_level_value(_value), do: nil
+
+  defp clean_reasoning_level(value) do
+    case String.trim(value) do
+      "" -> nil
+      effort -> effort
+    end
+  end
 
   @spec list_metadata(metadata(), String.t(), list()) :: list()
   def list_metadata(metadata, key, default \\ []) do

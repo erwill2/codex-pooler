@@ -487,7 +487,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
             },
             "prefer_websockets" => true,
             "reasoning_summary_format" => "json",
+            "supported_reasoning_levels" => ["max", "low", "focused"],
+            "default_reasoning_level" => "focused",
             "tool_mode" => "code_mode_only",
+            "use_responses_lite" => true,
             "source_assignment_ids" => ["upstream-source-id"],
             "source_assignment_models" => %{"upstream-source-id" => %{"id" => "provider"}},
             "raw_model_listing" => %{"id" => "provider"}
@@ -518,7 +521,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     assert model["prefer_websockets"] == true
     assert model["reasoning_summary_format"] == "json"
+
+    assert model["supported_reasoning_levels"] == [
+             %{"description" => "max", "effort" => "max"},
+             %{"description" => "low", "effort" => "low"},
+             %{"description" => "focused", "effort" => "focused"}
+           ]
+
+    assert model["default_reasoning_level"] == "focused"
     assert model["tool_mode"] == "code_mode_only"
+    assert model["use_responses_lite"] == true
     refute Map.has_key?(model, "upstream_model")
     refute Map.has_key?(model, "source_assignment_ids")
     refute Map.has_key?(model, "source_assignment_models")

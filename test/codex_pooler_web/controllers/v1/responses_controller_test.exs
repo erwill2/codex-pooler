@@ -394,6 +394,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
           "model" => setup.model.exposed_model_id,
           "previous_response_id" => "resp_v1_ws_opencode_previous",
           "store" => false,
+          "moderation" => %{"model" => "omni-moderation-latest"},
           "input" => [
             %{
               "role" => "assistant",
@@ -411,6 +412,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
               "id" => "fc_v1_ws_opencode_call",
               "call_id" => "",
               "name" => "lookup_fixture",
+              "namespace" => "browser.search",
               "arguments" => "{\"value\":\"sample\"}"
             },
             %{
@@ -439,6 +441,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert captured.json["stream"] == true
       assert captured.json["store"] == false
       assert captured.json["previous_response_id"] == "resp_v1_ws_opencode_previous"
+      assert captured.json["moderation"] == %{"model" => "omni-moderation-latest"}
 
       assert Enum.map(captured.json["input"], & &1["type"]) == [
                "message",
@@ -450,6 +453,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert hd(captured.json["input"])["role"] == "assistant"
 
       assert Enum.at(captured.json["input"], 2)["call_id"] == "fc_v1_ws_opencode_call"
+      assert Enum.at(captured.json["input"], 2)["namespace"] == "browser.search"
       assert Enum.at(captured.json["input"], 3)["call_id"] == "fc_v1_ws_opencode_call"
 
       assert_receive_finalized_request!()
@@ -1710,6 +1714,86 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.transport == "http_sse"
     assert request.status == "succeeded"
+  end
+
+  @tag :streaming_sequence
+  test "POST /v1/responses streaming passes moderation metadata without storing prompts", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.moderation.started",
+           %{
+             "type" => "response.moderation.started",
+             "model" => "omni-moderation-latest",
+             "check_id" => "mod_check_stream_fixture"
+           }},
+          {"response.output_text.delta",
+           %{"type" => "response.output_text.delta", "delta" => "visible moderated text"}},
+          {"response.moderation.completed",
+           %{
+             "type" => "response.moderation.completed",
+             "model" => "omni-moderation-latest",
+             "check_id" => "mod_check_stream_fixture",
+             "status" => "completed"
+           }},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_stream_moderation_metadata",
+               "status" => "completed",
+               "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic moderation stream request",
+        "moderation" => %{"model" => "omni-moderation-latest"},
+        "stream" => true
+      })
+
+    events = public_sse_events(conn.resp_body)
+
+    assert %{
+             "event" => "response.moderation.started",
+             "data" => %{
+               "type" => "response.moderation.started",
+               "model" => "omni-moderation-latest",
+               "check_id" => "mod_check_stream_fixture"
+             }
+           } = Enum.find(events, &(&1["event"] == "response.moderation.started"))
+
+    assert %{
+             "event" => "response.moderation.completed",
+             "data" => %{
+               "type" => "response.moderation.completed",
+               "model" => "omni-moderation-latest",
+               "check_id" => "mod_check_stream_fixture",
+               "status" => "completed"
+             }
+           } = Enum.find(events, &(&1["event"] == "response.moderation.completed"))
+
+    assert conn.resp_body =~ "visible moderated text"
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["moderation"] == %{"model" => "omni-moderation-latest"}
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "http_sse"
+    assert request.status == "succeeded"
+
+    metadata = inspect(request.request_metadata)
+    refute metadata =~ "synthetic moderation stream request"
+    refute metadata =~ "visible moderated text"
   end
 
   @tag :streaming_sequence

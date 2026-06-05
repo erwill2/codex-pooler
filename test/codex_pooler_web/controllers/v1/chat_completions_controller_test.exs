@@ -35,10 +35,12 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
 
     setup = gateway_setup(upstream)
 
+    payload = Map.put(chat_payload(setup), "moderation", %{"model" => "omni-moderation-latest"})
+
     conn =
       conn
       |> auth(setup)
-      |> post("/v1/chat/completions", chat_payload(setup))
+      |> post("/v1/chat/completions", payload)
 
     assert %{
              "id" => "resp_chat_non_stream",
@@ -62,6 +64,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert captured.json["model"] == setup.model.upstream_model_id
     assert captured.json["stream"] == true
     assert captured.json["store"] == false
+    assert captured.json["moderation"] == %{"model" => "omni-moderation-latest"}
 
     assert [
              %{"type" => "message", "role" => "system"},
@@ -274,6 +277,90 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.transport == "http_sse"
     assert request.status == "succeeded"
+  end
+
+  @tag :streaming_chat
+  test "POST /v1/chat/completions streaming emits moderation-only chunks", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.created",
+           %{
+             "type" => "response.created",
+             "response" => %{
+               "id" => "resp_chat_stream_moderation",
+               "status" => "in_progress"
+             }
+           }},
+          {"response.moderation.completed",
+           %{
+             "type" => "response.moderation.completed",
+             "moderation" => %{
+               "input" => %{
+                 "type" => "moderation_results",
+                 "model" => "omni-moderation-latest",
+                 "results" => []
+               },
+               "output" => %{
+                 "type" => "moderation_results",
+                 "model" => "omni-moderation-latest",
+                 "results" => []
+               }
+             }
+           }},
+          {"response.output_text.delta",
+           %{
+             "type" => "response.output_text.delta",
+             "delta" => "streamed moderated answer"
+           }},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_chat_stream_moderation",
+               "status" => "completed",
+               "usage" => %{"input_tokens" => 3, "output_tokens" => 4, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post(
+        "/v1/chat/completions",
+        chat_payload(setup)
+        |> Map.put("moderation", %{"model" => "omni-moderation-latest"})
+        |> Map.put("stream", true)
+      )
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+    assert conn.resp_body =~ "\"choices\":[]"
+    assert conn.resp_body =~ "\"moderation\""
+    assert conn.resp_body =~ "\"input\":{\"model\":\"omni-moderation-latest\""
+    assert conn.resp_body =~ "\"output\":{\"model\":\"omni-moderation-latest\""
+    assert conn.resp_body =~ "\"content\":\"streamed moderated answer\""
+    assert conn.resp_body =~ "data: [DONE]\n\n"
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.json["moderation"] == %{"model" => "omni-moderation-latest"}
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "http_sse"
+    assert request.status == "succeeded"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+
+    metadata = inspect({request.request_metadata, attempt.response_metadata})
+    refute metadata =~ "Synthetic user"
+    refute metadata =~ "streamed moderated answer"
+    refute metadata =~ "omni-moderation-latest"
   end
 
   test "POST /v1/chat/completions normalizes upstream JSON errors", %{conn: conn} do

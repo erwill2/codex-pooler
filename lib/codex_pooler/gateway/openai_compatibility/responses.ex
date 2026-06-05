@@ -5,7 +5,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   alias CodexPooler.Gateway.OpenAICompatibility.Responses.{Input, SSE}
   alias CodexPooler.Gateway.Payloads.{InputShape, RequestOptions, StrictSchema}
 
-  @reasoning_efforts ~w(none minimal low medium high xhigh)
   @reasoning_summaries ~w(auto concise detailed)
   @service_tiers ~w(auto default flex priority scale ultrafast)
   @locally_unsupported_fields ~w(background context_management conversation max_tool_calls prompt top_logprobs truncation user)
@@ -26,6 +25,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
          :ok <- validate_tool_choice(payload),
          :ok <- validate_max_output_tokens(payload),
          :ok <- validate_reasoning(payload),
+         :ok <- validate_moderation(payload),
          :ok <- validate_service_tier(payload),
          :ok <- validate_stream_options(payload),
          :ok <- StrictSchema.validate(payload),
@@ -120,13 +120,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
 
   defp validate_reasoning_map(reasoning) do
     with :ok <- validate_reasoning_keys(reasoning),
-         :ok <- validate_reasoning_effort(Map.get(reasoning, "effort")) do
-      validate_reasoning_summary(Map.get(reasoning, "summary"))
+         :ok <- validate_reasoning_effort(Map.get(reasoning, "effort")),
+         :ok <- validate_reasoning_summary(Map.get(reasoning, "summary")) do
+      validate_reasoning_context(Map.get(reasoning, "context"))
     end
   end
 
   defp validate_reasoning_keys(reasoning) do
-    case reasoning |> Map.keys() |> Enum.reject(&(&1 in ["effort", "summary"])) do
+    case reasoning |> Map.keys() |> Enum.reject(&(&1 in ["effort", "summary", "context"])) do
       [] ->
         :ok
 
@@ -138,9 +139,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   defp validate_reasoning_effort(nil), do: :ok
 
   defp validate_reasoning_effort(effort) when is_binary(effort) do
-    normalized = effort |> String.trim() |> String.downcase()
-
-    if normalized in @reasoning_efforts do
+    if String.trim(effort) != "" do
       :ok
     else
       {:error, Error.invalid_request("reasoning effort is not supported", "reasoning.effort")}
@@ -164,6 +163,41 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
 
   defp validate_reasoning_summary(_summary),
     do: {:error, Error.invalid_request("reasoning summary is not supported", "reasoning.summary")}
+
+  defp validate_reasoning_context(nil), do: :ok
+  defp validate_reasoning_context("all_turns"), do: :ok
+
+  defp validate_reasoning_context(_context),
+    do: {:error, Error.invalid_request("reasoning context is not supported", "reasoning.context")}
+
+  defp validate_moderation(%{"moderation" => moderation}) when is_map(moderation) do
+    with :ok <- validate_moderation_keys(moderation),
+         model when is_binary(model) <- Map.get(moderation, "model"),
+         true <- String.trim(model) != "" do
+      :ok
+    else
+      {:error, reason} ->
+        {:error, reason}
+
+      _value ->
+        {:error, Error.invalid_request("moderation model is required", "moderation.model")}
+    end
+  end
+
+  defp validate_moderation(%{"moderation" => _moderation}),
+    do: {:error, Error.invalid_request("moderation must be an object", "moderation")}
+
+  defp validate_moderation(_payload), do: :ok
+
+  defp validate_moderation_keys(moderation) do
+    case moderation |> Map.keys() |> Enum.reject(&(&1 == "model")) do
+      [] ->
+        :ok
+
+      [key | _rest] ->
+        {:error, Error.invalid_request("moderation field is not supported", "moderation." <> key)}
+    end
+  end
 
   defp validate_service_tier(%{"service_tier" => tier}) when is_binary(tier) do
     normalized = tier |> String.trim() |> String.downcase()
