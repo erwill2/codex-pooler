@@ -97,15 +97,16 @@ surface, while instance admins work only with their assigned Pools.
 
 ## Harness Configuration
 
-Keep Pool API keys and MCP tokens in environment variables when the harness
-supports secret expansion. For desktop harnesses that persist remote MCP headers
-in their own private settings, use a dedicated operator-scoped MCP token. For a
-local instance, the runtime URLs are:
+Keep Pool API keys in environment variables when the harness supports secret
+expansion. The `/mcp` endpoint is an optional operator-only add-on for metadata
+inspection; Codex Pooler runtime clients do not need it. If a desktop harness
+persists remote MCP headers in its own private settings, use a dedicated
+operator-scoped MCP token. For a local instance, the URLs are:
 
 ```text
-Codex backend base URL: http://localhost:4000/backend-api/codex
-OpenAI SDK base URL:    http://localhost:4000/v1
-MCP URL:                http://localhost:4000/mcp
+Codex backend base URL:      http://localhost:4000/backend-api/codex
+OpenAI SDK base URL:         http://localhost:4000/v1
+Optional operator MCP URL:   http://localhost:4000/mcp
 ```
 
 For a deployed instance, replace `http://localhost:4000` with your HTTPS host,
@@ -118,8 +119,10 @@ for example `https://pooler.example.com`.
 
 OpenCode talks to Codex Pooler through the OpenAI-compatible `/v1` surface. The
 provider uses the Pool API key, and the optional remote MCP entry uses an
-operator-owned MCP token. Its websocket support is the narrow Responses
-websocket route at `GET /v1/responses`, not OpenAI Realtime SDK compatibility.
+operator-owned MCP token. MCP is not required for OpenCode to use Codex Pooler;
+it only gives an operator MCP host read-only metadata tools. Its websocket
+support is the narrow Responses websocket route at `GET /v1/responses`, not
+OpenAI Realtime SDK compatibility.
 
 ```jsonc
 {
@@ -159,6 +162,7 @@ websocket route at `GET /v1/responses`, not OpenAI Realtime SDK compatibility.
       }
     }
   },
+  // Optional operator-only MCP metadata add-on. Omit for normal model/runtime use.
   "mcp": {
     "codex_pooler": {
       "type": "remote",
@@ -175,8 +179,8 @@ websocket route at `GET /v1/responses`, not OpenAI Realtime SDK compatibility.
 ```
 
 Define only models that your assigned Pool can serve. For deployed instances,
-change `baseURL` to `https://pooler.example.com/v1` and the MCP `url` to
-`https://pooler.example.com/mcp`.
+change `baseURL` to `https://pooler.example.com/v1`; if you keep the optional
+operator MCP entry, change its `url` to `https://codex-pooler.example.com/mcp`.
 
 </details>
 
@@ -209,6 +213,7 @@ wire_api = "responses"
 supports_websockets = false
 requires_openai_auth = true
 
+# Optional operator-only MCP metadata add-on. Omit for normal Codex runtime use.
 [mcp_servers.codex_pooler]
 url = "http://localhost:4000/mcp"
 bearer_token_env_var = "CODEX_POOLER_MCP_KEY"
@@ -216,8 +221,9 @@ bearer_token_env_var = "CODEX_POOLER_MCP_KEY"
 
 Use the websocket provider for normal Codex backend behavior, and keep the HTTP
 provider when you need to force SSE-only coverage. For deployed instances,
-change both `base_url` values to `https://pooler.example.com/backend-api/codex`
-and the MCP `url` to `https://pooler.example.com/mcp`.
+change both `base_url` values to `https://pooler.example.com/backend-api/codex`;
+if you keep the optional operator MCP add-on, change its `url` to
+`https://codex-pooler.example.com/mcp`.
 
 Codex filters resumable conversations by `model_provider`. If you already have
 sessions created with the built-in `openai` provider and want them to appear
@@ -329,6 +335,7 @@ the OpenAI provider to the PI runtime and point `baseUrl` at Codex Pooler.
       },
     },
   },
+  // Optional operator-only MCP metadata add-on. Omit for normal model/runtime use.
   mcp: {
     servers: {
       codex_pooler: {
@@ -344,8 +351,8 @@ the OpenAI provider to the PI runtime and point `baseUrl` at Codex Pooler.
 ```
 
 Define only models that your assigned Pool can serve. For deployed instances,
-change `baseUrl` to `https://pooler.example.com/v1` and the MCP `url` to
-`https://pooler.example.com/mcp`.
+change `baseUrl` to `https://pooler.example.com/v1`; if you keep the optional
+operator MCP add-on, change its `url` to `https://codex-pooler.example.com/mcp`.
 
 If you prefer to keep Codex Pooler separate from OpenClaw's built-in OpenAI
 provider behavior, use a custom provider id such as `codex-pooler/gpt-5.5`
@@ -361,13 +368,15 @@ OpenAI.
 ![Codex Pooler Hermes Agent integration](.github/assets/codex-pooler-hermes.png)
 
 Hermes works best through its `openai-api` provider with the Responses transport
-forced explicitly. Keep the Pool API key and MCP token in `~/.hermes/.env`,
-point the provider config at Codex Pooler's `/v1` surface, and point
-`mcp_servers` at `/mcp`.
+forced explicitly. This is the recommended Codex Pooler setup. Keep the Pool API
+key in `~/.hermes/.env` and point the provider config at Codex Pooler's `/v1`
+surface. The `mcp_servers` block is an optional operator-only add-on for
+read-only metadata tools; Codex Pooler works without it.
 
 ```bash
 OPENAI_API_KEY=<pool-api-key>
 OPENAI_BASE_URL=http://localhost:4000/v1
+# Optional operator-only MCP metadata add-on:
 CODEX_POOLER_MCP_KEY=<operator-mcp-token>
 ```
 
@@ -377,7 +386,13 @@ model:
   provider: openai-api
   base_url: http://localhost:4000/v1
   api_mode: codex_responses
+  context_length: 400000
+  supports_vision: true
 
+agent:
+  image_input_mode: native
+
+# Optional operator-only MCP metadata add-on. Omit for model/runtime use.
 mcp_servers:
   codex_pooler:
     url: http://localhost:4000/mcp
@@ -385,10 +400,16 @@ mcp_servers:
       Authorization: "Bearer ${CODEX_POOLER_MCP_KEY}"
     enabled: true
     timeout: 120
-    connect_timeout: 60
+    connect_timeout: 15
 ```
 
-Smoke-test with a one-shot prompt:
+Remote HTTP MCP servers require Hermes' `mcp` extra. If
+`hermes mcp test codex_pooler` reports `mcp.client.streamable_http is not
+available`, install MCP support into the Hermes environment, following the
+[Hermes MCP Integration docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp),
+and rerun the test.
+
+Check the one-shot model path:
 
 ```bash
 hermes -z 'Reply with exactly: hermes openai api ok' --ignore-rules
@@ -397,11 +418,14 @@ hermes -z 'Reply with exactly: hermes openai api ok' --ignore-rules
 Hermes can also be made to use its `openai-codex` provider against Codex
 Pooler. This is less direct because Hermes treats `openai-codex` as an OAuth
 provider by default; add a Pool API key credential ahead of any existing
-device-code credential and keep the entry's `base_url` on `/v1`. This variant
-stores the key in `auth.json` because Hermes credential pools live there.
+device-code credential and keep the entry's `base_url` on `/v1`. Use this only
+when you specifically need Hermes' `openai-codex` credential-pool behavior; the
+`openai-api` configuration above is the preferred setup. This variant stores
+the key in `auth.json` because Hermes credential pools live there.
 
 ```bash
 HERMES_CODEX_BASE_URL=http://localhost:4000/v1
+# Optional operator-only MCP metadata add-on:
 CODEX_POOLER_MCP_KEY=<operator-mcp-token>
 ```
 
@@ -410,7 +434,13 @@ model:
   default: gpt-5.5
   provider: openai-codex
   base_url: http://localhost:4000/v1
+  context_length: 400000
+  supports_vision: true
 
+agent:
+  image_input_mode: native
+
+# Optional operator-only MCP metadata add-on. Omit for model/runtime use.
 mcp_servers:
   codex_pooler:
     url: http://localhost:4000/mcp
@@ -418,7 +448,7 @@ mcp_servers:
       Authorization: "Bearer ${CODEX_POOLER_MCP_KEY}"
     enabled: true
     timeout: 120
-    connect_timeout: 60
+    connect_timeout: 15
 ```
 
 ```json
@@ -439,8 +469,9 @@ mcp_servers:
 }
 ```
 
-For deployed instances, change the model URLs to `https://pooler.example.com/v1`
-and the MCP `url` to `https://pooler.example.com/mcp`.
+For deployed instances, change the model URLs to
+`https://pooler.example.com/v1`; if you keep the optional operator MCP add-on,
+change the MCP `url` to `https://codex-pooler.example.com/mcp`.
 
 </details>
 
@@ -495,6 +526,7 @@ models:
       - tool_use
       - image_input
 
+# Optional operator-only MCP metadata add-on. Omit for model/runtime use.
 mcpServers:
   - name: codex_pooler
     type: streamable-http
@@ -505,8 +537,9 @@ mcpServers:
         Authorization: "Bearer ${{ secrets.CODEX_POOLER_MCP_KEY }}"
 ```
 
-For deployed instances, change `apiBase` to `https://pooler.example.com/v1` and
-the MCP `url` to `https://pooler.example.com/mcp`.
+For deployed instances, change `apiBase` to `https://pooler.example.com/v1`;
+if you keep the optional operator MCP add-on, change the MCP `url` to
+`https://codex-pooler.example.com/mcp`.
 
 </details>
 
@@ -525,9 +558,10 @@ cline auth \
   --modelid gpt-5.5
 ```
 
-For MCP in Cline CLI, add the remote server to `~/.cline/mcp.json`. The VS Code
-extension opens its own MCP settings JSON from the Cline MCP Servers panel; use
-the same `mcpServers` shape there.
+For optional operator MCP in Cline CLI, add the remote server to
+`~/.cline/mcp.json`. Codex Pooler does not require this for model use. The VS
+Code extension opens its own MCP settings JSON from the Cline MCP Servers panel;
+use the same `mcpServers` shape there.
 
 ```json
 {
@@ -545,7 +579,8 @@ the same `mcpServers` shape there.
 ```
 
 For deployed instances, change `--baseurl` to `https://pooler.example.com/v1`
-and the MCP `url` to `https://pooler.example.com/mcp`.
+and, if you keep the optional operator MCP add-on, change the MCP `url` to
+`https://codex-pooler.example.com/mcp`.
 
 </details>
 
@@ -562,9 +597,11 @@ API Key:      ${CODEX_POOLER_API_KEY}
 Model ID:     gpt-5.5
 ```
 
-Roo Code supports project-level MCP configuration in `.roo/mcp.json`. This file
-can be committed when it contains only the endpoint shape; keep the MCP token in
-a private copy or configure it through the Roo MCP settings UI.
+Roo Code supports project-level MCP configuration in `.roo/mcp.json`. This is
+only for optional operator MCP metadata access; Codex Pooler model use does not
+require it. This file can be committed when it contains only the endpoint shape;
+keep the MCP token in a private copy or configure it through the Roo MCP
+settings UI.
 
 ```json
 {
@@ -583,8 +620,8 @@ a private copy or configure it through the Roo MCP settings UI.
 ```
 
 For deployed instances, change the provider base URL to
-`https://pooler.example.com/v1` and the MCP `url` to
-`https://pooler.example.com/mcp`.
+`https://pooler.example.com/v1` and, if you keep the optional operator MCP
+add-on, change the MCP `url` to `https://codex-pooler.example.com/mcp`.
 
 </details>
 
@@ -603,10 +640,12 @@ OPENAI_HOST: http://localhost:4000
 OPENAI_BASE_PATH: v1/chat/completions
 ```
 
-For Codex Pooler MCP, add a remote Streamable HTTP extension. Goose stores
-remote extension headers in its config, so use a dedicated MCP token.
+For optional operator MCP metadata access, add a remote Streamable HTTP
+extension. Codex Pooler model use does not require this. Goose stores remote
+extension headers in its config, so use a dedicated MCP token.
 
 ```yaml
+# Optional operator-only MCP metadata add-on. Omit for model/runtime use.
 extensions:
   codex_pooler:
     enabled: true
@@ -620,8 +659,9 @@ extensions:
     available_tools: []
 ```
 
-For deployed instances, change `OPENAI_HOST` to `https://pooler.example.com` and
-the extension `uri` to `https://pooler.example.com/mcp`.
+For deployed instances, change `OPENAI_HOST` to `https://pooler.example.com`;
+if you keep the optional operator MCP add-on, change the extension `uri` to
+`https://codex-pooler.example.com/mcp`.
 
 </details>
 
@@ -818,9 +858,10 @@ route-specific timeout defaults are required.
 
 ## Operator MCP Service
 
-Codex Pooler includes a metadata-only MCP endpoint at `/mcp` for trusted
-operators who want an MCP host to inspect Pools, upstream accounts, Pool API key
-metadata, operators, invites, request logs, audit logs, and MCP service status.
+Codex Pooler includes an optional metadata-only MCP endpoint at `/mcp` for
+trusted operators who want an MCP host to inspect Pools, upstream accounts, Pool
+API key metadata, operators, invites, request logs, audit logs, and MCP service
+status. This operator add-on is not required for Codex Pooler runtime clients.
 The service is read-only and has no mutation tools. It uses the same owner vs
 assigned-Pool visibility model as the admin UI, but connected MCP hosts can read
 the metadata visible to that operator, so only connect hosts you trust with that
