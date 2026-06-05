@@ -13,10 +13,10 @@ For a deployed instance, use these URLs:
 
 ```text
 OpenAI API base URL:
-https://pooler.example.com/v1
+https://codex-pooler.example.com/v1
 
 Operator MCP URL:
-https://pooler.example.com/mcp
+https://codex-pooler.example.com/mcp
 ```
 
 For local setup, replace the host with `http://localhost:4000`.
@@ -27,7 +27,7 @@ Store the Pool API key and operator MCP token in a private Hermes environment fi
 
 ```bash
 OPENAI_API_KEY=<pool-api-key>
-OPENAI_BASE_URL=https://pooler.example.com/v1
+OPENAI_BASE_URL=https://codex-pooler.example.com/v1
 CODEX_POOLER_MCP_KEY=<operator-mcp-token>
 ```
 
@@ -37,12 +37,12 @@ Then point `~/.hermes/config.yaml` at the same `/v1` base URL and force the Resp
 model:
   default: gpt-5.5
   provider: openai-api
-  base_url: https://pooler.example.com/v1
+  base_url: https://codex-pooler.example.com/v1
   api_mode: codex_responses
 
 mcp_servers:
   codex_pooler:
-    url: https://pooler.example.com/mcp
+    url: https://codex-pooler.example.com/mcp
     headers:
       Authorization: "Bearer ${CODEX_POOLER_MCP_KEY}"
     enabled: true
@@ -67,7 +67,7 @@ Hermes can also use its `openai-codex` provider against Codex Pooler, but this p
 Keep endpoint and MCP token values in the environment:
 
 ```bash
-HERMES_CODEX_BASE_URL=https://pooler.example.com/v1
+HERMES_CODEX_BASE_URL=https://codex-pooler.example.com/v1
 CODEX_POOLER_MCP_KEY=<operator-mcp-token>
 ```
 
@@ -77,11 +77,11 @@ Set the provider in `~/.hermes/config.yaml`:
 model:
   default: gpt-5.5
   provider: openai-codex
-  base_url: https://pooler.example.com/v1
+  base_url: https://codex-pooler.example.com/v1
 
 mcp_servers:
   codex_pooler:
-    url: https://pooler.example.com/mcp
+    url: https://codex-pooler.example.com/mcp
     headers:
       Authorization: "Bearer ${CODEX_POOLER_MCP_KEY}"
     enabled: true
@@ -102,7 +102,7 @@ Add a credential-pool entry for Codex Pooler in the Hermes `auth.json` file. Thi
         "priority": -10,
         "source": "manual",
         "access_token": "<pool-api-key>",
-        "base_url": "https://pooler.example.com/v1"
+        "base_url": "https://codex-pooler.example.com/v1"
       }
     ]
   }

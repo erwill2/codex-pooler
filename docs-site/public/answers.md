@@ -4,7 +4,7 @@ Last reviewed: 2026-06-02
 Canonical docs: https://docs.codex-pooler.com/
 Canonical llms index: https://docs.codex-pooler.com/llms.txt
 
-Use this page for short, public-safe answers about Codex Pooler. It summarizes the public docs and keeps examples on `http://localhost:4000` or `https://pooler.example.com`.
+Use this page for short, public-safe answers about Codex Pooler. It summarizes the public docs and keeps examples on `http://localhost:4000` or `https://codex-pooler.example.com`.
 
 ## What is Codex Pooler?
 
@@ -22,11 +22,11 @@ Codex Pooler is for operators and client integrators who already manage trusted 
 
 | Client need | Base URL | Credential |
 | --- | --- | --- |
-| Codex backend-compatible clients | `https://pooler.example.com/backend-api/codex` | Pool API key |
-| Selected OpenAI SDK-compatible clients | `https://pooler.example.com/v1` | Pool API key |
-| Operator metadata tools | `https://pooler.example.com/mcp` | Operator MCP token |
+| Codex backend-compatible clients | `https://codex-pooler.example.com/backend-api/codex` | Pool API key |
+| Selected OpenAI SDK-compatible clients | `https://codex-pooler.example.com/v1` | Pool API key |
+| Operator metadata tools | `https://codex-pooler.example.com/mcp` | Operator MCP token |
 
-For local setup, replace `https://pooler.example.com` with `http://localhost:4000`.
+For local setup, replace `https://codex-pooler.example.com` with `http://localhost:4000`.
 
 ## Does Codex Pooler provide full OpenAI API parity?
 

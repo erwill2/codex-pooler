@@ -10,7 +10,7 @@ Codex CLI should talk to Codex Pooler through the Codex backend compatibility ro
 For a deployed instance, the Codex backend base URL is:
 
 ```text
-https://pooler.example.com/backend-api/codex
+https://codex-pooler.example.com/backend-api/codex
 ```
 
 For local setup and local smoke checks, use:
@@ -31,7 +31,7 @@ model_provider = "codex-pooler-ws"
 
 [model_providers.codex-pooler-ws]
 name = "OpenAI"
-base_url = "https://pooler.example.com/backend-api/codex"
+base_url = "https://codex-pooler.example.com/backend-api/codex"
 env_key = "CODEX_POOLER_API_KEY"
 wire_api = "responses"
 supports_websockets = true
@@ -47,7 +47,7 @@ Keep an HTTP/SSE provider when you need to force non-websocket behavior for a cl
 ```toml
 [model_providers.codex-pooler-http]
 name = "OpenAI"
-base_url = "https://pooler.example.com/backend-api/codex"
+base_url = "https://codex-pooler.example.com/backend-api/codex"
 env_key = "CODEX_POOLER_API_KEY"
 wire_api = "responses"
 supports_websockets = false
@@ -62,7 +62,7 @@ Codex Pooler also exposes an operator MCP endpoint at `/mcp`. MCP uses an operat
 
 ```toml
 [mcp_servers.codex_pooler]
-url = "https://pooler.example.com/mcp"
+url = "https://codex-pooler.example.com/mcp"
 bearer_token_env_var = "CODEX_POOLER_MCP_KEY"
 ```
 

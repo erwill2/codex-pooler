@@ -92,13 +92,13 @@ defmodule CodexPooler.Accounts.OperatorEmailTest do
   end
 
   test "public operator app URL with a trailing slash appends login once" do
-    update_login_base_url!("https://pooler.example.com/")
+    update_login_base_url!("https://codex-pooler.example.com/")
 
     email =
       OperatorEmail.temporary_password_email("operator@example.com", "TempPass123!", true)
 
-    assert email.text_body =~ "Login URL: https://pooler.example.com/login"
-    refute email.text_body =~ "https://pooler.example.com//login"
+    assert email.text_body =~ "Login URL: https://codex-pooler.example.com/login"
+    refute email.text_body =~ "https://codex-pooler.example.com//login"
   end
 
   defp sender do

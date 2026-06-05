@@ -31,9 +31,9 @@ Who Codex Pooler is for:
 Codex Pooler is for operators and client integrators who already manage trusted Codex accounts and want shared capacity, stable client credentials, route policy, account readiness checks, and metadata-only operational evidence. It is not a hosted provider, a general OpenAI API clone, or a way to bypass account terms and limits.
 
 Client base URLs:
-- Codex backend-compatible clients use https://pooler.example.com/backend-api/codex.
-- Selected OpenAI SDK-compatible clients use https://pooler.example.com/v1.
-- Operator metadata tools use https://pooler.example.com/mcp.
+- Codex backend-compatible clients use https://codex-pooler.example.com/backend-api/codex.
+- Selected OpenAI SDK-compatible clients use https://codex-pooler.example.com/v1.
+- Operator metadata tools use https://codex-pooler.example.com/mcp.
 - Local setup uses http://localhost:4000 with the same paths.
 
 Supported route families:
@@ -66,5 +66,5 @@ Agent guidance:
 - Start with https://docs.codex-pooler.com/clients/openai-compatible/ when configuring selected OpenAI SDK-compatible clients.
 - Use https://docs.codex-pooler.com/reference/routing-strategies/ when configuring Pools and routing behavior.
 - Use https://docs.codex-pooler.com/answers.md for short, citable answers about scope, routes, credentials, privacy, setup, and deployment.
-- Keep examples on http://localhost:4000 for local setup or https://pooler.example.com for deployed product examples.
+- Keep examples on http://localhost:4000 for local setup or https://codex-pooler.example.com for deployed product examples.
 - Use https://docs.codex-pooler.com/ links as canonical docs URLs.

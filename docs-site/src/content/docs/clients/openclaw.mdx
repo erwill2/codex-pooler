@@ -11,10 +11,10 @@ For a deployed instance, use these URLs:
 
 ```text
 OpenAI-compatible base URL:
-https://pooler.example.com/v1
+https://codex-pooler.example.com/v1
 
 Operator MCP URL:
-https://pooler.example.com/mcp
+https://codex-pooler.example.com/mcp
 ```
 
 For local setup, replace the host with `http://localhost:4000`.
@@ -34,7 +34,7 @@ OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surfac
     mode: "merge",
     providers: {
       openai: {
-        baseUrl: "https://pooler.example.com/v1",
+        baseUrl: "https://codex-pooler.example.com/v1",
         apiKey: "<pool-api-key>",
         api: "openai-responses",
         agentRuntime: { id: "pi" },
@@ -67,7 +67,7 @@ Add Codex Pooler as a remote Streamable HTTP MCP server only when OpenClaw shoul
   mcp: {
     servers: {
       codex_pooler: {
-        url: "https://pooler.example.com/mcp",
+        url: "https://codex-pooler.example.com/mcp",
         transport: "streamable-http",
         headers: {
           Authorization: "Bearer <operator-mcp-token>",

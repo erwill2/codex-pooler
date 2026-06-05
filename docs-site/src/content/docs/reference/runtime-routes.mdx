@@ -90,7 +90,7 @@ Use `/backend-api/codex` for Codex backend-compatible clients, `/v1` for selecte
 Use `/backend-api/codex` for Codex-compatible clients:
 
 ```text
-https://pooler.example.com/backend-api/codex
+https://codex-pooler.example.com/backend-api/codex
 ```
 
 These endpoints keep Codex backend semantics and do not translate through the public OpenAI SDK adapter.
@@ -364,7 +364,7 @@ These routes live under `/backend-api` or legacy usage paths. They are still Poo
 Use `/v1` only for clients that require an OpenAI-shaped base URL:
 
 ```text
-https://pooler.example.com/v1
+https://codex-pooler.example.com/v1
 ```
 
 Supported work is translated into Codex-compatible requests and then routed through the same Pool policy, limit, account-selection, accounting, and session-continuity machinery as backend traffic. Codex Pooler does not provide full OpenAI API parity.

@@ -11,10 +11,10 @@ For a deployed instance, use these URLs:
 
 ```text
 OpenCode provider base URL:
-https://pooler.example.com/v1
+https://codex-pooler.example.com/v1
 
 Remote MCP URL:
-https://pooler.example.com/mcp
+https://codex-pooler.example.com/mcp
 ```
 
 For local setup, replace the host with `http://localhost:4000`.
@@ -30,7 +30,7 @@ Store the Pool API key outside the config and read it through environment expans
       "npm": "@ai-sdk/openai",
       "name": "Codex Pooler",
       "options": {
-        "baseURL": "https://pooler.example.com/v1",
+        "baseURL": "https://codex-pooler.example.com/v1",
         "apiKey": "{env:CODEX_POOLER_API_KEY}",
         "reasoningEffort": "high",
         "reasoningSummary": "auto",
@@ -74,7 +74,7 @@ Add Codex Pooler as a remote MCP server when the OpenCode host should inspect me
   "mcp": {
     "codex_pooler": {
       "type": "remote",
-      "url": "https://pooler.example.com/mcp",
+      "url": "https://codex-pooler.example.com/mcp",
       "oauth": false,
       "headers": {
         "Authorization": "Bearer <operator-mcp-token>"

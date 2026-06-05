@@ -13,7 +13,7 @@ Root static files in `docs-site/public`, such as `llms.txt`, `answers.md`, `pric
 Use only these hosts in public examples:
 
 - `http://localhost:4000`, only for local setup and local smoke examples
-- `https://pooler.example.com`, for deployed product examples
+- `https://codex-pooler.example.com`, for deployed product examples
 - `https://docs.codex-pooler.com`, for the public docs site canonical URL
 
 Do not use private hostnames, cluster names, pod names, tenant names, real account identifiers, real repository evidence paths, or private service URLs in public docs.
@@ -100,7 +100,7 @@ Allowed public claims:
 
 Use placeholders that are clearly fake and generic:
 
-- Hosts: `http://localhost:4000`, `https://pooler.example.com`, `https://docs.codex-pooler.com`
+- Hosts: `http://localhost:4000`, `https://codex-pooler.example.com`, `https://docs.codex-pooler.com`
 - Pool API key placeholder: `<pool-api-key>` or `sk-example-redacted`
 - MCP token placeholder: `<operator-mcp-token>`
 - Account labels: `example-upstream`, `example-operator`, `example-pool`

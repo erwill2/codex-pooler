@@ -17,7 +17,7 @@ Use the `/v1` base URL and a Pool API key:
 
 ```text
 Base URL:
-https://pooler.example.com/v1
+https://codex-pooler.example.com/v1
 
 Authorization:
 Bearer <pool-api-key>
@@ -34,7 +34,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key=os.environ["CODEX_POOLER_API_KEY"],
-    base_url="https://pooler.example.com/v1",
+    base_url="https://codex-pooler.example.com/v1",
 )
 
 response = client.responses.create(
@@ -52,7 +52,7 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   apiKey: process.env.CODEX_POOLER_API_KEY,
-  baseURL: "https://pooler.example.com/v1",
+  baseURL: "https://codex-pooler.example.com/v1",
 });
 
 const response = await client.responses.create({
@@ -71,7 +71,7 @@ import { generateText } from "ai";
 
 const pooler = createOpenAI({
   apiKey: process.env.CODEX_POOLER_API_KEY,
-  baseURL: "https://pooler.example.com/v1",
+  baseURL: "https://codex-pooler.example.com/v1",
 });
 
 const { text } = await generateText({
@@ -125,7 +125,7 @@ The operator MCP endpoint is rooted at `/mcp`, not under `/v1`. It uses operator
 
 ```text
 MCP URL:
-https://pooler.example.com/mcp
+https://codex-pooler.example.com/mcp
 
 Authorization:
 Bearer <operator-mcp-token>
@@ -137,7 +137,7 @@ Don't use Pool API keys, browser sessions, cookies, query tokens, invite tokens,
 
 ### Can I use the official OpenAI SDK with Codex Pooler?
 
-Yes, for selected SDK routes. Set the SDK `base_url` or `baseURL` to `https://pooler.example.com/v1`, use a Pool API key as the bearer credential, and keep requests on supported route shapes such as responses, chat completions, models, usage, files, audio transcription, and image generation or edits.
+Yes, for selected SDK routes. Set the SDK `base_url` or `baseURL` to `https://codex-pooler.example.com/v1`, use a Pool API key as the bearer credential, and keep requests on supported route shapes such as responses, chat completions, models, usage, files, audio transcription, and image generation or edits.
 
 ### Should Codex backend clients use `/v1`?
 

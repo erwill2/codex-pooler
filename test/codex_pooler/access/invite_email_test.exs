@@ -13,7 +13,7 @@ defmodule CodexPooler.Access.InviteEmailTest do
   test "delivers Pool invite emails with the expected text body" do
     pool = pool_fixture(%{slug: "email-pool", name: "Email Pool"})
     scope = fixture_owner_scope()
-    invite_url = "https://pooler.example.com/onboarding/invites/raw-token"
+    invite_url = "https://codex-pooler.example.com/onboarding/invites/raw-token"
 
     {:ok, %{invite: invite}} =
       Access.create_invite(scope, pool, %{"invited_email" => "invitee@example.com"})
@@ -48,7 +48,7 @@ defmodule CodexPooler.Access.InviteEmailTest do
   test "escapes invite email html values" do
     pool = pool_fixture(%{slug: "escape-pool", name: "Escape <Pool>"})
     scope = fixture_owner_scope()
-    invite_url = "https://pooler.example.com/onboarding/invites/escape-token"
+    invite_url = "https://codex-pooler.example.com/onboarding/invites/escape-token"
 
     {:ok, %{invite: invite}} =
       Access.create_invite(scope, pool, %{"invited_email" => "escape@example.com"})
@@ -70,7 +70,7 @@ defmodule CodexPooler.Access.InviteEmailTest do
   test "maybe_deliver_pool_invite records delivery flags without leaking tokens" do
     pool = pool_fixture(%{slug: "flag-pool", name: "Flag Pool"})
     scope = fixture_owner_scope()
-    invite_url = "https://pooler.example.com/onboarding/invites/flag-token"
+    invite_url = "https://codex-pooler.example.com/onboarding/invites/flag-token"
 
     {:ok, %{invite: invite} = result} =
       Access.create_invite(scope, pool, %{"invited_email" => "flags@example.com"})

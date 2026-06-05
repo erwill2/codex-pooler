@@ -295,7 +295,7 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents do
               field={operator_form[:login_base_url]}
               type="url"
               label="Public operator app URL"
-              placeholder="https://pooler.example.com"
+              placeholder="https://codex-pooler.example.com"
             />
           </div>
         </.settings_group>

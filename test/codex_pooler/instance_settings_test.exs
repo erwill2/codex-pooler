@@ -138,12 +138,15 @@ defmodule CodexPooler.InstanceSettingsTest do
 
     assert {:ok, updated} =
              InstanceSettings.update(settings, %{
-               "operator" => %{"login_base_url" => "https://pooler.example.com/"}
+               "operator" => %{"login_base_url" => "https://codex-pooler.example.com/"}
              })
 
-    assert updated.operator.login_base_url == "https://pooler.example.com"
+    assert updated.operator.login_base_url == "https://codex-pooler.example.com"
 
-    for login_url <- ["https://pooler.example.com/login", "https://pooler.example.com/login/"] do
+    for login_url <- [
+          "https://codex-pooler.example.com/login",
+          "https://codex-pooler.example.com/login/"
+        ] do
       assert {:error, changeset} =
                InstanceSettings.update(updated, %{
                  "operator" => %{"login_base_url" => login_url}

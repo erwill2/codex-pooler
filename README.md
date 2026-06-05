@@ -109,8 +109,8 @@ OpenAI SDK base URL:         http://localhost:4000/v1
 Optional operator MCP URL:   http://localhost:4000/mcp
 ```
 
-For a deployed instance, replace `http://localhost:4000` with your HTTPS host,
-for example `https://pooler.example.com`.
+For a deployed instance, replace `http://localhost:4000` with your deployed host,
+for example `https://codex-pooler.example.com`.
 
 <details>
 <summary><img src=".github/assets/opencode-favicon.png" alt="opencode logo" width="16" height="16"> OpenCode <code>~/.config/opencode/opencode.jsonc</code></summary>
@@ -179,7 +179,7 @@ OpenAI Realtime SDK compatibility.
 ```
 
 Define only models that your assigned Pool can serve. For deployed instances,
-change `baseURL` to `https://pooler.example.com/v1`; if you keep the optional
+change `baseURL` to `https://codex-pooler.example.com/v1`; if you keep the optional
 operator MCP entry, change its `url` to `https://codex-pooler.example.com/mcp`.
 
 </details>
@@ -221,7 +221,7 @@ bearer_token_env_var = "CODEX_POOLER_MCP_KEY"
 
 Use the websocket provider for normal Codex backend behavior, and keep the HTTP
 provider when you need to force SSE-only coverage. For deployed instances,
-change both `base_url` values to `https://pooler.example.com/backend-api/codex`;
+change both `base_url` values to `https://codex-pooler.example.com/backend-api/codex`;
 if you keep the optional operator MCP add-on, change its `url` to
 `https://codex-pooler.example.com/mcp`.
 
@@ -351,7 +351,7 @@ the OpenAI provider to the PI runtime and point `baseUrl` at Codex Pooler.
 ```
 
 Define only models that your assigned Pool can serve. For deployed instances,
-change `baseUrl` to `https://pooler.example.com/v1`; if you keep the optional
+change `baseUrl` to `https://codex-pooler.example.com/v1`; if you keep the optional
 operator MCP add-on, change its `url` to `https://codex-pooler.example.com/mcp`.
 
 If you prefer to keep Codex Pooler separate from OpenClaw's built-in OpenAI
@@ -470,7 +470,7 @@ mcp_servers:
 ```
 
 For deployed instances, change the model URLs to
-`https://pooler.example.com/v1`; if you keep the optional operator MCP add-on,
+`https://codex-pooler.example.com/v1`; if you keep the optional operator MCP add-on,
 change the MCP `url` to `https://codex-pooler.example.com/mcp`.
 
 </details>
@@ -495,7 +495,7 @@ aider --model openai/gpt-5.5 --message 'Reply with exactly: aider ok'
 ```
 
 For deployed instances, change `openai-api-base` to
-`https://pooler.example.com/v1`.
+`https://codex-pooler.example.com/v1`.
 
 </details>
 
@@ -537,7 +537,7 @@ mcpServers:
         Authorization: "Bearer ${{ secrets.CODEX_POOLER_MCP_KEY }}"
 ```
 
-For deployed instances, change `apiBase` to `https://pooler.example.com/v1`;
+For deployed instances, change `apiBase` to `https://codex-pooler.example.com/v1`;
 if you keep the optional operator MCP add-on, change the MCP `url` to
 `https://codex-pooler.example.com/mcp`.
 
@@ -578,7 +578,7 @@ use the same `mcpServers` shape there.
 }
 ```
 
-For deployed instances, change `--baseurl` to `https://pooler.example.com/v1`
+For deployed instances, change `--baseurl` to `https://codex-pooler.example.com/v1`
 and, if you keep the optional operator MCP add-on, change the MCP `url` to
 `https://codex-pooler.example.com/mcp`.
 
@@ -620,7 +620,7 @@ settings UI.
 ```
 
 For deployed instances, change the provider base URL to
-`https://pooler.example.com/v1` and, if you keep the optional operator MCP
+`https://codex-pooler.example.com/v1` and, if you keep the optional operator MCP
 add-on, change the MCP `url` to `https://codex-pooler.example.com/mcp`.
 
 </details>
@@ -659,7 +659,7 @@ extensions:
     available_tools: []
 ```
 
-For deployed instances, change `OPENAI_HOST` to `https://pooler.example.com`;
+For deployed instances, change `OPENAI_HOST` to `https://codex-pooler.example.com`;
 if you keep the optional operator MCP add-on, change the extension `uri` to
 `https://codex-pooler.example.com/mcp`.
 
@@ -690,7 +690,7 @@ response = client.responses.create(
 print(response.output_text)
 ```
 
-For deployed instances, change `base_url` to `https://pooler.example.com/v1`.
+For deployed instances, change `base_url` to `https://codex-pooler.example.com/v1`.
 
 </details>
 
@@ -717,7 +717,7 @@ const response = await client.responses.create({
 console.log(response.output_text);
 ```
 
-For deployed instances, change `baseURL` to `https://pooler.example.com/v1`.
+For deployed instances, change `baseURL` to `https://codex-pooler.example.com/v1`.
 
 </details>
 
@@ -745,7 +745,7 @@ const { text } = await generateText({
 console.log(text);
 ```
 
-For deployed instances, change `baseURL` to `https://pooler.example.com/v1`.
+For deployed instances, change `baseURL` to `https://codex-pooler.example.com/v1`.
 
 </details>
 

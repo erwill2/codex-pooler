@@ -58,7 +58,7 @@ It is not a hosted provider, a general OpenAI API clone, or a way to bypass acco
 4. **Point clients at the right runtime URL.** Codex backend clients use `/backend-api/codex`; selected SDK clients use `/v1`; operator MCP hosts use `/mcp`.
 5. **Watch sanitized operations data.** The admin UI and MCP endpoint show metadata for routing, usage, requests, audit events, and account readiness.
 
-For local setup examples, use `http://localhost:4000`. For deployed examples, use `https://pooler.example.com`.
+For local setup examples, use `http://localhost:4000`. For deployed examples, use `https://codex-pooler.example.com`.
 
 ## Start Here
 
@@ -75,7 +75,7 @@ Selected SDK clients:  http://localhost:4000/v1
 Operator MCP hosts:    http://localhost:4000/mcp
 ```
 
-For a deployed instance, replace `http://localhost:4000` with your HTTPS host, for example `https://pooler.example.com`.
+For a deployed instance, replace `http://localhost:4000` with your deployed host, for example `https://codex-pooler.example.com`.
 
 The `/v1` surface is intentionally narrow. Supported requests are translated and routed through the same Pool rules as Codex backend traffic; unsupported routes return explicit errors instead of pretending full OpenAI API parity.
 
@@ -91,7 +91,7 @@ No. Codex Pooler provides narrow OpenAI-compatible `/v1` support for selected SD
 
 ### Which base URL should an AI coding client use?
 
-Codex backend-compatible clients should use `https://pooler.example.com/backend-api/codex`. Selected OpenAI SDK-compatible clients should use `https://pooler.example.com/v1`. Operator metadata tools should use `https://pooler.example.com/mcp` with an operator MCP token, not a Pool API key.
+Codex backend-compatible clients should use `https://codex-pooler.example.com/backend-api/codex`. Selected OpenAI SDK-compatible clients should use `https://codex-pooler.example.com/v1`. Operator metadata tools should use `https://codex-pooler.example.com/mcp` with an operator MCP token, not a Pool API key.
 
 ### What data is safe to cite from Codex Pooler?
 
