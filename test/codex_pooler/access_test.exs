@@ -537,6 +537,12 @@ defmodule CodexPooler.AccessTest do
                Access.normalize_api_key_policy(%{allowed_model_identifiers: "gpt-5"})
 
       assert {:error, :api_key_policy_malformed} =
+               Access.normalize_api_key_policy(%{allowed_model_identifiers: ["gpt-5", nil]})
+
+      assert {:error, :api_key_policy_malformed} =
+               Access.normalize_api_key_policy(%{allowed_model_identifiers: ["gpt 5"]})
+
+      assert {:error, :api_key_policy_malformed} =
                Access.normalize_api_key_policy(%{metadata: %{"labels" => "production"}})
     end
 
