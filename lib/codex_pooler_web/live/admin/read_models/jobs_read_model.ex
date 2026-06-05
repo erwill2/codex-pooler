@@ -2,6 +2,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
   @moduledoc false
 
   alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Jobs
   alias CodexPooler.Jobs.ReadModel
   alias CodexPooler.Jobs.Schedule
   alias CodexPooler.Pools
@@ -51,9 +52,13 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
 
   @spec worker_jobs_by_group(ReadModel.scope_ref()) :: worker_jobs_by_group()
   def worker_jobs_by_group(scope) do
-    Map.new(Schedule.worker_groups(), fn group ->
-      {group.key, ReadModel.worker_job_summary(scope, group.workers)}
-    end)
+    worker_groups = Schedule.worker_groups()
+
+    if owner_projection_scope?(scope) do
+      Jobs.worker_job_summaries_by_group(scope, worker_groups)
+    else
+      Jobs.worker_job_summaries_by_group(nil, worker_groups)
+    end
   end
 
   defp load_owner_projection(scope, opts) do

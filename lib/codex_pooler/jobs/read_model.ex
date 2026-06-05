@@ -68,9 +68,17 @@ defmodule CodexPooler.Jobs.ReadModel do
           active: [job_summary()],
           unresolved_failures: [job_summary()]
         }
+  @type worker_group_key :: atom() | String.t()
+  @type worker_group :: %{
+          required(:key) => worker_group_key(),
+          required(:workers) => [String.t() | module()]
+        }
+  @type worker_job_summaries_by_group :: %{optional(worker_group_key()) => worker_job_summary()}
   @type scope_ref :: Scope.t() | :system | term()
   @type pool_ref :: Pool.t() | %{required(:id) => Ecto.UUID.t()} | Ecto.UUID.t()
   @type identity_ref :: UpstreamIdentity.t() | %{required(:id) => Ecto.UUID.t()} | Ecto.UUID.t()
+
+  @single_worker_summary_group_key :worker_summary
 
   @spec list_system_jobs(keyword()) :: [job_summary()]
   def list_system_jobs(opts \\ []) do
@@ -163,24 +171,58 @@ defmodule CodexPooler.Jobs.ReadModel do
   def jobs_overview(_scope, _filters, _opts), do: empty_jobs_overview()
 
   @spec worker_job_summary(scope_ref(), [String.t()]) :: worker_job_summary()
-  def worker_job_summary(scope, workers)
-
   def worker_job_summary(_scope, []), do: empty_worker_job_summary()
 
-  def worker_job_summary(%Scope{} = scope, workers) do
+  def worker_job_summary(scope, workers) do
+    scope
+    |> worker_job_summaries_by_group([
+      %{key: @single_worker_summary_group_key, workers: workers}
+    ])
+    |> Map.fetch!(@single_worker_summary_group_key)
+  end
+
+  @spec worker_job_summaries_by_group(scope_ref(), [worker_group()]) ::
+          worker_job_summaries_by_group()
+  def worker_job_summaries_by_group(scope, worker_groups)
+
+  def worker_job_summaries_by_group(_scope, []), do: %{}
+
+  def worker_job_summaries_by_group(%Scope{} = scope, worker_groups) do
     if Pools.owner?(scope) do
-      worker_job_summary(:system, workers)
+      worker_job_summaries_by_group(:system, worker_groups)
     else
-      empty_worker_job_summary()
+      empty_worker_job_summaries_by_group(worker_groups)
     end
   end
 
-  def worker_job_summary(:system, workers) do
-    Oban.Job
-    |> worker_job_summary_query(workers)
+  def worker_job_summaries_by_group(:system, worker_groups) do
+    now = DateTime.utc_now()
+    worker_groups = normalize_worker_groups(worker_groups)
+    latest_by_group = latest_worker_jobs_by_group(worker_groups)
+    latest_success_by_group = latest_worker_jobs_by_group(worker_groups, state: @completed_state)
+    latest_failure_by_group = latest_worker_jobs_by_group(worker_groups, states: failure_states())
+    pending_by_group = next_pending_worker_jobs_by_group(worker_groups)
+    active_by_group = active_worker_jobs_by_group(worker_groups)
+    unresolved_failures_by_group = unresolved_failure_worker_jobs_by_group(worker_groups)
+
+    Map.new(worker_groups, fn {group_key, _workers} ->
+      summary = %{
+        empty_worker_job_summary()
+        | latest: Map.get(latest_by_group, group_key),
+          latest_success: Map.get(latest_success_by_group, group_key),
+          latest_failure: Map.get(latest_failure_by_group, group_key),
+          pending: Map.get(pending_by_group, group_key),
+          active: Map.get(active_by_group, group_key, []),
+          unresolved_failures: Map.get(unresolved_failures_by_group, group_key, [])
+      }
+
+      {group_key, with_worker_summary_attention(summary, now: now)}
+    end)
   end
 
-  def worker_job_summary(_scope, _workers), do: empty_worker_job_summary()
+  def worker_job_summaries_by_group(_scope, worker_groups) do
+    empty_worker_job_summaries_by_group(worker_groups)
+  end
 
   @spec list_recent_token_refresh_jobs(identity_ref(), keyword()) :: [job_summary()]
   def list_recent_token_refresh_jobs(identity_or_id, opts \\ []) do
@@ -256,33 +298,6 @@ defmodule CodexPooler.Jobs.ReadModel do
     with_attention(results, opts)
   end
 
-  defp where_worker_in(queryable, workers) do
-    from job in queryable, where: job.worker in ^workers
-  end
-
-  defp worker_job_summary_query(queryable, workers) do
-    queryable = where_worker_in(queryable, workers)
-
-    %{
-      latest: queryable |> latest_worker_job_query() |> Repo.one(),
-      latest_success: queryable |> latest_worker_job_query(state: "completed") |> Repo.one(),
-      latest_failure:
-        queryable |> latest_worker_job_query(states: failure_states()) |> Repo.one(),
-      pending: queryable |> next_pending_worker_job_query() |> Repo.one(),
-      active: queryable |> active_worker_jobs_query() |> Repo.all(),
-      unresolved_failures:
-        queryable
-        |> unresolved_failure_worker_jobs_query()
-        |> Repo.all()
-        |> reject_reauth_required_reconciliation_failures()
-    }
-    |> with_worker_summary_attention()
-  end
-
-  defp reject_reauth_required_reconciliation_failures(jobs) do
-    Enum.reject(jobs, &reauth_required_reconciliation_failure?/1)
-  end
-
   defp reauth_required_reconciliation_failure?(%{worker: worker, target: target})
        when is_map(target) do
     worker == worker_name(AccountReconciliationWorker) and reauth_required_target?(target)
@@ -296,8 +311,8 @@ defmodule CodexPooler.Jobs.ReadModel do
 
   defp reauth_required_target?(_target), do: false
 
-  defp with_worker_summary_attention(summary) do
-    now = DateTime.utc_now()
+  defp with_worker_summary_attention(summary, opts) do
+    now = attention_now(opts)
 
     %{
       summary
@@ -323,65 +338,270 @@ defmodule CodexPooler.Jobs.ReadModel do
 
   defp attention_now(opts), do: Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
 
-  defp latest_worker_job_query(queryable, opts \\ []) do
-    queryable
+  defp latest_worker_jobs_by_group(worker_groups, opts \\ []) do
+    {group_worker_rows, group_keys_by_index} = group_worker_rows_by_index(worker_groups)
+
+    if group_worker_rows == [] do
+      %{}
+    else
+      group_worker_rows
+      |> ranked_latest_worker_jobs_query(opts)
+      |> grouped_job_metadata_query()
+      |> Repo.all()
+      |> Map.new(fn %{group_index: group_index, job: job} ->
+        {Map.fetch!(group_keys_by_index, group_index), job}
+      end)
+    end
+  end
+
+  defp group_worker_rows_by_index(worker_groups) do
+    worker_groups = Enum.with_index(worker_groups)
+
+    group_worker_rows =
+      for {{_group_key, workers}, group_index} <- worker_groups,
+          worker <- Enum.uniq(workers) do
+        %{group_index: group_index, worker: worker}
+      end
+
+    group_keys_by_index =
+      Map.new(worker_groups, fn {{group_key, _workers}, group_index} ->
+        {group_index, group_key}
+      end)
+
+    {group_worker_rows, group_keys_by_index}
+  end
+
+  defp ranked_latest_worker_jobs_query(group_worker_rows, opts) do
+    group_worker_types = %{group_index: :integer, worker: :string}
+
+    ranked_query =
+      from job in Oban.Job,
+        join: group_worker in values(group_worker_rows, group_worker_types),
+        on: job.worker == group_worker.worker,
+        windows: [
+          group_partition: [
+            partition_by: group_worker.group_index,
+            order_by: [desc: job.inserted_at, desc: job.id]
+          ]
+        ],
+        select: %{
+          id: job.id,
+          group_index: group_worker.group_index,
+          row_number: over(row_number(), :group_partition)
+        }
+
+    ranked_query
     |> maybe_where_states(opts)
-    |> job_metadata_query()
-    |> order_by([job], desc: job.inserted_at, desc: job.id)
-    |> limit(1)
+    |> subquery()
+    |> then(fn ranked ->
+      from ranked_job in ranked,
+        where: ranked_job.row_number == 1,
+        select: %{id: ranked_job.id, group_index: ranked_job.group_index}
+    end)
   end
 
-  defp next_pending_worker_job_query(queryable) do
-    queryable
-    |> where([job], job.state in ^pending_states())
-    |> job_metadata_query()
-    |> order_by([job], asc: job.scheduled_at, desc: job.id)
-    |> limit(1)
+  defp grouped_job_metadata_query(grouped_query, order \\ nil) do
+    queryable =
+      from job in Oban.Job,
+        join: grouped_job in subquery(grouped_query),
+        on: grouped_job.id == job.id
+
+    query =
+      from [
+             job,
+             grouped_job,
+             pool,
+             assignment,
+             assignment_identity,
+             direct_identity,
+             api_key
+           ] in grouped_job_target_metadata_query(queryable),
+           select: %{
+             group_index: grouped_job.group_index,
+             job: %{
+               id: job.id,
+               worker: job.worker,
+               queue: job.queue,
+               state: job.state,
+               errors: job.errors,
+               attempt: job.attempt,
+               max_attempts: job.max_attempts,
+               inserted_at: job.inserted_at,
+               scheduled_at: job.scheduled_at,
+               attempted_at: job.attempted_at,
+               completed_at: job.completed_at,
+               discarded_at: job.discarded_at,
+               cancelled_at: job.cancelled_at,
+               target: %{
+                 pool_id: fragment("?->>?", job.args, "pool_id"),
+                 pool_name: pool.name,
+                 pool_slug: pool.slug,
+                 assignment_id: fragment("?->>?", job.args, "pool_upstream_assignment_id"),
+                 assignment_label: assignment.assignment_label,
+                 assignment_status: assignment.status,
+                 assignment_identity_id: type(assignment.upstream_identity_id, :string),
+                 upstream_identity_id: fragment("?->>?", job.args, "upstream_identity_id"),
+                 assignment_identity_label: assignment_identity.account_label,
+                 assignment_identity_status: assignment_identity.status,
+                 direct_identity_label: direct_identity.account_label,
+                 direct_identity_status: direct_identity.status,
+                 api_key_id: fragment("?->>?", job.args, "api_key_id"),
+                 api_key_label: api_key.display_name,
+                 api_key_prefix: api_key.key_prefix,
+                 rollup_date: fragment("?->>?", job.args, "rollup_date")
+               }
+             }
+           }
+
+    grouped_job_metadata_order(query, order)
   end
 
-  defp active_worker_jobs_query(queryable) do
-    queryable
-    |> where([job], job.state in ^pending_states())
-    |> job_metadata_query()
-    |> order_by([job], asc: job.scheduled_at, desc: job.id)
+  defp grouped_job_metadata_order(query, :scheduled) do
+    from [job, grouped_job, _pool, _assignment, _assignment_identity, _direct_identity, _api_key] in query,
+      order_by: [asc: grouped_job.group_index, asc: job.scheduled_at, desc: job.id]
   end
 
-  defp unresolved_failure_worker_jobs_query(queryable) do
-    queryable
-    |> where([job], job.state in ^failure_states())
-    |> where(
-      [job],
-      fragment(
-        """
-        NOT EXISTS (
-          SELECT 1
-          FROM oban_jobs resolved
-          WHERE resolved.worker = ?
-            AND resolved.state = 'completed'
-            AND (
-              resolved.inserted_at > ?
-              OR (resolved.inserted_at = ? AND resolved.id > ?)
-            )
-            AND COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
-            AND COALESCE(resolved.args->>'pool_upstream_assignment_id', '') = COALESCE(?->>'pool_upstream_assignment_id', '')
-            AND COALESCE(resolved.args->>'upstream_identity_id', '') = COALESCE(?->>'upstream_identity_id', '')
-            AND COALESCE(resolved.args->>'api_key_id', '') = COALESCE(?->>'api_key_id', '')
-            AND COALESCE(resolved.args->>'rollup_date', '') = COALESCE(?->>'rollup_date', '')
-        )
-        """,
-        job.worker,
-        job.inserted_at,
-        job.inserted_at,
-        job.id,
-        job.args,
-        job.args,
-        job.args,
-        job.args,
-        job.args
-      )
-    )
-    |> job_metadata_query()
-    |> order_by([job], desc: job.inserted_at, desc: job.id)
+  defp grouped_job_metadata_order(query, :inserted_desc) do
+    from [job, grouped_job, _pool, _assignment, _assignment_identity, _direct_identity, _api_key] in query,
+      order_by: [asc: grouped_job.group_index, desc: job.inserted_at, desc: job.id]
+  end
+
+  defp grouped_job_metadata_order(query, _order), do: query
+
+  defp next_pending_worker_jobs_by_group(worker_groups) do
+    {group_worker_rows, group_keys_by_index} = group_worker_rows_by_index(worker_groups)
+
+    if group_worker_rows == [] do
+      %{}
+    else
+      group_worker_rows
+      |> ranked_next_pending_worker_jobs_query()
+      |> grouped_job_metadata_query()
+      |> Repo.all()
+      |> Map.new(fn %{group_index: group_index, job: job} ->
+        {Map.fetch!(group_keys_by_index, group_index), job}
+      end)
+    end
+  end
+
+  defp ranked_next_pending_worker_jobs_query(group_worker_rows) do
+    group_worker_types = %{group_index: :integer, worker: :string}
+
+    ranked_query =
+      from job in Oban.Job,
+        join: group_worker in values(group_worker_rows, group_worker_types),
+        on: job.worker == group_worker.worker,
+        where: job.state in ^pending_states(),
+        windows: [
+          group_partition: [
+            partition_by: group_worker.group_index,
+            order_by: [asc: job.scheduled_at, desc: job.id]
+          ]
+        ],
+        select: %{
+          id: job.id,
+          group_index: group_worker.group_index,
+          row_number: over(row_number(), :group_partition)
+        }
+
+    ranked_query
+    |> subquery()
+    |> then(fn ranked ->
+      from ranked_job in ranked,
+        where: ranked_job.row_number == 1,
+        select: %{id: ranked_job.id, group_index: ranked_job.group_index}
+    end)
+  end
+
+  defp active_worker_jobs_by_group(worker_groups) do
+    {group_worker_rows, group_keys_by_index} = group_worker_rows_by_index(worker_groups)
+
+    if group_worker_rows == [] do
+      %{}
+    else
+      group_worker_rows
+      |> grouped_active_worker_jobs_query()
+      |> grouped_job_metadata_query(:scheduled)
+      |> Repo.all()
+      |> grouped_job_lists_by_group(group_keys_by_index)
+    end
+  end
+
+  defp grouped_active_worker_jobs_query(group_worker_rows) do
+    group_worker_types = %{group_index: :integer, worker: :string}
+
+    from job in Oban.Job,
+      join: group_worker in values(group_worker_rows, group_worker_types),
+      on: job.worker == group_worker.worker,
+      where: job.state in ^pending_states(),
+      select: %{id: job.id, group_index: group_worker.group_index}
+  end
+
+  defp unresolved_failure_worker_jobs_by_group(worker_groups) do
+    {group_worker_rows, group_keys_by_index} = group_worker_rows_by_index(worker_groups)
+
+    if group_worker_rows == [] do
+      %{}
+    else
+      group_worker_rows
+      |> grouped_unresolved_failure_worker_jobs_query()
+      |> grouped_job_metadata_query(:inserted_desc)
+      |> Repo.all()
+      |> reject_reauth_required_grouped_reconciliation_failures()
+      |> grouped_job_lists_by_group(group_keys_by_index)
+    end
+  end
+
+  defp grouped_unresolved_failure_worker_jobs_query(group_worker_rows) do
+    group_worker_types = %{group_index: :integer, worker: :string}
+
+    from job in Oban.Job,
+      join: group_worker in values(group_worker_rows, group_worker_types),
+      on: job.worker == group_worker.worker,
+      where: job.state in ^failure_states(),
+      where:
+        fragment(
+          """
+          NOT EXISTS (
+            SELECT 1
+            FROM oban_jobs resolved
+            WHERE resolved.worker = ?
+              AND resolved.state = 'completed'
+              AND (
+                resolved.inserted_at > ?
+                OR (resolved.inserted_at = ? AND resolved.id > ?)
+              )
+              AND COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
+              AND COALESCE(resolved.args->>'pool_upstream_assignment_id', '') = COALESCE(?->>'pool_upstream_assignment_id', '')
+              AND COALESCE(resolved.args->>'upstream_identity_id', '') = COALESCE(?->>'upstream_identity_id', '')
+              AND COALESCE(resolved.args->>'api_key_id', '') = COALESCE(?->>'api_key_id', '')
+              AND COALESCE(resolved.args->>'rollup_date', '') = COALESCE(?->>'rollup_date', '')
+          )
+          """,
+          job.worker,
+          job.inserted_at,
+          job.inserted_at,
+          job.id,
+          job.args,
+          job.args,
+          job.args,
+          job.args,
+          job.args
+        ),
+      select: %{id: job.id, group_index: group_worker.group_index}
+  end
+
+  defp reject_reauth_required_grouped_reconciliation_failures(grouped_jobs) do
+    Enum.reject(grouped_jobs, fn %{job: job} -> reauth_required_reconciliation_failure?(job) end)
+  end
+
+  defp grouped_job_lists_by_group(grouped_jobs, group_keys_by_index) do
+    grouped_jobs
+    |> Enum.reduce(%{}, fn %{group_index: group_index, job: job}, acc ->
+      group_key = Map.fetch!(group_keys_by_index, group_index)
+      Map.update(acc, group_key, [job], &[job | &1])
+    end)
+    |> Map.new(fn {group_key, jobs} -> {group_key, Enum.reverse(jobs)} end)
   end
 
   defp maybe_where_states(queryable, state: state) do
@@ -407,6 +627,42 @@ defmodule CodexPooler.Jobs.ReadModel do
       unresolved_failures: []
     }
   end
+
+  defp empty_worker_job_summaries_by_group(worker_groups) do
+    Map.new(normalize_worker_groups(worker_groups), fn {group_key, _workers} ->
+      {group_key, empty_worker_job_summary()}
+    end)
+  end
+
+  defp normalize_worker_groups(worker_groups) when is_list(worker_groups) do
+    worker_groups
+    |> Enum.map(&normalize_worker_group/1)
+    |> Enum.reject(fn {group_key, _workers} -> is_nil(group_key) end)
+  end
+
+  defp normalize_worker_groups(_worker_groups), do: []
+
+  defp normalize_worker_group(%{key: group_key, workers: workers}) do
+    {group_key, normalize_worker_names(workers)}
+  end
+
+  defp normalize_worker_group(%{"key" => group_key, "workers" => workers}) do
+    {group_key, normalize_worker_names(workers)}
+  end
+
+  defp normalize_worker_group(_group), do: {nil, []}
+
+  defp normalize_worker_names(workers) when is_list(workers) do
+    workers
+    |> Enum.map(&normalize_worker_name/1)
+    |> Enum.filter(&is_binary/1)
+  end
+
+  defp normalize_worker_names(_workers), do: []
+
+  defp normalize_worker_name(worker) when is_binary(worker), do: worker
+  defp normalize_worker_name(worker) when is_atom(worker), do: worker_name(worker)
+  defp normalize_worker_name(_worker), do: nil
 
   defp latest_jobs_query(queryable, opts) do
     limit =
@@ -941,6 +1197,23 @@ defmodule CodexPooler.Jobs.ReadModel do
 
   defp job_target_metadata_query(queryable) do
     from job in queryable,
+      left_join: pool in Pool,
+      on: fragment("?->>?", job.args, "pool_id") == type(pool.id, :string),
+      left_join: assignment in PoolUpstreamAssignment,
+      on:
+        fragment("?->>?", job.args, "pool_upstream_assignment_id") ==
+          type(assignment.id, :string),
+      left_join: assignment_identity in UpstreamIdentity,
+      on: assignment.upstream_identity_id == assignment_identity.id,
+      left_join: direct_identity in UpstreamIdentity,
+      on:
+        fragment("?->>?", job.args, "upstream_identity_id") == type(direct_identity.id, :string),
+      left_join: api_key in APIKey,
+      on: fragment("?->>?", job.args, "api_key_id") == type(api_key.id, :string)
+  end
+
+  defp grouped_job_target_metadata_query(queryable) do
+    from [job, _grouped_job] in queryable,
       left_join: pool in Pool,
       on: fragment("?->>?", job.args, "pool_id") == type(pool.id, :string),
       left_join: assignment in PoolUpstreamAssignment,

@@ -2,6 +2,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
   use CodexPooler.DataCase, async: false
 
   alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Jobs
   alias CodexPooler.Jobs.{RuntimeStateCleanupWorker, TokenRefreshWorker}
   alias CodexPooler.Repo
   alias CodexPoolerWeb.Admin.JobsReadModel
@@ -178,6 +179,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert %{field: :job_id, message: "Job id must be a positive integer"} in projection.filter_warnings
   end
 
+  @tag :non_owner
   test "returns a safe empty projection for non-owner scopes without global leakage" do
     %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
     owner_scope = Scope.for_user(owner, ["instance_owner"])
@@ -193,14 +195,17 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     %{user: admin} = operator_fixture(owner_scope, %{"email" => unique_user_email()})
     admin_scope = Scope.for_user(admin, ["instance_admin"])
 
-    projection =
-      JobsReadModel.load(admin_scope,
-        params: %{
-          "job_id" => Integer.to_string(global_job.id),
-          "worker" => worker_name(TokenRefreshWorker)
-        }
-      )
+    {projection, events} =
+      capture_repo_queries(fn ->
+        JobsReadModel.load(admin_scope,
+          params: %{
+            "job_id" => Integer.to_string(global_job.id),
+            "worker" => worker_name(TokenRefreshWorker)
+          }
+        )
+      end)
 
+    assert oban_jobs_query_count(events) == 0
     assert projection.overview.empty?
     assert projection.overview.total == 0
     assert projection.explorer == %{items: [], total: 0, limit: 20, offset: 0}
@@ -212,6 +217,42 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert projection.form_values["job_id"] == ""
     assert projection.form_values["worker"] == ""
     refute inspect(projection) =~ Integer.to_string(global_job.id)
+  end
+
+  @tag :non_owner
+  test "non-owner grouped worker summaries return empty group entries without querying jobs" do
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    owner_scope = Scope.for_user(owner, ["instance_owner"])
+
+    hidden_job =
+      insert_job(1,
+        worker: TokenRefreshWorker,
+        state: "retryable",
+        inserted_at: ~U[2026-06-02 10:00:00Z],
+        attempted_at: ~U[2026-06-02 10:01:00Z]
+      )
+
+    %{user: admin} = operator_fixture(owner_scope, %{"email" => unique_user_email()})
+    admin_scope = Scope.for_user(admin, ["instance_admin"])
+
+    worker_groups = [
+      %{key: :token_refresh, workers: [worker_name(TokenRefreshWorker)]},
+      %{key: :runtime_cleanup, workers: [worker_name(RuntimeStateCleanupWorker)]}
+    ]
+
+    {summaries, events} =
+      capture_repo_queries(fn ->
+        Jobs.worker_job_summaries_by_group(admin_scope, worker_groups)
+      end)
+
+    assert oban_jobs_query_count(events) == 0
+
+    assert summaries == %{
+             token_refresh: empty_worker_job_summary(),
+             runtime_cleanup: empty_worker_job_summary()
+           }
+
+    refute inspect(summaries) =~ Integer.to_string(hidden_job.id)
   end
 
   defp insert_job(index, attrs) do
@@ -260,6 +301,60 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
       updates
     end
   end
+
+  defp empty_worker_job_summary do
+    %{
+      latest: nil,
+      latest_success: nil,
+      latest_failure: nil,
+      pending: nil,
+      active: [],
+      unresolved_failures: []
+    }
+  end
+
+  def handle_repo_query_event(_event, _measurements, metadata, {handler_id, test_pid}) do
+    if metadata[:repo] == Repo do
+      send(test_pid, {handler_id, %{source: normalize_source(metadata[:source])}})
+    end
+  end
+
+  defp capture_repo_queries(fun) when is_function(fun, 0) do
+    test_pid = self()
+    handler_id = {__MODULE__, test_pid, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        &__MODULE__.handle_repo_query_event/4,
+        {handler_id, test_pid}
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_query_events(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_query_events(handler_id, events) do
+    receive do
+      {^handler_id, event} ->
+        drain_repo_query_events(handler_id, [event | events])
+    after
+      10 -> Enum.reverse(events)
+    end
+  end
+
+  defp oban_jobs_query_count(events) do
+    Enum.count(events, &(&1.source == "oban_jobs"))
+  end
+
+  defp normalize_source(nil), do: "unknown"
+  defp normalize_source(source) when is_binary(source), do: source
+  defp normalize_source(source), do: to_string(source)
 
   defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
 end

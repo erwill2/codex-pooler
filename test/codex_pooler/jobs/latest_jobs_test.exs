@@ -293,6 +293,547 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
       refute Enum.any?(unresolved_failures, &(&1.id == resolved_failure.id))
     end
 
+    @tag :latest
+    test "grouped worker summaries preserve latest and pending same-timestamp tie-breaks" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      scope = Scope.for_user(owner, ["instance_owner"])
+      same_inserted_at = ~U[2026-05-04 12:00:00Z]
+      same_scheduled_at = ~U[2026-05-04 13:00:00Z]
+
+      older_latest =
+        insert_listing_job(1,
+          worker: CatalogSyncWorker,
+          state: "completed",
+          inserted_at: same_inserted_at,
+          completed_at: ~U[2026-05-04 12:01:00Z]
+        )
+
+      newer_latest =
+        insert_listing_job(2,
+          worker: CatalogSyncWorker,
+          state: "completed",
+          inserted_at: same_inserted_at,
+          completed_at: ~U[2026-05-04 12:02:00Z]
+        )
+
+      older_pending =
+        insert_listing_job(3,
+          worker: TokenRefreshWorker,
+          state: "scheduled",
+          inserted_at: ~U[2026-05-04 11:00:00Z],
+          scheduled_at: same_scheduled_at
+        )
+
+      newer_pending =
+        insert_listing_job(4,
+          worker: TokenRefreshWorker,
+          state: "scheduled",
+          inserted_at: ~U[2026-05-04 11:01:00Z],
+          scheduled_at: same_scheduled_at
+        )
+
+      summaries =
+        Jobs.worker_job_summaries_by_group(scope, [
+          worker_group(:catalog_card, [CatalogSyncWorker]),
+          worker_group(:token_refresh_card, [TokenRefreshWorker])
+        ])
+
+      assert Map.keys(summaries) == [:catalog_card, :token_refresh_card]
+      refute Map.has_key?(summaries, worker_name(CatalogSyncWorker))
+      assert summaries.catalog_card.latest.id == newer_latest.id
+      assert summaries.catalog_card.latest_success.id == newer_latest.id
+      refute summaries.catalog_card.latest.id == older_latest.id
+      assert summaries.token_refresh_card.pending.id == newer_pending.id
+      refute summaries.token_refresh_card.pending.id == older_pending.id
+    end
+
+    @tag :latest
+    test "grouped worker summaries preserve latest-style category winners across overlapping groups" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      scope = Scope.for_user(owner, ["instance_owner"])
+      success_inserted_at = ~U[2026-05-04 12:00:00Z]
+      failure_inserted_at = ~U[2026-05-04 12:10:00Z]
+
+      older_catalog_success =
+        insert_listing_job(1,
+          worker: CatalogSyncWorker,
+          state: "completed",
+          inserted_at: success_inserted_at,
+          completed_at: ~U[2026-05-04 12:01:00Z],
+          args: %{"prompt" => "raw prompt must not project", "token" => "hidden-token"},
+          meta: %{"authorization" => "Bearer hidden"}
+        )
+
+      newer_catalog_success =
+        insert_listing_job(2,
+          worker: CatalogSyncWorker,
+          state: "completed",
+          inserted_at: success_inserted_at,
+          completed_at: ~U[2026-05-04 12:02:00Z]
+        )
+
+      older_catalog_failure =
+        insert_listing_job(3,
+          worker: CatalogSyncWorker,
+          state: "discarded",
+          inserted_at: failure_inserted_at,
+          discarded_at: ~U[2026-05-04 12:11:00Z]
+        )
+
+      newer_catalog_failure =
+        insert_listing_job(4,
+          worker: CatalogSyncWorker,
+          state: "discarded",
+          inserted_at: failure_inserted_at,
+          discarded_at: ~U[2026-05-04 12:12:00Z]
+        )
+
+      token_success =
+        insert_listing_job(5,
+          worker: TokenRefreshWorker,
+          state: "completed",
+          inserted_at: ~U[2026-05-04 12:05:00Z],
+          completed_at: ~U[2026-05-04 12:06:00Z]
+        )
+
+      token_latest =
+        insert_listing_job(6,
+          worker: TokenRefreshWorker,
+          state: "available",
+          inserted_at: ~U[2026-05-04 12:20:00Z],
+          scheduled_at: ~U[2026-05-04 12:30:00Z]
+        )
+
+      summaries =
+        Jobs.worker_job_summaries_by_group(scope, [
+          worker_group(:catalog_card, [CatalogSyncWorker]),
+          worker_group("overlap-card", [CatalogSyncWorker, TokenRefreshWorker]),
+          worker_group(:missing_card, [AccountReconciliationWorker])
+        ])
+
+      assert Map.keys(summaries) == [:catalog_card, :missing_card, "overlap-card"]
+
+      assert summaries.catalog_card.latest.id == newer_catalog_failure.id
+
+      assert DateTime.compare(summaries.catalog_card.latest.inserted_at, failure_inserted_at) ==
+               :eq
+
+      assert summaries.catalog_card.latest_success.id == newer_catalog_success.id
+
+      assert DateTime.compare(
+               summaries.catalog_card.latest_success.inserted_at,
+               success_inserted_at
+             ) ==
+               :eq
+
+      assert summaries.catalog_card.latest_failure.id == newer_catalog_failure.id
+
+      assert DateTime.compare(
+               summaries.catalog_card.latest_failure.inserted_at,
+               failure_inserted_at
+             ) ==
+               :eq
+
+      refute summaries.catalog_card.latest_success.id == older_catalog_success.id
+      refute summaries.catalog_card.latest_failure.id == older_catalog_failure.id
+
+      overlap_summary = Map.fetch!(summaries, "overlap-card")
+      assert overlap_summary.latest.id == token_latest.id
+      assert DateTime.compare(overlap_summary.latest.inserted_at, token_latest.inserted_at) == :eq
+      assert overlap_summary.latest_success.id == token_success.id
+
+      assert DateTime.compare(
+               overlap_summary.latest_success.inserted_at,
+               token_success.inserted_at
+             ) ==
+               :eq
+
+      assert overlap_summary.latest_failure.id == newer_catalog_failure.id
+
+      assert summaries.missing_card.latest == nil
+      assert summaries.missing_card.latest_success == nil
+      assert summaries.missing_card.latest_failure == nil
+
+      assert Enum.all?(
+               [
+                 summaries.catalog_card.latest,
+                 summaries.catalog_card.latest_success,
+                 summaries.catalog_card.latest_failure,
+                 overlap_summary.latest,
+                 overlap_summary.latest_success,
+                 overlap_summary.latest_failure
+               ],
+               &safe_job_shape?/1
+             )
+
+      serialized = inspect([summaries.catalog_card, overlap_summary])
+      refute serialized =~ "raw prompt must not project"
+      refute serialized =~ "hidden-token"
+      refute serialized =~ "Bearer hidden"
+    end
+
+    test "grouped worker summaries preserve pending winner and active ordering across groups" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      scope = Scope.for_user(owner, ["instance_owner"])
+      same_scheduled_at = ~U[2026-05-04 12:00:00Z]
+
+      catalog_later_active =
+        insert_listing_job(1,
+          worker: CatalogSyncWorker,
+          state: "available",
+          inserted_at: ~U[2026-05-04 10:00:00Z],
+          scheduled_at: ~U[2026-05-04 13:00:00Z]
+        )
+
+      older_catalog_pending =
+        insert_listing_job(2,
+          worker: CatalogSyncWorker,
+          state: "scheduled",
+          inserted_at: ~U[2026-05-04 10:01:00Z],
+          scheduled_at: same_scheduled_at
+        )
+
+      newer_catalog_pending =
+        insert_listing_job(3,
+          worker: CatalogSyncWorker,
+          state: "executing",
+          inserted_at: ~U[2026-05-04 10:02:00Z],
+          scheduled_at: same_scheduled_at
+        )
+
+      token_active =
+        insert_listing_job(4,
+          worker: TokenRefreshWorker,
+          state: "retryable",
+          inserted_at: ~U[2026-05-04 10:03:00Z],
+          scheduled_at: ~U[2026-05-04 12:30:00Z]
+        )
+
+      summaries =
+        Jobs.worker_job_summaries_by_group(scope, [
+          worker_group(:catalog_card, [CatalogSyncWorker]),
+          worker_group(:overlap_card, [CatalogSyncWorker, TokenRefreshWorker]),
+          worker_group(:missing_card, [AccountReconciliationWorker])
+        ])
+
+      assert summaries.catalog_card.pending.id == newer_catalog_pending.id
+
+      assert Enum.map(summaries.catalog_card.active, & &1.id) == [
+               newer_catalog_pending.id,
+               older_catalog_pending.id,
+               catalog_later_active.id
+             ]
+
+      assert summaries.overlap_card.pending.id == newer_catalog_pending.id
+
+      assert Enum.map(summaries.overlap_card.active, & &1.id) == [
+               newer_catalog_pending.id,
+               older_catalog_pending.id,
+               token_active.id,
+               catalog_later_active.id
+             ]
+
+      assert summaries.missing_card.pending == nil
+      assert summaries.missing_card.active == []
+      assert Enum.all?(summaries.overlap_card.active, &safe_job_shape?/1)
+    end
+
+    test "grouped worker summaries support overlapping worker groups and empty group entries" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      scope = Scope.for_user(owner, ["instance_owner"])
+
+      catalog_job =
+        insert_listing_job(1,
+          worker: CatalogSyncWorker,
+          state: "completed",
+          inserted_at: ~U[2026-05-04 10:00:00Z],
+          completed_at: ~U[2026-05-04 10:01:00Z]
+        )
+
+      token_job =
+        insert_listing_job(2,
+          worker: TokenRefreshWorker,
+          state: "completed",
+          inserted_at: ~U[2026-05-04 10:05:00Z],
+          completed_at: ~U[2026-05-04 10:06:00Z]
+        )
+
+      summaries =
+        Jobs.worker_job_summaries_by_group(scope, [
+          worker_group(:catalog_only, [CatalogSyncWorker]),
+          worker_group(:overlap, [CatalogSyncWorker, TokenRefreshWorker]),
+          worker_group(:empty_group, [AccountReconciliationWorker])
+        ])
+
+      assert summaries.catalog_only.latest.id == catalog_job.id
+      assert summaries.overlap.latest.id == token_job.id
+
+      assert summaries.empty_group == %{
+               latest: nil,
+               latest_success: nil,
+               latest_failure: nil,
+               pending: nil,
+               active: [],
+               unresolved_failures: []
+             }
+    end
+
+    @tag :unresolved
+    test "grouped worker summaries preserve unresolved failure target resolution semantics" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      scope = Scope.for_user(owner, ["instance_owner"])
+      resolved_pool = pool_fixture()
+
+      %{assignment: resolved_assignment} = upstream_assignment_fixture(resolved_pool)
+      %{assignment: different_assignment} = upstream_assignment_fixture(resolved_pool)
+      resolved_identity = active_upstream_identity_fixture()
+      different_identity = active_upstream_identity_fixture()
+      %{api_key: resolved_api_key} = api_key_fixture(resolved_pool)
+      %{api_key: different_api_key} = api_key_fixture(resolved_pool)
+
+      resolved_args = %{
+        "pool_id" => resolved_pool.id,
+        "pool_upstream_assignment_id" => resolved_assignment.id,
+        "upstream_identity_id" => resolved_identity.id,
+        "api_key_id" => resolved_api_key.id,
+        "rollup_date" => "2026-05-03"
+      }
+
+      resolved_failure =
+        insert_listing_job(1,
+          worker: CatalogSyncWorker,
+          state: "discarded",
+          inserted_at: ~U[2026-05-04 10:00:00Z],
+          discarded_at: ~U[2026-05-04 10:01:00Z],
+          args: resolved_args
+        )
+
+      insert_listing_job(2,
+        worker: CatalogSyncWorker,
+        state: "completed",
+        inserted_at: ~U[2026-05-04 10:05:00Z],
+        completed_at: ~U[2026-05-04 10:06:00Z],
+        args: resolved_args
+      )
+
+      pool_mismatch_failure =
+        insert_listing_job(3,
+          worker: CatalogSyncWorker,
+          state: "discarded",
+          inserted_at: ~U[2026-05-04 11:00:00Z],
+          discarded_at: ~U[2026-05-04 11:01:00Z],
+          args: %{resolved_args | "pool_id" => pool_fixture().id}
+        )
+
+      assignment_mismatch_failure =
+        insert_listing_job(4,
+          worker: CatalogSyncWorker,
+          state: "discarded",
+          inserted_at: ~U[2026-05-04 11:00:00Z],
+          discarded_at: ~U[2026-05-04 11:01:00Z],
+          args: %{resolved_args | "pool_upstream_assignment_id" => different_assignment.id}
+        )
+
+      identity_mismatch_failure =
+        insert_listing_job(5,
+          worker: CatalogSyncWorker,
+          state: "discarded",
+          inserted_at: ~U[2026-05-04 11:00:00Z],
+          discarded_at: ~U[2026-05-04 11:01:00Z],
+          args: %{resolved_args | "upstream_identity_id" => different_identity.id}
+        )
+
+      api_key_mismatch_failure =
+        insert_listing_job(6,
+          worker: CatalogSyncWorker,
+          state: "discarded",
+          inserted_at: ~U[2026-05-04 11:00:00Z],
+          discarded_at: ~U[2026-05-04 11:01:00Z],
+          args: %{resolved_args | "api_key_id" => different_api_key.id}
+        )
+
+      rollup_mismatch_failure =
+        insert_listing_job(7,
+          worker: CatalogSyncWorker,
+          state: "discarded",
+          inserted_at: ~U[2026-05-04 11:00:00Z],
+          discarded_at: ~U[2026-05-04 11:01:00Z],
+          args: %{resolved_args | "rollup_date" => "2026-05-04"}
+        )
+
+      insert_listing_job(8,
+        worker: CatalogSyncWorker,
+        state: "completed",
+        inserted_at: ~U[2026-05-04 11:05:00Z],
+        completed_at: ~U[2026-05-04 11:06:00Z],
+        args: resolved_args
+      )
+
+      summary =
+        Jobs.worker_job_summaries_by_group(scope, [
+          worker_group(:catalog_card, [CatalogSyncWorker])
+        ])
+        |> Map.fetch!(:catalog_card)
+
+      unresolved_ids = Enum.map(summary.unresolved_failures, & &1.id)
+
+      assert unresolved_ids == [
+               rollup_mismatch_failure.id,
+               api_key_mismatch_failure.id,
+               identity_mismatch_failure.id,
+               assignment_mismatch_failure.id,
+               pool_mismatch_failure.id
+             ]
+
+      refute resolved_failure.id in unresolved_ids
+    end
+
+    @tag :unresolved
+    test "grouped worker summaries reject reauth-required reconciliation failures" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      scope = Scope.for_user(owner, ["instance_owner"])
+
+      healthy_pool =
+        pool_fixture(%{name: "Healthy reconciliation", slug: "healthy-reconciliation"})
+
+      reauth_pool = pool_fixture(%{name: "Reauth reconciliation", slug: "reauth-reconciliation"})
+
+      %{assignment: healthy_assignment} = upstream_assignment_fixture(healthy_pool)
+
+      %{assignment: reauth_assignment} =
+        upstream_assignment_fixture(reauth_pool, %{
+          identity_status: "reauth_required",
+          assignment_health_status: "disabled",
+          assignment_eligibility_status: "ineligible"
+        })
+
+      visible_failure =
+        insert_listing_job(1,
+          worker: AccountReconciliationWorker,
+          state: "discarded",
+          inserted_at: ~U[2026-05-04 10:00:00Z],
+          discarded_at: ~U[2026-05-04 10:01:00Z],
+          args: %{
+            "pool_id" => healthy_pool.id,
+            "pool_upstream_assignment_id" => healthy_assignment.id
+          }
+        )
+
+      filtered_failure =
+        insert_listing_job(2,
+          worker: AccountReconciliationWorker,
+          state: "discarded",
+          inserted_at: ~U[2026-05-04 11:00:00Z],
+          discarded_at: ~U[2026-05-04 11:01:00Z],
+          args: %{
+            "pool_id" => reauth_pool.id,
+            "pool_upstream_assignment_id" => reauth_assignment.id
+          }
+        )
+
+      summary =
+        Jobs.worker_job_summaries_by_group(scope, [
+          worker_group(:reconciliation_card, [AccountReconciliationWorker])
+        ])
+        |> Map.fetch!(:reconciliation_card)
+
+      assert Enum.map(summary.unresolved_failures, & &1.id) == [visible_failure.id]
+      refute filtered_failure.id in Enum.map(summary.unresolved_failures, & &1.id)
+    end
+
+    test "grouped worker summaries preserve the single-summary facade shape" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      scope = Scope.for_user(owner, ["instance_owner"])
+
+      insert_listing_job(1,
+        worker: RuntimeStateCleanupWorker,
+        state: "retryable",
+        inserted_at: ~U[2026-05-04 10:00:00Z],
+        attempted_at: ~U[2026-05-04 10:01:00Z]
+      )
+
+      workers = [worker_name(RuntimeStateCleanupWorker)]
+      single_summary = Jobs.worker_job_summary(scope, workers)
+
+      grouped_summary =
+        Jobs.worker_job_summaries_by_group(scope, [
+          %{key: :runtime_cleanup_card, workers: workers}
+        ])
+        |> Map.fetch!(:runtime_cleanup_card)
+
+      assert grouped_summary == single_summary
+
+      assert Enum.all?(
+               [grouped_summary.latest, grouped_summary.latest_failure],
+               &safe_job_shape?/1
+             )
+    end
+
+    test "single-summary facade keeps empty and invalid scopes safe-empty" do
+      job =
+        insert_listing_job(1,
+          worker: RuntimeStateCleanupWorker,
+          state: "retryable",
+          inserted_at: ~U[2026-05-04 10:00:00Z],
+          attempted_at: ~U[2026-05-04 10:01:00Z]
+        )
+
+      assert Jobs.worker_job_summary(:system, []) == empty_worker_job_summary()
+
+      assert Jobs.worker_job_summary(:invalid_scope, [worker_name(RuntimeStateCleanupWorker)]) ==
+               empty_worker_job_summary()
+
+      refute inspect(Jobs.worker_job_summary(:system, [])) =~ Integer.to_string(job.id)
+    end
+
+    test "grouped worker summaries preserve target metadata from the single-summary path" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+      scope = Scope.for_user(owner, ["instance_owner"])
+      pool = pool_fixture(%{name: "Summary target pool", slug: "summary-target-pool"})
+
+      %{identity: assignment_identity, assignment: assignment} =
+        upstream_assignment_fixture(pool, %{
+          account_label: "Assignment identity",
+          assignment_label: "Summary assignment"
+        })
+
+      direct_identity = active_upstream_identity_fixture(%{account_label: "Direct identity"})
+      %{api_key: api_key} = api_key_fixture(pool, %{display_name: "Summary API key"})
+
+      cases = [
+        {:pool_target, %{"pool_id" => pool.id}},
+        {:assignment_target,
+         %{"pool_id" => pool.id, "pool_upstream_assignment_id" => assignment.id}},
+        {:upstream_identity_target, %{"upstream_identity_id" => direct_identity.id}},
+        {:api_key_target, %{"pool_id" => pool.id, "api_key_id" => api_key.id}},
+        {:rollup_target, %{"rollup_date" => "2026-05-03"}}
+      ]
+
+      for {group_key, args} <- cases do
+        Repo.delete_all(Oban.Job)
+
+        insert_listing_job(1,
+          worker: CatalogSyncWorker,
+          state: "completed",
+          inserted_at: ~U[2026-05-04 10:00:00Z],
+          completed_at: ~U[2026-05-04 10:01:00Z],
+          args: args
+        )
+
+        workers = [worker_name(CatalogSyncWorker)]
+        single_summary = Jobs.worker_job_summary(scope, workers)
+
+        grouped_summary =
+          Jobs.worker_job_summaries_by_group(scope, [%{key: group_key, workers: workers}])
+          |> Map.fetch!(group_key)
+
+        assert grouped_summary.latest.target == single_summary.latest.target
+        assert safe_job_shape?(grouped_summary.latest)
+      end
+
+      assert assignment_identity.id
+    end
+
     test "returns safe metadata for terminal and non-terminal Oban states" do
       base_time = ~U[2026-05-04 10:00:00Z]
 
@@ -381,7 +922,23 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
     end
   end
 
-  defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
+  defp worker_group(key, workers), do: %{key: key, workers: Enum.map(workers, &worker_name/1)}
+
+  defp worker_name(worker) when is_atom(worker),
+    do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
+
+  defp worker_name(worker) when is_binary(worker), do: worker
+
+  defp empty_worker_job_summary do
+    %{
+      latest: nil,
+      latest_success: nil,
+      latest_failure: nil,
+      pending: nil,
+      active: [],
+      unresolved_failures: []
+    }
+  end
 
   defp user_fixture(attrs) do
     %User{}

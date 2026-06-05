@@ -55,6 +55,7 @@ defmodule CodexPooler.Jobs do
            }}
   @type job_summary :: ReadModel.job_summary()
   @type worker_job_summary :: ReadModel.worker_job_summary()
+  @type worker_job_summaries_by_group :: ReadModel.worker_job_summaries_by_group()
   @type orchestration_result :: {:ok, map()} | {:error, term()}
 
   @spec enqueue_catalog_sync(pool_ref(), keyword()) :: job_insert_result()
@@ -109,6 +110,12 @@ defmodule CodexPooler.Jobs do
 
   @spec worker_job_summary(ReadModel.scope_ref(), [String.t()]) :: worker_job_summary()
   def worker_job_summary(scope, workers), do: ReadModel.worker_job_summary(scope, workers)
+
+  @spec worker_job_summaries_by_group(ReadModel.scope_ref(), [ReadModel.worker_group()]) ::
+          worker_job_summaries_by_group()
+  def worker_job_summaries_by_group(scope, worker_groups) do
+    ReadModel.worker_job_summaries_by_group(scope, worker_groups)
+  end
 
   @spec cleanup_runtime_state(DateTime.t()) :: orchestration_result()
   def cleanup_runtime_state(now \\ DateTime.utc_now()) do
