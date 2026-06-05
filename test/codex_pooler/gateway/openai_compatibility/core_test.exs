@@ -1558,7 +1558,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
               "size" => "1024x1024",
               "quality" => "high",
               "background" => "transparent",
-              "input_fidelity" => "high"
+              "input_fidelity" => "high",
+              "output_format" => "png"
             }
           ] do
         payload = %{

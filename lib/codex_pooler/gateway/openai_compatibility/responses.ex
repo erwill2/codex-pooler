@@ -331,7 +331,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
            "size",
            "quality",
            "background",
-           "input_fidelity"
+           "input_fidelity",
+           "output_format"
          ])
 
   defp validate_tool(%{"type" => "image_generation"} = tool),
