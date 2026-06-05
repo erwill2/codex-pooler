@@ -326,6 +326,7 @@ body {
 }
 
 .pool-redesign-audit .audit-name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -351,6 +352,26 @@ body {
   gap: 0.45rem;
 }
 
+.pool-redesign-audit .audit-identity {
+  min-width: 0;
+}
+
+.pool-redesign-audit .pool-card-title-line {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.pool-redesign-audit .pool-card-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.45rem;
+}
+
 .pool-redesign-audit .audit-row-v2 {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -361,7 +382,7 @@ body {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 0.6rem;
-  align-items: start;
+  align-items: center;
 }
 
 .pool-redesign-audit .audit-row-v2 .audit-states {
@@ -369,7 +390,7 @@ body {
   order: 2;
 }
 
-.pool-redesign-audit .audit-row-v2 .audit-command-line > .dropdown {
+.pool-redesign-audit .audit-row-v2 .pool-card-actions {
   justify-self: end;
 }
 
@@ -401,14 +422,11 @@ body {
   font-weight: 700;
 }
 
-.pool-token-histogram-header p {
-  color: color-mix(in oklab, var(--color-base-content) 56%, transparent);
-  font-size: 0.68rem;
-}
-
-.pool-token-histogram-header span {
+.pool-token-histogram-total {
   flex-shrink: 0;
+  font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   font-size: 0.72rem;
+  font-variant-numeric: normal;
   font-weight: 800;
   color: color-mix(in oklab, var(--color-base-content) 84%, transparent);
 }

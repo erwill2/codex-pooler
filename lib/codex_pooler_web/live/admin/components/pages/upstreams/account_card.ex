@@ -45,7 +45,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
             <span
               id={"upstream-account-#{@account.identity.id}-workspace"}
               data-role="upstream-workspace-context"
-              class="badge badge-ghost badge-sm shrink-0 max-w-48 truncate text-[0.65rem]"
+              class="badge badge-ghost badge-sm shrink-0 max-w-48 truncate text-[0.65rem] text-base-content/50"
               title={workspace_context_title(@account)}
             >
               {workspace_context_label(@account)}

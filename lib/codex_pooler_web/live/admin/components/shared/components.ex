@@ -532,26 +532,34 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :icon, :string, required: true
   attr :label, :string, required: true
   attr :variant, :atom, default: :secondary, values: [:secondary, :danger, :positive, :warning]
+  attr :copy_feedback?, :boolean, default: false
 
   attr :rest, :global,
     include:
-      ~w(href navigate patch disabled phx-click phx-value-id phx-value-pool-id title aria-label)
+      ~w(href navigate patch disabled phx-click phx-hook phx-update phx-value-id phx-value-pool-id title aria-label data-copy-text data-copy-label data-copied-label)
 
   def dropdown_action_item(assigns) do
-    assigns = assign(assigns, :class, dropdown_action_item_class(assigns.variant))
+    assigns =
+      assigns
+      |> assign(:class, dropdown_action_item_class(assigns.variant))
+      |> assign(:icon_class, ["size-4", assigns.copy_feedback? && "copy-icon"])
+      |> assign(
+        :label_attrs,
+        if(assigns.copy_feedback?, do: %{"data-copy-label" => ""}, else: %{})
+      )
 
     if assigns.rest[:href] || assigns.rest[:navigate] || assigns.rest[:patch] do
       ~H"""
       <.link id={@id} class={@class} {@rest}>
-        <.icon name={@icon} class="size-4" />
-        <span>{@label}</span>
+        <.icon name={@icon} class={@icon_class} />
+        <span {@label_attrs}>{@label}</span>
       </.link>
       """
     else
       ~H"""
       <button id={@id} type="button" class={@class} {@rest}>
-        <.icon name={@icon} class="size-4" />
-        <span>{@label}</span>
+        <.icon name={@icon} class={@icon_class} />
+        <span {@label_attrs}>{@label}</span>
       </button>
       """
     end

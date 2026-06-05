@@ -645,6 +645,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              "Primary Codex"
            )
 
+    assert render(view) =~
+             ~r/id="upstream-account-#{identity.id}-workspace"[^>]*class="badge badge-ghost badge-sm shrink-0 max-w-48 truncate text-\[0\.65rem\] text-base-content\/50"/
+
     refute has_element?(view, "#upstream-account-#{identity.id}-cockpit-link")
 
     open_auth_json_import_dialog(view)

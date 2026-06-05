@@ -184,7 +184,29 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-row-#{pool.id}-request-count-5h", "0")
     assert has_element?(view, "#pool-row-#{pool.id}-tokens-per-sec", "0")
     assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy", "Deterministic rotation")
-    assert has_element?(view, "#pool-row-#{pool.id}-id", pool.id)
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-title-line #pool-row-#{pool.id}-routing-strategy"
+           )
+
+    assert render(view) =~
+             ~r/id="pool-row-#{pool.id}-routing-strategy"[^>]*class="badge badge-ghost badge-sm shrink-0 max-w-48 truncate text-\[0\.65rem\] text-base-content\/50"/
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-actions #pool-row-#{pool.id}-status",
+             "active"
+           )
+
+    refute has_element?(view, "#pool-row-#{pool.id}-id")
+
+    assert has_element?(
+             view,
+             "#copy-pool-id-#{pool.id}[phx-hook='ClipboardCopy'][data-copy-text='#{pool.id}']",
+             "Copy Pool ID"
+           )
+
     assert has_element?(view, "#pool-row-#{pool.id}-activity[data-role='pool-activity-panel']")
 
     assert has_element?(
@@ -336,6 +358,18 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-row-#{pool.id}-request-count-5h", "1")
     assert has_element?(view, "#pool-row-#{pool.id}-tokens-per-sec", "50.0")
     assert has_element?(view, "#pool-row-#{pool.id}-traffic-histogram", "Traffic 24h")
+
+    refute has_element?(
+             view,
+             "#pool-row-#{pool.id}-traffic-histogram",
+             "Tokens and requests by hour"
+           )
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-traffic-histogram-total.pool-token-histogram-total"
+           )
+
     assert has_element?(view, "#pool-row-#{pool.id}-traffic-histogram", "100 tokens")
     assert has_element?(view, "#pool-row-#{pool.id}-traffic-histogram", "1 request")
 
@@ -402,16 +436,34 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#inspect-pool-#{pool.id}")
     refute has_element?(view, "#pool-row-#{pool.id}", "admin-pools")
     refute has_element?(view, "article#pool-row-#{pool.id}", "Created")
-    assert has_element?(view, "#pool-row-#{pool.id}-status", "active")
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-actions #pool-row-#{pool.id}-status",
+             "active"
+           )
+
     assert has_element?(view, "#pool-row-#{pool.id}-upstream-account-count")
     assert has_element?(view, "#pool-row-#{pool.id}-api-key-count")
     assert has_element?(view, "#pool-row-#{pool.id}-request-count-5h")
     assert has_element?(view, "#pool-row-#{pool.id}-tokens-per-sec")
-    assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy")
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-title-line #pool-row-#{pool.id}-routing-strategy"
+           )
+
     assert has_element?(view, "#pool-row-#{pool.id}-activity")
     refute has_element?(view, "#pool-row-#{pool.id}-quota-remaining")
     refute has_element?(view, "#pool-row-#{pool.id}-quota-capacity")
     assert has_element?(view, "#pool-actions-menu-#{pool.id}")
+
+    assert has_element?(
+             view,
+             "#copy-pool-id-#{pool.id}[data-copy-text='#{pool.id}']",
+             "Copy Pool ID"
+           )
+
     refute has_element?(view, "#pool-status-form-#{pool.id}")
     refute has_element?(view, "#archive-pool-#{pool.id}")
     refute has_element?(view, "#pool-row-#{pool.id}-compatibility-mode")

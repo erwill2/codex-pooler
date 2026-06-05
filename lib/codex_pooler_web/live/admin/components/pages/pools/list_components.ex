@@ -350,34 +350,33 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       <div class="audit-row audit-row-v2">
         <div class="audit-command-line">
           <div class="audit-identity">
-            <button
-              id={"inspect-pool-#{@pool_row.pool.id}"}
-              type="button"
-              class="audit-name text-left text-base-content transition-colors hover:text-primary"
-              phx-click="select_pool"
-              phx-value-id={@pool_row.pool.id}
-            >
-              {@pool_row.pool.name}
-            </button>
-            <p id={"pool-row-#{@pool_row.pool.id}-id"} class="audit-id">
-              {@pool_row.pool.id}
-            </p>
+            <div id={"pool-row-#{@pool_row.pool.id}-title-line"} class="pool-card-title-line">
+              <button
+                id={"inspect-pool-#{@pool_row.pool.id}"}
+                type="button"
+                class="audit-name text-left text-base-content transition-colors hover:text-primary"
+                phx-click="select_pool"
+                phx-value-id={@pool_row.pool.id}
+              >
+                {@pool_row.pool.name}
+              </button>
+              <span
+                id={"pool-row-#{@pool_row.pool.id}-routing-strategy"}
+                class={routing_strategy_class()}
+              >
+                {AdminBadges.routing_strategy_label(@pool_row.routing_strategy)}
+              </span>
+            </div>
           </div>
-          <div class="audit-states">
+          <div id={"pool-row-#{@pool_row.pool.id}-actions"} class="pool-card-actions">
             <span
               id={"pool-row-#{@pool_row.pool.id}-status"}
               class={AdminBadges.lifecycle_chip_class(@pool_row.pool.status)}
             >
               {@pool_row.pool.status}
             </span>
-            <span
-              id={"pool-row-#{@pool_row.pool.id}-routing-strategy"}
-              class={routing_strategy_class()}
-            >
-              {AdminBadges.routing_strategy_label(@pool_row.routing_strategy)}
-            </span>
+            <.pool_action_menu pool_row={@pool_row} can_manage_pools?={@can_manage_pools?} />
           </div>
-          <.pool_action_menu pool_row={@pool_row} can_manage_pools?={@can_manage_pools?} />
         </div>
       </div>
       <.pool_activity_panel pool_row={@pool_row} />
@@ -456,9 +455,11 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
         <div class="pool-token-histogram-header">
           <div class="grid gap-1">
             <h3>{@traffic_histogram_card.title}</h3>
-            <p>{@traffic_histogram_card.description}</p>
           </div>
-          <span id={"pool-row-#{@pool_row.pool.id}-traffic-histogram-total"}>
+          <span
+            id={"pool-row-#{@pool_row.pool.id}-traffic-histogram-total"}
+            class="pool-token-histogram-total"
+          >
             {@traffic_histogram_card.total_label}
           </span>
         </div>
@@ -520,6 +521,20 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       >
         <li>
           <AdminComponents.dropdown_action_item
+            id={"copy-pool-id-#{@pool_row.pool.id}"}
+            icon="hero-clipboard-document"
+            label="Copy Pool ID"
+            copy_feedback?={true}
+            phx-hook="ClipboardCopy"
+            phx-update="ignore"
+            data-copy-text={@pool_row.pool.id}
+            data-copy-label="Copy Pool ID"
+            data-copied-label="Copied"
+            aria-label={"Copy ID for #{@pool_row.pool.name}"}
+          />
+        </li>
+        <li>
+          <AdminComponents.dropdown_action_item
             id={"edit-pool-#{@pool_row.pool.id}"}
             icon="hero-pencil-square"
             label="Edit"
@@ -546,7 +561,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
   end
 
   defp routing_strategy_class do
-    "#{AdminBadges.metadata_chip_class(:neutral)} whitespace-nowrap"
+    "badge badge-ghost badge-sm shrink-0 max-w-48 truncate text-[0.65rem] text-base-content/50"
   end
 
   defp pool_traffic_histogram_card(pool_row) do
@@ -576,7 +591,6 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
 
     %{
       title: "Traffic 24h",
-      description: "Tokens and requests by hour",
       total_label:
         "#{format_token_count(token_total)} tokens / #{format_request_count(request_total)}",
       categories: Jason.encode!(Enum.map(points, & &1.label)),
