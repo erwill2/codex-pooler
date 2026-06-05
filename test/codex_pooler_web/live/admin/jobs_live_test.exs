@@ -222,9 +222,13 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert has_element?(view, "#admin-jobs-worker-grid.items-start")
     assert has_element?(view, worker_card_selector(:runtime_cleanup), "Runtime cleanup")
     assert has_element?(view, "#{worker_card_selector(:runtime_cleanup)} .hero-sparkles")
-    assert has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "Completed")
 
-    assert has_element?(
+    refute has_element?(
+             view,
+             "#{worker_card_selector(:runtime_cleanup)} [data-role='worker-state-badge']"
+           )
+
+    refute has_element?(
              view,
              "#{worker_card_selector(:runtime_cleanup)}",
              "Expired state cleanup"
@@ -267,8 +271,12 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     refute has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "Last success")
     refute has_element?(view, "#{worker_card_selector(:runtime_cleanup)}", "Last failure")
     assert has_element?(view, "#{worker_card_selector(:catalog_sync)}", "Catalog sync")
-    assert has_element?(view, "#{worker_card_selector(:catalog_sync)}", "Model catalog refresh")
-    assert has_element?(view, "#{worker_card_selector(:catalog_sync)}", "Awaiting first run")
+    refute has_element?(view, "#{worker_card_selector(:catalog_sync)}", "Model catalog refresh")
+
+    refute has_element?(
+             view,
+             "#{worker_card_selector(:catalog_sync)} [data-role='worker-state-badge']"
+           )
 
     rendered = render(view)
     assert rendered =~ "2xl:grid-cols-3"

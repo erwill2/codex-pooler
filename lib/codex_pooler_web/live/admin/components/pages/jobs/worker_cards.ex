@@ -36,17 +36,17 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
   defp job_worker_card_header(assigns) do
     ~H"""
     <header class="grid min-w-0 gap-3 px-4 pb-3 pt-4 sm:grid-cols-[minmax(0,1fr)_auto]">
-      <div class="flex min-w-0 items-start gap-2.5">
-        <span class="grid size-9 shrink-0 place-items-center rounded-box border border-base-300 bg-base-200 text-base-content/70">
-          <.icon name={@card.icon} class="size-4" />
-        </span>
-        <div class="grid min-w-0 gap-0.5">
+      <div data-role="worker-card-title-row" class="flex min-w-0 items-center gap-2.5">
+        <.icon name={@card.icon} class="size-5 shrink-0 text-base-content/45" />
+        <div class="grid min-w-0">
           <h2 class="truncate text-base font-semibold text-base-content">{@card.title}</h2>
-          <p class="text-xs leading-5 text-base-content/60">{@card.description}</p>
         </div>
       </div>
 
-      <div class="flex flex-wrap items-start gap-2 sm:justify-end">
+      <div
+        :if={worker_state_badge_visible?(@card.state)}
+        class="flex flex-wrap items-start gap-2 sm:justify-end"
+      >
         <span
           data-role="worker-state-badge"
           title={@card.state_label}
@@ -56,12 +56,7 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
             "shrink-0 gap-1.5 whitespace-nowrap"
           ]}
         >
-          <span
-            :if={@card.live_state}
-            data-role="worker-live-dot"
-            class="size-2 rounded-full bg-current motion-safe:animate-pulse"
-          />
-          <.icon :if={!@card.live_state} name={job_state_icon(@card.state)} class="size-4" />
+          <.icon name={job_state_icon(@card.state)} class="size-4" />
           <span>{@card.state_label}</span>
         </span>
       </div>
@@ -272,10 +267,11 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
           <dd class="truncate text-base-content/60">
             <span
               data-role="next-run"
-              class="tabular-nums"
+              class="inline-flex max-w-full items-center gap-1 tabular-nums"
               title={@card.next_run_title}
             >
-              {@card.next_run}
+              <.icon name="hero-clock" class="size-3 shrink-0" />
+              <span class="truncate">{@card.next_run}</span>
             </span>
           </dd>
         </div>
@@ -318,6 +314,9 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
     |> worker_state_tone()
     |> AdminBadges.metadata_chip_class()
   end
+
+  defp worker_state_badge_visible?("executing"), do: true
+  defp worker_state_badge_visible?(_state), do: false
 
   defp worker_state_tone(state) do
     case to_string(state || "") do

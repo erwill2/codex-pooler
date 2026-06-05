@@ -261,7 +261,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     assert has_element?(view, "#job-detail-sidebar #job-detail-failure-summary", "refresh failed")
   end
 
-  test "worker cards use short copy and compact schedule facts", %{conn: conn} do
+  test "worker cards omit subtitles and keep compact schedule facts", %{conn: conn} do
     job =
       insert_job(
         1,
@@ -276,13 +276,13 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs?show_completed=true")
     card = worker_card_selector(:runtime_cleanup)
 
-    assert has_element?(view, "#{card}", "Expired state cleanup")
+    assert has_element?(view, "#{card}", "Runtime cleanup")
+    assert has_element?(view, "#{card} [data-role='worker-card-title-row'].items-center")
+    assert has_element?(view, "#{card} [data-role='worker-card-title-row'] > .hero-sparkles")
+    refute has_element?(view, "#{card} [data-role='worker-card-title-row'] > .rounded-box")
+    refute has_element?(view, "#{card}", "Expired state cleanup")
 
-    assert has_element?(
-             view,
-             "#{card} [data-role='worker-state-badge'].rounded-full",
-             "Completed"
-           )
+    refute has_element?(view, "#{card} [data-role='worker-state-badge']")
 
     refute has_element?(view, "#{card} [data-role='state-icon']")
 
@@ -314,15 +314,21 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     rendered = render(view)
 
-    assert rendered =~ "border-success/20 bg-success/10"
     assert rendered =~ ~s(data-role="worker-schedule-grid")
+    refute has_element?(view, "#{card} [data-role='worker-state-badge']")
 
-    assert rendered =~ "Model catalog refresh"
-    assert rendered =~ "Pricing data refresh"
-    assert rendered =~ "Upstream account checks"
-    assert rendered =~ "Alert rule checks"
-    assert rendered =~ "Access-token renewal"
-    assert rendered =~ "Usage rollup rebuild"
+    refute has_element?(view, worker_card_selector(:catalog_sync), "Model catalog refresh")
+    refute has_element?(view, worker_card_selector(:pricing_import), "Pricing data refresh")
+
+    refute has_element?(
+             view,
+             worker_card_selector(:account_reconciliation),
+             "Upstream account checks"
+           )
+
+    refute has_element?(view, worker_card_selector(:alert_evaluation), "Alert rule checks")
+    refute has_element?(view, worker_card_selector(:token_refresh), "Access-token renewal")
+    refute has_element?(view, worker_card_selector(:daily_rollup_rebuild), "Usage rollup rebuild")
     refute rendered =~ "Expired files, sessions, runtime state, and stale reconciliation cleanup"
     refute rendered =~ "OpenAI pricing JSON catalog refreshes"
     refute rendered =~ "Quota, health, token, and catalog checks"
@@ -379,7 +385,9 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     rendered = render(view)
 
     assert has_element?(view, "#{card} [data-role='worker-activity-strip']")
-    assert has_element?(view, "#{card} [data-role='worker-live-dot']")
+    assert has_element?(view, "#{card} [data-role='worker-state-badge']", "Executing")
+    assert has_element?(view, "#{card} [data-role='worker-state-badge'] .hero-clock")
+    refute has_element?(view, "#{card} [data-role='worker-live-dot']")
     refute rendered =~ "Account fan-out slots are always visible"
     refute rendered =~ "Empty slots stay reserved"
     refute rendered =~ "job-target-board"
@@ -768,6 +776,9 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
     card = worker_card_selector(:token_refresh)
+
+    assert has_element?(view, "#{card} [data-role='next-run']", "On demand")
+    assert has_element?(view, "#{card} [data-role='next-run'] .hero-clock")
 
     assert has_element?(
              view,

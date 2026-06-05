@@ -33,8 +33,20 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
 
     assert has_element?(view, "#admin-jobs-worker-grid")
-    assert has_element?(view, worker_card_selector(:catalog_sync), "Awaiting first run")
-    assert has_element?(view, worker_card_selector(:token_refresh), "No observed run")
+    assert has_element?(view, worker_card_selector(:catalog_sync), "Catalog sync")
+
+    refute has_element?(
+             view,
+             "#{worker_card_selector(:catalog_sync)} [data-role='worker-state-badge']"
+           )
+
+    assert has_element?(view, worker_card_selector(:token_refresh), "Token refresh")
+
+    refute has_element?(
+             view,
+             "#{worker_card_selector(:token_refresh)} [data-role='worker-state-badge']"
+           )
+
     assert has_element?(view, "#admin-jobs-explorer")
     assert has_element?(view, "#admin-jobs-explorer-total", "0 jobs")
     assert has_element?(view, "#admin-jobs-explorer-range", "Showing 0 of 0")
@@ -65,7 +77,12 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTableTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
 
     refute has_element?(view, "#job-#{catalog_job.id}")
-    assert has_element?(view, worker_card_selector(:catalog_sync), "Completed")
+
+    refute has_element?(
+             view,
+             "#{worker_card_selector(:catalog_sync)} [data-role='worker-state-badge']"
+           )
+
     assert has_element?(view, worker_card_selector(:catalog_sync), "10:01:00 UTC")
   end
 
