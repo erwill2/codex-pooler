@@ -7,6 +7,7 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
 
   alias CodexPoolerWeb.Admin.AvatarComponents
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
+  alias CodexPoolerWeb.Admin.Components, as: AdminComponents
 
   attr :card, :map, required: true
   attr :datetime_preferences, :map, required: true
@@ -44,10 +45,11 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
       </div>
 
       <div
-        :if={worker_state_badge_visible?(@card.state)}
-        class="flex flex-wrap items-start gap-2 sm:justify-end"
+        :if={worker_state_badge_visible?(@card.state) or @card.manual_enqueue}
+        class="flex flex-wrap items-center gap-2 sm:justify-end"
       >
         <span
+          :if={worker_state_badge_visible?(@card.state)}
           data-role="worker-state-badge"
           title={@card.state_label}
           aria-label={"State: #{@card.state_label}"}
@@ -59,8 +61,44 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
           <.icon name={job_state_icon(@card.state)} class="size-4" />
           <span>{@card.state_label}</span>
         </span>
+        <.worker_card_actions :if={@card.manual_enqueue} card={@card} />
       </div>
     </header>
+    """
+  end
+
+  attr :card, :map, required: true
+
+  defp worker_card_actions(assigns) do
+    ~H"""
+    <div
+      class="dropdown dropdown-end inline-block shrink-0 self-center"
+      data-role="job-worker-card-actions"
+    >
+      <button
+        id={"job-worker-actions-menu-#{@card.id}"}
+        type="button"
+        class="btn btn-ghost btn-sm btn-square"
+        tabindex="0"
+        aria-label={"Actions for #{@card.title}"}
+      >
+        <.icon name="hero-ellipsis-vertical" class="size-5" />
+      </button>
+      <ul
+        tabindex="0"
+        class="menu dropdown-content z-20 mt-2 w-60 rounded-box border border-base-300 bg-base-100 p-2 text-left shadow-xl"
+      >
+        <li>
+          <AdminComponents.dropdown_action_item
+            id={"enqueue-job-worker-#{@card.id}"}
+            icon="hero-play"
+            label="Enqueue Now"
+            phx-click="enqueue_worker_group"
+            phx-value-id={Atom.to_string(@card.key)}
+          />
+        </li>
+      </ul>
+    </div>
     """
   end
 

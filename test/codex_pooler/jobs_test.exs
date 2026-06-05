@@ -119,6 +119,41 @@ defmodule CodexPooler.JobsTest do
     end
   end
 
+  describe "manual worker group enqueue" do
+    test "fans out targetless catalog sync requests to active pools" do
+      pool = pool_fixture()
+
+      assert {:ok, %{inserted: [job], conflicts: [], errors: []}} =
+               Jobs.enqueue_worker_group_now("catalog-sync", trigger_kind: "admin_jobs_live")
+
+      assert job.args == %{"pool_id" => pool.id, "trigger_kind" => "admin_jobs_live"}
+      assert [enqueued_job] = all_enqueued(worker: CatalogSyncWorker)
+      assert enqueued_job.id == job.id
+    end
+
+    test "enqueues singleton worker groups without extra params" do
+      assert {:ok, runtime_job} = Jobs.enqueue_worker_group_now(:runtime_cleanup)
+      assert {:ok, pricing_job} = Jobs.enqueue_worker_group_now("pricing_import")
+
+      assert runtime_job.worker == worker_name(RuntimeStateCleanupWorker)
+      assert runtime_job.args == %{}
+      assert pricing_job.worker == worker_name(PricingImportWorker)
+      assert pricing_job.args == %{}
+    end
+
+    test "keeps target-scoped worker groups out of manual enqueue" do
+      assert Jobs.worker_group_manual_enqueueable?(:runtime_cleanup)
+      refute Jobs.worker_group_manual_enqueueable?("token-refresh")
+      refute Jobs.worker_group_manual_enqueueable?("unknown-worker")
+
+      assert {:error, :worker_group_requires_target} =
+               Jobs.enqueue_worker_group_now("token-refresh")
+
+      assert {:error, :unknown_worker_group} = Jobs.enqueue_worker_group_now("unknown-worker")
+      assert [] = all_enqueued(worker: TokenRefreshWorker)
+    end
+  end
+
   describe "catalog jobs" do
     test "deduplicates duplicate catalog sync enqueue for the same pool" do
       pool = pool_fixture()
@@ -397,6 +432,8 @@ defmodule CodexPooler.JobsTest do
     |> worker.new()
     |> Ecto.Changeset.get_field(:max_attempts)
   end
+
+  defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
 
   defp active_assignment_fixture(metadata) do
     pool = pool_fixture()

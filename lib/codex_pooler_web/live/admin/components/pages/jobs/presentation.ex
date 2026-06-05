@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
   Presentation read model for the admin jobs dashboard.
   """
 
+  alias CodexPooler.Jobs
   alias CodexPooler.Jobs.Schedule
   alias CodexPoolerWeb.Admin.AvatarComponents
   alias CodexPoolerWeb.Admin.JobsPresentation.{State, Targets}
@@ -96,6 +97,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
       icon: group.icon,
       workers: group.workers,
       worker_labels: Enum.map(group.workers, &worker_label/1),
+      manual_enqueue: manual_enqueue_worker_group?(group.key),
       state: state,
       state_label: job_state_label(state),
       live_state: live_job_state?(state),
@@ -129,6 +131,9 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
     |> String.replace_prefix("CodexPooler.Jobs.", "")
     |> String.replace_suffix("Worker", "")
   end
+
+  defp manual_enqueue_worker_group?(worker_group),
+    do: Jobs.worker_group_manual_enqueueable?(worker_group)
 
   defp worker_card_state(_group, %{active: [_active | _rest]}, _latest_job), do: "executing"
   defp worker_card_state(_group, %{pending: %{state: state}}, _latest_job), do: state

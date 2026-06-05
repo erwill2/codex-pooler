@@ -4,6 +4,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
   import CodexPoolerWeb.Admin.JobsPresentation, only: [worker_cards: 2]
 
   alias CodexPooler.Events
+  alias CodexPooler.Jobs
   alias CodexPooler.Pools
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.JobDetailDrawer
@@ -127,6 +128,26 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
      push_patch(socket,
        to: ~p"/admin/jobs?#{close_worker_failure_query_params(socket.assigns.current_params)}"
      )}
+  end
+
+  def handle_event("enqueue_worker_group", %{"id" => worker_group}, socket) do
+    if socket.assigns.owner_authorized? do
+      case Jobs.enqueue_worker_group_now(worker_group, trigger_kind: "admin_jobs_live") do
+        {:ok, result} ->
+          {level, message} = enqueue_worker_group_flash(socket, worker_group, result)
+
+          {:noreply,
+           socket
+           |> put_flash(level, message)
+           |> refresh_jobs()}
+
+        {:error, reason} ->
+          {:noreply,
+           put_flash(socket, :error, enqueue_worker_group_error(socket, worker_group, reason))}
+      end
+    else
+      {:noreply, put_flash(socket, :error, "System jobs require owner access")}
+    end
   end
 
   @impl true
@@ -302,6 +323,86 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
       worker_cards: worker_cards,
       jobs_page_loaded?: true
     )
+  end
+
+  defp enqueue_worker_group_flash(socket, worker_group, %{
+         inserted: inserted,
+         conflicts: conflicts,
+         errors: errors
+       }) do
+    title = worker_group_title(socket, worker_group)
+    inserted_count = length(inserted)
+    conflicts_count = length(conflicts)
+    errors_count = length(errors)
+
+    cond do
+      errors_count > 0 ->
+        {:error,
+         "#{title} enqueue partially failed: #{inserted_count} queued, #{conflicts_count} already queued, #{errors_count} failed"}
+
+      inserted_count == 1 and conflicts_count == 0 ->
+        {:info, "#{title} queued"}
+
+      inserted_count == 0 and conflicts_count > 0 ->
+        {:info, "#{title} already queued"}
+
+      true ->
+        {:info,
+         "#{title} enqueue requested: #{inserted_count} queued, #{conflicts_count} already queued"}
+    end
+  end
+
+  defp enqueue_worker_group_flash(socket, worker_group, %{conflict?: true}) do
+    {:info, "#{worker_group_title(socket, worker_group)} already queued"}
+  end
+
+  defp enqueue_worker_group_flash(socket, worker_group, %Oban.Job{}) do
+    {:info, "#{worker_group_title(socket, worker_group)} queued"}
+  end
+
+  defp enqueue_worker_group_error(socket, worker_group, :worker_group_requires_target) do
+    "#{worker_group_title(socket, worker_group)} requires a target"
+  end
+
+  defp enqueue_worker_group_error(_socket, _worker_group, :unknown_worker_group) do
+    "Unknown worker group"
+  end
+
+  defp enqueue_worker_group_error(socket, worker_group, _reason) do
+    "#{worker_group_title(socket, worker_group)} could not be queued"
+  end
+
+  defp worker_group_title(socket, worker_group) do
+    worker_group_id = worker_group_id(worker_group)
+    worker_group_key = String.replace(worker_group_id, "-", "_")
+
+    Enum.find_value(
+      socket.assigns.worker_cards,
+      fallback_worker_group_title(worker_group),
+      fn card ->
+        if card.id == worker_group_id or Atom.to_string(card.key) == worker_group_key do
+          card.title
+        end
+      end
+    )
+  end
+
+  defp worker_group_id(worker_group) when is_atom(worker_group) do
+    worker_group
+    |> Atom.to_string()
+    |> worker_group_id()
+  end
+
+  defp worker_group_id(worker_group) when is_binary(worker_group) do
+    String.replace(worker_group, "_", "-")
+  end
+
+  defp fallback_worker_group_title(worker_group) do
+    worker_group
+    |> to_string()
+    |> String.replace("-", "_")
+    |> String.split("_", trim: true)
+    |> Enum.map_join(" ", &String.capitalize/1)
   end
 
   defp selection_only_params_change?(socket, params) do

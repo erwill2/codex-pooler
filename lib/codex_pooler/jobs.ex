@@ -15,6 +15,7 @@ defmodule CodexPooler.Jobs do
     DailyRollupRebuildWorker,
     DevelopmentControls,
     Options,
+    PricingImportWorker,
     ReadModel,
     RuntimeStateCleanup,
     RuntimeStateCleanupWorker,
@@ -53,10 +54,24 @@ defmodule CodexPooler.Jobs do
              required(:conflicts) => [Oban.Job.t()],
              required(:errors) => [term()]
            }}
+  @type manual_worker_group_enqueue_result ::
+          job_insert_result()
+          | batch_insert_result()
+          | {:error, :unknown_worker_group | :worker_group_requires_target}
   @type job_summary :: ReadModel.job_summary()
   @type worker_job_summary :: ReadModel.worker_job_summary()
   @type worker_job_summaries_by_group :: ReadModel.worker_job_summaries_by_group()
   @type orchestration_result :: {:ok, map()} | {:error, term()}
+
+  @manual_worker_groups %{
+    "catalog_sync" => :catalog_sync,
+    "pricing_import" => :pricing_import,
+    "account_reconciliation" => :account_reconciliation,
+    "alert_evaluation" => :alert_evaluation,
+    "token_refresh" => :token_refresh,
+    "daily_rollup_rebuild" => :daily_rollup_rebuild,
+    "runtime_cleanup" => :runtime_cleanup
+  }
 
   @spec enqueue_catalog_sync(pool_ref(), keyword()) :: job_insert_result()
   def enqueue_catalog_sync(pool_or_id, opts \\ []) do
@@ -98,6 +113,39 @@ defmodule CodexPooler.Jobs do
     args
     |> RuntimeStateCleanupWorker.new(Keyword.take(opts, [:scheduled_at, :schedule_in, :unique]))
     |> Oban.insert()
+  end
+
+  @spec enqueue_pricing_import(keyword()) :: job_insert_result()
+  def enqueue_pricing_import(opts \\ []) do
+    %{}
+    |> PricingImportWorker.new(Keyword.take(opts, [:scheduled_at, :schedule_in, :unique]))
+    |> Oban.insert()
+  end
+
+  @spec worker_group_manual_enqueueable?(atom() | String.t()) :: boolean()
+  def worker_group_manual_enqueueable?(worker_group) do
+    case normalize_manual_worker_group(worker_group) do
+      :unknown -> false
+      :token_refresh -> false
+      _worker_group -> true
+    end
+  end
+
+  @spec enqueue_worker_group_now(atom() | String.t(), keyword()) ::
+          manual_worker_group_enqueue_result()
+  def enqueue_worker_group_now(worker_group, opts \\ []) do
+    opts = Keyword.put_new(opts, :trigger_kind, "manual")
+
+    case normalize_manual_worker_group(worker_group) do
+      :catalog_sync -> enqueue_catalog_sync_for_active_pools(opts)
+      :pricing_import -> enqueue_pricing_import(opts)
+      :account_reconciliation -> enqueue_account_reconciliation_for_active_pools(opts)
+      :alert_evaluation -> enqueue_alert_evaluations_for_active_rules(opts)
+      :daily_rollup_rebuild -> enqueue_daily_rollup_rebuild(yesterday_utc(), opts)
+      :runtime_cleanup -> enqueue_runtime_state_cleanup(opts)
+      :token_refresh -> {:error, :worker_group_requires_target}
+      :unknown -> {:error, :unknown_worker_group}
+    end
   end
 
   @spec list_system_jobs(keyword()) :: [job_summary()]
@@ -285,6 +333,20 @@ defmodule CodexPooler.Jobs do
       _value -> "manual"
     end
   end
+
+  defp normalize_manual_worker_group(worker_group) when is_atom(worker_group) do
+    worker_group
+    |> Atom.to_string()
+    |> normalize_manual_worker_group()
+  end
+
+  defp normalize_manual_worker_group(worker_group) when is_binary(worker_group) do
+    worker_group
+    |> String.replace("-", "_")
+    |> then(&Map.get(@manual_worker_groups, &1, :unknown))
+  end
+
+  defp normalize_manual_worker_group(_worker_group), do: :unknown
 
   defp yesterday_utc, do: Date.utc_today() |> Date.add(-1)
   defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")

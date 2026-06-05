@@ -335,6 +335,42 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     assert has_element?(view, "#job-#{job.id}")
   end
 
+  test "worker card action menus enqueue runnable workers and skip target-scoped workers", %{
+    conn: conn
+  } do
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs")
+    runtime_card = worker_card_selector(:runtime_cleanup)
+    catalog_card = worker_card_selector(:catalog_sync)
+    token_card = worker_card_selector(:token_refresh)
+
+    assert has_element?(view, "#{runtime_card} [data-role='job-worker-card-actions']")
+
+    assert has_element?(
+             view,
+             "#{runtime_card} #enqueue-job-worker-runtime-cleanup",
+             "Enqueue Now"
+           )
+
+    assert has_element?(view, "#{catalog_card} #enqueue-job-worker-catalog-sync", "Enqueue Now")
+
+    refute has_element?(view, "#{token_card} [data-role='job-worker-card-actions']")
+    refute has_element?(view, "#{token_card}", "Enqueue Now")
+
+    render_click(element(view, "#{runtime_card} #enqueue-job-worker-runtime-cleanup"))
+
+    runtime_worker = worker_name(RuntimeStateCleanupWorker)
+
+    assert [
+             %Oban.Job{
+               args: %{},
+               state: "available",
+               worker: ^runtime_worker
+             }
+           ] = Repo.all(from job in Oban.Job, order_by: [asc: job.id])
+
+    assert render(view) =~ "Runtime cleanup queued"
+  end
+
   test "account reconciliation card renders one compact active marker per assignment", %{
     conn: conn
   } do
