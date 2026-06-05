@@ -19,7 +19,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     :ok
   end
 
-  test "worker cards render active markers and unresolved failure dialogs by target", %{
+  test "worker cards render active markers and unresolved failure panels by target", %{
     conn: conn
   } do
     active_pool = pool_fixture(%{name: "Active Pool", slug: "active-pool"})
@@ -104,23 +104,161 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
-             "#{card} #job-failure-#{failing_job.id}[aria-label*='Failing Pool']"
+             "#{card} #job-failure-#{failing_job.id}[aria-label*='Failing Pool'][aria-expanded='false'][aria-controls='job-failure-panel-#{failing_job.id}']"
            )
-
-    assert has_element?(view, "#{card} #job-failure-dialog-#{failing_job.id}")
-    assert has_element?(view, "#{card} #job-failure-dialog-#{failing_job.id}", "RuntimeError")
 
     assert has_element?(
              view,
-             "#{card} #job-failure-dialog-#{failing_job.id}",
+             "#{card} #{failure_panel_selector(failing_job)}[data-open='false'][aria-hidden='true']"
+           )
+
+    refute has_element?(view, "#{card} #job-failure-dialog-#{failing_job.id}")
+
+    render_click(element(view, "#{card} #job-failure-#{failing_job.id}"))
+    assert_patch(view, ~p"/admin/jobs?failure_job_id=#{failing_job.id}")
+
+    assert has_element?(
+             view,
+             "#{card} #job-failure-#{failing_job.id}[aria-expanded='true']"
+           )
+
+    assert has_element?(
+             view,
+             "#{card} #{failure_panel_selector(failing_job)}[data-open='true'][aria-hidden='false']",
+             "RuntimeError"
+           )
+
+    assert has_element?(
+             view,
+             "#{card} #{failure_panel_selector(failing_job)}",
              "catalog sync timeout"
            )
 
+    refute has_element?(view, "#job-detail-drawer[checked]")
     refute has_element?(view, "#{card} #job-failure-#{resolved_failure.id}")
 
     rendered = render(view)
     refute rendered =~ "secret-token-123"
     refute rendered =~ "Bearer secret-token"
+  end
+
+  test "selected worker failure panels survive LiveView refreshes and can close", %{conn: conn} do
+    job =
+      insert_job(
+        1,
+        worker: TokenRefreshWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 8,
+        inserted_at: ~U[2026-05-04 10:00:00Z],
+        discarded_at: ~U[2026-05-04 10:00:30Z],
+        errors: [
+          %{
+            "attempt" => 1,
+            "kind" => "RuntimeError",
+            "error" => "refresh failed"
+          }
+        ]
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs?failure_job_id=#{job.id}")
+    card = worker_card_selector(:token_refresh)
+
+    assert has_element?(
+             view,
+             "#{card} #{failure_panel_selector(job)}[data-open='true'][aria-hidden='false']",
+             "refresh failed"
+           )
+
+    send(view.pid, :refresh_jobs)
+    _ = :sys.get_state(view.pid)
+
+    assert has_element?(
+             view,
+             "#{card} #{failure_panel_selector(job)}[data-open='true'][aria-hidden='false']",
+             "refresh failed"
+           )
+
+    render_click(
+      element(view, "#{card} #{failure_panel_selector(job)} [data-role='failure-panel-close']")
+    )
+
+    assert_patch(view, ~p"/admin/jobs")
+
+    assert has_element?(
+             view,
+             "#{card} #{failure_panel_selector(job)}[data-open='false'][aria-hidden='true']"
+           )
+  end
+
+  test "opening an already rendered worker failure panel does not reload jobs", %{conn: conn} do
+    job =
+      insert_job(
+        1,
+        worker: TokenRefreshWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 8,
+        inserted_at: ~U[2026-05-04 10:00:00Z],
+        discarded_at: ~U[2026-05-04 10:00:30Z],
+        errors: [
+          %{
+            "attempt" => 1,
+            "kind" => "RuntimeError",
+            "error" => "refresh failed"
+          }
+        ]
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs")
+    card = worker_card_selector(:token_refresh)
+
+    {_result, events} =
+      capture_repo_queries(fn ->
+        render_click(element(view, "#{card} #job-failure-#{job.id}"))
+        assert_patch(view, ~p"/admin/jobs?failure_job_id=#{job.id}")
+      end)
+
+    assert oban_jobs_query_count(events) == 0
+
+    assert has_element?(
+             view,
+             "#{card} #{failure_panel_selector(job)}[data-open='true'][aria-hidden='false']",
+             "refresh failed"
+           )
+  end
+
+  test "opening an already rendered job detail drawer does not reload jobs", %{conn: conn} do
+    job =
+      insert_job(
+        1,
+        worker: TokenRefreshWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 8,
+        inserted_at: ~U[2026-05-04 10:00:00Z],
+        discarded_at: ~U[2026-05-04 10:00:30Z],
+        errors: [
+          %{
+            "attempt" => 1,
+            "kind" => "RuntimeError",
+            "error" => "refresh failed"
+          }
+        ]
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs")
+
+    {_result, events} =
+      capture_repo_queries(fn ->
+        render_click(element(view, "#admin-jobs-explorer-desktop #job-#{job.id}"))
+        assert_patch(view, ~p"/admin/jobs?job_id=#{job.id}")
+      end)
+
+    assert oban_jobs_query_count(events) == 0
+
+    assert has_element?(view, "#job-detail-drawer[checked]")
+    assert has_element?(view, "#job-detail-sidebar #job-detail-failure-summary", "refresh failed")
   end
 
   test "worker cards use short copy and compact schedule facts", %{conn: conn} do
@@ -384,26 +522,29 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
-             "#{worker_card_selector(:account_reconciliation)} #job-failure-dialog-#{job.id}",
+             "#{worker_card_selector(:account_reconciliation)} #{failure_panel_selector(job)}[data-open='false'][aria-hidden='true']"
+           )
+
+    render_click(
+      element(view, "#{worker_card_selector(:account_reconciliation)} #job-failure-#{job.id}")
+    )
+
+    assert has_element?(
+             view,
+             "#{worker_card_selector(:account_reconciliation)} #{failure_panel_selector(job)}[data-open='true'][aria-hidden='false']",
              "RuntimeError"
            )
 
     assert has_element?(
              view,
-             "#{worker_card_selector(:account_reconciliation)} #job-failure-dialog-#{job.id} [data-role='failure-message']",
+             "#{worker_card_selector(:account_reconciliation)} #{failure_panel_selector(job)} [data-role='failure-message']",
              "upstream timeout"
            )
 
     assert has_element?(
              view,
-             "#{worker_card_selector(:account_reconciliation)} [data-role='worker-latest-failure']",
+             "#{worker_card_selector(:account_reconciliation)} #{failure_panel_selector(job)}",
              "Latest failure"
-           )
-
-    assert has_element?(
-             view,
-             "#{worker_card_selector(:account_reconciliation)} [data-role='worker-latest-failure']",
-             "upstream timeout"
            )
 
     assert has_element?(view, "#job-#{job.id} [data-role='failure-details']", "Attempt 1")
@@ -443,17 +584,21 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
     card = worker_card_selector(:account_reconciliation)
 
+    render_click(element(view, "#{card} [data-role='failed-worker-marker']"))
+
     assert has_element?(
              view,
-             "#{card} [data-role='worker-latest-failure']",
+             "#{card} [data-role='worker-failure-panel'][data-open='true']",
              "Quota refresh needs account reauthentication."
            )
 
     assert has_element?(
              view,
-             "#{card} [data-role='failed-worker-dialog']",
+             "#{card} [data-role='worker-failure-panel'][data-open='true']",
              "Quota refresh blocked"
            )
+
+    refute has_element?(view, "#{card} [data-role='failed-worker-dialog']")
 
     rendered = render(view)
     refute rendered =~ "Oban.PerformError"
@@ -558,7 +703,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
     card = worker_card_selector(:account_reconciliation)
 
-    refute has_element?(view, "#{card} [data-role='worker-latest-failure']")
+    refute has_element?(view, "#{card} [data-role='worker-failure-panel']")
     refute has_element?(view, "#{card} [data-role='failed-worker-marker']")
   end
 
@@ -582,17 +727,21 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
     card = worker_card_selector(:catalog_sync)
 
+    render_click(element(view, "#{card} [data-role='failed-worker-marker']"))
+
     assert has_element?(
              view,
-             "#{card} [data-role='worker-latest-failure']",
+             "#{card} [data-role='worker-failure-panel'][data-open='true']",
              "upstream [redacted] could not be decrypted"
            )
 
     assert has_element?(
              view,
-             "#{card} [data-role='failed-worker-dialog']",
+             "#{card} [data-role='worker-failure-panel'][data-open='true']",
              "Catalog sync failed"
            )
+
+    refute has_element?(view, "#{card} [data-role='failed-worker-dialog']")
 
     rendered = render(view)
     refute rendered =~ "Oban.PerformError"
@@ -622,28 +771,37 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
-             "#{card} [data-role='worker-latest-failure']",
+             "#{card} [data-role='worker-failure-panel'][data-open='false'][aria-hidden='true']"
+           )
+
+    render_click(element(view, "#{card} [data-role='failed-worker-marker']"))
+
+    assert has_element?(
+             view,
+             "#{card} [data-role='worker-failure-panel'][data-open='true']",
              "The job stopped without additional diagnostics."
            )
 
     assert has_element?(
              view,
-             "#{card} [data-role='worker-latest-failure'] > div > [data-role='latest-failure-message']",
+             "#{card} [data-role='worker-failure-panel'][data-open='true'] [data-role='failure-message']",
              "The job stopped without additional diagnostics."
            )
 
     assert has_element?(
              view,
-             "#{card} [data-role='latest-failure-summary'] [data-role='latest-failure-meta']"
+             "#{card} [data-role='failure-panel-summary'] [data-role='failure-panel-meta']"
            )
 
-    refute has_element?(view, "#{card} [data-role='latest-failure-message'].line-clamp-2")
+    refute has_element?(view, "#{card} [data-role='failure-message'].line-clamp-2")
 
     assert has_element?(
              view,
-             "#{card} [data-role='failed-worker-dialog']",
+             "#{card} [data-role='worker-failure-panel'][data-open='true']",
              "Run discarded"
            )
+
+    refute has_element?(view, "#{card} [data-role='failed-worker-dialog']")
 
     rendered = render(view)
     refute rendered =~ "Oban.PerformError"
@@ -689,12 +847,57 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     "#job-worker-card-#{String.replace(Atom.to_string(worker_group), "_", "-")}"
   end
 
+  defp failure_panel_selector(job), do: "#job-failure-panel-#{job.id}"
+
   defp count_occurrences(source, pattern) do
     source
     |> String.split(pattern)
     |> length()
     |> Kernel.-(1)
   end
+
+  def handle_repo_query_event(_event, _measurements, metadata, {handler_id, test_pid}) do
+    if metadata[:repo] == Repo do
+      send(test_pid, {handler_id, %{source: normalize_source(metadata[:source])}})
+    end
+  end
+
+  defp capture_repo_queries(fun) when is_function(fun, 0) do
+    test_pid = self()
+    handler_id = {__MODULE__, test_pid, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        &__MODULE__.handle_repo_query_event/4,
+        {handler_id, test_pid}
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_query_events(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_query_events(handler_id, events) do
+    receive do
+      {^handler_id, event} ->
+        drain_repo_query_events(handler_id, [event | events])
+    after
+      10 -> Enum.reverse(events)
+    end
+  end
+
+  defp oban_jobs_query_count(events) do
+    Enum.count(events, &(&1.source == "oban_jobs"))
+  end
+
+  defp normalize_source(nil), do: "unknown"
+  defp normalize_source(source) when is_binary(source), do: source
+  defp normalize_source(source), do: to_string(source)
 
   defp maybe_put_worker_name(updates) do
     if Keyword.has_key?(updates, :worker) do

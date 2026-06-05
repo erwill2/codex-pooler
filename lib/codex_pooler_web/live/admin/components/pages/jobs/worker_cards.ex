@@ -10,6 +10,7 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
 
   attr :card, :map, required: true
   attr :datetime_preferences, :map, required: true
+  attr :selected_failure_job_id, :integer, default: nil
 
   def job_worker_card(assigns) do
     ~H"""
@@ -19,15 +20,12 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
     >
       <.job_worker_card_header card={@card} />
 
-      <.worker_activity_strip card={@card} />
-      <.job_failure_dialog
-        :for={marker <- @card.visible_failure_markers}
+      <.worker_activity_strip card={@card} selected_failure_job_id={@selected_failure_job_id} />
+      <.worker_failure_panel
+        :for={{marker, marker_index} <- Enum.with_index(@card.visible_failure_markers)}
         marker={marker}
-        datetime_preferences={@datetime_preferences}
-      />
-      <.worker_latest_failure
-        :if={@card.latest_failure}
-        card={@card}
+        latest?={marker_index == 0}
+        open?={marker.id == @selected_failure_job_id}
         datetime_preferences={@datetime_preferences}
       />
       <.worker_schedule_facts card={@card} datetime_preferences={@datetime_preferences} />
@@ -126,14 +124,20 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
             id={"job-failure-#{marker.id}"}
             type="button"
             data-role="failed-worker-marker"
+            aria-controls={"job-failure-panel-#{marker.id}"}
+            aria-expanded={to_string(marker.id == @selected_failure_job_id)}
             aria-label={marker.title}
             title={marker.title}
             data-has-avatar={marker.avatar_email && "true"}
+            data-selected={marker.id == @selected_failure_job_id && "true"}
+            phx-click="toggle_worker_failure"
+            phx-value-job-id={marker.id}
             class={[
               "avatar avatar-offline relative size-8 shrink-0 rounded-full text-[0.6875rem] font-semibold leading-none shadow-sm transition-opacity hover:opacity-80 focus:outline-none focus:ring-2 focus:ring-error/40",
+              marker.id == @selected_failure_job_id &&
+                "ring-2 ring-error/50 ring-offset-2 ring-offset-base-100",
               !marker.avatar_email && "avatar-placeholder"
             ]}
-            onclick={"document.getElementById('job-failure-dialog-#{marker.id}').showModal()"}
           >
             <div class="size-8 rounded-full ring-1 ring-error/40">
               <img
@@ -167,92 +171,83 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
     """
   end
 
-  attr :card, :map, required: true
+  attr :marker, :map, required: true
+  attr :latest?, :boolean, required: true
+  attr :open?, :boolean, required: true
   attr :datetime_preferences, :map, required: true
 
-  defp worker_latest_failure(assigns) do
+  defp worker_failure_panel(assigns) do
     ~H"""
     <section
-      data-role="worker-latest-failure"
-      class="border-t border-error/20 bg-error/5 px-4 py-3 text-sm"
+      id={"job-failure-panel-#{@marker.id}"}
+      data-role="worker-failure-panel"
+      data-open={to_string(@open?)}
+      aria-hidden={to_string(!@open?)}
+      class={[
+        "grid border-t border-error/20 bg-error/5 text-sm transition-[grid-template-rows,opacity] duration-200 ease-out motion-reduce:transition-none",
+        @open? && "grid-rows-[1fr] opacity-100",
+        !@open? && "grid-rows-[0fr] opacity-0"
+      ]}
     >
-      <div class="grid gap-3">
-        <div
-          data-role="latest-failure-summary"
-          class="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start"
-        >
-          <div class="min-w-0">
-            <p class="text-xs font-semibold uppercase text-error">Latest failure</p>
-            <p class="mt-1 truncate font-semibold text-base-content">
-              {@card.latest_failure.target_label}
-            </p>
+      <div class="min-h-0 overflow-hidden">
+        <div class="grid gap-3 px-4 py-3">
+          <div class="flex min-w-0 items-start justify-between gap-3">
+            <div class="min-w-0">
+              <p class="text-xs font-semibold uppercase text-error">
+                {if @latest?, do: "Latest failure", else: "Failure detail"}
+              </p>
+              <p class="mt-1 truncate font-semibold text-base-content">
+                {@marker.target_label}
+              </p>
+            </div>
+            <button
+              id={"job-failure-panel-close-#{@marker.id}"}
+              type="button"
+              data-role="failure-panel-close"
+              aria-label="Close failure panel"
+              phx-click="close_worker_failure"
+              class="grid size-7 shrink-0 place-items-center rounded-full text-base-content/45 transition-colors hover:bg-error/10 hover:text-error focus:outline-none focus:ring-2 focus:ring-error/40"
+            >
+              <.icon name="hero-x-mark" class="size-4" />
+            </button>
           </div>
-          <dl
-            data-role="latest-failure-meta"
-            class="grid grid-cols-2 gap-3 text-xs text-base-content/60 sm:min-w-44"
+
+          <div
+            data-role="failure-panel-summary"
+            class="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start"
           >
-            <div>
-              <dt>When</dt>
-              <dd class="font-semibold tabular-nums text-base-content">
-                {format_job_timestamp(@card.latest_failure.failed_at, @datetime_preferences)}
-              </dd>
+            <div class="min-w-0">
+              <p class="font-semibold text-error">
+                {@marker.failure.title}
+              </p>
+              <p class="mt-0.5 truncate text-xs text-base-content/60">
+                {@marker.worker_label}
+              </p>
             </div>
-            <div>
-              <dt>Attempts</dt>
-              <dd class="font-semibold tabular-nums text-base-content">
-                {@card.latest_failure.attempts}
-              </dd>
-            </div>
-          </dl>
-        </div>
-        <p data-role="latest-failure-message" class="leading-6 text-base-content/70">
-          {@card.latest_failure.message}
-        </p>
-      </div>
-    </section>
-    """
-  end
-
-  attr :marker, :map, required: true
-  attr :datetime_preferences, :map, required: true
-
-  defp job_failure_dialog(assigns) do
-    ~H"""
-    <dialog id={"job-failure-dialog-#{@marker.id}"} data-role="failed-worker-dialog" class="modal">
-      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
-        <header class="border-b border-base-300 px-5 py-4">
-          <p class="text-xs font-semibold uppercase text-error">Job failure</p>
-          <h3 class="mt-1 text-lg font-semibold text-base-content">
-            {@marker.target_label}
-          </h3>
-          <p class="mt-1 text-xs text-base-content/60">{@marker.worker_label}</p>
-        </header>
-        <div class="grid gap-3 px-5 py-4 text-sm">
-          <p class="font-semibold text-error">{@marker.failure.title}</p>
-          <p data-role="failure-message" class="leading-relaxed text-base-content/70">
+            <dl
+              data-role="failure-panel-meta"
+              class="grid grid-cols-2 gap-3 text-xs text-base-content/60 sm:min-w-44"
+            >
+              <div>
+                <dt>When</dt>
+                <dd class="font-semibold tabular-nums text-base-content">
+                  {format_job_timestamp(@marker.failed_at, @datetime_preferences)}
+                </dd>
+              </div>
+              <div>
+                <dt>Attempts</dt>
+                <dd class="font-semibold tabular-nums text-base-content">
+                  {@marker.attempts}
+                </dd>
+              </div>
+            </dl>
+          </div>
+          <p data-role="failure-message" class="leading-6 text-base-content/70">
             {@marker.failure.message}
           </p>
-          <dl class="grid gap-2 text-xs text-base-content/60 sm:grid-cols-2">
-            <div>
-              <dt>Last failure</dt>
-              <dd class="tabular-nums text-base-content">
-                {format_job_timestamp(@marker.failed_at, @datetime_preferences)}
-              </dd>
-            </div>
-            <div>
-              <dt>Attempts</dt>
-              <dd class="tabular-nums text-base-content">{@marker.attempts}</dd>
-            </div>
-          </dl>
         </div>
-        <form method="dialog" class="modal-action mt-0 border-t border-base-300 px-5 py-4">
-          <button class="btn btn-sm">Close</button>
-        </form>
       </div>
-      <form method="dialog" class="modal-backdrop">
-        <button>close</button>
-      </form>
-    </dialog>
+    </section>
     """
   end
 

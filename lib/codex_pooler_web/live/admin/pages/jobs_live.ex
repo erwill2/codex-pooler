@@ -17,6 +17,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
 
   @jobs_reload_debounce_ms 1_000
   @jobs_fallback_refresh_ms 5_000
+  @worker_failure_job_id_param "failure_job_id"
 
   @impl true
   def mount(_params, _session, socket) do
@@ -28,6 +29,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
         page_title: "Jobs",
         owner_authorized?: Pools.owner?(socket.assigns.current_scope),
         jobs_reload_timer: nil,
+        jobs_page_loaded?: false,
         subscribed_pool_ids: MapSet.new()
       )
       |> assign(
@@ -35,6 +37,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
         DateTimeDisplay.preferences_for_user(socket.assigns.current_scope.user)
       )
       |> assign_page_state(empty_page_state, %{})
+      |> assign(:jobs_page_loaded?, false)
 
     if socket.assigns.owner_authorized? do
       {:ok, maybe_start_connected_refresh(socket)}
@@ -46,9 +49,13 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
   @impl true
   def handle_params(params, _uri, socket) do
     socket =
-      socket
-      |> load_jobs_page(params)
+      if selection_only_params_change?(socket, params) do
+        assign_selection_state(socket, params)
+      else
+        load_jobs_page(socket, params)
+      end
       |> maybe_clear_missing_selected_job()
+      |> maybe_clear_missing_selected_worker_failure()
 
     {:noreply, socket}
   end
@@ -102,6 +109,23 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
     {:noreply,
      push_patch(socket,
        to: ~p"/admin/jobs?#{JobFilterForm.close_job_query_params(socket.assigns.current_params)}"
+     )}
+  end
+
+  def handle_event("toggle_worker_failure", %{"job-id" => job_id}, socket) do
+    failure_job_id = normalized_positive_integer(job_id)
+
+    {:noreply,
+     push_patch(socket,
+       to:
+         ~p"/admin/jobs?#{toggle_worker_failure_query_params(socket.assigns.current_params, socket.assigns.selected_worker_failure_job_id, failure_job_id)}"
+     )}
+  end
+
+  def handle_event("close_worker_failure", _params, socket) do
+    {:noreply,
+     push_patch(socket,
+       to: ~p"/admin/jobs?#{close_worker_failure_query_params(socket.assigns.current_params)}"
      )}
   end
 
@@ -165,6 +189,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
                 :for={card <- @worker_cards}
                 card={card}
                 datetime_preferences={@datetime_preferences}
+                selected_failure_job_id={@selected_worker_failure_job_id}
               />
             </div>
 
@@ -199,6 +224,18 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
          is_nil(socket.assigns.selected_job) do
       push_patch(socket,
         to: ~p"/admin/jobs?#{JobFilterForm.close_job_query_params(socket.assigns.current_params)}"
+      )
+    else
+      socket
+    end
+  end
+
+  defp maybe_clear_missing_selected_worker_failure(socket) do
+    if socket.assigns.owner_authorized? &&
+         Map.has_key?(socket.assigns.current_params, @worker_failure_job_id_param) &&
+         is_nil(socket.assigns.selected_worker_failure_job_id) do
+      push_patch(socket,
+        to: ~p"/admin/jobs?#{close_worker_failure_query_params(socket.assigns.current_params)}"
       )
     else
       socket
@@ -244,6 +281,11 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
   end
 
   defp assign_page_state(socket, page_state, params) do
+    worker_cards =
+      worker_cards(page_state.worker_jobs_by_group, socket.assigns.datetime_preferences)
+
+    selected_worker_failure_job_id = selected_worker_failure_job_id(params, worker_cards)
+
     assign(socket,
       current_params: params,
       overview: page_state.overview,
@@ -255,11 +297,94 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
       filter_warnings: page_state.filter_warnings,
       filter_errors: page_state.filter_warnings,
       selected_job: page_state.selected_job,
+      selected_worker_failure_job_id: selected_worker_failure_job_id,
       jobs: page_state.explorer.items,
-      worker_cards:
-        worker_cards(page_state.worker_jobs_by_group, socket.assigns.datetime_preferences)
+      worker_cards: worker_cards,
+      jobs_page_loaded?: true
     )
   end
+
+  defp selection_only_params_change?(socket, params) do
+    socket.assigns.owner_authorized? and socket.assigns.jobs_page_loaded? and
+      projection_query_params(params) == projection_query_params(socket.assigns.current_params)
+  end
+
+  defp projection_query_params(params) do
+    params
+    |> JobFilterForm.query_params()
+    |> Map.delete("job_id")
+  end
+
+  defp assign_selection_state(socket, params) do
+    {filters, form_values, filter_warnings} = JobFilterForm.parse_filters(params)
+
+    assign(socket,
+      current_params: params,
+      filters: filters,
+      form_values: form_values,
+      filter_form: JobFilterForm.filter_form(form_values, filter_warnings),
+      filter_warnings: filter_warnings,
+      filter_errors: filter_warnings,
+      selected_job: selected_job(filters.job_id, socket.assigns.explorer.items),
+      selected_worker_failure_job_id:
+        selected_worker_failure_job_id(params, socket.assigns.worker_cards)
+    )
+  end
+
+  defp selected_job(nil, _items), do: nil
+  defp selected_job(job_id, items), do: Enum.find(items, &(&1.id == job_id))
+
+  defp selected_worker_failure_job_id(params, worker_cards) do
+    params
+    |> Map.get(@worker_failure_job_id_param)
+    |> normalized_positive_integer()
+    |> case do
+      nil -> nil
+      job_id -> if visible_worker_failure_marker?(worker_cards, job_id), do: job_id
+    end
+  end
+
+  defp visible_worker_failure_marker?(worker_cards, job_id) do
+    Enum.any?(worker_cards, fn card ->
+      Enum.any?(card.visible_failure_markers, &(&1.id == job_id))
+    end)
+  end
+
+  defp toggle_worker_failure_query_params(
+         params,
+         selected_failure_job_id,
+         selected_failure_job_id
+       ) do
+    close_worker_failure_query_params(params)
+  end
+
+  defp toggle_worker_failure_query_params(params, _selected_failure_job_id, failure_job_id) do
+    params
+    |> JobFilterForm.query_params()
+    |> maybe_put_worker_failure_job_id(failure_job_id)
+  end
+
+  defp close_worker_failure_query_params(params) do
+    params
+    |> JobFilterForm.query_params()
+    |> Map.delete(@worker_failure_job_id_param)
+  end
+
+  defp maybe_put_worker_failure_job_id(params, nil), do: params
+
+  defp maybe_put_worker_failure_job_id(params, job_id),
+    do: Map.put(params, @worker_failure_job_id_param, Integer.to_string(job_id))
+
+  defp normalized_positive_integer(value) when is_integer(value) and value > 0, do: value
+
+  defp normalized_positive_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {integer, ""} when integer > 0 -> integer
+      _invalid -> nil
+    end
+  end
+
+  defp normalized_positive_integer(_value), do: nil
 
   defp jobs_params(socket, params) do
     if socket.assigns.owner_authorized?, do: params, else: %{}
