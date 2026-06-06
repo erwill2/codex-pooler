@@ -244,6 +244,26 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert_prompt_cache_locality_applied!(first_plan, prompt_cache_key, hd(expected_ids), 4)
     end
 
+    test "prompt-cache locality canonicalizes keys before hashing" do
+      setup = routing_setup(4)
+      prompt_cache_key = "synthetic-cache-key-canonical"
+      expected_ids = prompt_cache_order_ids(setup, setup.candidates, prompt_cache_key)
+
+      trimmed_plan = plan_for_prompt_cache(setup, "bridge_ring", "trimmed", prompt_cache_key)
+
+      padded_plan =
+        plan_for_prompt_cache(setup, "bridge_ring", "padded", "  #{prompt_cache_key}\n")
+
+      assert candidate_ids(trimmed_plan.candidates) == expected_ids
+      assert candidate_ids(padded_plan.candidates) == expected_ids
+      assert trimmed_plan.selected_assignment_id == padded_plan.selected_assignment_id
+
+      assert trimmed_plan.request_metadata["routing_locality_seed_fingerprint"] ==
+               padded_plan.request_metadata["routing_locality_seed_fingerprint"]
+
+      refute inspect(padded_plan.request_metadata) =~ prompt_cache_key
+    end
+
     test "prompt-cache locality metadata reports unavailable absent typed routing seed" do
       setup = routing_setup(3)
       plan = plan_for(setup, "bridge_ring", "request-without-prompt-cache")
@@ -258,6 +278,22 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
 
       refute Map.has_key?(plan.request_metadata, "routing_locality_seed_fingerprint")
       refute Map.has_key?(plan.request_metadata, "routing_locality_assignment_fingerprint")
+    end
+
+    test "oversized prompt-cache keys are absent from locality decisions" do
+      setup = routing_setup(3)
+      oversized_key = "oversized-cache-key-" <> String.duplicate("x", 257)
+
+      plan = plan_for_prompt_cache(setup, "bridge_ring", "oversized-request", oversized_key)
+
+      assert plan.request_metadata["routing_locality_status"] == "unavailable"
+      assert plan.request_metadata["routing_locality_applied"] == false
+
+      assert plan.request_metadata["routing_locality_unhonored_reason"] ==
+               "prompt_cache_key_absent"
+
+      refute Map.has_key?(plan.request_metadata, "routing_locality_seed_fingerprint")
+      refute inspect(plan.request_metadata) =~ oversized_key
     end
 
     test "eligible-set changes deterministically reselect among remaining candidates" do
@@ -1144,9 +1180,16 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       setup.auth.api_key.id,
       setup.model.exposed_model_id,
       "prompt_cache",
-      prompt_cache_key
+      normalized_prompt_cache_routing_key(prompt_cache_key)
     ]
     |> Enum.join(":")
+  end
+
+  defp normalized_prompt_cache_routing_key(value) do
+    value
+    |> String.trim()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
   end
 
   defp rendezvous_score(seed, assignment_id) do

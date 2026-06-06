@@ -66,6 +66,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     "/backend-api/codex/v1/chat/completions"
   ]
 
+  @prompt_cache_key_max_bytes 256
+
   @known_opt_keys [
     :accepted_turn_state,
     :authenticated_owner_attach,
@@ -632,7 +634,19 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   defp post_request?(_method), do: false
 
   defp normalized_prompt_cache_key(value) when is_binary(value) do
-    if String.trim(value) == "", do: nil, else: value
+    canonical = String.trim(value)
+
+    cond do
+      canonical == "" ->
+        nil
+
+      byte_size(canonical) > @prompt_cache_key_max_bytes ->
+        nil
+
+      true ->
+        :crypto.hash(:sha256, canonical)
+        |> Base.encode16(case: :lower)
+    end
   end
 
   defp normalized_prompt_cache_key(_value), do: nil

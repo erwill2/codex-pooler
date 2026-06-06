@@ -311,7 +311,8 @@ defmodule CodexPooler.CompatibilityMatrix do
         default_enabled: true,
         mode: "stateless_locality_over_already_eligible_assignments",
         typed_input: "prompt_cache_key",
-        privacy: "raw_key_not_persisted",
+        locality_key_material: "trimmed_sha256_hash",
+        privacy: "raw_key_not_persisted_hash_only_locality",
         provider_cache_evidence: "upstream_cached_input_tokens_only"
       },
       chat_input_fallback: %{

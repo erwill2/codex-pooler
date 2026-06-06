@@ -409,13 +409,16 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       ]
 
       for endpoint <- allowed_routes do
+        raw_prompt_cache_key = "fixture-cache-key"
+
         request_options =
           RequestOptions.build(%{request_method: "POST"}, endpoint, %{
             "model" => "gpt-fixture-text",
-            "prompt_cache_key" => "fixture-cache-key"
+            "prompt_cache_key" => raw_prompt_cache_key
           })
 
-        assert request_options.routing.prompt_cache_key == "fixture-cache-key"
+        assert request_options.routing.prompt_cache_key =~ ~r/\A[0-9a-f]{64}\z/
+        refute request_options.routing.prompt_cache_key == raw_prompt_cache_key
       end
 
       for {method, endpoint, opts} <- excluded_routes do

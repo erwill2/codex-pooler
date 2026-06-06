@@ -383,7 +383,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert result.payload["moderation"] == %{"model" => "omni-moderation-latest"}
     assert result.payload["prompt_cache_key"] == "fixture-cache-key"
     assert result.payload["prompt_cache_retention"] == "24h"
-    assert result.request_options.routing.prompt_cache_key == "fixture-cache-key"
+
+    assert result.request_options.routing.prompt_cache_key ==
+             prompt_cache_key_hash("fixture-cache-key")
+
+    refute result.request_options.routing.prompt_cache_key == "fixture-cache-key"
     refute Map.has_key?(result.request_options.extra, "prompt_cache_key")
     assert result.payload["reasoning"] == %{"effort" => "focused"}
     assert result.payload["safety_identifier"] == "fixture-safety-id"
@@ -751,7 +755,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert Map.take(result.payload, Map.keys(payload) -- ["input"]) ==
              Map.delete(payload, "input")
 
-    assert result.request_options.routing.prompt_cache_key == "fixture-cache-key"
+    assert result.request_options.routing.prompt_cache_key ==
+             prompt_cache_key_hash("fixture-cache-key")
+
+    refute result.request_options.routing.prompt_cache_key == "fixture-cache-key"
     refute Map.has_key?(result.request_options.extra, "prompt_cache_key")
   end
 
@@ -774,6 +781,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert response_result.payload["prompt_cache_retention"] == "24h"
 
     assert response_result.request_options.routing.prompt_cache_key ==
+             prompt_cache_key_hash("fixture-response-cache-key")
+
+    refute response_result.request_options.routing.prompt_cache_key ==
              "fixture-response-cache-key"
 
     refute Map.has_key?(response_result.request_options.extra, "prompt_cache_key")
@@ -793,7 +803,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
     assert chat_result.payload["prompt_cache_key"] == "fixture-chat-cache-key"
     assert chat_result.payload["prompt_cache_retention"] == "24h"
-    assert chat_result.request_options.routing.prompt_cache_key == "fixture-chat-cache-key"
+
+    assert chat_result.request_options.routing.prompt_cache_key ==
+             prompt_cache_key_hash("fixture-chat-cache-key")
+
+    refute chat_result.request_options.routing.prompt_cache_key == "fixture-chat-cache-key"
     refute Map.has_key?(chat_result.request_options.extra, "prompt_cache_key")
   end
 
@@ -2403,6 +2417,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       "required" => ["profile"],
       "$defs" => %{definition_name => definition_schema}
     }
+  end
+
+  defp prompt_cache_key_hash(value) do
+    :crypto.hash(:sha256, value)
+    |> Base.encode16(case: :lower)
   end
 
   defp upload_metadata do

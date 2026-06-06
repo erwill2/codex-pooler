@@ -220,7 +220,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.extra == %{}
     end
 
-    test "keeps prompt cache keys typed only for the exact routing allowlist" do
+    test "keeps hashed prompt cache routing hints only for the exact routing allowlist" do
       allowed_routes = [
         "/v1/responses",
         "/v1/chat/completions",
@@ -230,16 +230,40 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       ]
 
       for endpoint <- allowed_routes do
+        raw_prompt_cache_key = "  fixture-cache-key  "
+
         options =
           RequestOptions.build(
             %{request_method: "POST"},
             endpoint,
-            %{"model" => "example-model", "prompt_cache_key" => "fixture-cache-key"}
+            %{"model" => "example-model", "prompt_cache_key" => raw_prompt_cache_key}
           )
 
-        assert options.routing.prompt_cache_key == "fixture-cache-key"
+        assert options.routing.prompt_cache_key == prompt_cache_key_hash("fixture-cache-key")
+        assert options.routing.prompt_cache_key =~ ~r/\A[0-9a-f]{64}\z/
+        refute options.routing.prompt_cache_key == raw_prompt_cache_key
+        refute inspect(options.routing) =~ raw_prompt_cache_key
         assert options.extra == %{}
       end
+    end
+
+    test "canonicalizes prompt cache routing hints before hashing" do
+      trimmed =
+        RequestOptions.build(
+          %{request_method: "POST"},
+          "/backend-api/codex/responses",
+          %{"model" => "example-model", "prompt_cache_key" => "fixture-cache-key"}
+        )
+
+      padded =
+        RequestOptions.build(
+          %{request_method: "POST"},
+          "/backend-api/codex/responses",
+          %{"model" => "example-model", "prompt_cache_key" => "  fixture-cache-key\n"}
+        )
+
+      assert trimmed.routing.prompt_cache_key == padded.routing.prompt_cache_key
+      assert trimmed.routing.prompt_cache_key == prompt_cache_key_hash("fixture-cache-key")
     end
 
     test "treats blank and non-string prompt cache keys as absent" do
@@ -254,6 +278,21 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
         assert options.routing.prompt_cache_key == nil
         assert options.extra == %{}
       end
+    end
+
+    test "treats oversized prompt cache keys as absent" do
+      oversized_key = "oversized-cache-key-" <> String.duplicate("x", 257)
+
+      options =
+        RequestOptions.build(
+          %{request_method: "POST"},
+          "/backend-api/codex/responses",
+          %{"model" => "example-model", "prompt_cache_key" => oversized_key}
+        )
+
+      assert options.routing.prompt_cache_key == nil
+      refute inspect(options.routing) =~ oversized_key
+      assert options.extra == %{}
     end
 
     test "consumes raw prompt cache option keys without using them as routing input" do
@@ -789,5 +828,10 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
     test "returns nil for payloads that cannot be encoded as JSON" do
       assert RequestOptions.json_request_bytes(%{"callback" => fn -> :ok end}) == nil
     end
+  end
+
+  defp prompt_cache_key_hash(value) do
+    :crypto.hash(:sha256, value)
+    |> Base.encode16(case: :lower)
   end
 end
