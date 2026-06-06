@@ -24,6 +24,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
     "x-codex-parent-thread-id",
     "x-openai-subagent"
   ]
+  @responses_lite_header_name "x-openai-internal-codex-responses-lite"
 
   @type header :: {String.t(), String.t()}
 
@@ -83,6 +84,8 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         :forwarded_headers,
         regular_runtime_forwarded_metadata_headers(request_options)
       )
+
+    headers = maybe_put_responses_lite_header(headers, request_options)
 
     TransportEnvelope.headers(identity, token, headers, envelope_opts)
   end
@@ -487,6 +490,23 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   end
 
   defp mark_visible_output(_request, _data), do: :ok
+
+  defp maybe_put_responses_lite_header(headers, %RequestOptions{} = request_options) do
+    if responses_lite_request?(request_options) do
+      [{@responses_lite_header_name, "true"} | headers]
+    else
+      headers
+    end
+  end
+
+  defp responses_lite_request?(%RequestOptions{
+         routing: %{use_responses_lite?: true},
+         transport: %{upstream_endpoint: endpoint}
+       }) do
+    endpoint in @regular_runtime_metadata_endpoints
+  end
+
+  defp responses_lite_request?(%RequestOptions{}), do: false
 
   defp response_processed_response_id(payload) do
     case clean_string(Map.get(payload, "response_id")) do

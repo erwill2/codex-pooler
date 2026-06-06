@@ -7,6 +7,8 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.ToolResultShape
 
+  @websocket_responses_lite_client_metadata_key "ws_request_header_x_openai_internal_codex_responses_lite"
+
   @unsupported_upstream_fields ~w(
     max_output_tokens
     prompt_cache_retention
@@ -106,12 +108,13 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
   defp strip_backend_codex_fields(
          payload,
          _endpoint,
-         %RequestOptions{transport: %{transport: "websocket"}}
+         %RequestOptions{transport: %{transport: "websocket"}} = request_options
        ) do
     payload
     |> Map.drop(["request_id"])
     |> Map.put_new("type", "response.create")
     |> Map.put_new("instructions", "")
+    |> maybe_put_websocket_responses_lite_client_metadata(request_options)
   end
 
   defp strip_backend_codex_fields(
@@ -225,6 +228,23 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
         payload
     end
   end
+
+  defp maybe_put_websocket_responses_lite_client_metadata(
+         payload,
+         %RequestOptions{routing: %{use_responses_lite?: true}}
+       ) do
+    Map.update(
+      payload,
+      "client_metadata",
+      %{@websocket_responses_lite_client_metadata_key => "true"},
+      fn
+        %{} = metadata -> Map.put(metadata, @websocket_responses_lite_client_metadata_key, "true")
+        _metadata -> %{@websocket_responses_lite_client_metadata_key => "true"}
+      end
+    )
+  end
+
+  defp maybe_put_websocket_responses_lite_client_metadata(payload, %RequestOptions{}), do: payload
 
   defp maybe_strip_unsupported_upstream_fields(payload, "/backend-api/codex/responses") do
     Map.drop(payload, @unsupported_upstream_fields)

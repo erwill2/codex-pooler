@@ -8,7 +8,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
   alias CodexPooler.Gateway.Contracts, as: GatewayContracts
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.RoutingCircuitState
-  alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput, RoutingSelection}
+  alias CodexPooler.Gateway.Routing.{BridgeRing, ModelMetadata, RoutePlanInput, RoutingSelection}
   alias CodexPooler.Gateway.Runtime.Dispatch.Context
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
@@ -189,7 +189,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
       {:ok, request} ->
         request_options =
           RequestOptions.put_routing(context.request_options,
-            routing_attempt_metadata: selection.attempt_metadata
+            routing_attempt_metadata: selection.attempt_metadata,
+            use_responses_lite?:
+              selected_uses_responses_lite?(context.model, selection.assignment)
           )
 
         selected_context =
@@ -216,6 +218,14 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
           reason
         )
     end
+  end
+
+  defp selected_uses_responses_lite?(model, assignment) do
+    metadata =
+      get_in(model.metadata || %{}, ["source_assignment_models", assignment.id]) ||
+        ModelMetadata.metadata(model)
+
+    ModelMetadata.bool_metadata(metadata, "use_responses_lite")
   end
 
   defp put_routing_circuit_state(%Context{} = context, %RoutingCircuitState{} = state) do

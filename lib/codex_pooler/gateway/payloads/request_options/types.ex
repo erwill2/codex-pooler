@@ -108,7 +108,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
     :prompt_cache_key,
     :quota_decision,
     :routing_attempt_metadata,
-    :routing_circuit_state
+    :routing_circuit_state,
+    :use_responses_lite?
   ]
 
   @type t :: %__MODULE__{
@@ -119,7 +120,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
           prompt_cache_key: String.t() | nil,
           quota_decision: map() | nil,
           routing_attempt_metadata: map() | nil,
-          routing_circuit_state: term()
+          routing_circuit_state: term(),
+          use_responses_lite?: boolean()
         }
 end
 

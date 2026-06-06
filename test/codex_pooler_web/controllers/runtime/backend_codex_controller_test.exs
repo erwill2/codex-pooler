@@ -947,6 +947,84 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert_lineage_metadata_not_persisted!(setup, metadata)
   end
 
+  test "POST /backend-api/codex/responses sends trusted Responses Lite marker from selected model metadata",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_backend_responses_lite_marker",
+          "object" => "response",
+          "status" => "completed",
+          "output" => [],
+          "usage" => %{"input_tokens" => 3, "output_tokens" => 2, "total_tokens" => 5}
+        })
+      )
+
+    setup =
+      upstream
+      |> gateway_setup()
+      |> put_setup_model_source_metadata!(%{"use_responses_lite" => true})
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post_json_runtime_with_headers(
+        "/backend-api/codex/responses",
+        %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic Responses Lite marker request"
+        },
+        [{"x-openai-internal-unapproved", "client-internal-spoof"}]
+      )
+
+    assert %{"id" => "resp_backend_responses_lite_marker"} = json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    captured_headers = Map.new(captured.headers)
+
+    assert captured_headers["x-openai-internal-codex-responses-lite"] == "true"
+    refute Map.has_key?(captured_headers, "x-openai-internal-unapproved")
+  end
+
+  test "POST /backend-api/codex/responses ignores client-spoofed Responses Lite marker for non-Lite models",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_backend_responses_lite_spoof_ignored",
+          "object" => "response",
+          "status" => "completed",
+          "output" => [],
+          "usage" => %{"input_tokens" => 3, "output_tokens" => 2, "total_tokens" => 5}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post_json_runtime_with_headers(
+        "/backend-api/codex/responses",
+        %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic Responses Lite spoof request"
+        },
+        [
+          {"x-openai-internal-codex-responses-lite", "true"},
+          {"x-openai-internal-unapproved", "client-internal-spoof"}
+        ]
+      )
+
+    assert %{"id" => "resp_backend_responses_lite_spoof_ignored"} = json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    captured_headers = Map.new(captured.headers)
+
+    refute Map.has_key?(captured_headers, "x-openai-internal-codex-responses-lite")
+    refute Map.has_key?(captured_headers, "x-openai-internal-unapproved")
+  end
+
   test "POST /backend-api/codex/v1/responses forwards approved lineage metadata headers and configured user-agent",
        %{conn: conn} do
     previous_env = Application.get_env(:codex_pooler, OperationalSettings)
@@ -7258,6 +7336,42 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert_lineage_metadata_not_persisted!(setup, metadata)
   end
 
+  test "POST /backend-api/codex/responses/compact sends trusted Responses Lite marker from selected model metadata",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "object" => "response.compaction",
+          "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+        })
+      )
+
+    setup =
+      upstream
+      |> gateway_setup(compact?: true)
+      |> put_setup_model_source_metadata!(%{"use_responses_lite" => true})
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post_json_runtime_with_headers(
+        "/backend-api/codex/responses/compact",
+        %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic compact Responses Lite marker request"
+        },
+        [{"x-openai-internal-unapproved", "client-internal-spoof"}]
+      )
+
+    assert %{"object" => "response.compaction"} = json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    captured_headers = Map.new(captured.headers)
+
+    assert captured_headers["x-openai-internal-codex-responses-lite"] == "true"
+    refute Map.has_key?(captured_headers, "x-openai-internal-unapproved")
+  end
+
   test "POST /backend-api/codex/v1/responses/compact forwards approved lineage metadata headers and configured user-agent",
        %{conn: conn} do
     previous_env = Application.get_env(:codex_pooler, OperationalSettings)
@@ -8570,6 +8684,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     }
   end
 
+  defp put_setup_model_source_metadata!(setup, source_metadata) when is_map(source_metadata) do
+    metadata =
+      setup.model.metadata
+      |> Map.put("source_assignment_models", %{setup.assignment.id => source_metadata})
+
+    model =
+      setup.model
+      |> Ecto.Changeset.change(%{metadata: metadata})
+      |> Repo.update!()
+
+    %{setup | model: model}
+  end
+
   defp lineage_request_headers(metadata) do
     [
       {"accept", "application/json; lineage-client-accept=1"},
@@ -8581,6 +8708,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       {"x-codex-window-id", metadata.window_id},
       {"x-codex-parent-thread-id", metadata.parent_thread_id},
       {"x-openai-subagent", metadata.subagent},
+      {"x-openai-internal-codex-responses-lite", "lineage-spoofed-lite"},
       {"x-codex-unapproved", "lineage-unapproved-codex"},
       {"x-openai-unapproved", "lineage-unapproved-openai"},
       {"x-unrelated-lineage", "lineage-unrelated"}
@@ -8622,6 +8750,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     refute Map.has_key?(captured_headers, "cookie")
     refute Map.has_key?(captured_headers, "idempotency-key")
+    refute Map.has_key?(captured_headers, "x-openai-internal-codex-responses-lite")
     refute Map.has_key?(captured_headers, "x-codex-unapproved")
     refute Map.has_key?(captured_headers, "x-openai-unapproved")
     refute Map.has_key?(captured_headers, "x-unrelated-lineage")
@@ -8630,6 +8759,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute inspect(captured.headers) =~ "lineage-client-cookie=secret"
     refute inspect(captured.headers) =~ "lineage-client-idempotency-secret"
     refute inspect(captured.headers) =~ "lineage-client-accept"
+    refute inspect(captured.headers) =~ "lineage-spoofed-lite"
     refute inspect(captured.headers) =~ "lineage-unapproved-codex"
     refute inspect(captured.headers) =~ "lineage-unapproved-openai"
     refute inspect(captured.headers) =~ "lineage-unrelated"

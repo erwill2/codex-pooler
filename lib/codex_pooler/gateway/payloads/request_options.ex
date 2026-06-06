@@ -122,6 +122,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :response_id,
     :routing_attempt_metadata,
     :routing_circuit_state,
+    :use_responses_lite?,
     :session_header,
     :session_header_source,
     :session_key,
@@ -475,7 +476,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       prompt_cache_key: prompt_cache_key(opts, endpoint, payload),
       quota_decision: Map.get(opts, :quota_decision),
       routing_attempt_metadata: Map.get(opts, :routing_attempt_metadata),
-      routing_circuit_state: Map.get(opts, :routing_circuit_state)
+      routing_circuit_state: Map.get(opts, :routing_circuit_state),
+      use_responses_lite?: Map.get(opts, :use_responses_lite?, false) == true
     }
   end
 

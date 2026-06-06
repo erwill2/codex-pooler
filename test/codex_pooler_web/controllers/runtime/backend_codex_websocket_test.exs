@@ -700,6 +700,124 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     refute persistence_text =~ setup.authorization
   end
 
+  test "websocket dispatch sends trusted Responses Lite marker as per-request client metadata" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_responses_lite_marker",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup =
+      upstream
+      |> gateway_setup()
+      |> put_setup_model_source_metadata!(%{"use_responses_lite" => true})
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-responses-lite"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{
+                 request_id: "ws-responses-lite-marker",
+                 client_ip: "127.0.0.1",
+                 codex_session: session,
+                 forwarded_headers: [
+                   {"x-openai-internal-codex-responses-lite", "client-spoofed-lite"},
+                   {"x-openai-internal-unapproved", "client-internal-spoof"}
+                 ]
+               },
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_responses_lite_marker"} = Jason.decode!(frame)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "WEBSOCKET"
+    assert captured.path == "/backend-api/codex/responses"
+
+    assert captured.json["client_metadata"][
+             "ws_request_header_x_openai_internal_codex_responses_lite"
+           ] ==
+             "true"
+
+    refute Enum.any?(captured.headers, fn {name, _value} ->
+             name == "x-openai-internal-codex-responses-lite"
+           end)
+
+    persistence_text = inspect(Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id)))
+    refute persistence_text =~ "client-spoofed-lite"
+    refute persistence_text =~ "client-internal-spoof"
+  end
+
+  test "websocket dispatch ignores client-spoofed Responses Lite marker for non-Lite models" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_responses_lite_spoof_ignored",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Gateway.start_codex_session(auth, %{accepted_turn_state: "stable-ws-responses-lite-spoof"})
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => [%{"type" => "message", "role" => "user", "content" => "hello"}],
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{
+                 request_id: "ws-responses-lite-spoof-ignored",
+                 client_ip: "127.0.0.1",
+                 codex_session: session,
+                 forwarded_headers: [
+                   {"x-openai-internal-codex-responses-lite", "true"},
+                   {"x-openai-internal-unapproved", "client-internal-spoof"}
+                 ]
+               },
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_responses_lite_spoof_ignored"} = Jason.decode!(frame)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.method == "WEBSOCKET"
+    assert captured.path == "/backend-api/codex/responses"
+
+    refute get_in(captured.json, [
+             "client_metadata",
+             "ws_request_header_x_openai_internal_codex_responses_lite"
+           ])
+
+    refute Enum.any?(captured.headers, fn {name, _value} ->
+             name == "x-openai-internal-codex-responses-lite"
+           end)
+  end
+
   test "websocket response dispatch returns a structured error for non-text frames" do
     upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
     setup = gateway_setup(upstream)
@@ -6724,6 +6842,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
           flunk("expected codex.rate_limits persistence tasks to finish")
         end
     end
+  end
+
+  defp put_setup_model_source_metadata!(setup, source_metadata) when is_map(source_metadata) do
+    metadata =
+      setup.model.metadata
+      |> Map.put("source_assignment_models", %{setup.assignment.id => source_metadata})
+
+    model =
+      setup.model
+      |> Ecto.Changeset.change(%{metadata: metadata})
+      |> Repo.update!()
+
+    %{setup | model: model}
   end
 
   defp refute_rate_limit_event_windows(identity) do
