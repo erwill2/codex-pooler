@@ -5,7 +5,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
   @locally_unsupported_fields ~w(audio frequency_penalty logit_bias logprobs modalities n prediction presence_penalty seed stop top_logprobs user web_search_options)
-  @service_tiers ~w(auto default flex priority scale ultrafast)
+  @service_tiers ~w(auto default flex priority scale)
   @verbosity_values ~w(low medium high)
 
   @spec validate(term()) :: {:ok, map()} | {:error, Error.reason()}
