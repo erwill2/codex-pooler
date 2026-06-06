@@ -43,7 +43,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   def format_upstream_account_label(_log), do: "—"
 
-  def fast_mode?(log), do: speed_tier_mode(log) in [:fast, :ultrafast]
+  def fast_mode?(log), do: speed_tier_mode(log) == :fast
 
   def speed_tier_mode(log) when is_map(log) do
     metadata = Map.get(log, :metadata)
@@ -51,7 +51,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
     tier = Map.get(log, :requested_service_tier)
 
     cond do
-      ultrafast_metadata?(metadata) or service_tier_ultrafast?(tier) -> :ultrafast
       fast_metadata?(metadata) or model == "gpt-5.4" or service_tier_priority?(tier) -> :fast
       true -> nil
     end
@@ -59,7 +58,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   def speed_tier_mode(_log), do: nil
 
-  def speed_tier_label(:ultrafast), do: "Ultrafast mode"
   def speed_tier_label(:fast), do: "Fast mode"
 
   def protocol_label("websocket"), do: "WebSocket"
@@ -77,7 +75,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
       end
 
     case speed_tier_mode(log) do
-      :ultrafast -> "#{transport_label}; ultrafast mode"
       :fast -> "#{transport_label}; fast mode"
       nil -> transport_label
     end
@@ -313,19 +310,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
     do: tier |> String.trim() |> String.downcase() == "priority"
 
   defp service_tier_priority?(_tier), do: false
-
-  defp service_tier_ultrafast?(tier) when is_binary(tier),
-    do: tier |> String.trim() |> String.downcase() == "ultrafast"
-
-  defp service_tier_ultrafast?(_tier), do: false
-
-  defp ultrafast_metadata?(%{} = metadata) do
-    Map.get(metadata, "codex_mode") == "ultrafast" or
-      get_in(metadata, ["codex", "mode"]) == "ultrafast" or
-      get_in(metadata, ["request", "mode"]) == "ultrafast"
-  end
-
-  defp ultrafast_metadata?(_metadata), do: false
 
   defp fast_metadata?(%{} = metadata) do
     truthy?(Map.get(metadata, "fast_mode")) or Map.get(metadata, "codex_mode") == "fast" or

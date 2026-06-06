@@ -85,12 +85,12 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
         status: "succeeded"
       })
 
-    %{request: ultrafast_request} =
+    %{request: model_fast_request} =
       request_log_fixture(pool, %{
-        correlation_id: "req-live-ultrafast",
+        correlation_id: "req-live-model-fast",
         requested_model: "gpt-5.4",
-        requested_service_tier: "ultrafast",
-        actual_service_tier: "ultrafast",
+        requested_service_tier: "default",
+        actual_service_tier: "default",
         status: "succeeded"
       })
 
@@ -305,8 +305,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     refute has_element?(view, "#request-log-#{fast_request.id}-fast-mode")
     refute has_element?(view, "#request-log-#{fast_request.id}-requested-tier")
 
-    assert has_element?(view, "#request-log-row-#{ultrafast_request.id}", "gpt-5.4")
-    assert has_element?(view, "#request-log-row-#{ultrafast_request.id}", "ultrafast")
+    assert has_element?(view, "#request-log-row-#{model_fast_request.id}", "gpt-5.4")
+    assert has_element?(view, "#request-log-row-#{model_fast_request.id}", "default")
 
     assert has_element?(
              view,
@@ -315,7 +315,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#request-log-#{ultrafast_request.id}-protocol [data-role='fast-mode-indicator'][data-speed-tier='ultrafast']"
+             "#request-log-#{model_fast_request.id}-protocol [data-role='fast-mode-indicator'][data-speed-tier='fast']"
            )
 
     refute has_element?(view, "#request-log-#{request.id}-fast-mode")
