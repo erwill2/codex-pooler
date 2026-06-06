@@ -336,10 +336,23 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
           status: "active",
           enforced_model_identifier: "gpt-5.4-mini",
           enforced_reasoning_effort: "medium",
-          enforced_service_tier: "ultrafast"
+          enforced_service_tier: "priority"
         })
 
       assert valid_api_key_changeset.valid?
+
+      ultrafast_api_key_changeset =
+        APIKey.changeset(%APIKey{}, %{
+          pool_id: Ecto.UUID.generate(),
+          display_name: "Typed policy key",
+          key_prefix: "sk_typed_policy_ultrafast",
+          key_hash: <<"typed-policy-ultrafast">>,
+          status: "active",
+          enforced_service_tier: "ultrafast"
+        })
+
+      refute ultrafast_api_key_changeset.valid?
+      assert "is invalid" in errors_on(ultrafast_api_key_changeset).enforced_service_tier
 
       binding_changeset =
         APIKeyPolicyBinding.changeset(%APIKeyPolicyBinding{}, %{
