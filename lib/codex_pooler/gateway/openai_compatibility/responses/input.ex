@@ -107,16 +107,18 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
       |> Map.put("type", "message")
       |> Map.put_new("role", "user")
       |> Map.put("content", [%{"type" => "input_text", "text" => content}])
+      |> normalize_message_role()
 
     {:ok, item}
   end
 
   defp normalize_input_item(%{"content" => content} = item) when is_list(content) do
-    {:ok, item |> Map.put("type", "message") |> Map.put_new("role", "user")}
+    {:ok,
+     item |> Map.put("type", "message") |> Map.put_new("role", "user") |> normalize_message_role()}
   end
 
   defp normalize_input_item(%{"role" => _role} = item),
-    do: {:ok, Map.put_new(item, "type", "message")}
+    do: {:ok, item |> Map.put_new("type", "message") |> normalize_message_role()}
 
   defp normalize_input_item(%{"type" => "input_file"} = item), do: {:ok, item}
   defp normalize_input_item(%{"type" => "item_reference"} = item), do: {:ok, item}
@@ -139,6 +141,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
       "content" => [%{"type" => "input_text", "text" => text}]
     }
   end
+
+  defp normalize_message_role(%{"type" => "message", "role" => "system"} = item),
+    do: Map.put(item, "role", "developer")
+
+  defp normalize_message_role(item), do: item
 
   def validate_input(%{"input" => input}) when is_binary(input), do: :ok
 

@@ -121,6 +121,35 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
            ]
   end
 
+  @tag :responses_coercion
+  test "Responses system message input is normalized to developer role for Codex backend compatibility" do
+    assert {:ok, result} =
+             Responses.coerce(%{
+               "model" => "gpt-fixture-text",
+               "input" => [
+                 %{
+                   "type" => "message",
+                   "role" => "system",
+                   "content" => [%{"type" => "input_text", "text" => "synthetic system"}]
+                 },
+                 %{"role" => "user", "content" => "synthetic input"}
+               ]
+             })
+
+    assert result.payload["input"] == [
+             %{
+               "type" => "message",
+               "role" => "developer",
+               "content" => [%{"type" => "input_text", "text" => "synthetic system"}]
+             },
+             %{
+               "type" => "message",
+               "role" => "user",
+               "content" => [%{"type" => "input_text", "text" => "synthetic input"}]
+             }
+           ]
+  end
+
   describe "Task 2 Responses additional_tools input item compatibility" do
     @tag :responses_coercion
     test "Responses preserves request-shaped additional_tools input items without executable tool merging" do
@@ -316,7 +345,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert [
              %{
                "type" => "message",
-               "role" => "system",
+               "role" => "developer",
                "content" => [%{"type" => "input_text", "text" => "Synthetic system"}]
              },
              %{

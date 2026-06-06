@@ -1,6 +1,6 @@
 ---
 title: OpenClaw
-description: Configure OpenClaw with Codex Pooler's narrow OpenAI-compatible /v1 surface, PI runtime pin, model metadata, and operator MCP endpoint.
+description: Configure OpenClaw with Codex Pooler's narrow OpenAI-compatible /v1 surface, current runtime id, model metadata, and operator MCP endpoint.
 ---
 
 ![Codex Pooler OpenClaw integration](/codex-pooler-openclaw.png)
@@ -21,7 +21,7 @@ For local setup, replace the host with `http://localhost:4000`.
 
 ## Provider shape
 
-OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surface, use a Pool API key for model requests, and pin the agent runtime to PI.
+OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surface, use a Pool API key for model requests, and pin the agent runtime to `openclaw`. The older `pi` runtime id is a deprecated alias and should not be used in new Codex Pooler examples.
 
 ```json5
 {
@@ -37,7 +37,7 @@ OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surfac
         baseUrl: "https://codex-pooler.example.com/v1",
         apiKey: "<pool-api-key>",
         api: "openai-responses",
-        agentRuntime: { id: "pi" },
+        agentRuntime: { id: "openclaw" },
         timeoutSeconds: 300,
         models: [
           {

@@ -70,7 +70,7 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert captured.json["moderation"] == %{"model" => "omni-moderation-latest"}
 
     assert [
-             %{"type" => "message", "role" => "system"},
+             %{"type" => "message", "role" => "developer"},
              %{"type" => "message", "role" => "user"}
            ] = captured.json["input"]
 

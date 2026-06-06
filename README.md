@@ -302,8 +302,8 @@ Get-ChildItem -Path $CodexHome -Filter "state_*.sqlite" |
 ![Codex Pooler OpenClaw integration](.github/assets/codex-pooler-openclaw.png)
 
 OpenClaw uses `openai/*` as the canonical OpenAI route. To keep that model name
-while sending agent turns to Codex Pooler's OpenAI-compatible `/v1` surface, pin
-the OpenAI provider to the PI runtime and point `baseUrl` at Codex Pooler.
+while sending agent turns to Codex Pooler's OpenAI-compatible `/v1` surface,
+point the OpenAI provider at Codex Pooler and use the current OpenClaw runtime id.
 
 ```json5
 {
@@ -319,7 +319,7 @@ the OpenAI provider to the PI runtime and point `baseUrl` at Codex Pooler.
         baseUrl: "http://localhost:4000/v1",
         apiKey: "${CODEX_POOLER_API_KEY}",
         api: "openai-responses",
-        agentRuntime: { id: "pi" },
+        agentRuntime: { id: "openclaw" },
         timeoutSeconds: 300,
         models: [
           {
@@ -353,7 +353,6 @@ the OpenAI provider to the PI runtime and point `baseUrl` at Codex Pooler.
 Define only models that your assigned Pool can serve. For deployed instances,
 change `baseUrl` to `https://codex-pooler.example.com/v1`; if you keep the optional
 operator MCP add-on, change its `url` to `https://codex-pooler.example.com/mcp`.
-
 If you prefer to keep Codex Pooler separate from OpenClaw's built-in OpenAI
 provider behavior, use a custom provider id such as `codex-pooler/gpt-5.5`
 instead. That follows OpenClaw's generic custom-provider shape, but tools that
