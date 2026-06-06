@@ -33,10 +33,7 @@ RUNBOOK.md
 /scripts/*.dump
 /scripts/*.sql
 /scripts/*.sql.gz
-/scripts/dev/*
-!/scripts/dev/gateway-perf-*.exs
-!/scripts/dev/gateway-perf-*.mjs
-!/scripts/dev/gateway-perf-*.sh
+/scripts/dev/
 /scripts/smoke/
 /.agents/
 /.codex/

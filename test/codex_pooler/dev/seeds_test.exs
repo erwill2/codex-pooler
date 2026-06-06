@@ -196,59 +196,6 @@ defmodule CodexPooler.Dev.SeedsTest do
     assert Bitwise.band(env_stat.mode, 0o777) == 0o600
   end
 
-  test "gateway perf guard script accepts local and cluster env targets" do
-    {output, 0} =
-      System.cmd("bash", ["scripts/dev/gateway-perf-guard.sh", "--check"],
-        env: [
-          {"MIX_ENV", "test"},
-          {"CODEX_POOLER_PERF_GUARD_DB", "0"},
-          {"CODEX_POOLER_PERF_ENV", "/tmp/codex-pooler-missing-perf.env"},
-          {"CODEX_POOLER_PERF_HTTP_URL", "http://127.0.0.1:4058"},
-          {"CODEX_POOLER_PERF_WEBSOCKET_URL",
-           "ws://gateway-perf-fake-upstream.codex-pooler-perf.svc.cluster.local:4058/ws"}
-        ],
-        stderr_to_stdout: true
-      )
-
-    assert output =~ "gateway perf guard ok"
-  end
-
-  test "gateway perf guard script ignores non-target noise lines" do
-    {output, 0} =
-      System.cmd("bash", ["scripts/dev/gateway-perf-guard.sh", "--check"],
-        env: [
-          {"MIX_ENV", "test"},
-          {"CODEX_POOLER_PERF_GUARD_DB", "0"},
-          {"CODEX_POOLER_PERF_ENV", "/tmp/codex-pooler-missing-perf.env"},
-          {"CODEX_POOLER_PERF_HTTP_URL", "http://127.0.0.1:4058\n[debug] mix run noise"}
-        ],
-        stderr_to_stdout: true
-      )
-
-    assert output =~ "gateway perf guard ok: checked 1 target(s)"
-  end
-
-  test "gateway perf guard script rejects unsafe env targets" do
-    {output, exit_code} =
-      System.cmd("bash", ["scripts/dev/gateway-perf-guard.sh", "--check"],
-        env: [
-          {"MIX_ENV", "test"},
-          {"CODEX_POOLER_PERF_GUARD_DB", "0"},
-          {"CODEX_POOLER_PERF_ENV", "/tmp/codex-pooler-missing-perf.env"},
-          {"CODEX_POOLER_PERF_HTTP_URL", "https://example.com"},
-          {"CODEX_POOLER_PERF_WEBSOCKET_URL", "wss://example.com/ws"}
-        ],
-        stderr_to_stdout: true
-      )
-
-    assert exit_code == 1
-    assert output =~ "gateway perf guard failed: 2 unsafe target(s)"
-    assert output =~ "example.com"
-    assert output =~ "env:CODEX_POOLER_PERF_HTTP_URL"
-    assert output =~ "env:CODEX_POOLER_PERF_WEBSOCKET_URL"
-    refute output =~ "gateway perf guard ok"
-  end
-
   test "full seed recreates representative fake UI states without accumulating rows" do
     Seeds.full()
     result = Seeds.full()

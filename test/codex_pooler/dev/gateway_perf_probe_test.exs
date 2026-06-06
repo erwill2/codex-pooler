@@ -3,8 +3,6 @@ defmodule CodexPooler.Dev.GatewayPerfProbeTest do
 
   alias CodexPooler.Dev.GatewayPerfProbe
 
-  @script Path.expand("../../../scripts/dev/gateway-perf-sanitize.sh", __DIR__)
-
   setup do
     :telemetry.detach({GatewayPerfProbe, :telemetry})
 
@@ -420,51 +418,6 @@ defmodule CodexPooler.Dev.GatewayPerfProbeTest do
     assert request_summary["measured_failure_count"] == 1
   end
 
-  test "local short-25c dry-run writes top-level measured plan summary without changing scenario contract" do
-    run_id = "probe-contract-dry-run-#{System.unique_integer([:positive])}"
-    run_dir = Path.join(["tmp", "gateway-perf", run_id])
-
-    on_exit(fn -> File.rm_rf!(run_dir) end)
-
-    assert {output, 0} =
-             System.cmd(
-               "bash",
-               [
-                 "scripts/dev/gateway-perf-run.sh",
-                 "--scenario",
-                 "short-25c",
-                 "--run-id",
-                 run_id,
-                 "--dry-run"
-               ],
-               stderr_to_stdout: true
-             )
-
-    assert output =~ "summary: tmp/gateway-perf/#{run_id}/summary.json"
-
-    scenario_plan = run_dir |> Path.join("scenario.json") |> File.read!() |> Jason.decode!()
-    summary = run_dir |> Path.join("summary.json") |> File.read!() |> Jason.decode!()
-
-    assert Enum.map(scenario_plan["plan"], & &1["phase"]) == ["warmup", "measured", "cooldown"]
-
-    assert Enum.map(scenario_plan["plan"], & &1["name"]) == [
-             "warmup-default",
-             "short-25c",
-             "cooldown-default"
-           ]
-
-    assert [measured] = Enum.filter(summary["scenarios"], &(&1["phase"] == "measured"))
-    assert measured["name"] == "short-25c"
-    assert measured["driver_scenario"] == "short-25c"
-    assert measured["duration_seconds"] == 120
-    assert measured["concurrency"] == 25
-
-    assert summary["scenario_count"] == 3
-    assert summary["failed_scenario_count"] == 0
-    assert summary["artifact_paths"]["probe"] == "tmp/gateway-perf/#{run_id}/probe"
-    assert File.exists?(Path.join(run_dir, "summary.json"))
-  end
-
   test "without a running probe telemetry does not write artifacts", %{root: root} do
     conn =
       Plug.Test.conn("POST", "/backend-api/codex/responses")
@@ -483,41 +436,6 @@ defmodule CodexPooler.Dev.GatewayPerfProbeTest do
     )
 
     refute File.exists?(Path.join([root, "disabled-test", "probe"]))
-  end
-
-  test "sanitizer exits zero for clean artifacts and nonzero for sentinel or log token leakage",
-       %{
-         root: root
-       } do
-    clean_dir = Path.join(root, "clean-run")
-    dirty_dir = Path.join(root, "dirty-run")
-    dirty_log_dir = Path.join(root, "dirty-log-run")
-    File.mkdir_p!(Path.join(clean_dir, "probe"))
-    File.mkdir_p!(Path.join(dirty_dir, "probe"))
-    File.mkdir_p!(Path.join(dirty_log_dir, "logs"))
-
-    File.write!(Path.join([clean_dir, "probe", "request-summary.json"]), ~s({"run_id":"clean"}))
-
-    File.write!(
-      Path.join([dirty_dir, "probe", "request-summary.json"]),
-      "SENTINEL_PROMPT_DO_NOT_LOG"
-    )
-
-    File.write!(
-      Path.join([dirty_log_dir, "logs", "perf-seed.log"]),
-      "metrics token dev-perf-metrics-synthetic-leak"
-    )
-
-    assert {clean_output, 0} = System.cmd("bash", [@script, clean_dir], stderr_to_stdout: true)
-    assert clean_output =~ "ok"
-
-    assert {dirty_output, 1} = System.cmd("bash", [@script, dirty_dir], stderr_to_stdout: true)
-    assert dirty_output =~ "request-summary.json"
-
-    assert {dirty_log_output, 1} =
-             System.cmd("bash", [@script, dirty_log_dir], stderr_to_stdout: true)
-
-    assert dirty_log_output =~ "perf-seed.log"
   end
 
   defp emit_successful_probe_request(%{} = attrs) do
