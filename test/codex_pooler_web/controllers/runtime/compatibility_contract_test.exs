@@ -334,6 +334,59 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       end
     end
 
+    test "keeps app-server, remote-control, and permission-profile routes outside supported surfaces" do
+      route_set =
+        CodexPoolerWeb.Router
+        |> Phoenix.Router.routes()
+        |> Enum.map(&{router_method(&1.verb), &1.path})
+        |> MapSet.new()
+
+      matrix_route_set =
+        CompatibilityMatrix.features()
+        |> Enum.flat_map(& &1.routes)
+        |> Enum.map(&{&1.method, &1.path})
+        |> MapSet.new()
+
+      control_plane_route_set =
+        ControlPlaneRoutes.all()
+        |> Enum.map(&{&1.method, &1.local_path})
+        |> MapSet.new()
+
+      unsupported_routes = [
+        %{method: :post, path: "/backend-api/codex/thread/start", family: :app_server},
+        %{method: :post, path: "/backend-api/codex/thread/resume", family: :app_server},
+        %{method: :post, path: "/backend-api/codex/thread/fork", family: :app_server},
+        %{method: :post, path: "/backend-api/codex/turn/start", family: :app_server},
+        %{method: :post, path: "/backend-api/codex/configRequirements/read", family: :app_server},
+        %{
+          method: :get,
+          path: "/backend-api/codex/remote-control/pairing/status",
+          family: :remote_control
+        },
+        %{
+          method: :post,
+          path: "/backend-api/codex/remote-control/pairing/status",
+          family: :remote_control
+        },
+        %{
+          method: :post,
+          path: "/backend-api/codex/permission-profiles/validate",
+          family: :permission_profile
+        },
+        %{method: :post, path: "/v1/remote-control/pairing/status", family: :remote_control},
+        %{method: :post, path: "/v1/permission-profiles/validate", family: :permission_profile}
+      ]
+
+      assert unsupported_routes |> Enum.map(& &1.family) |> Enum.uniq() |> Enum.sort() ==
+               [:app_server, :permission_profile, :remote_control]
+
+      for route <- unsupported_routes do
+        refute MapSet.member?(route_set, {route.method, route.path})
+        refute MapSet.member?(matrix_route_set, {route.method, route.path})
+        refute MapSet.member?(control_plane_route_set, {route.method, route.path})
+      end
+    end
+
     test "documents unsupported v1 public surface with exact OpenAI-shaped error contract" do
       feature = CompatibilityMatrix.by_slug!(:v1_unsupported_public_surface)
       fixture = CompatibilityMatrix.fixture!(:v1_unsupported_public_surface)
@@ -967,6 +1020,14 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       "\r\n--#{multipart_boundary()}--\r\n"
     ]
     |> IO.iodata_to_binary()
+  end
+
+  defp router_method(verb) when is_atom(verb), do: verb
+
+  defp router_method(verb) when is_binary(verb) do
+    verb
+    |> String.downcase()
+    |> String.to_atom()
   end
 
   defp auth(conn, setup), do: put_req_header(conn, "authorization", setup.authorization)
