@@ -126,6 +126,20 @@
     },
     {
       "customType": "regex",
+      "description": "Update mise Elixir runtime version from Docker Elixir slim tags",
+      "managerFilePatterns": [
+        "/(^|/)mise\\.toml$/"
+      ],
+      "matchStrings": [
+        "(?<prefix>elixir\\s*=\\s*\")(?<currentValue>\\d+\\.\\d+\\.\\d+-otp-\\d+)(?<suffix>\")"
+      ],
+      "depNameTemplate": "elixir",
+      "datasourceTemplate": "docker",
+      "currentValueTemplate": "{{{currentValue}}}-slim",
+      "autoReplaceStringTemplate": "{{{prefix}}}{{{replace '-slim' '' newValue}}}{{{suffix}}}"
+    },
+    {
+      "customType": "regex",
       "description": "Update Tailwind CSS binary version used by the Phoenix Mix task",
       "managerFilePatterns": [
         "/(^|/)config/config\\.exs$/"
