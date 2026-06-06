@@ -14,10 +14,6 @@
         },
         {
           "type": "generic",
-          "path": "charts/codex-pooler/Chart.yaml"
-        },
-        {
-          "type": "generic",
           "path": "docs-site/src/content/docs/deployment/docker-compose.mdx"
         },
         {

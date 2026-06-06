@@ -1,11 +1,33 @@
 ---
 title: Helm
-description: Deploy Codex Pooler to Kubernetes with separate release roles.
+description: Deploy Codex Pooler to Kubernetes from the iCoreTech Helm repository.
 ---
 
-The Helm chart in `charts/codex-pooler` deploys the same Codex Pooler release image into Kubernetes. It separates web traffic, background work, scheduled work, and migration work so each role can scale and restart on its own.
+The `icoretech/codex-pooler` Helm chart deploys Codex Pooler into Kubernetes from the iCoreTech Helm repository. It separates web traffic, background work, scheduled work, and migration work so each role can scale and restart on its own.
 
 Use this page as the public shape of the chart. Keep environment-specific secrets, private image repository names, internal hostnames, and operational evidence out of values files and public docs.
+
+## Install the chart
+
+```bash
+helm repo add icoretech https://icoretech.github.io/helm
+helm repo update
+helm upgrade --install codex-pooler icoretech/codex-pooler \
+  --namespace codex-pooler \
+  --create-namespace \
+  --version 0.0.1 \
+  --values ./values.production.yaml
+```
+
+The same chart is also published as an OCI artifact:
+
+```bash
+helm upgrade --install codex-pooler oci://ghcr.io/icoretech/charts/codex-pooler \
+  --namespace codex-pooler \
+  --create-namespace \
+  --version 0.0.1 \
+  --values ./values.production.yaml
+```
 
 ## Chart shape
 
@@ -16,7 +38,7 @@ The chart has four release roles:
 - `oban.scheduler`, runs scheduled jobs with `OBAN_MODE=scheduler`
 - `migrations`, runs release migrations before app rollout when enabled
 
-All roles use the same image repository and tag. Only the app role serves HTTP. Worker, scheduler, and migration pods don't expose the Phoenix endpoint.
+All roles use the same image repository and tag. Only the app role serves HTTP. Worker, scheduler, and migration pods don't expose the HTTP endpoint.
 
 ## Image expectations
 
@@ -100,7 +122,7 @@ The migration hook runs database migrations and imports the vendored OpenAI pric
 
 ## Metrics collection
 
-The app role exposes Prometheus metrics on `/metrics` through the same HTTP service as `/healthz` and `/readyz`. Worker, scheduler, and migration pods don't expose the Phoenix endpoint, so app-level metrics such as BEAM memory, request rate, route latency, gateway admission, stream-buffer pressure, and Ecto query pressure are scraped from app pods only. Worker and scheduler roles still run the memory sampler and VM telemetry poller, but they don't start the Prometheus reporter because unswept histogram samples are drained only by a `/metrics` scrape.
+The app role exposes Prometheus metrics on `/metrics` through the same HTTP service as `/healthz` and `/readyz`. Worker, scheduler, and migration pods don't expose the HTTP endpoint, so app-level metrics such as BEAM memory, request rate, route latency, gateway admission, stream-buffer pressure, and Ecto query pressure are scraped from app pods only. Worker and scheduler roles still run the memory sampler and VM telemetry poller, but they don't start the Prometheus reporter because unswept histogram samples are drained only by a `/metrics` scrape.
 
 If you run Prometheus Operator, enable the chart `ServiceMonitor`:
 
@@ -133,8 +155,9 @@ Don't put the raw metrics token in Helm values. The app stores only a keyed dige
 Render the monitoring resource before installing:
 
 ```bash
-helm template codex-pooler ./charts/codex-pooler \
+helm template codex-pooler icoretech/codex-pooler \
   --namespace codex-pooler \
+  --version 0.0.1 \
   --set monitoring.serviceMonitor.enabled=true \
   --set monitoring.serviceMonitor.labels.release=kube-prometheus-stack \
   --set monitoring.serviceMonitor.interval=10s \
@@ -200,7 +223,8 @@ Render manifests locally before applying them:
 {/* x-release-please-start-version */}
 
 ```bash
-helm template codex-pooler ./charts/codex-pooler \
+helm template codex-pooler icoretech/codex-pooler \
+  --version 0.0.1 \
   --set image.repository=ghcr.io/icoretech/codex-pooler \
   --set image.tag=0.0.1 \
   --set config.host=pooler.example.com \
@@ -215,9 +239,10 @@ Inspect the output for the expected app, worker, scheduler, migration, Secret re
 For install or upgrade, provide your production values file from a private path:
 
 ```bash
-helm upgrade --install codex-pooler ./charts/codex-pooler \
+helm upgrade --install codex-pooler icoretech/codex-pooler \
   --namespace codex-pooler \
   --create-namespace \
+  --version 0.0.1 \
   --values ./values.production.yaml
 ```
 

@@ -1,10 +1,3 @@
-> [!NOTE]
-> **Work in Progress**
->
-> Codex Pooler is under active development. No published release exists yet, so
-> expect the application, docs, and deployment shape to change before the first
-> release.
-
 <h1 align="center">Codex Pooler</h1>
 
 <p align="center">
@@ -891,7 +884,7 @@ the database:
 - `CODEX_POOLER_HTTP_PORT`, the local host port, default `4000`
 - `DATABASE_URL`, the Postgres connection used by the app
 - `SECRET_KEY_BASE`, Phoenix signing and encryption secret
-- `PHX_HOST`, `PORT`, and `PHX_SERVER`, Phoenix endpoint boot settings
+- `PHX_HOST`, `PORT`, and `PHX_SERVER`, HTTP endpoint boot settings
 - `OBAN_MODE` and `OBAN_JOBS_QUEUE_LIMIT`, release role and queue topology
 - `DNS_CLUSTER_QUERY`, plus release distribution variables when clustering is on
 - `CODEX_POOLER_TOTP_ENCRYPTION_KEY` and `CODEX_POOLER_TOTP_KEY_VERSION`, TOTP
@@ -915,14 +908,16 @@ mail send or credential-test paths.
 
 ## Deployment
 
-Docker Compose is the easiest way to try the software. For Kubernetes, this
-repository also ships a Helm chart in `charts/codex-pooler` with separate app,
-worker, scheduler, and migration roles. The chart expects an explicit immutable
-image tag for real deployments. The chart defaults the web app to one replica
-because backend websocket continuity owns a live upstream websocket in an app
-pod. Owner-alive cross-node forwarding is wired, but scaling web replicas still
-requires clustering, owner-forwarding, and the explicit unsafe topology
-acknowledgement until Kubernetes smoke evidence relaxes that guard.
+Docker Compose is the easiest way to try the software. For Kubernetes, use the
+`icoretech/codex-pooler` Helm chart from the
+[iCoreTech Helm repository](https://github.com/icoretech/helm). The chart
+deploys the same release image with separate app, worker, scheduler, and
+migration roles. It expects an explicit immutable image tag for real
+deployments. The chart defaults the web app to one replica because backend
+websocket continuity owns a live upstream websocket in an app pod. Owner-alive
+cross-node forwarding is wired, but scaling web replicas still requires
+clustering, owner-forwarding, and the explicit unsafe topology acknowledgement
+until Kubernetes smoke evidence relaxes that guard.
 
 The Helm migration hook runs database migrations and imports the vendored OpenAI
 pricing feed so request-log cost reporting has pricing snapshots after install
@@ -972,8 +967,10 @@ mix precommit
 mix quality
 docker compose -f docker-compose.dev.yml config
 docker build .
-helm template codex-pooler ./charts/codex-pooler
 ```
+
+Helm chart validation lives with the published chart in the iCoreTech Helm
+repository when Kubernetes deployment behavior or values change.
 
 `mix test` and `mix precommit` serialize database-backed test runs with a
 PostgreSQL advisory lock keyed by the configured test database, so concurrent

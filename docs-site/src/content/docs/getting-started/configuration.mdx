@@ -5,10 +5,6 @@ description: Configure release environment variables, runtime URLs, and public-s
 
 Codex Pooler keeps boot-time release settings in environment variables and day-to-day operator settings in the database-backed admin UI.
 
-:::note[Work in Progress]
-Codex Pooler has no published release yet. Treat configuration examples as current project guidance, not a frozen release contract.
-:::
-
 ## Local Defaults
 
 For Docker Compose, `scripts/self-host/generate-env.sh` writes a local `.env` file with generated secrets and local defaults. Keep that file private. Don't reuse generated values across public installs.
@@ -49,7 +45,7 @@ Set release environment variables for values the app needs before it can read da
     </tr>
     <tr>
       <td><code>PHX_HOST</code></td>
-      <td>Public host used by the Phoenix endpoint</td>
+      <td>Public host used by the HTTP endpoint</td>
     </tr>
     <tr>
       <td><code>PORT</code></td>
