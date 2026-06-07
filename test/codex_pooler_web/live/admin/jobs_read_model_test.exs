@@ -222,7 +222,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert projection.filters.worker == nil
     assert projection.form_values["job_id"] == ""
     assert projection.form_values["worker"] == ""
-    refute inspect(projection) =~ Integer.to_string(global_job.id)
+    refute projected_job_id?(projection, global_job.id)
   end
 
   @tag :non_owner
@@ -258,7 +258,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
              runtime_cleanup: empty_worker_job_summary()
            }
 
-    refute inspect(summaries) =~ Integer.to_string(hidden_job.id)
+    refute projected_job_id?(summaries, hidden_job.id)
   end
 
   defp insert_job(index, attrs) do
@@ -318,6 +318,36 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
       unresolved_failures: []
     }
   end
+
+  defp projected_job_id?(value, job_id) do
+    value
+    |> projected_job_id_values()
+    |> Enum.any?(&job_id_value?(&1, job_id))
+  end
+
+  defp projected_job_id_values(%{} = value) do
+    own_values =
+      value
+      |> Map.take([:id, :job_id, "id", "job_id"])
+      |> Map.values()
+
+    nested_values =
+      value
+      |> Map.values()
+      |> Enum.flat_map(&projected_job_id_values/1)
+
+    own_values ++ nested_values
+  end
+
+  defp projected_job_id_values(values) when is_list(values) do
+    Enum.flat_map(values, &projected_job_id_values/1)
+  end
+
+  defp projected_job_id_values(_value), do: []
+
+  defp job_id_value?(value, job_id) when is_integer(value), do: value == job_id
+  defp job_id_value?(value, job_id) when is_binary(value), do: value == Integer.to_string(job_id)
+  defp job_id_value?(_value, _job_id), do: false
 
   def handle_repo_query_event(_event, _measurements, metadata, {handler_id, test_pid}) do
     if metadata[:repo] == Repo do
