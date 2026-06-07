@@ -206,6 +206,63 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
     refute key_cell_html =~ "Primary Pool"
   end
 
+  test "filters grouped API keys from pool_id query params", %{conn: conn, scope: scope} do
+    {:ok, primary_pool} =
+      Pools.create_pool(scope, %{slug: "filtered-primary", name: "Filtered Primary"})
+
+    {:ok, backup_pool} =
+      Pools.create_pool(scope, %{slug: "filtered-backup", name: "Filtered Backup"})
+
+    {:ok, disabled_pool} =
+      Pools.create_pool(scope, %{slug: "filtered-disabled", name: "Filtered Disabled"})
+
+    {:ok, %{api_key: primary_key, raw_key: primary_raw_key}} =
+      Access.create_api_key(scope, primary_pool, %{display_name: "Filtered primary key"})
+
+    {:ok, %{api_key: backup_key, raw_key: backup_raw_key}} =
+      Access.create_api_key(scope, backup_pool, %{display_name: "Filtered backup key"})
+
+    {:ok, %{api_key: disabled_key, raw_key: disabled_raw_key}} =
+      Access.create_api_key(scope, disabled_pool, %{display_name: "Filtered disabled key"})
+
+    assert {:ok, disabled_pool} = Pools.change_pool_status(scope, disabled_pool, "disabled")
+
+    {:ok, view, _html} = live(conn, ~p"/admin/api-keys?pool_id=#{primary_pool.id}")
+
+    assert has_element?(view, "#api-key-active-pool-filter", "Filtered Primary")
+    assert has_element?(view, "#api-key-clear-pool-filter", "Show all API keys")
+    assert has_element?(view, "#api-key-pool-group-filtered-primary", "Filtered Primary")
+    refute has_element?(view, "#api-key-pool-group-filtered-backup")
+    assert has_element?(view, "#api-key-row-#{primary_key.id}", "Filtered primary key")
+    refute has_element?(view, "#api-key-row-#{backup_key.id}")
+    refute has_element?(view, "#api-key-row-#{disabled_key.id}")
+
+    view
+    |> element("#api-key-clear-pool-filter")
+    |> render_click()
+
+    assert_patch(view, ~p"/admin/api-keys")
+    refute has_element?(view, "#api-key-active-pool-filter")
+    assert has_element?(view, "#api-key-pool-group-filtered-primary", "Filtered Primary")
+    assert has_element?(view, "#api-key-pool-group-filtered-backup", "Filtered Backup")
+    assert has_element?(view, "#api-key-row-#{primary_key.id}", "Filtered primary key")
+    assert has_element?(view, "#api-key-row-#{backup_key.id}", "Filtered backup key")
+    refute has_element?(view, "#api-key-row-#{disabled_key.id}")
+
+    {:ok, disabled_filter_view, _html} =
+      live(conn, ~p"/admin/api-keys?pool_id=#{disabled_pool.id}")
+
+    refute has_element?(disabled_filter_view, "#api-key-active-pool-filter")
+    assert has_element?(disabled_filter_view, "#api-key-row-#{primary_key.id}")
+    assert has_element?(disabled_filter_view, "#api-key-row-#{backup_key.id}")
+    refute has_element?(disabled_filter_view, "#api-key-row-#{disabled_key.id}")
+
+    html = render(disabled_filter_view)
+    refute html =~ primary_raw_key
+    refute html =~ backup_raw_key
+    refute html =~ disabled_raw_key
+  end
+
   test "renders API key usage summaries in grouped rows", %{conn: conn, scope: scope} do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "row-usage", name: "Row Usage"})
 

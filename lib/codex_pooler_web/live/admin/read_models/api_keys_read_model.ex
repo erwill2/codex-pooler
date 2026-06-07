@@ -11,6 +11,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysReadModel do
   alias CodexPoolerWeb.Admin.OptionLoaderFallback
 
   @type data_load_warning :: map()
+  @type filters :: %{optional(String.t()) => String.t()}
   @type option :: {String.t(), Ecto.UUID.t() | String.t()}
   @type pool_lookup :: %{optional(Ecto.UUID.t()) => Pool.t()}
   @type usage_summary :: map()
@@ -25,6 +26,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysReadModel do
           required(:pools) => [Pool.t()],
           required(:pool_lookup) => pool_lookup(),
           required(:api_keys) => [APIKey.t()],
+          required(:filter_values) => filters(),
+          required(:selected_pool) => Pool.t() | nil,
           required(:api_key_usage_summaries) => %{optional(Ecto.UUID.t()) => usage_summary()},
           required(:api_key_pool_groups) => [pool_group()],
           required(:pool_options) => [option()],
@@ -32,18 +35,27 @@ defmodule CodexPoolerWeb.Admin.ApiKeysReadModel do
         }
 
   @spec load(term()) :: page_state()
-  def load(scope) do
+  def load(scope), do: load(scope, %{})
+
+  @spec load(term(), map()) :: page_state()
+  def load(scope, params) do
     pools = Pools.list_visible_pools(scope)
     pool_lookup = Map.new(pools, &{&1.id, &1})
+    selected_pool = selected_pool(pools, Map.get(params, "pool_id"))
+    filter_values = filter_values(selected_pool)
     {api_keys, data_load_warnings} = list_api_keys(scope)
-    usage_summaries = usage_summaries(api_keys)
+    visible_api_keys = filter_api_keys(api_keys, selected_pool)
+    usage_summaries = usage_summaries(visible_api_keys)
 
     %{
       pools: pools,
       pool_lookup: pool_lookup,
-      api_keys: api_keys,
+      api_keys: visible_api_keys,
+      filter_values: filter_values,
+      selected_pool: selected_pool,
       api_key_usage_summaries: usage_summaries,
-      api_key_pool_groups: pool_groups(pools, pool_lookup, api_keys),
+      api_key_pool_groups:
+        pool_groups(filter_pools(pools, selected_pool), pool_lookup, visible_api_keys),
       pool_options: pool_options(pools),
       data_load_warnings: data_load_warnings
     }
@@ -54,6 +66,10 @@ defmodule CodexPoolerWeb.Admin.ApiKeysReadModel do
     do: Enum.find(pools, &(&1.id == pool_id))
 
   def selected_pool(_pools, _pool_id), do: nil
+
+  @spec filter_values(Pool.t() | nil) :: filters()
+  def filter_values(%Pool{id: pool_id}), do: %{"pool_id" => pool_id}
+  def filter_values(_pool), do: %{"pool_id" => ""}
 
   @spec usage_for_params(map()) :: usage_summary()
   def usage_for_params(%{"id" => api_key_id, "pool_id" => pool_id}) do
@@ -209,6 +225,15 @@ defmodule CodexPoolerWeb.Admin.ApiKeysReadModel do
     |> Enum.map(& &1.id)
     |> Accounting.list_api_key_usage_summaries()
   end
+
+  defp filter_api_keys(api_keys, nil), do: api_keys
+
+  defp filter_api_keys(api_keys, %Pool{id: pool_id}) do
+    Enum.filter(api_keys, &(&1.pool_id == pool_id))
+  end
+
+  defp filter_pools(pools, nil), do: pools
+  defp filter_pools(_pools, %Pool{} = pool), do: [pool]
 
   defp load_api_key_usage(pool_id, api_key_id) do
     case Accounting.build_api_key_self_usage(pool_id, api_key_id) do

@@ -149,12 +149,14 @@ defmodule CodexPooler.UpstreamsTest do
   end
 
   describe "pool assignment lifecycle" do
-    test "counts pool assignments by pool id and includes every assignment row" do
+    test "counts visible pool assignments by pool id and excludes deleted rows" do
       pool = pool_fixture()
       other_pool = pool_fixture()
 
       upstream_assignment_fixture(pool, %{assignment_status: "active"})
       upstream_assignment_fixture(pool, %{assignment_status: "paused"})
+      upstream_assignment_fixture(pool, %{assignment_status: "deleted"})
+      upstream_assignment_fixture(pool, %{identity_status: "deleted"})
       upstream_assignment_fixture(other_pool, %{assignment_status: "deleted"})
 
       pool_id = pool.id
@@ -163,7 +165,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert %{
                ^pool_id => 2,
-               ^other_pool_id => 1,
+               ^other_pool_id => 0,
                ^missing_pool_id => 0
              } =
                Upstreams.count_pool_assignments_by_pool_ids([

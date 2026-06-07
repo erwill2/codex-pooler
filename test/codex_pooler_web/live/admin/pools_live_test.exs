@@ -6,6 +6,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   import CodexPooler.PoolerFixtures
   import ExUnit.CaptureLog
 
+  alias CodexPooler.Access
   alias CodexPooler.Access.APIKey
   alias CodexPooler.Accounts
   alias CodexPooler.Events
@@ -153,7 +154,21 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
       })
 
     %{api_key: _api_key} = api_key_fixture(pool)
+    %{api_key: paused_api_key} = api_key_fixture(pool)
+    %{api_key: _hidden_api_key} = api_key_fixture(other_pool)
+    assert {:ok, _paused_api_key} = Access.pause_api_key(scope, paused_api_key)
+    assert {:ok, other_pool} = Pools.change_pool_status(scope, other_pool, "disabled")
     %{assignment: _assignment} = upstream_assignment_fixture(pool)
+
+    upstream_assignment_fixture(pool, %{
+      account_label: "Deleted summary upstream",
+      assignment_status: "deleted"
+    })
+
+    upstream_assignment_fixture(other_pool, %{
+      account_label: "Deleted only upstream",
+      assignment_status: "deleted"
+    })
 
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
 
@@ -163,7 +178,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert %{
              pool: %Pool{id: ^pool_id},
-             api_key_count: 1,
+             api_key_count: 2,
              upstream_count: 1,
              request_count_5h: 0,
              tokens_per_second: nil,
@@ -180,7 +195,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
            } = Enum.find(state.socket.assigns.pools, &(&1.pool.id == other_pool_id))
 
     assert has_element?(view, "#pool-row-#{pool.id}-upstream-account-count", "1")
-    assert has_element?(view, "#pool-row-#{pool.id}-api-key-count", "1")
+    assert has_element?(view, "#pool-row-#{pool.id}-api-key-count", "2")
     assert has_element?(view, "#pool-row-#{pool.id}-request-count-5h", "0")
     assert has_element?(view, "#pool-row-#{pool.id}-tokens-per-sec", "0")
     assert has_element?(view, "#pool-row-#{pool.id}-routing-strategy", "Deterministic rotation")
@@ -226,7 +241,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
       {"pool-upstream-count-cell", "pool-row-#{pool.id}-upstream-account-count",
        "/admin/upstreams?pool_id=#{pool.id}", "Upstreams", "1"},
       {"pool-api-key-count-cell", "pool-row-#{pool.id}-api-key-count",
-       "/admin/api-keys?pool_id=#{pool.id}", "API keys", "1"},
+       "/admin/api-keys?pool_id=#{pool.id}", "API keys", "2"},
       {"pool-request-count-cell", "pool-row-#{pool.id}-request-count-5h",
        "/admin/request-logs?pool_id=#{pool.id}", "Requests 5h", "0"}
     ]
@@ -282,7 +297,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool-row-#{other_pool.id}-request-count-5h", "0")
     assert has_element?(view, "#pool-row-#{other_pool.id}-tokens-per-sec", "0")
     assert has_element?(view, "#pool-row-#{other_pool.id}-routing-strategy", "Bridge ring")
-    assert has_element?(view, "#pool-row-#{other_pool.id}-status", "active")
+    assert has_element?(view, "#pool-row-#{other_pool.id}-status", "disabled")
     assert has_element?(view, "#pool-row-#{other_pool.id}-activity")
     refute has_element?(view, "#pool-row-#{other_pool.id}-quota-remaining")
 

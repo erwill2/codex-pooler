@@ -149,19 +149,43 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
   attr :pools, :list, required: true
   attr :groups, :list, required: true
   attr :usage_summaries, :map, required: true
+  attr :selected_pool, :any, default: nil
   attr :can_manage_pools?, :boolean, required: true
 
   def api_key_groups(assigns) do
     ~H"""
     <div id="admin-api-keys" class="grid min-w-0 gap-4">
+      <div
+        :if={@selected_pool}
+        id="api-key-active-pool-filter"
+        class="flex flex-wrap items-center justify-between gap-3 rounded-box border border-base-300 bg-base-100 px-4 py-3 text-sm shadow-sm"
+      >
+        <div class="flex items-center gap-2 text-base-content/70">
+          <.icon name="hero-funnel" class="size-4 text-primary" />
+          <span>
+            Showing API keys for
+            <span class="font-medium text-base-content">{@selected_pool.name}</span>
+          </span>
+        </div>
+        <.link
+          id="api-key-clear-pool-filter"
+          patch={~p"/admin/api-keys"}
+          class="btn btn-ghost btn-xs"
+        >
+          Show all API keys
+        </.link>
+      </div>
+
       <AdminComponents.empty_state
         :if={@groups == []}
         id="api-key-empty-state"
         title="No API keys"
         description={
-          if @pools == [],
-            do: "Create a Pool before adding API keys.",
-            else: "Create the first API key for an active Pool."
+          cond do
+            @pools == [] -> "Create a Pool before adding API keys."
+            @selected_pool -> "Create the first API key for this Pool."
+            true -> "Create the first API key for an active Pool."
+          end
         }
         icon="hero-key"
       >

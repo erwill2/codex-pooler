@@ -47,6 +47,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     completed_job =
       insert_job(2,
         worker: RuntimeStateCleanupWorker,
+        queue: "critical",
         state: "completed",
         inserted_at: ~U[2026-06-02 10:10:00Z],
         completed_at: ~U[2026-06-02 10:11:00Z]
@@ -80,8 +81,13 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert filters.queue == "jobs"
     assert filters.job_id == selected_job.id
     assert form_values["job_id"] == Integer.to_string(selected_job.id)
-    assert filter_options.worker |> Enum.map(& &1.value) == ["", worker_name(TokenRefreshWorker)]
-    assert filter_options.queue |> Enum.map(& &1.value) == ["", "jobs"]
+
+    worker_option_values = Enum.map(filter_options.worker, & &1.value)
+    assert "" in worker_option_values
+    assert worker_name(RuntimeStateCleanupWorker) in worker_option_values
+    assert worker_name(TokenRefreshWorker) in worker_option_values
+
+    assert filter_options.queue |> Enum.map(& &1.value) == ["", "critical", "jobs"]
 
     refute Enum.any?(projection.explorer.items, &(&1.id == completed_job.id))
     refute Map.has_key?(projection, :recent_jobs)

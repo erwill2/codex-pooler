@@ -9,6 +9,7 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   @active UpstreamIdentity.active_status()
+  @deleted UpstreamIdentity.deleted_status()
   @assignment_active PoolUpstreamAssignment.active_status()
   @assignment_deleted PoolUpstreamAssignment.deleted_status()
   @assignment_disabled PoolUpstreamAssignment.disabled_status()
@@ -215,7 +216,11 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
         _ ->
           Repo.all(
             from assignment in PoolUpstreamAssignment,
+              join: identity in UpstreamIdentity,
+              on: identity.id == assignment.upstream_identity_id,
               where: assignment.pool_id in ^pool_ids,
+              where: assignment.status != ^@assignment_deleted,
+              where: identity.status != ^@deleted,
               group_by: assignment.pool_id,
               select: {assignment.pool_id, count(assignment.id)}
           )

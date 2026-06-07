@@ -23,6 +23,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
        pools: [],
        pool_lookup: %{},
        api_keys: [],
+       filter_values: %{"pool_id" => ""},
+       selected_pool: nil,
        api_key_usage_summaries: %{},
        api_key_form: nil,
        api_key_params: %{},
@@ -43,8 +45,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
   end
 
   @impl true
-  def handle_params(_params, _uri, socket) do
-    {:noreply, load_api_keys(socket, reset_form: true, clear_secret: true)}
+  def handle_params(params, _uri, socket) do
+    {:noreply, load_api_keys(socket, params, reset_form: true, clear_secret: true)}
   end
 
   @impl true
@@ -368,6 +370,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
           pools={@pools}
           groups={@api_key_pool_groups}
           usage_summaries={@api_key_usage_summaries}
+          selected_pool={@selected_pool}
           can_manage_pools?={Pools.can_manage_pools?(@current_scope)}
         />
       </section>
@@ -469,7 +472,11 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
   defp reset_delete_form(socket), do: clear_deleting_api_key(socket)
 
   defp load_api_keys(socket, opts) do
-    read_model = ApiKeysReadModel.load(socket.assigns.current_scope)
+    load_api_keys(socket, socket.assigns.filter_values || %{}, opts)
+  end
+
+  defp load_api_keys(socket, params, opts) do
+    read_model = ApiKeysReadModel.load(socket.assigns.current_scope, params)
 
     socket
     |> assign(read_model)

@@ -483,6 +483,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
   test "renders URL-backed filter controls and patches selected filters", %{conn: conn} do
     pool = pool_fixture(%{name: "Jobs Filter Pool", slug: unique_slug("jobs-filter-pool")})
     worker = worker_name(TokenRefreshWorker)
+    completed_worker = worker_name(RuntimeStateCleanupWorker)
 
     retryable_job =
       insert_job(
@@ -502,7 +503,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
         2,
         worker: RuntimeStateCleanupWorker,
         state: "completed",
-        queue: "jobs",
+        queue: "critical",
         inserted_at: ~U[2026-05-04 10:02:00Z],
         completed_at: ~U[2026-05-04 10:03:00Z]
       )
@@ -552,6 +553,11 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
              "#job-worker-filter [data-role='worker-filter-option'][data-worker='#{worker}']"
            )
 
+    assert has_element?(
+             view,
+             "#job-worker-filter [data-role='worker-filter-option'][data-worker='#{completed_worker}']"
+           )
+
     assert has_element?(view, "#filters_worker[value='']")
 
     assert has_element?(view, "#job-queue-filter [data-role='queue-filter-trigger']", "Any queue")
@@ -559,6 +565,11 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     assert has_element?(
              view,
              "#job-queue-filter [data-role='queue-filter-option'][data-queue='jobs']"
+           )
+
+    assert has_element?(
+             view,
+             "#job-queue-filter [data-role='queue-filter-option'][data-queue='critical']"
            )
 
     assert has_element?(view, "#filters_queue[value='']")

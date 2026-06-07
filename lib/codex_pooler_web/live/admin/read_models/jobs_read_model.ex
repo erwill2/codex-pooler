@@ -81,7 +81,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
       explorer: explorer,
       filters: filters,
       form_values: form_values,
-      filter_options: filter_options(explorer.items, filters),
+      filter_options: filter_options(ReadModel.explorer_filter_values(scope), filters),
       filter_warnings: filter_warnings,
       selected_job: selected_job(filters.job_id, explorer.items),
       worker_jobs_by_group: grouped_jobs
@@ -97,7 +97,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
       explorer: ReadModel.list_explorer_jobs(nil, explorer_filters),
       filters: filters,
       form_values: form_values,
-      filter_options: filter_options([], filters),
+      filter_options: filter_options(ReadModel.explorer_filter_values(nil), filters),
       filter_warnings: [],
       selected_job: nil,
       worker_jobs_by_group: worker_jobs_by_group(nil)
@@ -120,20 +120,14 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
   defp selected_job(nil, _items), do: nil
   defp selected_job(job_id, items), do: Enum.find(items, &(&1.id == job_id))
 
-  defp filter_options(items, filters) do
+  defp filter_options(filter_values, filters) do
     %{
       state: JobFilterForm.state_options(),
       attention: JobFilterForm.attention_options(),
       target_kind: JobFilterForm.target_kind_options(),
-      worker: items |> projection_values(:worker) |> JobFilterForm.worker_options(filters.worker),
-      queue: items |> projection_values(:queue) |> JobFilterForm.queue_options(filters.queue)
+      worker: JobFilterForm.worker_options(filter_values.workers, filters.worker),
+      queue: JobFilterForm.queue_options(filter_values.queues, filters.queue)
     }
-  end
-
-  defp projection_values(items, key) do
-    items
-    |> Enum.map(&Map.get(&1, key))
-    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
   end
 
   defp sanitize_projection(value) when is_list(value), do: Enum.map(value, &sanitize_projection/1)

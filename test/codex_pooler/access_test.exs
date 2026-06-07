@@ -295,6 +295,61 @@ defmodule CodexPooler.AccessTest do
   end
 
   describe "assigned-admin API key scoping" do
+    test "pool count projections include visible key statuses and exclude inactive parent pools" do
+      {scope, active_pool} = owner_scope_and_pool()
+
+      assert {:ok, disabled_pool} =
+               Pools.create_pool(scope, %{
+                 slug: "count-disabled-#{System.unique_integer([:positive])}",
+                 name: "Count Disabled"
+               })
+
+      assert {:ok, archived_pool} =
+               Pools.create_pool(scope, %{
+                 slug: "count-archived-#{System.unique_integer([:positive])}",
+                 name: "Count Archived"
+               })
+
+      assert {:ok, %{api_key: active_key}} =
+               Access.create_api_key(scope, active_pool, %{display_name: "Count active"})
+
+      assert {:ok, %{api_key: paused_key}} =
+               Access.create_api_key(scope, active_pool, %{display_name: "Count paused"})
+
+      assert {:ok, _paused_key} = Access.pause_api_key(scope, paused_key)
+
+      assert {:ok, %{api_key: revoked_key}} =
+               Access.create_api_key(scope, active_pool, %{display_name: "Count revoked"})
+
+      assert {:ok, _revoked_key} = Access.revoke_api_key(scope, revoked_key)
+
+      assert {:ok, %{api_key: disabled_key}} =
+               Access.create_api_key(scope, disabled_pool, %{display_name: "Count disabled"})
+
+      assert {:ok, %{api_key: archived_key}} =
+               Access.create_api_key(scope, archived_pool, %{display_name: "Count archived"})
+
+      assert {:ok, disabled_pool} = Pools.change_pool_status(scope, disabled_pool, "disabled")
+      assert {:ok, archived_pool} = Pools.change_pool_status(scope, archived_pool, "archived")
+
+      counts =
+        Access.count_api_keys_by_pool_ids([
+          active_pool.id,
+          disabled_pool.id,
+          archived_pool.id
+        ])
+
+      assert counts[active_pool.id] == 3
+      assert counts[disabled_pool.id] == 0
+      assert counts[archived_pool.id] == 0
+
+      assert Repo.get!(APIKey, active_key.id).status == "active"
+      assert Repo.get!(APIKey, paused_key.id).status == "paused"
+      assert Repo.get!(APIKey, revoked_key.id).status == "revoked"
+      assert Repo.get!(APIKey, disabled_key.id).pool_id == disabled_pool.id
+      assert Repo.get!(APIKey, archived_key.id).pool_id == archived_pool.id
+    end
+
     test "assigned admins list and read only API keys from assigned pools" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
       owner_scope = Scope.for_user(owner)

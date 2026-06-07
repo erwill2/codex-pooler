@@ -18,6 +18,8 @@ defmodule CodexPooler.Access.APIKeys.Queries do
           required(:policy_bindings) => [%APIKeyPolicyBinding{}]
         }
 
+  @pool_status_active "active"
+
   @spec list_api_keys(Scope.t()) :: {:ok, [APIKey.t()]} | {:error, access_error()}
   def list_api_keys(%Scope{} = scope) do
     with {:ok, pools} <-
@@ -58,7 +60,10 @@ defmodule CodexPooler.Access.APIKeys.Queries do
         _ ->
           Repo.all(
             from key in APIKey,
+              join: pool in Pool,
+              on: pool.id == key.pool_id,
               where: key.pool_id in ^pool_ids,
+              where: pool.status == ^@pool_status_active,
               group_by: key.pool_id,
               select: {key.pool_id, count(key.id)}
           )

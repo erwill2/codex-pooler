@@ -13,6 +13,7 @@ defmodule CodexPooler.Jobs.ReadModel do
   alias CodexPooler.Jobs.{
     AccountReconciliationWorker,
     HealthPolicy,
+    Schedule,
     TokenRefreshWorker
   }
 
@@ -39,6 +40,10 @@ defmodule CodexPooler.Jobs.ReadModel do
           required(:total) => non_neg_integer(),
           required(:limit) => pos_integer(),
           required(:offset) => non_neg_integer()
+        }
+  @type explorer_filter_values :: %{
+          required(:workers) => [String.t()],
+          required(:queues) => [String.t()]
         }
   @type overview_status :: :attention_required | :healthy | :empty
   @type overview_bucket :: %{
@@ -140,6 +145,23 @@ defmodule CodexPooler.Jobs.ReadModel do
   end
 
   def list_explorer_jobs(_scope, filters, _opts), do: empty_explorer_page(filters)
+
+  @spec explorer_filter_values(scope_ref()) :: explorer_filter_values()
+  def explorer_filter_values(%Scope{} = scope) do
+    if Pools.owner?(scope),
+      do: explorer_filter_values(:system),
+      else: empty_explorer_filter_values()
+  end
+
+  def explorer_filter_values(:system) do
+    %{
+      workers:
+        filter_option_values(configured_worker_values(), distinct_job_field_values(:worker)),
+      queues: filter_option_values(configured_queue_values(), distinct_job_field_values(:queue))
+    }
+  end
+
+  def explorer_filter_values(_scope), do: empty_explorer_filter_values()
 
   @spec jobs_overview(scope_ref(), explorer_filters(), keyword()) :: jobs_overview()
   def jobs_overview(scope, filters, opts \\ [])
@@ -660,6 +682,7 @@ defmodule CodexPooler.Jobs.ReadModel do
 
   defp normalize_worker_names(_workers), do: []
 
+  defp normalize_worker_name(nil), do: nil
   defp normalize_worker_name(worker) when is_binary(worker), do: worker
   defp normalize_worker_name(worker) when is_atom(worker), do: worker_name(worker)
   defp normalize_worker_name(_worker), do: nil
@@ -684,6 +707,50 @@ defmodule CodexPooler.Jobs.ReadModel do
       filters |> normalize_explorer_filters() |> Map.fetch!(:page) |> explorer_offset(limit)
 
     %{items: [], total: 0, limit: limit, offset: offset}
+  end
+
+  defp empty_explorer_filter_values, do: %{workers: [], queues: []}
+
+  defp configured_worker_values do
+    Schedule.entries()
+    |> Enum.flat_map(fn entry ->
+      [Map.get(entry, :scheduled_worker) | Map.get(entry, :workers, [])]
+    end)
+    |> normalize_worker_names()
+  end
+
+  defp configured_queue_values do
+    :codex_pooler
+    |> Application.get_env(Oban, [])
+    |> Keyword.get(:queues, [])
+    |> case do
+      queues when is_list(queues) -> Enum.map(queues, &queue_name/1)
+      _queues_disabled -> []
+    end
+    |> Enum.filter(&is_binary/1)
+  end
+
+  defp queue_name({queue, _limit}) when is_atom(queue), do: Atom.to_string(queue)
+  defp queue_name({queue, _limit}) when is_binary(queue), do: queue
+  defp queue_name(queue) when is_atom(queue), do: Atom.to_string(queue)
+  defp queue_name(queue) when is_binary(queue), do: queue
+  defp queue_name(_queue), do: nil
+
+  defp filter_option_values(configured_values, persisted_values) do
+    [configured_values, persisted_values]
+    |> List.flatten()
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp distinct_job_field_values(field) when field in [:worker, :queue] do
+    Repo.all(
+      from job in Oban.Job,
+        where: not is_nil(field(job, ^field)) and field(job, ^field) != "",
+        select: field(job, ^field),
+        distinct: true,
+        order_by: field(job, ^field)
+    )
   end
 
   defp normalize_explorer_filters(filters) when is_map(filters) do
