@@ -85,6 +85,18 @@ export default defineConfig({
           attrs: { type: "application/ld+json" },
           content: JSON.stringify(softwareStructuredData),
         },
+        {
+          tag: "script",
+          attrs: {
+            async: true,
+            src: "https://analytics.icorete.ch/js/pa-5Klr1c-TW2X9D5KwXBBis.js",
+          },
+        },
+        {
+          tag: "script",
+          content:
+            "window.plausible=window.plausible||function(){(plausible.q=plausible.q||[]).push(arguments)},plausible.init=plausible.init||function(i){plausible.o=i||{}};plausible.init();",
+        },
       ],
       social: [
         {
