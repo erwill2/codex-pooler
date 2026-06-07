@@ -204,6 +204,29 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     refute html =~ second_workspace_id
   end
 
+  test "leaves legacy workspace context blank on upstream account cards", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "legacy-workspace-slot", name: "Legacy Workspace Slot"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Legacy workspace account",
+        chatgpt_account_id: "acct_workspace_legacy_#{System.unique_integer([:positive])}"
+      })
+
+    {:ok, view, html} = live(conn, ~p"/admin/upstreams")
+
+    selector =
+      "#upstream-account-#{identity.id}-workspace[data-role='upstream-workspace-context']"
+
+    refute has_element?(view, selector)
+    refute html =~ "Workspace legacy"
+    refute html =~ "Workspace reference legacy"
+  end
+
   @tag :upstream_filters
   test "renders URL-backed upstream filter controls without legacy select fallbacks", %{
     conn: conn,
@@ -472,6 +495,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       upstream_assignment_fixture(pool, %{
         account_label: "Primary Codex",
         assignment_label: "Primary assignment",
+        workspace_label: "Primary workspace",
         plan_label: "Team",
         assignment_metadata: %{
           "quota_priming" => %{

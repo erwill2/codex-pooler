@@ -16,7 +16,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
 
   def account_card(assigns) do
     assigns =
-      assign(assigns, :reported_quota_limits, reported_quota_limits(assigns.account.quota_limits))
+      assigns
+      |> assign(:reported_quota_limits, reported_quota_limits(assigns.account.quota_limits))
+      |> assign(:workspace_context_label, workspace_context_label(assigns.account))
+      |> assign(:workspace_context_title, workspace_context_title(assigns.account))
 
     ~H"""
     <article
@@ -43,12 +46,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
               </.link>
             </h3>
             <span
+              :if={@workspace_context_label != ""}
               id={"upstream-account-#{@account.identity.id}-workspace"}
               data-role="upstream-workspace-context"
               class="badge badge-ghost badge-sm shrink-0 max-w-48 truncate text-[0.65rem] text-base-content/50"
-              title={workspace_context_title(@account)}
+              title={@workspace_context_title}
             >
-              {workspace_context_label(@account)}
+              {@workspace_context_label}
             </span>
           </div>
         </div>
@@ -500,16 +504,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
   defp workspace_context_label(%{workspace_label: label}) when is_binary(label) and label != "",
     do: "Workspace " <> label
 
+  defp workspace_context_label(%{workspace_ref: "legacy"}), do: ""
+
   defp workspace_context_label(%{workspace_ref: ref}) when is_binary(ref) and ref != "",
     do: "Workspace " <> ref
 
-  defp workspace_context_label(_account), do: "Workspace legacy"
+  defp workspace_context_label(_account), do: ""
 
-  @spec workspace_context_title(map()) :: String.t()
+  @spec workspace_context_title(map()) :: String.t() | nil
+  defp workspace_context_title(%{workspace_ref: "legacy"}), do: nil
+
   defp workspace_context_title(%{workspace_ref: ref}) when is_binary(ref) and ref != "",
     do: "Workspace reference " <> ref
 
-  defp workspace_context_title(_account), do: "Workspace reference legacy"
+  defp workspace_context_title(_account), do: nil
 
   defp account_status_label(%{identity: %{status: status}}) when is_binary(status) do
     status
