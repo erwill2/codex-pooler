@@ -2359,6 +2359,101 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     end
   end
 
+  test "tool output websocket continuations wait for the active upstream turn" do
+    release_ref = make_ref()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.barrier_sse_stream(
+          [
+            {"response.completed",
+             %{
+               "type" => "response.completed",
+               "response" => %{
+                 "id" => "resp_ws_ordered_tool",
+                 "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+               }
+             }}
+          ],
+          barrier_after: 0,
+          notify: self(),
+          release_ref: release_ref
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, state} =
+      CodexResponsesSocket.init(%{
+        auth: auth,
+        opts: %{
+          request_id: "ws-ordered-tool-continuation",
+          accepted_turn_state: "stable-ws-ordered-tool-continuation",
+          client_ip: "127.0.0.1"
+        }
+      })
+
+    try do
+      first_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [%{"type" => "message", "role" => "user", "content" => "main turn"}],
+          "stream" => true,
+          "generate" => true
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({first_payload, [opcode: :text]}, state)
+
+      assert_receive {:fake_upstream_chunk_barrier, 0, first_upstream_pid, ^release_ref}, 1_000
+
+      second_payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_ordered_tool",
+              "output" => "sample output"
+            }
+          ],
+          "stream" => true,
+          "generate" => true,
+          "previous_response_id" => "resp_ws_ordered_tool"
+        })
+
+      assert {:ok, state} =
+               CodexResponsesSocket.handle_in({second_payload, [opcode: :text]}, state)
+
+      refute_receive {:fake_upstream_chunk_barrier, 0, _second_upstream_pid, ^release_ref}, 100
+
+      send(first_upstream_pid, {:fake_upstream_release_chunk, release_ref})
+
+      assert {:push, {:text, first_frame}, state} = receive_socket_push(state)
+      assert %{"type" => "response.completed"} = Jason.decode!(first_frame)
+      assert {:ok, state} = receive_socket_done(state)
+
+      assert_receive {:fake_upstream_chunk_barrier, 0, second_upstream_pid, ^release_ref}, 1_000
+      send(second_upstream_pid, {:fake_upstream_release_chunk, release_ref})
+
+      assert {:push, {:text, second_frame}, state} = receive_socket_push(state)
+      assert %{"type" => "response.completed"} = Jason.decode!(second_frame)
+      assert {:ok, _state} = receive_socket_done(state)
+
+      assert [first_request, second_request] = FakeUpstream.requests(upstream)
+      assert first_request.websocket_connection_id == second_request.websocket_connection_id
+      assert second_request.json["previous_response_id"] == "resp_ws_ordered_tool"
+
+      assert [%{"type" => "function_call_output", "call_id" => "call_ordered_tool"}] =
+               second_request.json["input"]
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
   test "downstream websocket does not inject last response id when continuation omits previous_response_id" do
     upstream =
       start_upstream(

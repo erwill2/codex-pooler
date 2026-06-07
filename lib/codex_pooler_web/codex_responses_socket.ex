@@ -6,6 +6,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Payloads.ToolResultShape
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata, as: FinalizationMetadata
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
@@ -82,7 +83,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     state =
       state
       |> remove_tracked_response_task(pid)
-      |> maybe_start_queued_owner_response_task()
+      |> maybe_start_queued_response_task()
 
     {:ok, state}
   end
@@ -91,7 +92,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     state =
       state
       |> remove_tracked_response_task(pid)
-      |> maybe_start_queued_owner_response_task()
+      |> maybe_start_queued_response_task()
 
     {:push, {:text, Jason.encode!(websocket_error(reason))}, state}
   end
@@ -131,7 +132,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     state =
       state
       |> remove_tracked_response_task(pid, ref)
-      |> maybe_start_queued_owner_response_task()
+      |> maybe_start_queued_response_task()
 
     {:ok, state}
   end
@@ -365,22 +366,26 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp start_or_queue_response_task(payload, state) do
-    if owner_forwarded_socket?(state) and active_response_task?(state) do
-      queue_owner_payload(state, payload)
-    else
-      if suppress_owner_reconnect_replay?(payload, state) do
+    cond do
+      owner_forwarded_socket?(state) and active_response_task?(state) ->
+        queue_response_payload(state, payload)
+
+      active_response_task?(state) and continuity_ordered_payload?(payload) ->
+        queue_response_payload(state, payload)
+
+      suppress_owner_reconnect_replay?(payload, state) ->
         state
-      else
+
+      true ->
         start_tracked_response_task(payload, state)
-      end
     end
   end
 
-  defp maybe_start_queued_owner_response_task(state) do
-    if owner_forwarded_socket?(state) and not active_response_task?(state) do
-      case Map.get(state, :queued_owner_payloads, :queue.new()) |> :queue.out() do
+  defp maybe_start_queued_response_task(state) do
+    if not active_response_task?(state) do
+      case Map.get(state, :queued_response_payloads, :queue.new()) |> :queue.out() do
         {{:value, payload}, queue} ->
-          state = Map.put(state, :queued_owner_payloads, queue)
+          state = Map.put(state, :queued_response_payloads, queue)
           start_tracked_response_task(payload, state)
 
         {:empty, _queue} ->
@@ -400,10 +405,10 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     track_response_task(state, pid, monitor)
   end
 
-  defp queue_owner_payload(state, payload) do
+  defp queue_response_payload(state, payload) do
     Map.update(
       state,
-      :queued_owner_payloads,
+      :queued_response_payloads,
       :queue.from_list([payload]),
       &:queue.in(payload, &1)
     )
@@ -430,6 +435,26 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp request_row_producing_response_payload?(_payload), do: false
+
+  defp continuity_ordered_payload?(payload) when is_binary(payload) do
+    case Jason.decode(payload) do
+      {:ok, %{"type" => "response.processed"}} ->
+        true
+
+      {:ok,
+       %{"type" => "response.create", "previous_response_id" => previous_response_id} = decoded}
+      when is_binary(previous_response_id) ->
+        decoded
+        |> Map.get("input")
+        |> ToolResultShape.items()
+        |> Enum.any?()
+
+      _payload ->
+        false
+    end
+  end
+
+  defp continuity_ordered_payload?(_payload), do: false
 
   defp owner_forwarded_socket?(state), do: is_map(Map.get(state, :websocket_owner_downstream))
 

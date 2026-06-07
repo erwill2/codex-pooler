@@ -623,7 +623,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
                CodexResponsesSocket.handle_in({tool_payload, [opcode: :text]}, queued_state)
 
       assert MapSet.size(queued_state.tasks) == 1
-      assert :queue.len(Map.get(queued_state, :queued_owner_payloads, :queue.new())) == 1
+      assert :queue.len(Map.get(queued_state, :queued_response_payloads, :queue.new())) == 1
       refute_received {:chained_owner_upstream_tool_started, ^release_ref}
 
       send(processed_pid, {:chained_owner_upstream_release, release_ref})
