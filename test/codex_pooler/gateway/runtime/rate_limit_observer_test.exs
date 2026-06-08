@@ -1,6 +1,7 @@
 defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
   use CodexPooler.DataCase, async: false
 
+  import ExUnit.CaptureLog
   import CodexPooler.PoolerFixtures
 
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
@@ -99,6 +100,107 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
                  RateLimitObserver.event_state()
                )
     end
+
+    test "normalizes non-streaming fallback states" do
+      assert {:ok, %{buffer: "kept"}} =
+               RateLimitObserver.record_events(:not_an_identity, :not_binary, %{buffer: "kept"})
+
+      assert {:ok, %{buffer: ""}} =
+               RateLimitObserver.record_events(:not_an_identity, :not_binary, %{buffer: 1})
+
+      assert :ok =
+               RateLimitObserver.clear_event_buffer(%UpstreamIdentity{id: Ecto.UUID.generate()})
+    end
+
+    test "keeps partial SSE tail when later blocks are complete" do
+      identity = %UpstreamIdentity{id: Ecto.UUID.generate()}
+
+      assert {:ok, %{buffer: "event: codex.rate_limits\n"}} =
+               RateLimitObserver.record_events(
+                 identity,
+                 "event: response.output_text.delta\n" <>
+                   "data: #{Jason.encode!(%{"type" => "response.output_text.delta"})}\n\n" <>
+                   "event: codex.rate_limits\n",
+                 RateLimitObserver.event_state()
+               )
+    end
+  end
+
+  describe "observer failure logging" do
+    test "records header and error failures with sanitized metadata" do
+      identity = %UpstreamIdentity{id: Ecto.UUID.generate()}
+      headers = reset_bearing_headers()
+      log_opts = [metadata: [:operation, :reason, :upstream_identity_id]]
+
+      header_log =
+        capture_log(log_opts, fn ->
+          assert :ok = RateLimitObserver.record_headers(identity, %Req.Response{headers: headers})
+        end)
+
+      assert header_log =~ "gateway observer failure"
+      assert header_log =~ "operation=rate_limit_headers"
+      assert header_log =~ "reason=upstream_identity_not_found"
+      assert header_log =~ "upstream_identity_id=#{identity.id}"
+
+      frame_log =
+        capture_log(log_opts, fn ->
+          assert :ok =
+                   RateLimitObserver.record_websocket_frame_headers(identity, Map.new(headers))
+        end)
+
+      assert frame_log =~ "operation=rate_limit_websocket_frame_headers"
+      assert frame_log =~ "reason=upstream_identity_not_found"
+      assert frame_log =~ "upstream_identity_id=#{identity.id}"
+
+      error_log =
+        capture_log(log_opts, fn ->
+          assert :ok =
+                   RateLimitObserver.record_error(
+                     identity,
+                     Jason.encode!(%{
+                       "limit_id" => "codex_future_family",
+                       "window_kind" => "secondary",
+                       "window_minutes" => "10080",
+                       "used_percent" => "100",
+                       "reset_after_seconds" => "120"
+                     })
+                   )
+        end)
+
+      assert error_log =~ "operation=rate_limit_error"
+      assert error_log =~ "reason=upstream_identity_not_found"
+      assert error_log =~ "upstream_identity_id=#{identity.id}"
+    end
+
+    test "normalizes explicit failure reasons" do
+      reasons = [
+        {%Ecto.Changeset{}, "changeset_invalid"},
+        {%{code: :quota_window_invalid}, "quota_window_invalid"},
+        {%{code: "quota_window_invalid"}, "quota_window_invalid"},
+        {{:quota_refresh_failed, %{}}, "quota_refresh_failed"},
+        {{"opaque", %{}}, "tuple_error"},
+        {:timeout, "timeout"},
+        {"upstream closed", "upstream closed"},
+        {123, "unknown_error"}
+      ]
+
+      for {reason, code} <- reasons do
+        log =
+          capture_log([metadata: [:operation, :reason]], fn ->
+            assert :ok = RateLimitObserver.log_failure("rate_limit_test", [], reason)
+          end)
+
+        assert log =~ "operation=rate_limit_test"
+        assert log =~ "reason=#{code}"
+      end
+    end
+
+    test "ignores malformed error bodies" do
+      assert :ok =
+               RateLimitObserver.record_error(%UpstreamIdentity{id: Ecto.UUID.generate()}, :bad)
+
+      assert :ok = RateLimitObserver.record_error(:not_an_identity, "{}")
+    end
   end
 
   defp usage_limit_terminal_payload do
@@ -130,6 +232,19 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
         }
       }
     }
+  end
+
+  defp reset_bearing_headers do
+    reset_at =
+      DateTime.utc_now()
+      |> DateTime.add(600, :second)
+      |> DateTime.truncate(:second)
+
+    [
+      {"x-codex-primary-used-percent", ["12"]},
+      {"x-codex-primary-window-minutes", ["300"]},
+      {"x-codex-primary-reset-at", [DateTime.to_iso8601(reset_at)]}
+    ]
   end
 
   defp wait_for_rate_limit_event_window(identity, window_kind, deadline \\ nil) do

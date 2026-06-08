@@ -10,7 +10,7 @@ defmodule CodexPooler.MixProject do
       elixir: "~> 1.16",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      test_coverage: [tool: Six, minimum_coverage: 83.0, threshold: 83],
+      test_coverage: [tool: Six, minimum_coverage: 85.0, threshold: 85],
       aliases: aliases(),
       deps: deps(),
       dialyzer: [plt_add_apps: [:ex_unit, :mix]],

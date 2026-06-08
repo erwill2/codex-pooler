@@ -10,6 +10,11 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReasonTest do
              reason: :closed,
              source: %Mint.TransportError{reason: :econnrefused}
            }) == "econnrefused"
+
+    assert TransportFailureReason.safe_reason(%Finch.HTTPError{
+             reason: :closed,
+             source: %Mint.HTTPError{reason: {:proxy, {:unexpected_status, 503}}}
+           }) == "proxy_unexpected_status_503"
   end
 
   test "normalizes tuple reasons without inspecting full terms" do
@@ -18,6 +23,19 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReasonTest do
 
     assert TransportFailureReason.safe_reason({:bad_alpn_protocol, :http1}) ==
              "bad_alpn_protocol_http1"
+
+    assert TransportFailureReason.safe_reason({:upstream_status, 503, %{body: "hidden"}}) ==
+             "upstream_status_503"
+  end
+
+  test "normalizes blank and long string reasons" do
+    assert TransportFailureReason.safe_reason(" !!! ") == nil
+
+    assert TransportFailureReason.safe_reason(%Req.TransportError{reason: "Gateway Timeout!"}) ==
+             "gateway_timeout"
+
+    assert TransportFailureReason.safe_reason(String.duplicate("A", 120)) ==
+             String.duplicate("a", 96)
   end
 
   test "returns only exception module names" do
