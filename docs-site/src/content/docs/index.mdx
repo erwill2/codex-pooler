@@ -38,13 +38,42 @@ It is not a hosted provider, a general OpenAI API clone, or a way to bypass acco
 
 ## Codex Pooler Vs Direct Account Credentials
 
-| Question | Direct account credentials | Codex Pooler |
-| --- | --- | --- |
-| Client configuration | Each client needs account-specific material | Clients use stable Pool API keys |
-| Capacity changes | Every client may need reconfiguration | Operators adjust Pool assignments and policy centrally |
-| Routing decisions | Usually fixed by client setup | Pool policy, account health, quota evidence, model support, and continuity decide |
-| Operator visibility | Spread across clients and local logs | Admin UI and MCP expose sanitized metadata |
-| Secret exposure | More places can hold account secrets | Upstream secrets stay inside Codex Pooler secret storage |
+<table>
+  <thead>
+    <tr>
+      <th>Question</th>
+      <th>Direct account credentials</th>
+      <th>Codex Pooler</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Client configuration</td>
+      <td>Each client needs account-specific material</td>
+      <td>Clients use stable Pool API keys</td>
+    </tr>
+    <tr>
+      <td>Capacity changes</td>
+      <td>Every client may need reconfiguration</td>
+      <td>Operators adjust Pool assignments and policy centrally</td>
+    </tr>
+    <tr>
+      <td>Routing decisions</td>
+      <td>Usually fixed by client setup</td>
+      <td>Pool policy, account health, quota evidence, model support, and continuity decide</td>
+    </tr>
+    <tr>
+      <td>Operator visibility</td>
+      <td>Spread across clients and local logs</td>
+      <td>Admin UI and MCP expose sanitized metadata</td>
+    </tr>
+    <tr>
+      <td>Secret exposure</td>
+      <td>More places can hold account secrets</td>
+      <td>Upstream secrets stay inside Codex Pooler secret storage</td>
+    </tr>
+  </tbody>
+</table>
 
 ## How It Works
 
