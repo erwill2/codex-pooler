@@ -14,6 +14,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
     Metadata,
     PricingResolution,
     Request,
+    RequestLogFacts,
     Rollups
   }
 
@@ -92,39 +93,43 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
     pricing_snapshot = attempt_pricing_snapshot(request, model, attrs)
     timestamp = now(attrs)
 
-    attempt_number =
-      Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count, :id) + 1
+    Repo.transaction(fn ->
+      attempt_number =
+        Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count, :id) + 1
 
-    attempt_changes =
-      %Attempt{
-        id: Map.get(attrs, :id),
-        request_id: request.id,
-        attempt_number: attempt_number,
-        pool_upstream_assignment_id: assignment.id,
-        upstream_identity_id: assignment.upstream_identity_id,
-        pricing_snapshot_id: pricing_snapshot && pricing_snapshot.id,
-        model_id: request.model_id,
-        upstream_model_id: (model && model.upstream_model_id) || request.requested_model,
-        transport: request.transport,
-        status: Map.get(attrs, :status, "in_progress"),
-        started_at: timestamp,
-        retryable: Map.get(attrs, :retryable, false),
-        usage_status: Map.get(attrs, :usage_status, @usage_pending),
-        response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :response_metadata, %{}))
-      }
+      attempt_changes =
+        %Attempt{
+          id: Map.get(attrs, :id),
+          request_id: request.id,
+          attempt_number: attempt_number,
+          pool_upstream_assignment_id: assignment.id,
+          upstream_identity_id: assignment.upstream_identity_id,
+          pricing_snapshot_id: pricing_snapshot && pricing_snapshot.id,
+          model_id: request.model_id,
+          upstream_model_id: (model && model.upstream_model_id) || request.requested_model,
+          transport: request.transport,
+          status: Map.get(attrs, :status, "in_progress"),
+          started_at: timestamp,
+          retryable: Map.get(attrs, :retryable, false),
+          usage_status: Map.get(attrs, :usage_status, @usage_pending),
+          response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :response_metadata, %{}))
+        }
 
-    case Repo.insert(attempt_changes,
-           on_conflict: {:replace, [:id]},
-           conflict_target: :id,
-           returning: true
-         ) do
-      {:ok, attempt} ->
-        IdentitySnapshot.persist_request_identity_snapshot(request, assignment, attrs)
-        {:ok, attempt}
+      case Repo.insert(attempt_changes,
+             on_conflict: {:replace, [:id]},
+             conflict_target: :id,
+             returning: true
+           ) do
+        {:ok, attempt} ->
+          IdentitySnapshot.persist_request_identity_snapshot(request, assignment, attrs)
+          RequestLogFacts.record_attempt_written!(attempt)
+          attempt
 
-      {:error, _changeset} = error ->
-        error
-    end
+        {:error, changeset} ->
+          Repo.rollback(changeset)
+      end
+    end)
+    |> unwrap_transaction()
   end
 
   @spec record_retryable_attempt_failure(Attempt.t(), map()) ::
@@ -132,19 +137,29 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
   def record_retryable_attempt_failure(%Attempt{} = attempt, attrs \\ %{}) do
     timestamp = now(attrs)
 
-    attempt
-    |> Ecto.Changeset.change(%{
-      status: Map.get(attrs, :attempt_status, "retryable_failed"),
-      completed_at: timestamp,
-      upstream_status_code: Map.get(attrs, :response_status_code),
-      retryable: true,
-      network_error_code: blank_to_nil(Map.get(attrs, :last_error_code)),
-      error_message: blank_to_nil(Map.get(attrs, :error_message)),
-      latency_ms: Map.get(attrs, :latency_ms),
-      usage_status: Map.get(attrs, :usage_status, @usage_unknown),
-      response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :attempt_metadata, %{}))
-    })
-    |> Repo.update()
+    Repo.transaction(fn ->
+      case attempt
+           |> Ecto.Changeset.change(%{
+             status: Map.get(attrs, :attempt_status, "retryable_failed"),
+             completed_at: timestamp,
+             upstream_status_code: Map.get(attrs, :response_status_code),
+             retryable: true,
+             network_error_code: blank_to_nil(Map.get(attrs, :last_error_code)),
+             error_message: blank_to_nil(Map.get(attrs, :error_message)),
+             latency_ms: Map.get(attrs, :latency_ms),
+             usage_status: Map.get(attrs, :usage_status, @usage_unknown),
+             response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :attempt_metadata, %{}))
+           })
+           |> Repo.update() do
+        {:ok, attempt} ->
+          RequestLogFacts.record_attempt_written!(attempt)
+          attempt
+
+        {:error, changeset} ->
+          Repo.rollback(changeset)
+      end
+    end)
+    |> unwrap_transaction()
   end
 
   @spec finalize_reserved_request_failure(Request.t(), map()) :: request_result()
@@ -218,6 +233,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
       {request, attempt, reservation} = lock_finalization_rows(request, attempt)
 
       attempt = persist_final_attempt(attempt, usage, attrs, finalization)
+      RequestLogFacts.record_attempt_written!(attempt)
 
       pricing =
         PricingResolution.lookup_for_settlement(
@@ -236,6 +252,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
 
       %{settlement: settlement, release: release} =
         persist_settlement_entries(request, attempt, reservation, settlement_state)
+
+      RequestLogFacts.record_settlement_written!(settlement)
 
       %{request: request, attempt: attempt, settlement: settlement, release: release}
     end)

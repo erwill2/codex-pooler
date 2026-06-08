@@ -1733,13 +1733,10 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
   end
 
   defp attempt_with_latency(request, assignment, latency_ms) do
-    request
-    |> attempt_fixture(assignment)
-    |> Ecto.Changeset.change(%{
+    attempt_fixture(request, assignment, %{
       latency_ms: latency_ms,
       upstream_identity_id: assignment.upstream_identity_id
     })
-    |> Repo.update!()
   end
 
   defp unsafe_metadata(extra) do

@@ -12,6 +12,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
   alias CodexPooler.Repo
   alias CodexPoolerWeb.Admin.RequestLogsPresentation
 
+  @request_logs_reload_event [:codex_pooler, :admin, :request_logs, :reload]
+
   setup :register_and_log_in_user
 
   test "renders required selectors and sanitized request log rows with priced cost $0.123456 and unpriced_missing_model status",
@@ -796,8 +798,10 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
   test "refreshes selected pool rows when request log events arrive", %{conn: conn, scope: scope} do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "realtime-logs", name: "Realtime Logs"})
+    reload_ref = attach_request_log_reload_telemetry()
 
     {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+    assert_request_log_reload(reload_ref, :initial_load, :selected_pool)
     assert has_element?(view, "#request-log-empty-state")
     _ = :sys.get_state(view.pid)
 
@@ -814,7 +818,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
                status: request.status
              })
 
-    _ = :sys.get_state(view.pid)
+    assert_request_log_reload(reload_ref, :event_refresh, :selected_pool)
 
     assert has_element?(view, "#request-log-row-#{request.id}", "gpt-realtime-model")
   end
@@ -826,7 +830,10 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     {:ok, pool} =
       Pools.create_pool(scope, %{slug: "all-realtime-logs", name: "All Realtime Logs"})
 
+    reload_ref = attach_request_log_reload_telemetry()
+
     {:ok, view, _html} = live(conn, ~p"/admin/request-logs?status=failed")
+    assert_request_log_reload(reload_ref, :initial_load, :all_pools)
     assert has_element?(view, "#request-log-empty-state")
     _ = :sys.get_state(view.pid)
 
@@ -843,7 +850,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
                status: succeeded_request.status
              })
 
-    _ = :sys.get_state(view.pid)
+    assert_request_log_reload(reload_ref, :event_refresh, :all_pools)
     refute has_element?(view, "#request-log-row-#{succeeded_request.id}")
     assert has_element?(view, "#request-log-empty-state")
 
@@ -860,10 +867,51 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
                status: failed_request.status
              })
 
-    _ = :sys.get_state(view.pid)
+    assert_request_log_reload(reload_ref, :event_refresh, :all_pools)
 
     assert has_element?(view, "#request-log-row-#{failed_request.id}", "gpt-all-realtime-visible")
     refute has_element?(view, "#request-log-row-#{succeeded_request.id}")
+  end
+
+  test "coalesces request log event bursts into one light refresh", %{conn: conn, scope: scope} do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "coalesced-realtime-logs", name: "Coalesced Logs"})
+
+    reload_ref = attach_request_log_reload_telemetry()
+
+    {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+    assert_request_log_reload(reload_ref, :initial_load, :selected_pool)
+    refute_request_log_reload(reload_ref, :initial_load)
+    assert has_element?(view, "#request-log-empty-state")
+
+    requests =
+      for index <- 1..5 do
+        request_log_fixture(pool, %{
+          correlation_id: "req-coalesced-#{index}",
+          status: "succeeded",
+          requested_model: "gpt-coalesced-#{index}"
+        }).request
+      end
+
+    {_result, query_events} =
+      capture_repo_queries(fn ->
+        for request <- requests do
+          assert {:ok, _event} =
+                   Events.broadcast_request_logs(pool.id, "request_log_created", %{
+                     request_id: request.id,
+                     status: request.status
+                   })
+        end
+
+        assert_request_log_reload(reload_ref, :event_refresh, :selected_pool)
+        refute_request_log_reload(reload_ref, :event_refresh)
+      end)
+
+    assert has_element?(view, "#request-log-row-#{List.last(requests).id}", "gpt-coalesced-5")
+    assert source_select_count(query_events, "requests") in 1..3
+    assert source_select_count(query_events, "pools") == 0
+    assert source_select_count(query_events, "upstream_identities") == 0
+    assert source_select_count(query_events, "pool_upstream_assignments") == 0
   end
 
   test "model details helper renders reasoning and effective tier with requested-vs-effective when different",
@@ -2153,6 +2201,80 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
            )
   end
 
+  defp attach_request_log_reload_telemetry do
+    test_pid = self()
+    telemetry_ref = make_ref()
+    handler_id = {__MODULE__, :request_log_reload, telemetry_ref}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        @request_logs_reload_event,
+        fn _event, measurements, metadata, _config ->
+          send(test_pid, {telemetry_ref, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    telemetry_ref
+  end
+
+  defp assert_request_log_reload(telemetry_ref, stage, scope) do
+    assert_receive {^telemetry_ref, %{count: 1}, %{stage: ^stage, scope: ^scope}}, 1_000
+  end
+
+  defp refute_request_log_reload(telemetry_ref, stage) do
+    refute_receive {^telemetry_ref, _measurements, %{stage: ^stage}}, 100
+  end
+
+  defp capture_repo_queries(fun) when is_function(fun, 0) do
+    test_pid = self()
+    handler_id = {__MODULE__, :repo_query, test_pid, System.unique_integer([:positive])}
+
+    handler = fn _event, _measurements, metadata, _config ->
+      if metadata[:repo] == Repo do
+        send(test_pid, {handler_id, repo_query_event(metadata)})
+      end
+    end
+
+    :ok = :telemetry.attach(handler_id, [:codex_pooler, :repo, :query], handler, nil)
+
+    try do
+      result = fun.()
+      {result, drain_repo_query_events(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp repo_query_event(metadata) do
+    %{
+      source: normalize_query_metadata(metadata[:source]),
+      query: normalize_query_metadata(metadata[:query])
+    }
+  end
+
+  defp drain_repo_query_events(handler_id, events) do
+    receive do
+      {^handler_id, event} -> drain_repo_query_events(handler_id, [event | events])
+    after
+      0 -> Enum.reverse(events)
+    end
+  end
+
+  defp source_select_count(events, source) do
+    Enum.count(events, fn event ->
+      event.source == source and
+        event.query |> String.trim_leading() |> String.upcase() |> String.starts_with?("SELECT")
+    end)
+  end
+
+  defp normalize_query_metadata(nil), do: "unknown"
+  defp normalize_query_metadata(value) when is_binary(value), do: value
+  defp normalize_query_metadata(value), do: to_string(value)
+
   defp request_log_fixture(pool, attrs) do
     %{api_key: api_key} =
       active_api_key_fixture(pool, %{
@@ -2202,9 +2324,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
       end
 
     attempt =
-      request
-      |> attempt_fixture(assignment)
-      |> Ecto.Changeset.change(%{
+      attempt_fixture(request, assignment, %{
         status: Map.get(attrs, :attempt_status, "succeeded"),
         latency_ms: Map.get(attrs, :latency_ms),
         usage_status:
@@ -2214,7 +2334,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
           Map.get(attrs, :attempt_network_error_code, Map.get(attrs, :last_error_code)),
         response_metadata: Map.get(attrs, :attempt_response_metadata, %{})
       })
-      |> Repo.update!()
 
     ledger_entry_fixture(request, %{
       attempt_id: attempt.id,

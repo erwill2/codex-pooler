@@ -193,6 +193,74 @@ defmodule CodexPoolerWeb.TelemetryTest do
              metric.tag_values.(%{route_class: "unsafe class", transport: nil})
   end
 
+  test "exports admin request-log reload metrics with bounded tags" do
+    metrics = CodexPoolerWeb.Telemetry.prometheus_metrics()
+
+    admin_request_log_metric_names =
+      metrics
+      |> Enum.map(&metric_name/1)
+      |> Enum.filter(&String.starts_with?(&1, "codex_pooler.admin.request_logs."))
+      |> Enum.sort()
+
+    assert admin_request_log_metric_names == [
+             "codex_pooler.admin.request_logs.reload.count",
+             "codex_pooler.admin.request_logs.reload.duration.seconds"
+           ]
+
+    assert %Telemetry.Metrics.Counter{
+             event_name: [:codex_pooler, :admin, :request_logs, :reload],
+             measurement: :count,
+             tags: [:stage, :scope]
+           } =
+             reload_count_metric =
+             metric_by_name(metrics, "codex_pooler.admin.request_logs.reload.count")
+
+    assert %{stage: "initial_load", scope: "selected_pool"} =
+             reload_count_metric.tag_values.(%{
+               stage: :initial_load,
+               scope: :selected_pool,
+               pool_id: "pool-123",
+               request_id: "request-123",
+               model: "gpt-5.5",
+               user_id: "user-123",
+               path: "/admin/request-logs?status=failed",
+               query: "SELECT * FROM requests",
+               params: ["raw-param"]
+             })
+
+    assert %{stage: "filter_patch", scope: "all_pools"} =
+             reload_count_metric.tag_values.(%{stage: "filter_patch", scope: :all_pools})
+
+    assert %{stage: "event_refresh", scope: "all_pools"} =
+             reload_count_metric.tag_values.(%{stage: :event_refresh, scope: :all_visible_pools})
+
+    assert %{stage: "unknown", scope: "unknown"} =
+             reload_count_metric.tag_values.(%{stage: "resubscribe", scope: "pool-123"})
+
+    assert %Telemetry.Metrics.Distribution{
+             event_name: [:codex_pooler, :admin, :request_logs, :reload],
+             measurement: measurement,
+             unit: :second,
+             tags: [:stage, :scope],
+             reporter_options: reporter_options
+           } = metric_by_name(metrics, "codex_pooler.admin.request_logs.reload.duration.seconds")
+
+    assert measurement.(%{duration: 1_000_000_000}) == 1.0
+
+    assert Keyword.fetch!(reporter_options, :buckets) == [
+             0.005,
+             0.01,
+             0.025,
+             0.05,
+             0.1,
+             0.25,
+             0.5,
+             1,
+             2,
+             5
+           ]
+  end
+
   test "exports admin stats Prometheus metrics with exact names and bounded tags" do
     metrics = CodexPoolerWeb.Telemetry.prometheus_metrics()
 

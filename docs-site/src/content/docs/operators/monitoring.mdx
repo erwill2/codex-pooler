@@ -35,6 +35,7 @@ Build your Grafana or Prometheus dashboard around the signals needed to correlat
 6. gateway admission accepted, queued, rejected, timed-out, and queue-time p95 signals
 7. stream-buffer oversized and truncated events
 8. Ecto query rate, queries per request, hot query sources by safe source and SQL command, unknown query rate, and DB queue p95
+9. admin request-log reload rate and p95 duration by bounded stage/scope tags: `initial_load`, `filter_patch`, `event_refresh`, `selected_pool`, and `all_pools`
 
 Read the dashboard as a correlation view. If cgroup memory climbs while BEAM total stays flat, look outside normal BEAM heap attribution. If `vm_memory_binary_bytes` climbs with cgroup memory, inspect streaming response retention, file bodies, and upstream transport buffering. If process count, ports, or run queue climb, inspect stuck request processes, websocket ownership, and overloaded route classes.
 
@@ -161,6 +162,41 @@ histogram_quantile(0.95,
   )
 )
 ```
+
+```text
+sum by (stage, scope) (
+  rate(codex_pooler_admin_request_logs_reload_count{
+    namespace="codex-pooler",
+    job="codex-pooler-app"
+  }[5m])
+)
+```
+
+```text
+histogram_quantile(0.95,
+  sum by (le, stage, scope) (
+    rate(codex_pooler_admin_request_logs_reload_duration_seconds_bucket{
+      namespace="codex-pooler",
+      job="codex-pooler-app"
+    }[5m])
+  )
+)
+```
+
+## Request-log performance evidence
+
+For request-log read-path remediation, collect metadata-only before/after evidence from a restored staging or local clone before deploying the change. Use an authenticated admin session to refresh the request-log page with the same filters operators will use, then compare the baseline and verification outputs from the same evidence window.
+
+The evidence should answer four questions before production rollout:
+
+1. Did the verification window stop using the legacy expensive request-log read path?
+2. Did projection coverage match the restored dataset after migration?
+3. Did `pg_stat_statements` and database temp-byte deltas stay flat enough to rule out new temp-file pressure?
+4. Did application logs stay free of DB ownership timeout, queue pressure, or request-log reload timeout warnings during authenticated admin refreshes?
+
+Keep the captured files to aggregate counters, plan shape, projection coverage counts, HTTP status, timing, and byte-size summaries only. Never collect cookies, headers, request bodies, response bodies, prompts, bearer tokens, Pool API keys, upstream tokens, websocket frames, raw SQL params, raw `pg_stat_statements.query`, raw idempotency keys, or private admin credentials as evidence.
+
+Use the Grafana request-log reload panels with the generic repo query panels: reload count and duration isolate operator page pressure, while repo query rate, hot safe query sources, DB queue p95, `pg_stat_statements` deltas, `pg_stat_database` temp-byte deltas, and projection coverage prove whether the request-log projection removed the legacy expensive read path without introducing temp-file pressure.
 
 ## Memory sampler logs
 

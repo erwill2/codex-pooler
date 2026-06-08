@@ -5,7 +5,7 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
   import CodexPooler.PoolerFixtures
 
   alias CodexPooler.Accounting
-  alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestLogFact, RequestLogFacts}
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Gateway.Denials
   alias CodexPooler.Gateway.Payloads.RequestOptions
@@ -14,6 +14,200 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
   alias CodexPooler.Repo
 
   @pinned_continuation_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
+
+  test "accounting reservations create empty request log facts" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    model = model_fixture(pool, %{exposed_model_id: "gpt-facts-reserve"})
+
+    assert {:ok, %{request: request}} =
+             Accounting.reserve(
+               %{pool: pool, api_key: api_key},
+               model,
+               %{"model" => "gpt-facts-reserve", "input" => "redacted by policy"},
+               %{correlation_id: "facts-reserve"}
+             )
+
+    fact = Repo.get!(RequestLogFact, request.id)
+    assert fact.request_id == request.id
+    assert is_nil(fact.latest_attempt_id)
+    assert is_nil(fact.latest_settlement_entry_id)
+  end
+
+  test "latest attempt facts ignore older attempt writes after a newer attempt exists" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    assert {:ok, %{request: request}} =
+             Accounting.record_metadata_request(%{pool: pool, api_key: api_key}, %{
+               endpoint: "/backend-api/codex/responses",
+               requested_model: "gpt-facts-attempts",
+               correlation_id: "facts-attempts"
+             })
+
+    assert {:ok, first_attempt} = Accounting.create_attempt(request, assignment)
+    assert {:ok, second_attempt} = Accounting.create_attempt(request, assignment)
+
+    assert {:ok, _first_attempt} =
+             Accounting.record_retryable_attempt_failure(first_attempt, %{
+               attempt_status: "retryable_failed",
+               response_status_code: 429,
+               last_error_code: "older_retry_failed",
+               latency_ms: 999,
+               attempt_metadata: %{
+                 "response_metadata" => "should not affect request log facts"
+               }
+             })
+
+    fact = Repo.get!(RequestLogFact, request.id)
+    assert fact.latest_attempt_id == second_attempt.id
+    assert fact.latest_attempt_number == 2
+    assert fact.latest_attempt_status == "in_progress"
+    assert fact.latest_latency_ms != 999
+  end
+
+  test "final settlement writes latest settlement facts" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    model = model_fixture(pool, %{exposed_model_id: "gpt-facts-settlement"})
+
+    assert {:ok, %{request: request}} =
+             Accounting.reserve(
+               %{pool: pool, api_key: api_key},
+               model,
+               %{"model" => "gpt-facts-settlement", "input" => "metadata only"},
+               %{correlation_id: "facts-settlement"}
+             )
+
+    assert {:ok, attempt} = Accounting.create_attempt(request, assignment)
+
+    assert {:ok, %{settlement: settlement}} =
+             Accounting.finalize_success(
+               request,
+               attempt,
+               %{
+                 status: "usage_known",
+                 input_tokens: 11,
+                 cached_input_tokens: 3,
+                 output_tokens: 7,
+                 reasoning_tokens: 2,
+                 total_tokens: 18
+               },
+               %{response_status_code: 200, latency_ms: 321}
+             )
+
+    fact = Repo.get!(RequestLogFact, request.id)
+    assert fact.latest_attempt_id == attempt.id
+    assert fact.latest_attempt_status == "succeeded"
+    assert fact.latest_latency_ms == 321
+    assert fact.latest_settlement_entry_id == settlement.id
+    assert fact.latest_settlement_usage_status == "usage_known"
+    assert fact.latest_input_tokens == 11
+    assert fact.latest_cached_input_tokens == 3
+    assert fact.latest_output_tokens == 7
+    assert fact.latest_reasoning_tokens == 2
+    assert fact.latest_total_tokens == 18
+    assert fact.latest_settlement_occurred_at == settlement.occurred_at
+    assert fact.latest_settlement_created_at == settlement.created_at
+  end
+
+  test "voided and non-settlement ledger entries do not become latest facts" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    assert {:ok, %{request: request}} =
+             Accounting.record_metadata_request(%{pool: pool, api_key: api_key}, %{
+               endpoint: "/backend-api/codex/responses",
+               requested_model: "gpt-facts-voided",
+               correlation_id: "facts-voided"
+             })
+
+    recorded =
+      ledger_entry_fixture(request, %{
+        entry_kind: "settlement",
+        amount_status: "recorded",
+        usage_status: "usage_known",
+        total_tokens: 10,
+        occurred_at: ~U[2026-06-07 10:00:00.000000Z],
+        created_at: ~U[2026-06-07 10:00:01.000000Z]
+      })
+
+    voided =
+      ledger_entry_fixture(request, %{
+        entry_kind: "settlement",
+        amount_status: "voided",
+        usage_status: "usage_known",
+        total_tokens: 999,
+        occurred_at: ~U[2026-06-07 10:05:00.000000Z],
+        created_at: ~U[2026-06-07 10:05:01.000000Z]
+      })
+
+    release =
+      ledger_entry_fixture(request, %{
+        entry_kind: "release",
+        amount_status: "recorded",
+        usage_status: "usage_known",
+        total_tokens: 888,
+        occurred_at: ~U[2026-06-07 10:10:00.000000Z],
+        created_at: ~U[2026-06-07 10:10:01.000000Z]
+      })
+
+    RequestLogFacts.record_settlement_written!(recorded)
+    RequestLogFacts.record_settlement_written!(voided)
+    RequestLogFacts.record_settlement_written!(release)
+
+    fact = Repo.get!(RequestLogFact, request.id)
+    assert fact.latest_settlement_entry_id == recorded.id
+    assert fact.latest_total_tokens == 10
+  end
+
+  test "request log facts do not copy raw request attempt or settlement payload fields" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    sentinel = "request-log-fact-raw-material"
+
+    assert {:ok, %{request: request}} =
+             Accounting.record_metadata_request(%{pool: pool, api_key: api_key}, %{
+               endpoint: "/backend-api/codex/responses",
+               requested_model: "gpt-facts-safety",
+               correlation_id: "facts-safety",
+               request_metadata: %{
+                 "prompt" => sentinel,
+                 "authorization" => "Bearer #{sentinel}",
+                 "cookie" => "session=#{sentinel}",
+                 "websocket_frame" => sentinel,
+                 "body" => %{"input" => sentinel}
+               }
+             })
+
+    assert {:ok, attempt} = Accounting.create_attempt(request, assignment)
+
+    assert {:ok, _attempt} =
+             Accounting.record_retryable_attempt_failure(attempt, %{
+               attempt_status: "failed",
+               response_status_code: 502,
+               last_error_code: "safe_network_code",
+               error_message: "raw upstream body #{sentinel}",
+               latency_ms: 44,
+               attempt_metadata: %{
+                 "response_metadata" => sentinel,
+                 "prompt" => sentinel,
+                 "authorization" => "Bearer #{sentinel}",
+                 "cookie" => "session=#{sentinel}",
+                 "websocket_frame" => sentinel
+               }
+             })
+
+    fact = Repo.get!(RequestLogFact, request.id)
+    rendered_fact = inspect(Map.from_struct(fact))
+    assert fact.latest_network_error_code == "safe_network_code"
+    assert fact.latest_upstream_status_code == 502
+    refute rendered_fact =~ sentinel
+    refute rendered_fact =~ "response_metadata"
+    refute rendered_fact =~ "error_message"
+    refute rendered_fact =~ "prompt"
+    refute rendered_fact =~ "authorization"
+    refute rendered_fact =~ "cookie"
+    refute rendered_fact =~ "websocket_frame"
+  end
 
   test "request logs present latest settlement token counts and persisted costs" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
@@ -127,10 +321,7 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
       })
 
     first_attempt =
-      first_request
-      |> attempt_fixture(first_assignment)
-      |> Ecto.Changeset.change(%{latency_ms: 123})
-      |> Repo.update!()
+      attempt_fixture(first_request, first_assignment, %{latency_ms: 123})
 
     ledger_entry_fixture(first_request, %{
       attempt_id: first_attempt.id,
@@ -153,10 +344,10 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
       |> Repo.update!()
 
     second_attempt =
-      second_request
-      |> attempt_fixture(second_assignment)
-      |> Ecto.Changeset.change(%{latency_ms: 456, network_error_code: "upstream_rate_limited"})
-      |> Repo.update!()
+      attempt_fixture(second_request, second_assignment, %{
+        latency_ms: 456,
+        network_error_code: "upstream_rate_limited"
+      })
 
     ledger_entry_fixture(second_request, %{
       attempt_id: second_attempt.id,
@@ -203,6 +394,598 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
 
     assert %{items: [], total: 0} =
              Accounting.list_request_logs(first_pool, filters: [status: "failed"])
+  end
+
+  test "projection reader preserves list filters ordering pagination and nil joins" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    %{identity: older_identity, assignment: older_assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Projection older upstream",
+        assignment_label: "Projection older assignment"
+      })
+
+    %{identity: latest_identity, assignment: latest_assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Projection latest upstream",
+        assignment_label: "Projection latest assignment"
+      })
+
+    admitted_at = ~U[2026-06-08 10:00:00.000000Z]
+
+    nil_key_request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projection-reader-alpha",
+        status: "succeeded",
+        correlation_id: "projection-reader-nil-key",
+        request_metadata: %{"client_request_id" => "projection-reader-client"}
+      })
+      |> Ecto.Changeset.change(%{admitted_at: admitted_at})
+      |> Repo.update!()
+
+    nil_key_request
+    |> attempt_fixture(older_assignment, %{
+      attempt_number: 1,
+      status: "failed",
+      latency_ms: 111,
+      network_error_code: "older_projection_failure"
+    })
+
+    latest_attempt =
+      nil_key_request
+      |> attempt_fixture(latest_assignment, %{
+        attempt_number: 2,
+        status: "succeeded",
+        latency_ms: 222
+      })
+
+    _settlement =
+      ledger_entry_fixture(nil_key_request, %{
+        attempt_id: latest_attempt.id,
+        pool_upstream_assignment_id: latest_assignment.id,
+        upstream_identity_id: latest_identity.id,
+        input_tokens: 5,
+        output_tokens: 6,
+        total_tokens: 11,
+        settled_cost_micros: 11_000,
+        details: %{"pricing_status" => "priced", "settled_cost_micros" => "11000"}
+      })
+
+    nil_key_request =
+      nil_key_request
+      |> Ecto.Changeset.change(%{api_key_id: nil})
+      |> Repo.update!()
+
+    second_request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projection-reader-alpha",
+        status: "succeeded",
+        correlation_id: "projection-reader-second"
+      })
+      |> Ecto.Changeset.change(%{admitted_at: DateTime.add(admitted_at, -1, :second)})
+      |> Repo.update!()
+
+    second_attempt =
+      second_request
+      |> attempt_fixture(latest_assignment, %{
+        attempt_number: 1,
+        status: "succeeded",
+        latency_ms: 333
+      })
+
+    ledger_entry_fixture(second_request, %{
+      attempt_id: second_attempt.id,
+      pool_upstream_assignment_id: latest_assignment.id,
+      upstream_identity_id: latest_identity.id,
+      total_tokens: 7,
+      settled_cost_micros: 7_000,
+      details: %{"pricing_status" => "priced", "settled_cost_micros" => "7000"}
+    })
+
+    ignored_request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projection-reader-alpha",
+        status: "failed",
+        correlation_id: "projection-reader-ignored"
+      })
+      |> Ecto.Changeset.change(%{admitted_at: DateTime.add(admitted_at, 60, :second)})
+      |> Repo.update!()
+
+    ignored_request
+    |> attempt_fixture(latest_assignment, %{
+      attempt_number: 1,
+      status: "failed",
+      network_error_code: "ignored_projection_failure"
+    })
+
+    refresh_request_log_facts([nil_key_request, second_request, ignored_request])
+
+    projection_page =
+      Accounting.list_request_logs(pool,
+        limit: 1,
+        offset: 0,
+        filters: [
+          status: "succeeded",
+          model: "projection-reader-alpha",
+          upstream_identity_id: latest_identity.id
+        ]
+      )
+
+    assert projection_page.total == 2
+    assert projection_page.limit == 1
+    assert projection_page.offset == 0
+
+    assert [projected] = projection_page.items
+    assert projected.id == nil_key_request.id
+    assert projected.api_key_id == nil
+    assert projected.api_key_display_name == nil
+    assert projected.api_key_prefix == nil
+    assert projected.pool_upstream_assignment_id == latest_assignment.id
+    assert projected.assignment_label == "Projection latest assignment"
+    assert projected.upstream_identity_id == latest_identity.id
+    assert projected.upstream_identity_label == "Projection latest upstream"
+    assert projected.latency_ms == 222
+    assert projected.token_counts.total_tokens == 11
+    assert Decimal.equal?(projected.cost.usd, Decimal.new("0.011000"))
+    assert projected.debug.attempt.latest_attempt_number == 2
+    assert projected.debug.attempt.attempt_count == 2
+
+    assert %{items: [], total: 0} =
+             Accounting.list_request_logs(pool,
+               filters: [status: "succeeded", upstream_identity_id: older_identity.id]
+             )
+  end
+
+  test "projection reader preserves exact unpriced settlement pricing status" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projection-unpriced",
+        status: "succeeded",
+        correlation_id: "projection-unpriced"
+      })
+
+    ledger_entry_fixture(request, %{
+      input_tokens: 12,
+      cached_input_tokens: 2,
+      output_tokens: 3,
+      reasoning_tokens: 1,
+      total_tokens: 15,
+      settled_cost_micros: 0,
+      details: %{"pricing_status" => "unpriced_missing_model", "settled_cost_micros" => nil}
+    })
+
+    refresh_request_log_facts([request])
+
+    projection = Accounting.list_request_logs(pool) |> Map.fetch!(:items) |> List.first()
+
+    assert projection.cost.status == "unpriced_missing_model"
+    assert is_nil(projection.cost.usd)
+    assert projection.token_counts.input_tokens == 12
+    assert projection.token_counts.cached_input_tokens == 2
+    assert projection.token_counts.output_tokens == 3
+    assert projection.token_counts.reasoning_tokens == 1
+    assert projection.token_counts.total_tokens == 15
+  end
+
+  test "projection reader exact scoped get preserves deleted left-joined identity semantics" do
+    reset_bootstrap_state_fixture!()
+    %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
+    owner_scope = Scope.for_user(owner, [])
+
+    pool =
+      pool_fixture(%{slug: "projection-deleted-identity", name: "Projection Deleted Identity"})
+
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projection-deleted-identity",
+        upstream_account_label: "stored deleted identity label",
+        correlation_id: "projection-deleted-identity"
+      })
+
+    attempt = attempt_fixture(request, assignment)
+    refresh_request_log_facts([request])
+
+    Repo.delete!(attempt)
+    Repo.delete!(assignment)
+    Repo.delete!(identity)
+
+    projected = Accounting.get_request_log_for_scope(owner_scope, request.id)
+
+    assert projected.id == request.id
+    assert projected.upstream_account_label == "stored deleted identity label"
+    assert projected.upstream_identity_id == nil
+    assert projected.upstream_identity_label == nil
+  end
+
+  test "projection reader SQL hot path avoids retired global latest subqueries" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projection-sql-shape",
+        status: "succeeded",
+        correlation_id: "projection-sql-shape"
+      })
+
+    request
+    |> attempt_fixture(assignment)
+    |> Ecto.Changeset.change(%{latency_ms: 123})
+    |> Repo.update!()
+
+    refresh_request_log_facts([request])
+
+    queries =
+      capture_request_log_queries(fn ->
+        Accounting.list_request_logs(pool, filters: [model: "projection-sql-shape"])
+      end)
+
+    assert_projection_hot_path_shape(queries)
+  end
+
+  test "projection reader preserves empty facts nil snapshots nil api keys and deleted identity filters" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    %{identity: deleted_identity, assignment: deleted_assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Projection deleted upstream",
+        assignment_label: "Projection deleted assignment"
+      })
+
+    empty_fact_request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projection-edge-empty",
+        status: "succeeded",
+        correlation_id: "projection-edge-empty"
+      })
+      |> Ecto.Changeset.change(%{api_key_id: nil})
+      |> Repo.update!()
+
+    deleted_identity_request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projection-edge-deleted",
+        status: "failed",
+        correlation_id: "projection-edge-deleted",
+        upstream_account_label: "stored deleted projection label"
+      })
+
+    deleted_attempt =
+      deleted_identity_request
+      |> attempt_fixture(deleted_assignment, %{attempt_number: 1, status: "failed"})
+      |> Ecto.Changeset.change(%{
+        latency_ms: 444,
+        network_error_code: "deleted_projection_identity"
+      })
+      |> Repo.update!()
+
+    refresh_request_log_facts([empty_fact_request, deleted_identity_request])
+    Repo.delete!(deleted_attempt)
+    Repo.delete!(deleted_assignment)
+    Repo.delete!(deleted_identity)
+
+    projection_page =
+      Accounting.list_request_logs(pool,
+        filters: [model: "projection-edge"],
+        limit: 10
+      )
+
+    assert projection_page.total == 2
+    logs_by_id = Map.new(projection_page.items, &{&1.id, &1})
+
+    assert empty_log = logs_by_id[empty_fact_request.id]
+    assert empty_log.api_key_id == nil
+    assert empty_log.api_key_display_name == nil
+    assert empty_log.api_key_prefix == nil
+    assert empty_log.upstream_account_label == nil
+    assert empty_log.upstream_identity_id == nil
+    assert empty_log.debug.attempt.attempt_count == 0
+
+    assert deleted_log = logs_by_id[deleted_identity_request.id]
+    assert deleted_log.upstream_account_label == "stored deleted projection label"
+    assert deleted_log.upstream_identity_id == nil
+    assert deleted_log.upstream_identity_label == nil
+    assert deleted_log.pool_upstream_assignment_id == nil
+    assert deleted_log.assignment_label == nil
+
+    assert %{items: [], total: 0} =
+             Accounting.list_request_logs(pool,
+               filters: [model: "projection-edge", upstream_identity_id: deleted_identity.id]
+             )
+  end
+
+  test "projection reader preserves highest attempt and representable settlement invariants" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projection-invariants",
+        status: "succeeded",
+        correlation_id: "projection-invariants"
+      })
+
+    request
+    |> attempt_fixture(assignment, %{attempt_number: 1, status: "failed"})
+    |> Ecto.Changeset.change(%{latency_ms: 111, network_error_code: "older_projection_attempt"})
+    |> Repo.update!()
+
+    request
+    |> attempt_fixture(assignment, %{attempt_number: 3, status: "succeeded"})
+    |> Ecto.Changeset.change(%{latency_ms: 333})
+    |> Repo.update!()
+
+    recorded_at = ~U[2026-06-08 11:00:00.000000Z]
+    voided_at = ~U[2026-06-08 12:00:00.000000Z]
+
+    ledger_entry_fixture(request, %{
+      amount_status: "recorded",
+      input_tokens: 3,
+      output_tokens: 4,
+      total_tokens: 7,
+      settled_cost_micros: 7_000,
+      occurred_at: recorded_at,
+      created_at: recorded_at,
+      details: %{"pricing_status" => "priced", "settled_cost_micros" => "7000"}
+    })
+
+    ledger_entry_fixture(request, %{
+      amount_status: "voided",
+      input_tokens: 30,
+      output_tokens: 40,
+      total_tokens: 70,
+      settled_cost_micros: 70_000,
+      occurred_at: voided_at,
+      created_at: voided_at,
+      details: %{"pricing_status" => "priced", "settled_cost_micros" => "70000"}
+    })
+
+    assert_raise Ecto.ConstraintError, fn ->
+      ledger_entry_fixture(request, %{
+        amount_status: "recorded",
+        total_tokens: 9,
+        settled_cost_micros: 9_000
+      })
+    end
+
+    refresh_request_log_facts([request])
+
+    assert %{items: [log], total: 1} =
+             Accounting.list_request_logs(pool, filters: [model: "projection-invariants"])
+
+    assert log.debug.attempt.latest_attempt_number == 3
+    assert log.latency_ms == 333
+    assert log.denial_reason == nil
+    assert log.token_counts.input_tokens == 3
+    assert log.token_counts.output_tokens == 4
+    assert log.token_counts.total_tokens == 7
+    assert Decimal.equal?(log.cost.usd, Decimal.new("0.007000"))
+  end
+
+  test "projection reader keeps large page hot SQL on facts and hydrates attempts only for the page" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    admitted_at = ~U[2026-06-08 12:00:00.000000Z]
+
+    requests =
+      for index <- 1..18 do
+        request =
+          request_fixture(%{pool: pool, api_key: api_key}, %{
+            requested_model: "gpt-projection-large-page",
+            status: "failed",
+            correlation_id: "projection-large-page-#{index}"
+          })
+          |> Ecto.Changeset.change(%{
+            admitted_at: DateTime.add(admitted_at, index, :second),
+            last_error_code: "large_page_failure_#{index}"
+          })
+          |> Repo.update!()
+
+        for attempt_number <- 1..3 do
+          request
+          |> attempt_fixture(assignment, %{
+            attempt_number: attempt_number,
+            status: if(attempt_number == 3, do: "failed", else: "retryable_failed"),
+            retryable: attempt_number < 3,
+            upstream_status_code: 500 + attempt_number
+          })
+          |> Ecto.Changeset.change(%{
+            latency_ms: index * 10 + attempt_number,
+            network_error_code: "large_page_attempt_#{attempt_number}"
+          })
+          |> Repo.update!()
+        end
+
+        request
+      end
+
+    refresh_request_log_facts(requests)
+
+    expected_page_ids =
+      requests |> Enum.reverse() |> Enum.drop(4) |> Enum.take(5) |> Enum.map(& &1.id)
+
+    queries =
+      capture_request_log_queries(fn ->
+        assert %{items: logs, total: 18, limit: 5, offset: 4} =
+                 Accounting.list_request_logs(pool,
+                   limit: 5,
+                   offset: 4,
+                   filters: [model: "projection-large-page"]
+                 )
+
+        assert Enum.map(logs, & &1.id) == expected_page_ids
+        assert Enum.all?(logs, &(&1.debug.attempt.attempt_count == 3))
+        assert Enum.all?(logs, &(&1.debug.attempt.latest_attempt_number == 3))
+      end)
+
+    assert_projection_hot_path_shape(queries)
+
+    attempt_queries = Enum.filter(queries, &(&1 =~ ~s(FROM "attempts")))
+    assert length(attempt_queries) == 1
+    assert [attempt_query] = attempt_queries
+    assert attempt_query =~ ~s("request_id")
+    assert attempt_query =~ "ANY($1)"
+    refute attempt_query =~ "DISTINCT ON"
+  end
+
+  test "request log list freezes exact filtered totals ordering and offset pagination" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    admitted_at = ~U[2026-06-07 10:00:00.000000Z]
+
+    matching_requests =
+      for index <- 1..3 do
+        request_fixture(%{pool: pool, api_key: api_key}, %{
+          requested_model: "gpt-freeze-page-#{index}",
+          status: "succeeded",
+          correlation_id: "freeze-page-#{index}"
+        })
+        |> Ecto.Changeset.change(%{admitted_at: admitted_at, completed_at: admitted_at})
+        |> Repo.update!()
+      end
+
+    ignored_request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-freeze-page-ignored",
+        status: "failed",
+        correlation_id: "freeze-page-ignored"
+      })
+      |> Ecto.Changeset.change(%{admitted_at: admitted_at, completed_at: admitted_at})
+      |> Repo.update!()
+
+    expected_order = matching_requests |> Enum.map(& &1.id) |> Enum.sort(:desc)
+
+    assert %{items: page_items, total: 3, limit: 2, offset: 1} =
+             Accounting.list_request_logs(pool,
+               limit: 2,
+               offset: 1,
+               filters: [status: "succeeded"]
+             )
+
+    assert Enum.map(page_items, & &1.id) == Enum.slice(expected_order, 1, 2)
+    refute ignored_request.id in Enum.map(page_items, & &1.id)
+
+    assert %{items: all_items, total: 3} =
+             Accounting.list_request_logs(pool, filters: [status: "succeeded"])
+
+    assert Enum.map(all_items, & &1.id) == expected_order
+  end
+
+  test "request logs use the highest attempt number for latest attempt and upstream filters" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    %{identity: first_identity, assignment: first_assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Historical upstream",
+        assignment_label: "Historical assignment"
+      })
+
+    %{identity: latest_identity, assignment: latest_assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Latest upstream",
+        assignment_label: "Latest assignment"
+      })
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-freeze-latest-attempt",
+        correlation_id: "freeze-latest-attempt"
+      })
+
+    request
+    |> attempt_fixture(first_assignment, %{
+      attempt_number: 1,
+      status: "failed",
+      latency_ms: 111,
+      network_error_code: "historical_failure"
+    })
+
+    request
+    |> attempt_fixture(latest_assignment, %{
+      attempt_number: 2,
+      status: "succeeded",
+      latency_ms: 222
+    })
+
+    assert %{items: [], total: 0} =
+             Accounting.list_request_logs(pool,
+               filters: [upstream_identity_id: first_identity.id]
+             )
+
+    assert %{items: [log], total: 1} =
+             Accounting.list_request_logs(pool,
+               filters: [upstream_identity_id: latest_identity.id]
+             )
+
+    assert log.id == request.id
+    assert log.upstream_identity_id == latest_identity.id
+    assert log.upstream_identity_label == "Latest upstream"
+    assert log.pool_upstream_assignment_id == latest_assignment.id
+    assert log.assignment_label == "Latest assignment"
+    assert log.latency_ms == 222
+    assert log.debug.attempt.latest_attempt_number == 2
+    assert log.debug.attempt.attempt_count == 2
+  end
+
+  test "request logs use the recorded settlement and ignore newer voided settlement rows" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-freeze-settlement",
+        correlation_id: "freeze-settlement"
+      })
+
+    recorded_at = ~U[2026-06-07 09:00:00.000000Z]
+    voided_at = ~U[2026-06-07 10:00:00.000000Z]
+
+    ledger_entry_fixture(request, %{
+      amount_status: "recorded",
+      input_tokens: 3,
+      output_tokens: 4,
+      total_tokens: 7,
+      settled_cost_micros: 7_000,
+      occurred_at: recorded_at,
+      created_at: recorded_at,
+      details: %{"pricing_status" => "priced", "settled_cost_micros" => "7000"}
+    })
+
+    ledger_entry_fixture(request, %{
+      amount_status: "voided",
+      input_tokens: 30,
+      output_tokens: 40,
+      total_tokens: 70,
+      settled_cost_micros: 70_000,
+      occurred_at: voided_at,
+      created_at: voided_at,
+      details: %{"pricing_status" => "priced", "settled_cost_micros" => "70000"}
+    })
+
+    assert_raise Ecto.ConstraintError, fn ->
+      ledger_entry_fixture(request, %{
+        amount_status: "recorded",
+        total_tokens: 9,
+        settled_cost_micros: 9_000
+      })
+    end
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+    assert log.token_counts.total_tokens == 7
+    assert log.token_counts.input_tokens == 3
+    assert log.token_counts.output_tokens == 4
+    assert Decimal.equal?(log.cost.usd, Decimal.new("0.007000"))
+
+    assert Repo.aggregate(
+             from(entry in LedgerEntry,
+               where:
+                 entry.request_id == ^request.id and entry.entry_kind == "settlement" and
+                   entry.amount_status == "recorded"
+             ),
+             :count
+           ) == 1
   end
 
   test "exact scoped request log lookup is not affected by fuzzy correlation matches" do
@@ -1292,6 +2075,79 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
 
     assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
     refute inspect(log) =~ raw_idempotency_key
+  end
+
+  defp refresh_request_log_facts(requests) do
+    Enum.each(requests, fn request ->
+      RequestLogFacts.record_request_created!(request)
+
+      request.id
+      |> attempts_for_request()
+      |> Enum.each(&RequestLogFacts.record_attempt_written!/1)
+
+      request.id
+      |> settlements_for_request()
+      |> Enum.each(&RequestLogFacts.record_settlement_written!/1)
+    end)
+  end
+
+  defp attempts_for_request(request_id) do
+    Attempt
+    |> where([attempt], attempt.request_id == ^request_id)
+    |> order_by([attempt], asc: attempt.attempt_number)
+    |> Repo.all()
+  end
+
+  defp settlements_for_request(request_id) do
+    LedgerEntry
+    |> where([entry], entry.request_id == ^request_id)
+    |> order_by([entry], asc: entry.occurred_at, asc: entry.created_at, asc: entry.id)
+    |> Repo.all()
+  end
+
+  defp assert_projection_hot_path_shape(queries) do
+    hot_queries = request_log_hot_queries(queries)
+
+    assert length(hot_queries) == 2
+    assert Enum.all?(hot_queries, &(&1 =~ ~s("request_log_facts")))
+    refute Enum.any?(hot_queries, &(&1 =~ "DISTINCT ON"))
+    refute Enum.any?(hot_queries, &(&1 =~ ~s(FROM "attempts")))
+    refute Enum.any?(hot_queries, &(&1 =~ ~s(FROM "ledger_entries")))
+  end
+
+  defp request_log_hot_queries(queries) do
+    Enum.filter(queries, &(&1 =~ ~s(FROM "requests")))
+  end
+
+  defp capture_request_log_queries(fun) do
+    parent = self()
+    handler_id = {:request_logs_sql_shape, self(), System.unique_integer([:positive])}
+
+    :telemetry.attach(
+      handler_id,
+      [:codex_pooler, :repo, :query],
+      fn _event, _measurements, metadata, _config ->
+        unless String.starts_with?(metadata.query, ["begin", "commit", "rollback"]) do
+          send(parent, {:request_log_query, metadata.query})
+        end
+      end,
+      nil
+    )
+
+    try do
+      fun.()
+      collect_request_log_queries([])
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp collect_request_log_queries(queries) do
+    receive do
+      {:request_log_query, query} -> collect_request_log_queries([query | queries])
+    after
+      0 -> Enum.reverse(queries)
+    end
   end
 
   defp pinned_denial_request_fixture(pool, api_key, assignment, identity) do

@@ -18,6 +18,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
     only: [request_log_filter_dropdown: 1]
 
   @page_size 50
+  @request_logs_reload_debounce_ms 250
+  @reload_telemetry_event [:codex_pooler, :admin, :request_logs, :reload]
 
   @impl true
   def mount(_params, _session, socket) do
@@ -37,7 +39,11 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
        pool_filter_options: [],
        model_filter_options: [],
        upstream_account_options: [],
-       subscribed_pool_ids: MapSet.new()
+       subscribed_pool_ids: MapSet.new(),
+       request_logs_reload_timer: nil,
+       request_logs_loaded?: false,
+       visible_pool_ids: [],
+       request_log_filters: %{}
      )}
   end
 
@@ -92,10 +98,14 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   @impl true
   def handle_info({Events, %{pool_id: pool_id, topics: topics}}, socket) do
     if "request_logs" in topics and request_log_event_in_scope?(socket, pool_id) do
-      {:noreply, load_request_logs(socket, socket.assigns.current_params)}
+      {:noreply, schedule_request_logs_refresh(socket)}
     else
       {:noreply, socket}
     end
+  end
+
+  def handle_info(:refresh_request_logs_from_events, socket) do
+    {:noreply, refresh_request_logs_from_events(socket)}
   end
 
   @impl true
@@ -245,6 +255,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   defp form_field_value(_field), do: ""
 
   defp load_request_logs(socket, params) do
+    started_at = System.monotonic_time()
+    reload_stage = if socket.assigns.request_logs_loaded?, do: :filter_patch, else: :initial_load
     pools = Pools.list_log_filter_pools(socket.assigns.current_scope)
 
     visible_upstream_identities =
@@ -264,28 +276,14 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       RequestLogFilterForm.parse_filters(params, selected_pool, visible_upstream_identity_ids)
 
     filter_errors = Enum.reject([pool_error | filter_errors], &is_nil/1)
+    visible_pool_ids = pool_ids(pools)
+    request_logs = request_logs(selected_pool, filters, visible_pool_ids)
+    model_filter_models = request_log_models(selected_pool, visible_pool_ids)
 
-    request_logs =
-      if selected_pool do
-        Accounting.list_request_logs(selected_pool, limit: @page_size, filters: filters)
-      else
-        Accounting.list_request_logs_for_scope(
-          socket.assigns.current_scope,
-          limit: @page_size,
-          filters: filters
-        )
-      end
-
-    model_filter_models =
-      if selected_pool do
-        Accounting.list_request_log_models(selected_pool)
-      else
-        Accounting.list_request_log_models_for_scope(socket.assigns.current_scope)
-      end
-
-    socket = maybe_subscribe_pool_events(socket, pools, selected_pool)
-
-    assign(socket,
+    socket
+    |> cancel_request_logs_reload_timer()
+    |> maybe_subscribe_pool_events(pools, selected_pool)
+    |> assign(
       pools: pools,
       selected_pool: selected_pool,
       request_logs: request_logs,
@@ -299,9 +297,53 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       filter_errors: filter_errors,
       pool_filter_options: PoolFilterComponents.pool_filter_options(pools),
       model_filter_options: model_filter_options(model_filter_models, form_values["model"]),
-      upstream_account_options: upstream_account_options(upstream_filter_identities)
+      upstream_account_options: upstream_account_options(upstream_filter_identities),
+      visible_pool_ids: visible_pool_ids,
+      request_log_filters: filters,
+      request_logs_loaded?: true
+    )
+    |> notify_request_logs_reload(reload_stage, started_at)
+  end
+
+  defp refresh_request_logs_from_events(socket) do
+    started_at = System.monotonic_time()
+    selected_pool = socket.assigns.selected_pool
+    filters = socket.assigns.request_log_filters
+    visible_pool_ids = socket.assigns.visible_pool_ids
+    request_logs = request_logs(selected_pool, filters, visible_pool_ids)
+    model_filter_models = request_log_models(selected_pool, visible_pool_ids)
+
+    socket
+    |> cancel_request_logs_reload_timer()
+    |> assign(
+      request_logs: request_logs,
+      model_filter_options:
+        model_filter_options(model_filter_models, socket.assigns.filter_values["model"])
+    )
+    |> notify_request_logs_reload(:event_refresh, started_at)
+  end
+
+  defp request_logs(selected_pool, filters, _visible_pool_ids) when not is_nil(selected_pool) do
+    Accounting.list_request_logs(selected_pool, limit: @page_size, filters: filters)
+  end
+
+  defp request_logs(_selected_pool, filters, visible_pool_ids) do
+    Accounting.list_request_logs(nil,
+      limit: @page_size,
+      filters: filters,
+      visible_pool_ids: visible_pool_ids
     )
   end
+
+  defp request_log_models(selected_pool, _visible_pool_ids) when not is_nil(selected_pool) do
+    Accounting.list_request_log_models(selected_pool)
+  end
+
+  defp request_log_models(_selected_pool, visible_pool_ids) do
+    Accounting.list_request_log_models(nil, visible_pool_ids: visible_pool_ids)
+  end
+
+  defp pool_ids(pools), do: Enum.map(pools, & &1.id)
 
   defp maybe_subscribe_pool_events(socket, _pools, selected_pool)
        when not is_nil(selected_pool) do
@@ -317,6 +359,44 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       socket
     end)
   end
+
+  defp schedule_request_logs_refresh(socket) do
+    if is_reference(socket.assigns[:request_logs_reload_timer]) do
+      socket
+    else
+      timer =
+        Process.send_after(
+          self(),
+          :refresh_request_logs_from_events,
+          @request_logs_reload_debounce_ms
+        )
+
+      assign(socket, :request_logs_reload_timer, timer)
+    end
+  end
+
+  defp cancel_request_logs_reload_timer(socket) do
+    if is_reference(socket.assigns[:request_logs_reload_timer]) do
+      Process.cancel_timer(socket.assigns.request_logs_reload_timer, async: false, info: false)
+    end
+
+    assign(socket, :request_logs_reload_timer, nil)
+  end
+
+  defp notify_request_logs_reload(socket, stage, started_at) do
+    if connected?(socket) do
+      :telemetry.execute(
+        @reload_telemetry_event,
+        %{count: 1, duration: System.monotonic_time() - started_at},
+        %{stage: stage, scope: telemetry_scope(socket.assigns.selected_pool)}
+      )
+    end
+
+    socket
+  end
+
+  defp telemetry_scope(nil), do: :all_pools
+  defp telemetry_scope(_selected_pool), do: :selected_pool
 
   defp selected_pool_id(%{assigns: %{selected_pool: %{id: pool_id}}}), do: pool_id
   defp selected_pool_id(_socket), do: nil

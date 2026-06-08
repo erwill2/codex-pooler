@@ -3,7 +3,7 @@ defmodule CodexPooler.Accounting.Metadata do
 
   import Ecto.Query
 
-  alias CodexPooler.Accounting.Request
+  alias CodexPooler.Accounting.{Request, RequestLogFacts}
   alias CodexPooler.Events
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
@@ -69,6 +69,8 @@ defmodule CodexPooler.Accounting.Metadata do
           upstream_account_plan_family: metadata_identity_plan_family(attrs)
         }
         |> Repo.insert!()
+
+      RequestLogFacts.record_request_created!(request)
 
       %{request: request}
     end)
@@ -175,6 +177,8 @@ defmodule CodexPooler.Accounting.Metadata do
           upstream_account_plan_family: identity.plan_family
         }
         |> Repo.insert!()
+
+      RequestLogFacts.record_request_created!(request)
 
       %{request: request}
     end)

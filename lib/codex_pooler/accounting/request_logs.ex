@@ -1,14 +1,20 @@
 defmodule CodexPooler.Accounting.RequestLogs do
   @moduledoc """
   Request-log read model and safe error shaping for admin reporting.
+
+  The list projection intentionally keeps the legacy request-log contract stable:
+  totals count the exact filtered visible request rows before pagination, rows are
+  ordered by `requests.admitted_at DESC, requests.id DESC`, offset pagination is
+  preserved, upstream filters apply to the latest attempt only, latest attempts
+  are selected by highest `attempt_number`, and settlement presentation uses the
+  newest recorded settlement by `occurred_at`, `created_at`, then `id`.
   """
 
   import Ecto.Query
 
   alias CodexPooler.Accounting
-  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
+  alias CodexPooler.Accounting.{Attempt, Request, RequestLogFact}
   alias CodexPooler.Accounting.RequestLogs.{ErrorSummaries, SettlementPresentation}
-  alias CodexPooler.Catalog.PricingSnapshot
   alias CodexPooler.Gateway.Persistence.CodexTurn
   alias CodexPooler.Pools
   alias CodexPooler.Pools.Pool
@@ -16,7 +22,6 @@ defmodule CodexPooler.Accounting.RequestLogs do
   alias CodexPooler.RouteClass
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
-  @entry_settlement "settlement"
   @proxy_control_route_class RouteClass.proxy_control()
   @bounded_detail_attempts 10
 
@@ -98,13 +103,13 @@ defmodule CodexPooler.Accounting.RequestLogs do
       on: pool.id == r.pool_id,
       left_join: key in CodexPooler.Access.APIKey,
       on: key.id == r.api_key_id,
-      left_join: latest in subquery(latest_attempt_query()),
+      left_join: latest in subquery(projected_latest_attempt_query()),
       on: latest.request_id == r.id,
       left_join: assignment in PoolUpstreamAssignment,
       on: assignment.id == latest.pool_upstream_assignment_id,
       left_join: identity in UpstreamIdentity,
       on: identity.id == latest.upstream_identity_id,
-      left_join: settlement in subquery(latest_settlement_query()),
+      left_join: settlement in subquery(projected_latest_settlement_query()),
       on: settlement.request_id == r.id,
       left_join: turn in CodexTurn,
       on: turn.request_id == r.id
@@ -479,39 +484,49 @@ defmodule CodexPooler.Accounting.RequestLogs do
     |> Map.new()
   end
 
-  defp latest_attempt_query do
-    from a in Attempt,
-      distinct: a.request_id,
-      order_by: [asc: a.request_id, desc: a.attempt_number],
+  defp projected_latest_attempt_query do
+    from fact in RequestLogFact,
       select: %{
-        request_id: a.request_id,
-        attempt_number: a.attempt_number,
-        pool_upstream_assignment_id: a.pool_upstream_assignment_id,
-        upstream_identity_id: a.upstream_identity_id,
-        network_error_code: a.network_error_code,
-        latency_ms: a.latency_ms,
-        response_metadata: a.response_metadata
+        request_id: fact.request_id,
+        attempt_number: fact.latest_attempt_number,
+        status: fact.latest_attempt_status,
+        retryable: fact.latest_attempt_retryable,
+        upstream_status_code: fact.latest_upstream_status_code,
+        pool_upstream_assignment_id: fact.latest_pool_upstream_assignment_id,
+        upstream_identity_id: fact.latest_upstream_identity_id,
+        network_error_code: fact.latest_network_error_code,
+        latency_ms: fact.latest_latency_ms
       }
   end
 
-  defp latest_settlement_query do
-    from entry in LedgerEntry,
-      left_join: pricing in PricingSnapshot,
-      on: pricing.id == entry.pricing_snapshot_id,
-      where: entry.entry_kind == @entry_settlement,
-      distinct: entry.request_id,
-      order_by: [asc: entry.request_id, desc: entry.occurred_at, desc: entry.created_at],
+  defp projected_latest_settlement_query do
+    from fact in RequestLogFact,
+      where: not is_nil(fact.latest_settlement_entry_id),
       select: %{
-        request_id: entry.request_id,
-        usage_status: entry.usage_status,
-        input_tokens: entry.input_tokens,
-        cached_input_tokens: entry.cached_input_tokens,
-        output_tokens: entry.output_tokens,
-        reasoning_tokens: entry.reasoning_tokens,
-        total_tokens: entry.total_tokens,
-        settled_cost_micros: entry.settled_cost_micros,
-        cached_input_token_micros: pricing.cached_input_token_micros,
-        details: entry.details
+        request_id: fact.request_id,
+        usage_status: fact.latest_settlement_usage_status,
+        pricing_status: fact.latest_settlement_pricing_status,
+        input_tokens: fact.latest_input_tokens,
+        cached_input_tokens: fact.latest_cached_input_tokens,
+        output_tokens: fact.latest_output_tokens,
+        reasoning_tokens: fact.latest_reasoning_tokens,
+        total_tokens: fact.latest_total_tokens,
+        settled_cost_micros: fact.latest_settled_cost_micros,
+        cached_input_token_micros:
+          type(fragment("?::numeric", fact.latest_cached_input_token_micros), :decimal),
+        details:
+          type(
+            fragment(
+              "CASE WHEN ? IS NULL THEN NULL WHEN ? = 'priced' THEN jsonb_strip_nulls(jsonb_build_object('pricing_status', ?, 'settled_cost_micros', (?::bigint)::text, 'cached_input_cost_micros', (?::bigint)::text)) ELSE jsonb_build_object('pricing_status', COALESCE(?, 'unpriced')) END",
+              fact.latest_settlement_pricing_status,
+              fact.latest_settlement_pricing_status,
+              fact.latest_settlement_pricing_status,
+              fact.latest_settled_cost_micros,
+              fact.latest_cached_input_cost_micros,
+              fact.latest_settlement_pricing_status
+            ),
+            :map
+          )
       }
   end
 

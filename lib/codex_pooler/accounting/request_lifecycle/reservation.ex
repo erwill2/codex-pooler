@@ -5,6 +5,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
     Metadata,
     PricingResolution,
     Request,
+    RequestLogFacts,
     ReservationPolicy
   }
 
@@ -57,6 +58,7 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
       }
 
       request = insert_reserved_request!(request_context)
+      RequestLogFacts.record_request_created!(request)
 
       reservation =
         request
@@ -109,6 +111,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle.Reservation do
           last_error_code: to_string(reason)
         }
         |> Repo.insert!()
+
+      RequestLogFacts.record_request_created!(request)
 
       %{request: request}
     end)

@@ -11,7 +11,7 @@ defmodule CodexPooler.PoolerFixtures do
   import Ecto.Query
 
   alias CodexPooler.Access
-  alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Accounting.{Attempt, Request, RequestLogFacts}
   alias CodexPooler.Accounting.LedgerEntry
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Accounts.User
@@ -367,82 +367,96 @@ defmodule CodexPooler.PoolerFixtures do
   end
 
   def request_fixture(%{pool: pool, api_key: api_key}, attrs \\ %{}) do
-    %Request{
-      pool_id: pool.id,
-      api_key_id: api_key.id,
-      model_id: Map.get(attrs, :model_id),
-      requested_model: Map.get(attrs, :requested_model, "gpt-5.4-mini"),
-      endpoint: Map.get(attrs, :endpoint, "/backend-api/codex/responses"),
-      transport: Map.get(attrs, :transport, "http_json"),
-      status: Map.get(attrs, :status, "succeeded"),
-      usage_status: Map.get(attrs, :usage_status, "usage_known"),
-      correlation_id:
-        Map.get(attrs, :correlation_id, "corr-#{System.unique_integer([:positive])}"),
-      user_agent: Map.get(attrs, :user_agent),
-      request_metadata: Map.get(attrs, :request_metadata, %{}),
-      admitted_at: now(),
-      completed_at: Map.get(attrs, :completed_at, now()),
-      response_status_code: Map.get(attrs, :response_status_code, 200),
-      retry_count: Map.get(attrs, :retry_count, 0),
-      last_error_code: Map.get(attrs, :last_error_code),
-      upstream_account_label: Map.get(attrs, :upstream_account_label),
-      upstream_account_email: Map.get(attrs, :upstream_account_email),
-      upstream_account_plan_label: Map.get(attrs, :upstream_account_plan_label),
-      upstream_account_plan_family: Map.get(attrs, :upstream_account_plan_family),
-      reasoning_effort: Map.get(attrs, :reasoning_effort),
-      service_tier: Map.get(attrs, :service_tier),
-      requested_service_tier: Map.get(attrs, :requested_service_tier),
-      actual_service_tier: Map.get(attrs, :actual_service_tier)
-    }
-    |> Repo.insert!()
+    request =
+      %Request{
+        pool_id: pool.id,
+        api_key_id: api_key.id,
+        model_id: Map.get(attrs, :model_id),
+        requested_model: Map.get(attrs, :requested_model, "gpt-5.4-mini"),
+        endpoint: Map.get(attrs, :endpoint, "/backend-api/codex/responses"),
+        transport: Map.get(attrs, :transport, "http_json"),
+        status: Map.get(attrs, :status, "succeeded"),
+        usage_status: Map.get(attrs, :usage_status, "usage_known"),
+        correlation_id:
+          Map.get(attrs, :correlation_id, "corr-#{System.unique_integer([:positive])}"),
+        user_agent: Map.get(attrs, :user_agent),
+        request_metadata: Map.get(attrs, :request_metadata, %{}),
+        admitted_at: now(),
+        completed_at: Map.get(attrs, :completed_at, now()),
+        response_status_code: Map.get(attrs, :response_status_code, 200),
+        retry_count: Map.get(attrs, :retry_count, 0),
+        last_error_code: Map.get(attrs, :last_error_code),
+        upstream_account_label: Map.get(attrs, :upstream_account_label),
+        upstream_account_email: Map.get(attrs, :upstream_account_email),
+        upstream_account_plan_label: Map.get(attrs, :upstream_account_plan_label),
+        upstream_account_plan_family: Map.get(attrs, :upstream_account_plan_family),
+        reasoning_effort: Map.get(attrs, :reasoning_effort),
+        service_tier: Map.get(attrs, :service_tier),
+        requested_service_tier: Map.get(attrs, :requested_service_tier),
+        actual_service_tier: Map.get(attrs, :actual_service_tier)
+      }
+      |> Repo.insert!()
+
+    RequestLogFacts.record_request_created!(request)
+    request
   end
 
   def attempt_fixture(request, assignment, attrs \\ %{}) do
-    %Attempt{
-      request_id: request.id,
-      attempt_number: Map.get(attrs, :attempt_number, 1),
-      pool_upstream_assignment_id: assignment.id,
-      upstream_identity_id: assignment.upstream_identity_id,
-      upstream_model_id: Map.get(attrs, :upstream_model_id, "upstream-gpt-5.4-mini"),
-      transport: Map.get(attrs, :transport, request.transport),
-      status: Map.get(attrs, :status, "succeeded"),
-      started_at: now(),
-      completed_at: Map.get(attrs, :completed_at, now()),
-      upstream_status_code: Map.get(attrs, :upstream_status_code, 200),
-      retryable: Map.get(attrs, :retryable, false),
-      usage_status: Map.get(attrs, :usage_status, "usage_known"),
-      response_metadata: Map.get(attrs, :response_metadata, %{})
-    }
-    |> Repo.insert!()
+    attempt =
+      %Attempt{
+        request_id: request.id,
+        attempt_number: Map.get(attrs, :attempt_number, 1),
+        pool_upstream_assignment_id: assignment.id,
+        upstream_identity_id: assignment.upstream_identity_id,
+        upstream_model_id: Map.get(attrs, :upstream_model_id, "upstream-gpt-5.4-mini"),
+        transport: Map.get(attrs, :transport, request.transport),
+        status: Map.get(attrs, :status, "succeeded"),
+        started_at: now(),
+        completed_at: Map.get(attrs, :completed_at, now()),
+        upstream_status_code: Map.get(attrs, :upstream_status_code, 200),
+        network_error_code: Map.get(attrs, :network_error_code),
+        latency_ms: Map.get(attrs, :latency_ms),
+        retryable: Map.get(attrs, :retryable, false),
+        usage_status: Map.get(attrs, :usage_status, "usage_known"),
+        response_metadata: Map.get(attrs, :response_metadata, %{})
+      }
+      |> Repo.insert!()
+
+    RequestLogFacts.record_attempt_written!(attempt)
+    attempt
   end
 
   def ledger_entry_fixture(request, attrs \\ %{}) do
-    %LedgerEntry{
-      request_id: request.id,
-      attempt_id: Map.get(attrs, :attempt_id),
-      pricing_snapshot_id: Map.get(attrs, :pricing_snapshot_id),
-      pool_id: request.pool_id,
-      api_key_id: request.api_key_id,
-      pool_upstream_assignment_id: Map.get(attrs, :pool_upstream_assignment_id),
-      upstream_identity_id: Map.get(attrs, :upstream_identity_id),
-      entry_kind: Map.get(attrs, :entry_kind, "settlement"),
-      amount_status: Map.get(attrs, :amount_status, "recorded"),
-      usage_status: Map.get(attrs, :usage_status, "usage_known"),
-      transport: Map.get(attrs, :transport, request.transport),
-      currency_code: Map.get(attrs, :currency_code, "USD"),
-      input_tokens: Map.get(attrs, :input_tokens, 10),
-      cached_input_tokens: Map.get(attrs, :cached_input_tokens, 0),
-      output_tokens: Map.get(attrs, :output_tokens, 4),
-      reasoning_tokens: Map.get(attrs, :reasoning_tokens, 0),
-      total_tokens: Map.get(attrs, :total_tokens, 14),
-      request_count: Map.get(attrs, :request_count, 1),
-      estimated_cost_micros: Decimal.new(Map.get(attrs, :estimated_cost_micros, 0)),
-      settled_cost_micros: Decimal.new(Map.get(attrs, :settled_cost_micros, 0)),
-      occurred_at: Map.get(attrs, :occurred_at, now()),
-      created_at: Map.get(attrs, :created_at, now()),
-      details: Map.get(attrs, :details, %{})
-    }
-    |> Repo.insert!()
+    entry =
+      %LedgerEntry{
+        request_id: request.id,
+        attempt_id: Map.get(attrs, :attempt_id),
+        pricing_snapshot_id: Map.get(attrs, :pricing_snapshot_id),
+        pool_id: request.pool_id,
+        api_key_id: request.api_key_id,
+        pool_upstream_assignment_id: Map.get(attrs, :pool_upstream_assignment_id),
+        upstream_identity_id: Map.get(attrs, :upstream_identity_id),
+        entry_kind: Map.get(attrs, :entry_kind, "settlement"),
+        amount_status: Map.get(attrs, :amount_status, "recorded"),
+        usage_status: Map.get(attrs, :usage_status, "usage_known"),
+        transport: Map.get(attrs, :transport, request.transport),
+        currency_code: Map.get(attrs, :currency_code, "USD"),
+        input_tokens: Map.get(attrs, :input_tokens, 10),
+        cached_input_tokens: Map.get(attrs, :cached_input_tokens, 0),
+        output_tokens: Map.get(attrs, :output_tokens, 4),
+        reasoning_tokens: Map.get(attrs, :reasoning_tokens, 0),
+        total_tokens: Map.get(attrs, :total_tokens, 14),
+        request_count: Map.get(attrs, :request_count, 1),
+        estimated_cost_micros: Decimal.new(Map.get(attrs, :estimated_cost_micros, 0)),
+        settled_cost_micros: Decimal.new(Map.get(attrs, :settled_cost_micros, 0)),
+        occurred_at: Map.get(attrs, :occurred_at, now()),
+        created_at: Map.get(attrs, :created_at, now()),
+        details: Map.get(attrs, :details, %{})
+      }
+      |> Repo.insert!()
+
+    RequestLogFacts.record_settlement_written!(entry)
+    entry
   end
 
   def assert_accounting_for_request(request, attrs \\ %{}) do

@@ -1150,10 +1150,7 @@ defmodule CodexPoolerWeb.McpControllerTest do
   end
 
   defp attempt_with_latency(request, assignment, latency_ms) do
-    request
-    |> attempt_fixture(assignment)
-    |> Ecto.Changeset.change(latency_ms: latency_ms)
-    |> Repo.update!()
+    attempt_fixture(request, assignment, %{latency_ms: latency_ms})
   end
 
   defp unsafe_log_metadata(extra) do

@@ -17,7 +17,7 @@ defmodule CodexPooler.SchemaContractTest do
     AlertRuleChannel
   }
 
-  alias CodexPooler.Accounting.{DailyRollup, LedgerEntry}
+  alias CodexPooler.Accounting.{DailyRollup, LedgerEntry, RequestLogFact}
   alias CodexPooler.Catalog.{Model, PricingSnapshot}
   alias CodexPooler.Files.FileRecord
   alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, RoutingCircuitState}
@@ -32,7 +32,7 @@ defmodule CodexPooler.SchemaContractTest do
     alert_rule_channels alert_rules api_key_policy_bindings api_keys attempts audit_events bridge_owner_leases
     bridge_session_aliases codex_files codex_sessions codex_turns daily_rollups
     encrypted_secrets gateway_idempotency_keys instance_settings invite_acceptances invites ledger_entries memberships
-    models operator_pool_assignments platform_bootstrap_state pricing_snapshots recovery_codes requests routing_circuit_states
+    models operator_pool_assignments platform_bootstrap_state pricing_snapshots recovery_codes request_log_facts requests routing_circuit_states
     sessions sync_runs pools pool_routing_settings pool_upstream_assignments totp_settings
     upstream_identities users
   )
@@ -56,6 +56,7 @@ defmodule CodexPooler.SchemaContractTest do
     AlertRuleChannel,
     DailyRollup,
     LedgerEntry,
+    RequestLogFact,
     CodexPooler.Audit.AuditEvent,
     Model,
     PricingSnapshot,
@@ -123,6 +124,7 @@ defmodule CodexPooler.SchemaContractTest do
           "models_pool_exposed_uq",
           "ledger_entries_settlement_request_uq",
           "ledger_entries_api_key_recorded_occurred_idx",
+          "request_log_facts_latest_upstream_identity_request_idx",
           "daily_rollups_pool_uq",
           "codex_sessions_pool_session_key_uq",
           "codex_turns_session_sequence_uq",
@@ -156,6 +158,12 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert indexes["ledger_entries_api_key_recorded_occurred_idx"] =~
              "WHERE (amount_status = 'recorded'::text)"
+
+    assert indexes["request_log_facts_latest_upstream_identity_request_idx"] =~
+             "(latest_upstream_identity_id, request_id)"
+
+    assert indexes["request_log_facts_latest_upstream_identity_request_idx"] =~
+             "WHERE (latest_upstream_identity_id IS NOT NULL)"
 
     assert indexes["account_quota_windows_evidence_identity_uq"] =~ "quota_scope"
     assert indexes["requests_api_key_admitted_idx"] =~ "api_key_id"
@@ -313,6 +321,13 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert column_type("ledger_entries", "input_tokens") == "bigint"
     assert column_type("ledger_entries", "total_tokens") == "bigint"
+    assert column_type("request_log_facts", "latest_input_tokens") == "bigint"
+    assert column_type("request_log_facts", "latest_settled_cost_micros") == "bigint"
+    assert column_type("request_log_facts", "latest_cached_input_cost_micros") == "bigint"
+
+    assert column_type("request_log_facts", "latest_settlement_occurred_at") ==
+             "timestamp without time zone"
+
     assert column_type("daily_rollups", "output_tokens") == "bigint"
     assert column_type("api_key_policy_bindings", "max_tokens_per_day") == "bigint"
     assert column_type("api_key_policy_bindings", "max_tokens_per_week") == "bigint"
@@ -347,6 +362,11 @@ defmodule CodexPooler.SchemaContractTest do
     assert fk_action("codex_sessions_pool_upstream_assignment_id_fkey") == {"c", "a"}
     assert fk_action("ledger_entries_pool_upstream_assignment_id_fkey") == {"n", "a"}
     assert fk_action("ledger_entries_upstream_identity_id_fkey") == {"n", "a"}
+    assert fk_action("request_log_facts_request_id_fkey") == {"c", "a"}
+    assert fk_action("request_log_facts_latest_attempt_id_fkey") == {"n", "a"}
+    assert fk_action("request_log_facts_latest_pool_upstream_assignment_id_fkey") == {"n", "a"}
+    assert fk_action("request_log_facts_latest_upstream_identity_id_fkey") == {"n", "a"}
+    assert fk_action("request_log_facts_latest_settlement_entry_id_fkey") == {"n", "a"}
     assert fk_action("codex_turns_final_attempt_id_request_id_fkey") == {"a", "a"}
     assert fk_action("codex_files_request_id_fkey") == {"n", "a"}
     assert fk_action("codex_files_pool_upstream_assignment_id_fkey") == {"n", "a"}
@@ -559,6 +579,111 @@ defmodule CodexPooler.SchemaContractTest do
     assert AlertIncidentReceipt.__schema__(:type, :dismissed_at) == :utc_datetime_usec
     assert AlertIncidentTarget.__schema__(:type, :last_matched_at) == :utc_datetime_usec
     assert AlertDeliveryAttempt.__schema__(:type, :max_attempts) == :integer
+  end
+
+  test "request log facts preserve the 1:1 metadata-only projection contract" do
+    columns = table_columns("request_log_facts")
+
+    assert Map.take(columns, [
+             "request_id",
+             "latest_attempt_id",
+             "latest_attempt_number",
+             "latest_attempt_status",
+             "latest_attempt_retryable",
+             "latest_upstream_status_code",
+             "latest_pool_upstream_assignment_id",
+             "latest_upstream_identity_id",
+             "latest_network_error_code",
+             "latest_latency_ms",
+             "latest_settlement_entry_id",
+             "latest_settlement_usage_status",
+             "latest_settlement_pricing_status",
+             "latest_input_tokens",
+             "latest_cached_input_tokens",
+             "latest_output_tokens",
+             "latest_reasoning_tokens",
+             "latest_total_tokens",
+             "latest_settled_cost_micros",
+             "latest_cached_input_cost_micros",
+             "latest_cached_input_token_micros",
+             "latest_settlement_occurred_at",
+             "latest_settlement_created_at",
+             "inserted_at",
+             "updated_at"
+           ]) == %{
+             "request_id" => {"uuid", "NO"},
+             "latest_attempt_id" => {"uuid", "YES"},
+             "latest_attempt_number" => {"integer", "YES"},
+             "latest_attempt_status" => {"character varying", "YES"},
+             "latest_attempt_retryable" => {"boolean", "YES"},
+             "latest_upstream_status_code" => {"integer", "YES"},
+             "latest_pool_upstream_assignment_id" => {"uuid", "YES"},
+             "latest_upstream_identity_id" => {"uuid", "YES"},
+             "latest_network_error_code" => {"character varying", "YES"},
+             "latest_latency_ms" => {"integer", "YES"},
+             "latest_settlement_entry_id" => {"uuid", "YES"},
+             "latest_settlement_usage_status" => {"character varying", "YES"},
+             "latest_settlement_pricing_status" => {"character varying", "YES"},
+             "latest_input_tokens" => {"bigint", "YES"},
+             "latest_cached_input_tokens" => {"bigint", "YES"},
+             "latest_output_tokens" => {"bigint", "YES"},
+             "latest_reasoning_tokens" => {"bigint", "YES"},
+             "latest_total_tokens" => {"bigint", "YES"},
+             "latest_settled_cost_micros" => {"bigint", "YES"},
+             "latest_cached_input_cost_micros" => {"bigint", "YES"},
+             "latest_cached_input_token_micros" => {"bigint", "YES"},
+             "latest_settlement_occurred_at" => {"timestamp without time zone", "YES"},
+             "latest_settlement_created_at" => {"timestamp without time zone", "YES"},
+             "inserted_at" => {"timestamp without time zone", "NO"},
+             "updated_at" => {"timestamp without time zone", "NO"}
+           }
+
+    assert Map.keys(columns) |> Enum.sort() ==
+             [
+               "inserted_at",
+               "latest_attempt_id",
+               "latest_attempt_number",
+               "latest_attempt_retryable",
+               "latest_attempt_status",
+               "latest_cached_input_cost_micros",
+               "latest_cached_input_token_micros",
+               "latest_cached_input_tokens",
+               "latest_input_tokens",
+               "latest_latency_ms",
+               "latest_network_error_code",
+               "latest_output_tokens",
+               "latest_pool_upstream_assignment_id",
+               "latest_reasoning_tokens",
+               "latest_settled_cost_micros",
+               "latest_settlement_created_at",
+               "latest_settlement_entry_id",
+               "latest_settlement_occurred_at",
+               "latest_settlement_pricing_status",
+               "latest_settlement_usage_status",
+               "latest_total_tokens",
+               "latest_upstream_identity_id",
+               "latest_upstream_status_code",
+               "request_id",
+               "updated_at"
+             ]
+
+    assert RequestLogFact.__schema__(:source) == "request_log_facts"
+    assert RequestLogFact.__schema__(:primary_key) == [:request_id]
+    assert RequestLogFact.__schema__(:type, :request_id) == :binary_id
+    assert RequestLogFact.__schema__(:type, :latest_attempt_id) == :binary_id
+    assert RequestLogFact.__schema__(:type, :latest_input_tokens) == :integer
+    assert RequestLogFact.__schema__(:type, :latest_settlement_pricing_status) == :string
+    assert RequestLogFact.__schema__(:type, :latest_settlement_occurred_at) == :utc_datetime_usec
+
+    forbidden_columns = ~w(
+      pool_id api_key_id status model requested_model endpoint transport admitted_at completed_at
+      request_metadata response_metadata details prompt request_body response_body authorization
+      cookie websocket_frame idempotency_key
+    )
+
+    for column <- forbidden_columns do
+      refute Map.has_key?(columns, column)
+    end
   end
 
   test "operator pool assignments preserve the scoped admin grant storage contract" do
