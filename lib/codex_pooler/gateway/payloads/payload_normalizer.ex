@@ -73,14 +73,14 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
 
     fields =
       [
-        {"prompt", Map.get(payload, "prompt")}
+        {:prompt, Map.get(payload, "prompt")}
       ]
       |> Enum.reject(fn {_key, value} -> blank?(value) end)
       |> Enum.map(fn {key, value} -> {key, to_string(value)} end)
 
     with {:ok, stream} <- upload_stream(upload) do
       file_part =
-        {"file",
+        {:file,
          {stream,
           filename: upload.redacted_filename, content_type: upload.content_type, size: upload.size}}
 
