@@ -242,6 +242,32 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     assert Decimal.equal?(log.cost.usd, Decimal.new("0.123456"))
   end
 
+  test "request logs do not infer cached cost from projected token price without a persisted cached-cost fact" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-projected-cache-cost",
+        status: "succeeded",
+        correlation_id: "req-projected-cache-cost"
+      })
+
+    ledger_entry_fixture(request, %{
+      input_tokens: 10,
+      cached_input_tokens: 4,
+      output_tokens: 6,
+      reasoning_tokens: 0,
+      total_tokens: 16,
+      settled_cost_micros: 12_345,
+      details: %{"pricing_status" => "priced", "settled_cost_micros" => "12345"}
+    })
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+    assert log.token_counts.cached_input_tokens == 4
+    assert is_nil(log.token_counts.cached_input_cost_usd)
+    assert Decimal.equal?(log.cost.usd, Decimal.new("0.012345"))
+  end
+
   test "request log cost marks unpriced settlements explicitly" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
 

@@ -27,17 +27,23 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
 
   @spec from_websocket_body(binary()) :: usage()
   def from_websocket_body(body) when is_binary(body) do
-    case from_sse_body(body, "websocket_usage_missing") do
+    case usage_from_sse_lines(body) do
       %{status: "usage_known"} = usage ->
         usage
 
-      %{status: "usage_unknown"} ->
+      _missing ->
         from_delimited_json_messages(body) ||
+          usage_from_retained_usage_fragment(body) ||
           %{status: "usage_unknown", source: "websocket_usage_missing"}
     end
   end
 
   defp from_sse_body(body, missing_source) do
+    usage_from_sse_lines(body) || usage_from_retained_usage_fragment(body) ||
+      %{status: "usage_unknown", source: missing_source}
+  end
+
+  defp usage_from_sse_lines(body) do
     body
     |> String.split("\n")
     |> Enum.filter(&String.starts_with?(&1, "data: "))
@@ -45,7 +51,44 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == "[DONE]"))
     |> usage_from_json_lines()
-    |> Kernel.||(%{status: "usage_unknown", source: missing_source})
+  end
+
+  defp usage_from_retained_usage_fragment(body) do
+    with {:ok, input_tokens} <- retained_int(body, ~r/"input_tokens"\s*:\s*(\d+)/),
+         {:ok, output_tokens} <- retained_int(body, ~r/"output_tokens"\s*:\s*(\d+)/),
+         {:ok, total_tokens} <- retained_int(body, ~r/"total_tokens"\s*:\s*(\d+)/) do
+      %{
+        "input_tokens" => input_tokens,
+        "cached_input_tokens" => retained_cached_input_tokens(body),
+        "output_tokens" => output_tokens,
+        "reasoning_tokens" => retained_int_or_zero(body, ~r/"reasoning_tokens"\s*:\s*(\d+)/),
+        "total_tokens" => total_tokens
+      }
+      |> normalize_usage(%{})
+    else
+      :error -> nil
+    end
+  end
+
+  defp retained_cached_input_tokens(body) do
+    case retained_int(body, ~r/"cached_input_tokens"\s*:\s*(\d+)/) do
+      {:ok, tokens} -> tokens
+      :error -> retained_int_or_zero(body, ~r/"cached_tokens"\s*:\s*(\d+)/)
+    end
+  end
+
+  defp retained_int_or_zero(body, pattern) do
+    case retained_int(body, pattern) do
+      {:ok, value} -> value
+      :error -> 0
+    end
+  end
+
+  defp retained_int(body, pattern) do
+    case Regex.run(pattern, body, capture: :all_but_first) do
+      [value] -> int_value(value)
+      _other -> :error
+    end
   end
 
   defp from_delimited_json_messages(body) do

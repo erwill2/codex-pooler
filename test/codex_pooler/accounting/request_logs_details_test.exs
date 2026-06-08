@@ -68,7 +68,11 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
       reasoning_tokens: 3,
       total_tokens: 21,
       settled_cost_micros: 42_000,
-      details: %{"pricing_status" => "priced", "settled_cost_micros" => "42000"}
+      details: %{
+        "pricing_status" => "priced",
+        "settled_cost_micros" => "42000",
+        "cached_input_cost_micros" => "12"
+      }
     })
 
     assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)

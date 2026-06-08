@@ -61,28 +61,15 @@ defmodule CodexPooler.Accounting.RequestLogs.SettlementPresentation do
 
   defp unpriced_status(_status), do: "unpriced"
 
-  defp cached_input_cost_usd(%{details: details} = settlement) do
+  defp cached_input_cost_usd(%{details: details}) do
     persisted_micros = details && Map.get(details, "cached_input_cost_micros")
 
     if is_binary(persisted_micros) do
       decimal_micros_to_usd(persisted_micros)
     else
-      calculate_cached_input_cost_usd(
-        settlement.cached_input_tokens,
-        settlement.cached_input_token_micros
-      )
+      nil
     end
   end
-
-  defp calculate_cached_input_cost_usd(tokens, %Decimal{} = token_micros)
-       when is_integer(tokens) and tokens > 0 do
-    tokens
-    |> Decimal.new()
-    |> Decimal.mult(token_micros)
-    |> decimal_micros_to_usd()
-  end
-
-  defp calculate_cached_input_cost_usd(_tokens, _token_micros), do: nil
 
   defp decimal_micros_to_usd(%Decimal{} = micros),
     do: micros |> Decimal.div(Decimal.new(1_000_000)) |> Decimal.round(6)

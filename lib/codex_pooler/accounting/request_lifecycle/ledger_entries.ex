@@ -344,7 +344,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
       "response_status_code" => Map.fetch!(context, :response_status_code),
       "retry_count" => Map.fetch!(context, :retry_count),
       "estimated_from_reserve" => usage.status != "usage_known",
-      "settled_cost_micros" => context |> Map.fetch!(:settled_cost) |> decimal_string_or_nil()
+      "settled_cost_micros" => context |> Map.fetch!(:settled_cost) |> decimal_string_or_nil(),
+      "cached_input_cost_micros" => cached_input_cost_micros(usage, pricing)
     }
     |> Map.merge(PricingResolution.details(pricing))
   end
@@ -371,6 +372,21 @@ defmodule CodexPooler.Accounting.RequestLifecycle.LedgerEntries do
   defp decimal_string_or_nil(nil), do: nil
   defp decimal_string_or_nil(%Decimal{} = value), do: Decimal.to_string(value)
   defp decimal_string_or_nil(value), do: to_string(value)
+
+  defp cached_input_cost_micros(
+         %{input_tokens: input_tokens, cached_input_tokens: cached_input_tokens},
+         %{snapshot: %{cached_input_token_micros: %Decimal{} = token_micros}}
+       )
+       when is_integer(input_tokens) and is_integer(cached_input_tokens) do
+    cached_input_tokens
+    |> min(input_tokens)
+    |> max(0)
+    |> Decimal.new()
+    |> Decimal.mult(token_micros)
+    |> decimal_string_or_nil()
+  end
+
+  defp cached_input_cost_micros(_usage, _pricing), do: nil
 
   defp normalize_windows(windows) when is_list(windows), do: Map.new(windows)
   defp normalize_windows(windows) when is_map(windows), do: windows

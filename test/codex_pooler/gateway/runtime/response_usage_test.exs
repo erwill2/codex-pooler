@@ -128,6 +128,24 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
              }
     end
 
+    test "extracts usage from a retained SSE suffix that starts inside a large data frame" do
+      body =
+        ~s(output_text":"truncated prefix) <>
+          ~s(","usage":{"input_tokens":214407,"input_tokens_details":{"cached_tokens":206848},"output_tokens":512,"reasoning_tokens":0,"total_tokens":214919},"status":"completed"}}\n\n) <>
+          "data: [DONE]\n\n"
+
+      assert ResponseUsage.from_sse(body) == %{
+               status: "usage_known",
+               source: "upstream_usage",
+               input_tokens: 214_407,
+               cached_input_tokens: 206_848,
+               output_tokens: 512,
+               reasoning_tokens: 0,
+               total_tokens: 214_919,
+               service_tier: nil
+             }
+    end
+
     test "marks SSE without usage as unknown" do
       body = ~S"""
       data: {"type":"response.created"}
