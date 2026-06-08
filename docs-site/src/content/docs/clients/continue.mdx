@@ -1,0 +1,41 @@
+---
+title: Continue
+description: Configure Continue with Codex Pooler's narrow OpenAI-compatible /v1 surface, model capabilities, and optional operator MCP metadata access.
+---
+
+Continue can use Codex Pooler as an OpenAI-compatible provider by setting `provider: openai`, `apiBase` to `/v1`, and the Pool API key as a Continue secret. For `gpt-5*` models, Continue uses the Responses API by default.
+
+```yaml
+name: Codex Pooler
+version: 1.0.0
+schema: v1
+
+models:
+  - name: GPT-5.5 via Codex Pooler
+    provider: openai
+    model: gpt-5.5
+    apiBase: https://codex-pooler.example.com/v1
+    apiKey: "${{ secrets.CODEX_POOLER_API_KEY }}"
+    roles:
+      - chat
+      - edit
+      - apply
+      - summarize
+    capabilities:
+      - tool_use
+      - image_input
+
+# Optional operator-only MCP metadata add-on. Omit for model/runtime use.
+mcpServers:
+  - name: codex_pooler
+    type: streamable-http
+    url: https://codex-pooler.example.com/mcp
+    requestOptions:
+      timeout: 30000
+      headers:
+        Authorization: "Bearer ${{ secrets.CODEX_POOLER_MCP_KEY }}"
+```
+
+For local setup, change `apiBase` to `http://localhost:4000/v1`. If you keep the optional operator MCP add-on locally, change the MCP `url` to `http://localhost:4000/mcp`.
+
+The Pool API key authenticates model requests. The MCP token authenticates only the operator metadata endpoint.

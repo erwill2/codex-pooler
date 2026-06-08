@@ -1,0 +1,29 @@
+---
+title: Aider
+description: Configure Aider with Codex Pooler's narrow OpenAI-compatible /v1 surface and a Pool API key.
+---
+
+Aider uses the OpenAI-compatible route with the `openai/` model prefix. Keep the Pool API key in the environment and point Aider's OpenAI API base at Codex Pooler's `/v1` surface.
+
+For a deployed instance, use:
+
+```yaml
+model: openai/gpt-5.5
+openai-api-base: https://codex-pooler.example.com/v1
+```
+
+For local setup, use:
+
+```yaml
+model: openai/gpt-5.5
+openai-api-base: http://localhost:4000/v1
+```
+
+Smoke-test from a repository:
+
+```bash
+export OPENAI_API_KEY="$CODEX_POOLER_API_KEY"
+aider --model openai/gpt-5.5 --message 'Reply with exactly: aider ok'
+```
+
+The Pool API key authenticates `/v1` model requests. Do not use an operator MCP token as the OpenAI API key.

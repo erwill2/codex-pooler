@@ -1,11 +1,11 @@
 ---
 title: OpenClaw
-description: Configure OpenClaw with Codex Pooler's narrow OpenAI-compatible /v1 surface, current runtime id, model metadata, and operator MCP endpoint.
+description: Configure OpenClaw with Codex Pooler's narrow OpenAI-compatible /v1 surface, current runtime id, model metadata, and optional operator MCP endpoint.
 ---
 
 ![Codex Pooler OpenClaw integration](/codex-pooler-openclaw.png)
 
-OpenClaw should use Codex Pooler through the narrow OpenAI-compatible `/v1` surface. Keep `openai/*` model names when you want OpenClaw and its tools to treat the model as the canonical OpenAI provider path.
+OpenClaw should use Codex Pooler through the narrow OpenAI-compatible `/v1` surface. Keep `openai/*` model names when you want OpenClaw and its tools to treat the model as the canonical OpenAI provider path. The optional MCP block is only for operator metadata tools.
 
 For a deployed instance, use these URLs:
 
@@ -35,7 +35,7 @@ OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surfac
     providers: {
       openai: {
         baseUrl: "https://codex-pooler.example.com/v1",
-        apiKey: "<pool-api-key>",
+        apiKey: "${CODEX_POOLER_API_KEY}",
         api: "openai-responses",
         agentRuntime: { id: "openclaw" },
         timeoutSeconds: 300,
@@ -60,7 +60,7 @@ Define only model ids your assigned Pool can serve. If you run Codex Pooler loca
 
 ## Operator MCP server
 
-Add Codex Pooler as a remote Streamable HTTP MCP server only when OpenClaw should inspect metadata that the operator can already see in the admin UI.
+Add Codex Pooler as a remote Streamable HTTP MCP server only when OpenClaw should inspect metadata that the operator can already see in the admin UI. Omit this block for normal model/runtime use.
 
 ```json5
 {

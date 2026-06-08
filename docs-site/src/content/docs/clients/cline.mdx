@@ -1,0 +1,37 @@
+---
+title: Cline
+description: Configure Cline with Codex Pooler's narrow OpenAI-compatible /v1 surface and optional operator MCP metadata access.
+---
+
+Cline's OpenAI-compatible provider id is `openai`. Configure it with the Pool API key, the Codex Pooler `/v1` base URL, and the model id that your assigned Pool can serve.
+
+```bash
+cline auth \
+  --provider openai \
+  --apikey "$CODEX_POOLER_API_KEY" \
+  --baseurl https://codex-pooler.example.com/v1 \
+  --modelid gpt-5.5
+```
+
+For local setup, change `--baseurl` to `http://localhost:4000/v1`.
+
+For optional operator MCP in Cline CLI, add the remote server to `~/.cline/mcp.json`. Codex Pooler does not require this for model use. The VS Code extension opens its own MCP settings JSON from the Cline MCP Servers panel; use the same `mcpServers` shape there.
+
+```json
+{
+  "mcpServers": {
+    "codex_pooler": {
+      "url": "https://codex-pooler.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <operator-mcp-token>"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+For local MCP setup, change the MCP `url` to `http://localhost:4000/mcp`.
+
+Use a Pool API key for `/v1` model requests and an operator MCP token for `/mcp`. Do not reuse the Pool API key for MCP.

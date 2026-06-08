@@ -1,11 +1,13 @@
 ---
 title: OpenCode
-description: Configure OpenCode with Codex Pooler's narrow OpenAI-compatible /v1 surface and remote operator MCP endpoint.
+description: Configure OpenCode with Codex Pooler's narrow OpenAI-compatible /v1 surface and optional remote operator MCP endpoint.
 ---
 
 ![Codex Pooler OpenCode integration](/codex-pooler-opencode.png)
 
-OpenCode should use Codex Pooler through the narrow OpenAI-compatible `/v1` surface. The Pool API key authenticates model requests. A separate operator MCP token authenticates the remote MCP endpoint.
+OpenCode should use Codex Pooler through the narrow OpenAI-compatible `/v1` surface. The Pool API key authenticates model requests. A separate operator MCP token authenticates the optional remote MCP endpoint. MCP is not required for OpenCode to use Codex Pooler; it only gives an operator MCP host read-only metadata tools.
+
+OpenCode websocket support is the narrow Responses websocket route at `GET /v1/responses`, not OpenAI Realtime SDK compatibility.
 
 For a deployed instance, use these URLs:
 
@@ -25,6 +27,7 @@ Store the Pool API key outside the config and read it through environment expans
 
 ```jsonc
 {
+  "$schema": "https://opencode.ai/config.json",
   "provider": {
     "openai": {
       "npm": "@ai-sdk/openai",
@@ -67,7 +70,7 @@ Define only model ids your assigned Pool can serve. If you run Codex Pooler loca
 
 ## Remote MCP example
 
-Add Codex Pooler as a remote MCP server when the OpenCode host should inspect metadata that the operator can already see in the admin UI.
+Add Codex Pooler as a remote MCP server only when the OpenCode host should inspect metadata that the operator can already see in the admin UI.
 
 ```jsonc
 {
