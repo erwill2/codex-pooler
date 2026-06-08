@@ -1,8 +1,8 @@
 # The directory Mix will write compiled artifacts to.
 /_build/
 
-# If you run "mix test --cover", coverage assets end up here.
-/cover/
+# If you run "mix coverage" or "mix six", coverage assets end up here.
+/.six/
 
 # The directory Mix downloads your dependencies sources to.
 /deps/

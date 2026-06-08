@@ -7,10 +7,10 @@ defmodule CodexPooler.MixProject do
       # x-release-please-start-version
       version: "0.0.4",
       # x-release-please-end
-      elixir: "~> 1.15",
+      elixir: "~> 1.16",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
-      test_coverage: [summary: [threshold: 83.0]],
+      test_coverage: [tool: Six, minimum_coverage: 83.0, threshold: 83],
       aliases: aliases(),
       deps: deps(),
       dialyzer: [plt_add_apps: [:ex_unit, :mix]],
@@ -31,7 +31,13 @@ defmodule CodexPooler.MixProject do
 
   def cli do
     [
-      preferred_envs: [coverage: :test, precommit: :test]
+      preferred_envs: [
+        coverage: :test,
+        precommit: :test,
+        six: :test,
+        "six.detail": :test,
+        "six.html": :test
+      ]
     ]
   end
 
@@ -77,6 +83,7 @@ defmodule CodexPooler.MixProject do
       {:credo, "== 1.7.19", only: [:dev, :test], runtime: false},
       {:dialyxir, "== 1.4.7", only: [:dev, :test], runtime: false},
       {:sobelow, "== 0.14.1", only: [:dev, :test], runtime: false},
+      {:six, "== 0.3.0", only: :test},
       {:gettext, "== 1.0.2"},
       {:jason, "== 1.4.5"},
       {:dns_cluster, "== 0.2.0"},
