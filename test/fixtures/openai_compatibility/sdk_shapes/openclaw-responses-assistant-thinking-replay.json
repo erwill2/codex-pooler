@@ -1,0 +1,53 @@
+{
+  "schema_version": "2026-05-24.sdk-shape-corpus.v1",
+  "scenario_id": "openclaw.responses.assistant_thinking_replay.v1",
+  "sdk_name": "OpenClaw",
+  "sdk_package": "openclaw",
+  "sdk_version": "2026.6.1",
+  "version_provenance": "Observed from a sanitized OpenClaw session-state structural summary on 2026-06-09; fixture records metadata only and does not store raw request content.",
+  "endpoint": "/v1/responses",
+  "http_method": "POST",
+  "scenario": "OpenClaw ordinary Responses replay containing prior assistant reasoning and assistant text during a second session-key turn.",
+  "top_level_keys": ["model", "store", "input"],
+  "input_item_types": ["message:user", "reasoning", "message:assistant", "message:user"],
+  "content_part_types": ["input_text", "thinking", "text", "summary_text", "output_text"],
+  "tool_shape_keys": [],
+  "expected_decision": {
+    "status": "translate",
+    "allowed_values": ["accept", "translate", "reject", "passthrough"]
+  },
+  "owner_placeholder": "openclaw_replay_fix",
+  "synthetic_data_policy": {
+    "model_placeholder": "sample-model",
+    "assistant_text_placeholder": "sample-assistant-message",
+    "reasoning_placeholder": "sample-encrypted-reasoning",
+    "thinking_signature_placeholder": "sample-thinking-signature",
+    "user_message_placeholder": "sample-user-message"
+  },
+  "structural_summary": {
+    "payload_kind": "openclaw_assistant_thinking_replay",
+    "previous_response_id_present": false,
+    "converted_responses_reasoning_item_present": true,
+    "converted_reasoning_content_field_present": true,
+    "converted_reasoning_content_field_empty": true,
+    "converted_assistant_output_annotations_present": true,
+    "assistant_thinking_part_present": true,
+    "assistant_text_part_present": true,
+    "thinking_forwarded_upstream": false,
+    "reasoning_content_field_forwarded_upstream": false,
+    "assistant_output_annotations_forwarded_upstream": false,
+    "raw_payload_stored": false,
+    "placeholder_values_only": true,
+    "notes": [
+      "The observed failure was a pre-dispatch adapter rejection after OpenClaw converted assistant thinking metadata into a Responses reasoning item that retained content: [].",
+      "The fixture intentionally omits raw prompt, thinking content, signatures, and transport bodies."
+    ]
+  },
+  "redaction_status": {
+    "metadata_only": true,
+    "contains_real_prompt": false,
+    "contains_credentials": false,
+    "contains_headers": false,
+    "contains_media_or_file_bytes": false
+  }
+}
