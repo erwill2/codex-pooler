@@ -81,6 +81,68 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
              )
     end
 
+    test "removes backend Codex encrypted-only agent messages from websocket upstream JSON" do
+      payload = %{
+        "model" => "gpt-5.5",
+        "input" => [
+          %{"type" => "message", "role" => "user", "content" => "hello"},
+          %{
+            "type" => "agent_message",
+            "author" => "root",
+            "recipient" => "worker",
+            "content" => [
+              %{"type" => "encrypted_content", "encrypted_content" => "opaque-agent-message"}
+            ]
+          },
+          %{
+            "type" => "message",
+            "role" => "assistant",
+            "content" => nil,
+            "encrypted_content" => "preserved-assistant-replay"
+          },
+          %{
+            "type" => "agent_message",
+            "author" => "root",
+            "recipient" => "worker",
+            "content" => [%{"type" => "output_text", "text" => "clear agent message"}]
+          }
+        ]
+      }
+
+      request_options =
+        %{}
+        |> RequestOptions.build("/backend-api/codex/responses", payload)
+        |> RequestOptions.for_websocket(payload)
+
+      model = %Model{upstream_model_id: "provider-model"}
+
+      assert {:ok, encoded} =
+               PayloadNormalizer.upstream_payload(
+                 payload,
+                 model,
+                 "/backend-api/codex/responses",
+                 request_options
+               )
+
+      upstream = Jason.decode!(encoded)
+
+      assert upstream["input"] == [
+               %{"type" => "message", "role" => "user", "content" => "hello"},
+               %{
+                 "type" => "message",
+                 "role" => "assistant",
+                 "content" => nil,
+                 "encrypted_content" => "preserved-assistant-replay"
+               },
+               %{
+                 "type" => "agent_message",
+                 "author" => "root",
+                 "recipient" => "worker",
+                 "content" => [%{"type" => "output_text", "text" => "clear agent message"}]
+               }
+             ]
+    end
+
     test "omits absent, auto, and default service tiers while preserving concrete tiers upstream" do
       model = %Model{upstream_model_id: "provider-model"}
 

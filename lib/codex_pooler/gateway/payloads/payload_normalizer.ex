@@ -114,6 +114,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
     |> Map.drop(["request_id"])
     |> Map.put_new("type", "response.create")
     |> Map.put_new("instructions", "")
+    |> normalize_backend_codex_websocket_input()
     |> remove_backend_codex_encrypted_tool_schema_markers()
     |> maybe_put_websocket_responses_lite_client_metadata(request_options)
   end
@@ -194,6 +195,30 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
   end
 
   defp normalize_backend_codex_http_input(payload), do: payload
+
+  defp normalize_backend_codex_websocket_input(%{"input" => input} = payload)
+       when is_list(input) do
+    input = Enum.reject(input, &backend_codex_encrypted_only_agent_message?/1)
+    Map.put(payload, "input", input)
+  end
+
+  defp normalize_backend_codex_websocket_input(payload), do: payload
+
+  defp backend_codex_encrypted_only_agent_message?(%{
+         "type" => "agent_message",
+         "content" => content
+       })
+       when is_list(content) and content != [] do
+    Enum.all?(content, &backend_codex_encrypted_content_item?/1)
+  end
+
+  defp backend_codex_encrypted_only_agent_message?(_item), do: false
+
+  defp backend_codex_encrypted_content_item?(%{"type" => "encrypted_content"} = item) do
+    Map.has_key?(item, "encrypted_content")
+  end
+
+  defp backend_codex_encrypted_content_item?(_item), do: false
 
   defp backend_codex_encrypted_only_input_item?(%{"content" => nil} = item) do
     Map.has_key?(item, "encrypted_content")

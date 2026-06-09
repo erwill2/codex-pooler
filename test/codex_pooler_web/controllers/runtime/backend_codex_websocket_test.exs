@@ -914,6 +914,17 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
           "input" => [
             %{"type" => "message", "role" => "user", "content" => "hello"},
             %{
+              "type" => "agent_message",
+              "author" => "root",
+              "recipient" => "worker",
+              "content" => [
+                %{
+                  "type" => "encrypted_content",
+                  "encrypted_content" => "sample-agent-encrypted-content"
+                }
+              ]
+            },
+            %{
               "type" => "message",
               "role" => "assistant",
               "content" => nil,
