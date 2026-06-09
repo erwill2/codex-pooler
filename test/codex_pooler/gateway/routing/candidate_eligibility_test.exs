@@ -57,6 +57,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       active = upstream_assignment_fixture(pool, %{})
       disabled = upstream_assignment_fixture(pool, %{assignment_status: "disabled"})
       stale_identity = upstream_assignment_fixture(pool, %{identity_status: "refresh_due"})
+      refreshing_identity = upstream_assignment_fixture(pool, %{identity_status: "refreshing"})
 
       visible_model =
         model_fixture(pool, %{
@@ -65,7 +66,8 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
             "source_assignment_ids" => [
               active.assignment.id,
               disabled.assignment.id,
-              stale_identity.assignment.id
+              stale_identity.assignment.id,
+              refreshing_identity.assignment.id
             ]
           }
         })
@@ -83,7 +85,12 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibilityTest do
       refute Enum.any?(context.visible_models, &(&1.id == hidden_model.id))
 
       assert {:ok, candidates} = CandidateEligibility.routable_candidates(context, visible_model)
-      assert candidate_ids(candidates) == [active.assignment.id]
+
+      assert candidate_ids(candidates) == [
+               active.assignment.id,
+               refreshing_identity.assignment.id
+             ]
+
       refute disabled.assignment.id in candidate_ids(candidates)
       refute stale_identity.assignment.id in candidate_ids(candidates)
 

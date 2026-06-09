@@ -96,6 +96,10 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     PoolUpstreamAssignment.disabled_health_status(),
     PoolUpstreamAssignment.errored_health_status()
   ]
+  @visible_identity_statuses [
+    UpstreamIdentity.active_status(),
+    UpstreamIdentity.refreshing_status()
+  ]
 
   @type candidate :: {PoolUpstreamAssignment.t(), UpstreamIdentity.t()}
   @type gateway_error :: Contracts.gateway_error()
@@ -392,7 +396,6 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     else
       assignment_active_status = PoolUpstreamAssignment.active_status()
       assignment_eligible_status = PoolUpstreamAssignment.eligible_status()
-      identity_active_status = UpstreamIdentity.active_status()
 
       Repo.all(
         from assignment in PoolUpstreamAssignment,
@@ -402,7 +405,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
             assignment.id in ^assignment_ids and assignment.status == ^assignment_active_status and
               assignment.eligibility_status == ^assignment_eligible_status and
               assignment.health_status not in ^@health_excluded and
-              identity.status == ^identity_active_status and
+              identity.status in ^@visible_identity_statuses and
               (is_nil(assignment.cooldown_until) or assignment.cooldown_until <= ^timestamp),
           order_by: [asc: assignment.created_at, asc: assignment.id],
           select: {assignment, identity}
