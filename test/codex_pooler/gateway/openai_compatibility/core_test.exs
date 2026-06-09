@@ -1007,6 +1007,44 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                Enum.at(coerced["input"], 3)
     end
 
+    test "Hermes ordinary replay accepts completed assistant message metadata" do
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "store" => false,
+        "input" => [
+          %{
+            "type" => "reasoning",
+            "summary" => [],
+            "encrypted_content" => "synthetic-encrypted-reasoning"
+          },
+          %{
+            "type" => "message",
+            "role" => "assistant",
+            "id" => "msg_fixture_hermes_completed_assistant",
+            "phase" => "final_answer",
+            "status" => "completed",
+            "content" => [%{"type" => "output_text", "text" => "synthetic assistant replay"}]
+          },
+          %{"role" => "user", "content" => "synthetic follow-up"}
+        ]
+      }
+
+      assert {:ok, %{payload: coerced}} = Responses.coerce(payload)
+
+      assert [
+               %{"type" => "reasoning"},
+               %{
+                 "type" => "message",
+                 "role" => "assistant",
+                 "id" => "msg_fixture_hermes_completed_assistant",
+                 "phase" => "final_answer",
+                 "status" => "completed",
+                 "content" => [%{"type" => "output_text"}]
+               },
+               %{"type" => "message", "role" => "user"}
+             ] = coerced["input"]
+    end
+
     test "opencode native replay repairs paired blank tool call ids only" do
       payload = %{
         "model" => "gpt-fixture-text",
@@ -1046,7 +1084,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         %{
           "role" => "assistant",
           "content" => [%{"type" => "output_text", "text" => "bad"}],
-          "status" => "completed"
+          "status" => "failed"
         },
         %{
           "role" => "assistant",
@@ -1057,7 +1095,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "role" => "assistant",
           "content" => [%{"type" => "output_text", "text" => "bad"}],
           "phase" => "commentary",
-          "status" => "completed"
+          "status" => "failed"
         },
         %{
           "role" => "user",

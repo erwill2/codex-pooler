@@ -1,0 +1,49 @@
+{
+  "schema_version": "2026-05-24.sdk-shape-corpus.v1",
+  "scenario_id": "hermes.responses.completed_assistant_replay.v1",
+  "sdk_name": "Hermes Agent",
+  "sdk_package": "hermes-agent",
+  "sdk_version": "0.16.x",
+  "version_provenance": "Observed from a sanitized Hermes request-dump structural summary on 2026-06-09; fixture records metadata only and does not store raw request content.",
+  "endpoint": "/v1/responses",
+  "http_method": "POST",
+  "scenario": "Hermes ordinary Responses replay containing encrypted reasoning, a completed assistant message replay, and a follow-up user message without previous_response_id.",
+  "top_level_keys": ["model", "store", "input", "instructions", "tools", "tool_choice", "reasoning", "include", "parallel_tool_calls", "prompt_cache_key"],
+  "input_item_types": ["reasoning", "message:assistant", "message:user"],
+  "content_part_types": ["summary_text", "output_text", "input_text"],
+  "tool_shape_keys": ["type", "name", "description", "parameters"],
+  "expected_decision": {
+    "status": "translate",
+    "allowed_values": ["accept", "translate", "reject", "passthrough"]
+  },
+  "owner_placeholder": "hermes_replay_fix",
+  "synthetic_data_policy": {
+    "model_placeholder": "sample-model",
+    "assistant_message_placeholder": "sample-assistant-message",
+    "reasoning_placeholder": "sample-encrypted-reasoning",
+    "user_message_placeholder": "sample-user-message",
+    "phase_placeholder": "final_answer",
+    "status_placeholder": "completed"
+  },
+  "structural_summary": {
+    "payload_kind": "hermes_completed_assistant_replay",
+    "previous_response_id_present": false,
+    "reasoning_encrypted_content_present": true,
+    "assistant_message_status_present": true,
+    "assistant_message_status_values": ["completed"],
+    "assistant_message_phase_present": true,
+    "raw_payload_stored": false,
+    "placeholder_values_only": true,
+    "notes": [
+      "The observed failure was a pre-dispatch adapter rejection of the assistant message status field.",
+      "The fixture intentionally omits raw prompt, tool output, and encrypted content values."
+    ]
+  },
+  "redaction_status": {
+    "metadata_only": true,
+    "contains_real_prompt": false,
+    "contains_credentials": false,
+    "contains_headers": false,
+    "contains_media_or_file_bytes": false
+  }
+}

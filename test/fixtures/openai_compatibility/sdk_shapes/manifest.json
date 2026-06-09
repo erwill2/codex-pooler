@@ -77,6 +77,7 @@
     "openai-node-responses-basic.json",
     "openai-python-chat-basic.json",
     "opencode-responses-replay-continuation.json",
+    "hermes-responses-completed-assistant-replay.json",
     "vercel-ai-responses-tool-continuation.json",
     "vercel-ai-sdk-openai-flat-tool.json"
   ]

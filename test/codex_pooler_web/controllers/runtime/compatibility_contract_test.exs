@@ -161,6 +161,10 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert responses_chat.contract =~ "never used to satisfy tool_choice"
       assert responses_chat.contract =~ "truncation accepts auto and disabled locally"
       assert responses_chat.contract =~ "not forwarded upstream"
+
+      assert responses_chat.contract =~
+               "Hermes assistant replay may include safe assistant status metadata"
+
       refute responses_chat.contract =~ "Responses-to-chat parity"
       refute responses_chat.contract =~ "top-level additional_tools"
 
@@ -244,6 +248,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert feature.contract =~ "restart_with_full_context recovery guidance"
       assert feature.contract =~ "accept Responses truncation auto and disabled locally"
       assert feature.contract =~ "without forwarding it upstream"
+      assert feature.contract =~ "accept safe Hermes assistant replay status values"
       assert feature.contract =~ "chat input fallback"
       assert feature.contract =~ "Responses additional_tools support narrow and non-executable"
       refute feature.contract =~ "metadata"
@@ -296,6 +301,12 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                idle_silent_gap_min_ms: 250,
                idle_error_code: "stream_idle_timeout"
              }
+
+      assert fixture.hermes_assistant_tool_call_replay.ordinary_replay_status_values == [
+               "completed",
+               "incomplete",
+               "in_progress"
+             ]
 
       assert fixture.unsupported_realtime_routes == [
                %{method: :get, path: "/v1/realtime"},
