@@ -71,8 +71,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.SSE do
     end
   end
 
-  defp maybe_backfill_output(%{"output" => output} = response, _events) when is_list(output),
-    do: response
+  defp maybe_backfill_output(%{"output" => output} = response, _events)
+       when is_list(output) and output != [],
+       do: response
 
   defp maybe_backfill_output(response, events) do
     output_items =

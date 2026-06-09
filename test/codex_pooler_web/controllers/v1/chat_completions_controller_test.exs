@@ -154,7 +154,11 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
           {"response.completed",
            %{
              "type" => "response.completed",
-             "response" => %{"id" => "resp_chat_delta_collect", "status" => "completed"}
+             "response" => %{
+               "id" => "resp_chat_delta_collect",
+               "status" => "completed",
+               "output" => []
+             }
            }}
         ])
       )
