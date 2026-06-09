@@ -75,7 +75,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :responses_chat,
       contract:
-        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path; chat completions use messages when present and fall back to top-level input only when messages is absent or empty, with omitted fallback instructions defaulting to a blank string; request-shaped additional_tools input items are preserved as non-executable input, never merged into executable tools, and never used to satisfy tool_choice; Responses truncation accepts auto and disabled locally but is not forwarded upstream; compaction_trigger payloads pass through unchanged on backend Responses, while context-overflow recovery stays client/upstream-owned with no server-side compaction, hidden replay, or stored prompt/frame reconstruction; Hermes assistant replay may include safe assistant status metadata; OpenClaw assistant replay drops thinking metadata and normalizes text before upstream dispatch; safe OpenAI Responses fields, prompt-cache locality, SDK-control rejection, and backend-only control stripping stay scope-specific"
+        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path; chat completions use messages when present and fall back to top-level input only when messages is absent or empty, with omitted fallback instructions defaulting to a blank string; request-shaped additional_tools input items are preserved as non-executable input, never merged into executable tools, and never used to satisfy tool_choice; Responses namespace tool definitions are accepted only for non-empty namespace name/description values and nested function tools; Responses truncation accepts auto and disabled locally but is not forwarded upstream; compaction_trigger payloads pass through unchanged on backend Responses, while context-overflow recovery stays client/upstream-owned with no server-side compaction, hidden replay, or stored prompt/frame reconstruction; Hermes assistant replay may include safe assistant status metadata; OpenClaw assistant replay drops thinking metadata and normalizes text before upstream dispatch; safe OpenAI Responses fields, prompt-cache locality, SDK-control rejection, and backend-only control stripping stay scope-specific"
     },
     %{
       slug: :backend_v1_alias_surface,
@@ -258,7 +258,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :v1_supported_surface,
       contract:
-        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, include narrow GET /v1/responses Responses websocket compatibility only, exclude broad /v1/realtime routes, consume continuity headers using the documented local precedence without forwarding session-id or x-session-affinity upstream, fail closed for pinned /v1/responses continuations whose upstream account needs revoked-refresh-token reauthentication with the shared restart_with_full_context recovery guidance, allow prompt-cache routing locality only on POST responses and chat completions, accept Responses truncation auto and disabled locally without forwarding it upstream, translate chat-style role=tool continuation messages and Hermes assistant tool-call replays into Responses function_call/function_call_output input items before validation, accept safe Hermes assistant replay status values, translate OpenClaw assistant thinking replays before validation, and keep chat input fallback plus Responses additional_tools support narrow and non-executable"
+        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, include narrow GET /v1/responses Responses websocket compatibility only, exclude broad /v1/realtime routes, consume continuity headers using the documented local precedence without forwarding session-id or x-session-affinity upstream, fail closed for pinned /v1/responses continuations whose upstream account needs revoked-refresh-token reauthentication with the shared restart_with_full_context recovery guidance, allow prompt-cache routing locality only on POST responses and chat completions, accept Responses truncation auto and disabled locally without forwarding it upstream, translate chat-style role=tool continuation messages and Hermes assistant tool-call replays into Responses function_call/function_call_output input items before validation, accept safe Hermes assistant replay status values, translate OpenClaw assistant thinking replays before validation, and keep chat input fallback, Responses additional_tools support narrow and non-executable, and Responses namespace-tool support narrow"
     },
     %{
       slug: :v1_unsupported_public_surface,
@@ -329,6 +329,13 @@ defmodule CodexPooler.CompatibilityMatrix do
         executable: false,
         merges_into_tools: false,
         satisfies_tool_choice: false
+      },
+      namespace_tool: %{
+        shape: "top_level_namespace_tool",
+        required: ["type", "name", "description", "tools"],
+        nested_tool_types: ["function"],
+        nested_optional: ["strict", "defer_loading"],
+        satisfies_tool_choice: true
       },
       responses_truncation: %{
         accepted_values: ["auto", "disabled"],
