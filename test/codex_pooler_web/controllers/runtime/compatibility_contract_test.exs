@@ -165,6 +165,9 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert responses_chat.contract =~
                "Hermes assistant replay may include safe assistant status metadata"
 
+      assert responses_chat.contract =~
+               "OpenClaw assistant replay drops thinking metadata and normalizes text"
+
       refute responses_chat.contract =~ "Responses-to-chat parity"
       refute responses_chat.contract =~ "top-level additional_tools"
 
@@ -249,6 +252,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert feature.contract =~ "accept Responses truncation auto and disabled locally"
       assert feature.contract =~ "without forwarding it upstream"
       assert feature.contract =~ "accept safe Hermes assistant replay status values"
+      assert feature.contract =~ "translate OpenClaw assistant thinking replays before validation"
       assert feature.contract =~ "chat input fallback"
       assert feature.contract =~ "Responses additional_tools support narrow and non-executable"
       refute feature.contract =~ "metadata"
@@ -307,6 +311,15 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                "incomplete",
                "in_progress"
              ]
+
+      assert fixture.openclaw_assistant_thinking_replay == %{
+               input_role: "assistant",
+               dropped_content_part_type: "thinking",
+               normalized_content_part_type: "output_text",
+               source_text_part_type: "text",
+               requires_previous_response_id: false,
+               metadata_only: true
+             }
 
       assert fixture.unsupported_realtime_routes == [
                %{method: :get, path: "/v1/realtime"},
