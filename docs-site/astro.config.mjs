@@ -115,6 +115,7 @@ export default defineConfig({
       },
       plugins: [
         starlightPageActions({
+          prompt: "Read {url}. I want to ask questions about it.",
           actions: {
             chatgpt: true,
             claude: true,
