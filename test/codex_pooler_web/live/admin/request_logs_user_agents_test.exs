@@ -40,7 +40,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsUserAgentsTest do
       assert %{kind: "aider", label: "Aider"} = UserAgents.classify("aider/0.86.2")
       assert %{kind: "continue", label: "Continue"} = UserAgents.classify("Continue/1.5.45")
       assert %{kind: "cline", label: "Cline"} = UserAgents.classify("Cline/3.16.0")
-      assert %{kind: "roo_code", label: "Roo Code"} = UserAgents.classify("Roo-Code/3.54.0")
       assert %{kind: "goose", label: "Goose"} = UserAgents.classify("goose/1.35.0")
     end
   end

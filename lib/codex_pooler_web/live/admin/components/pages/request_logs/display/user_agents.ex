@@ -17,8 +17,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.UserAgents do
     {:contains, ["aider"], "aider", "Aider", "hero-pencil-square", :primary},
     {:contains, ["continue"], "continue", "Continue", "hero-arrow-path-rounded-square", :primary},
     {:contains, ["cline"], "cline", "Cline", "hero-command-line", :primary},
-    {:contains, ["roo-code", "roocode", "roo code"], "roo_code", "Roo Code",
-     "hero-wrench-screwdriver", :primary},
     {:contains, ["goose"], "goose", "Goose", "hero-sparkles", :primary},
     {:prefix, "openai/python", "openai_python", "OpenAI Python SDK", "hero-code-bracket",
      :success},

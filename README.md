@@ -597,47 +597,6 @@ and, if you keep the optional operator MCP add-on, change the MCP `url` to
 </details>
 
 <details>
-<summary><img src=".github/assets/roo-code-favicon.png" alt="Roo Code logo" width="16" height="16"> Roo Code VS Code settings + <code>.roo/mcp.json</code></summary>
-
-Roo Code is configured from its VS Code settings panel. Select the
-OpenAI-compatible provider and use the Codex Pooler `/v1` URL.
-
-```text
-API Provider: OpenAI Compatible
-Base URL:     http://localhost:4000/v1
-API Key:      ${CODEX_POOLER_API_KEY}
-Model ID:     gpt-5.5
-```
-
-Roo Code supports project-level MCP configuration in `.roo/mcp.json`. This is
-only for optional operator MCP metadata access; Codex Pooler model use does not
-require it. This file can be committed when it contains only the endpoint shape;
-keep the MCP token in a private copy or configure it through the Roo MCP
-settings UI.
-
-```json
-{
-  "mcpServers": {
-    "codex_pooler": {
-      "type": "streamable-http",
-      "url": "http://localhost:4000/mcp",
-      "headers": {
-        "Authorization": "Bearer <operator-mcp-token>"
-      },
-      "disabled": false,
-      "timeout": 300
-    }
-  }
-}
-```
-
-For deployed instances, change the provider base URL to
-`https://codex-pooler.example.com/v1` and, if you keep the optional operator MCP
-add-on, change the MCP `url` to `https://codex-pooler.example.com/mcp`.
-
-</details>
-
-<details>
 <summary><img src=".github/assets/goose-favicon.png" alt="Goose logo" width="16" height="16"> Goose <code>~/.config/goose/config.yaml</code></summary>
 
 Goose's OpenAI provider supports OpenAI-compatible endpoints through
