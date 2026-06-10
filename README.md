@@ -548,9 +548,9 @@ npx -y @continuedev/cli@latest -p \
 <details>
 <summary><img src=".github/assets/cline-favicon.png" alt="Cline logo" width="16" height="16"> Cline <code>~/.cline</code> + <code>~/.cline/mcp.json</code></summary>
 
-Cline's OpenAI-compatible provider id is `openai`. Configure it with the Pool
-API key, the Codex Pooler `/v1` base URL, and the model id that your assigned
-Pool can serve.
+Cline CLI accepts `openai` as shorthand for its OpenAI-compatible provider and
+stores it as `openai-compatible`. Configure it with the Pool API key, the Codex
+Pooler `/v1` base URL, and the model id that your assigned Pool can serve.
 
 ```bash
 cline auth \
@@ -558,6 +558,16 @@ cline auth \
   --apikey "$CODEX_POOLER_API_KEY" \
   --baseurl http://localhost:4000/v1 \
   --modelid gpt-5.5
+```
+
+Check the headless CLI path after saving auth:
+
+```bash
+cline --provider openai \
+  --model gpt-5.5 \
+  --json \
+  --auto-approve false \
+  'Reply with exactly: cline ok'
 ```
 
 For optional operator MCP in Cline CLI, add the remote server to
