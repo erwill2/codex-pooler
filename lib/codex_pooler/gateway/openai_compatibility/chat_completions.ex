@@ -31,13 +31,18 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
           required(:created) => integer(),
           required(:model) => String.t() | nil,
           required(:role_sent?) => boolean(),
-          required(:include_usage?) => boolean()
+          required(:include_usage?) => boolean(),
+          required(:passthrough?) => boolean()
         }
 
   @spec stream_state(map()) :: stream_state()
   def stream_state(chat_payload), do: initial_state(chat_payload)
 
   @spec normalize_stream_data(binary(), stream_state()) :: {binary(), stream_state()}
+  def normalize_stream_data(data, %{passthrough?: true} = state) when is_binary(data) do
+    normalize_passthrough_data(data, state)
+  end
+
   def normalize_stream_data(data, state) when is_binary(data) and is_map(state) do
     buffered_data = state.buffer <> data
     {blocks, buffer} = StreamProtocol.complete_sse_blocks(buffered_data, bounded?: true)
@@ -49,13 +54,30 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
         StreamProtocol.max_incomplete_sse_block_bytes()
       )
 
-      {buffered_data, %{state | buffer: ""}}
+      {buffered_data, %{state | buffer: "", passthrough?: true}}
     else
       normalize_stream_blocks(blocks, buffer, state)
     end
   end
 
   def normalize_stream_data(data, state), do: {data, state}
+
+  defp normalize_passthrough_data(data, state) do
+    case sse_block_separator(data) do
+      {index, separator_size} ->
+        passthrough_size = index + separator_size
+        passthrough = binary_part(data, 0, passthrough_size)
+        rest = binary_part(data, passthrough_size, byte_size(data) - passthrough_size)
+
+        state = %{state | passthrough?: false, buffer: ""}
+        {normalized_rest, state} = normalize_stream_data(rest, state)
+
+        {[passthrough, normalized_rest] |> IO.iodata_to_binary(), state}
+
+      nil ->
+        {data, state}
+    end
+  end
 
   defp normalize_stream_blocks(blocks, buffer, state) do
     {iodata, state} =
@@ -231,7 +253,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
       created: System.system_time(:second),
       model: Map.get(chat_payload, "model"),
       role_sent?: false,
-      include_usage?: get_in(chat_payload, ["stream_options", "include_usage"]) == true
+      include_usage?: get_in(chat_payload, ["stream_options", "include_usage"]) == true,
+      passthrough?: false
     }
   end
 
@@ -404,6 +427,16 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
     do: type in ["response.completed", "response.failed", "response.incomplete"]
 
   defp codex_event?(type) when is_binary(type), do: String.starts_with?(type, "codex.")
+
+  defp sse_block_separator(data) do
+    ["\n\n", "\r\n\r\n"]
+    |> Enum.map(fn separator -> {separator, :binary.match(data, separator)} end)
+    |> Enum.flat_map(fn
+      {separator, {index, _size}} -> [{index, byte_size(separator)}]
+      {_separator, :nomatch} -> []
+    end)
+    |> Enum.min_by(fn {index, _size} -> index end, fn -> nil end)
+  end
 
   defp decoded_string(decoded, key) when is_map(decoded) do
     case Map.get(decoded, key) do

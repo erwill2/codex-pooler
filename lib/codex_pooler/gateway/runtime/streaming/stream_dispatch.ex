@@ -212,10 +212,22 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
 
   defp http_sse_keepalive_writer(response) do
     if sse_response?(response) do
-      fn conn -> update_relay_target(conn, &Plug.Conn.chunk(&1, @sse_keepalive_frame)) end
+      &write_sse_keepalive/1
     else
       fn conn -> {:ok, conn} end
     end
+  end
+
+  defp write_sse_keepalive(conn) do
+    if keepalive_allowed?(conn) do
+      update_relay_target(conn, &Plug.Conn.chunk(&1, @sse_keepalive_frame))
+    else
+      {:ok, conn}
+    end
+  end
+
+  defp keepalive_allowed?(state) do
+    first_event_state(state).buffer == "" and DownstreamStream.keepalive_allowed?(state)
   end
 
   defp sse_keepalive_interval_ms(response) do

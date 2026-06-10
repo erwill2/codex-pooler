@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
 
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Runtime.Streaming.DownstreamStream
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
   describe "endpoint/2" do
     test "selects the typed upstream endpoint from request options" do
@@ -47,6 +48,93 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       assert chunk =~ "\"content\":\"split answer\""
     end
 
+    test "blocks keepalive comments while public OpenAI chat SSE is incomplete" do
+      opts =
+        RequestOptions.build(
+          %{
+            public_openai_chat_stream: true,
+            openai_chat_payload: %{"model" => "gpt-example"}
+          },
+          "/v1/chat/completions",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      incomplete =
+        [
+          "event: response.output_text.delta\n",
+          "data: ",
+          Jason.encode!(%{"type" => "response.output_text.delta", "delta" => "split answer"})
+        ]
+        |> IO.iodata_to_binary()
+
+      split_at = div(byte_size(incomplete), 2)
+      first = binary_part(incomplete, 0, split_at)
+      second = binary_part(incomplete, split_at, byte_size(incomplete) - split_at)
+
+      assert {"", state} =
+               DownstreamStream.normalize_data(first, "/v1/chat/completions", opts, state)
+
+      refute DownstreamStream.keepalive_allowed?(state)
+
+      assert {chunk, state} =
+               DownstreamStream.normalize_data(
+                 second <> "\n\n",
+                 "/v1/chat/completions",
+                 opts,
+                 state
+               )
+
+      assert chunk =~ "\"object\":\"chat.completion.chunk\""
+      assert chunk =~ "\"content\":\"split answer\""
+      assert DownstreamStream.keepalive_allowed?(state)
+    end
+
+    test "blocks keepalive comments during oversized public OpenAI chat passthrough" do
+      opts =
+        RequestOptions.build(
+          %{
+            public_openai_chat_stream: true,
+            openai_chat_payload: %{"model" => "gpt-example"}
+          },
+          "/v1/chat/completions",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      oversized =
+        [
+          "event: response.output_text.delta\n",
+          "data: ",
+          Jason.encode!(%{
+            "type" => "response.output_text.delta",
+            "delta" => String.duplicate("synthetic chat delta ", 5_000)
+          })
+        ]
+        |> IO.iodata_to_binary()
+
+      split_at = StreamProtocol.max_incomplete_sse_block_bytes() + 1
+      first = binary_part(oversized, 0, split_at)
+      second = binary_part(oversized, split_at, byte_size(oversized) - split_at)
+
+      assert {^first, state} =
+               DownstreamStream.normalize_data(first, "/v1/chat/completions", opts, state)
+
+      refute DownstreamStream.keepalive_allowed?(state)
+
+      assert {^second, state} =
+               DownstreamStream.normalize_data(second, "/v1/chat/completions", opts, state)
+
+      refute DownstreamStream.keepalive_allowed?(state)
+
+      assert {"\n\n", state} =
+               DownstreamStream.normalize_data("\n\n", "/v1/chat/completions", opts, state)
+
+      assert DownstreamStream.keepalive_allowed?(state)
+    end
+
     test "passes through non-SSE JSON bodies on backend codex responses stream relay" do
       opts = RequestOptions.build(%{}, "/backend-api/codex/responses", %{"stream" => true})
       state = DownstreamStream.initial_state(:relay, opts)
@@ -88,6 +176,99 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
 
       assert bytes > 65_536
       assert is_binary(route_class)
+    end
+
+    test "blocks keepalive comments while public OpenAI Responses SSE is incomplete" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      incomplete =
+        [
+          "event: response.created\n",
+          "data: ",
+          Jason.encode!(%{
+            "type" => "response.created",
+            "response" => %{
+              "id" => "resp_public_incomplete_keepalive",
+              "tools" => [
+                %{
+                  "type" => "function",
+                  "name" => "synthetic_tool",
+                  "description" => String.duplicate("synthetic description ", 4_000)
+                }
+              ]
+            }
+          })
+        ]
+        |> IO.iodata_to_binary()
+
+      split_at = div(byte_size(incomplete), 2)
+      first = binary_part(incomplete, 0, split_at)
+      second = binary_part(incomplete, split_at, byte_size(incomplete) - split_at)
+
+      assert {"", state} = DownstreamStream.normalize_data(first, "/v1/responses", opts, state)
+      refute DownstreamStream.keepalive_allowed?(state)
+
+      assert {_chunk, state} =
+               DownstreamStream.normalize_data(second <> "\n\n", "/v1/responses", opts, state)
+
+      assert DownstreamStream.keepalive_allowed?(state)
+    end
+
+    test "blocks keepalive comments during oversized public OpenAI Responses passthrough" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      oversized =
+        [
+          "event: response.created\n",
+          "data: ",
+          Jason.encode!(%{
+            "type" => "response.created",
+            "response" => %{
+              "id" => "resp_public_oversized_keepalive",
+              "tools" => [
+                %{
+                  "type" => "function",
+                  "name" => "synthetic_tool",
+                  "description" => String.duplicate("synthetic description ", 5_000)
+                }
+              ]
+            }
+          })
+        ]
+        |> IO.iodata_to_binary()
+
+      split_at = StreamProtocol.max_incomplete_sse_block_bytes() + 1
+      first = binary_part(oversized, 0, split_at)
+      second = binary_part(oversized, split_at, byte_size(oversized) - split_at)
+
+      assert {^first, state} =
+               DownstreamStream.normalize_data(first, "/v1/responses", opts, state)
+
+      refute DownstreamStream.keepalive_allowed?(state)
+
+      assert {^second, state} =
+               DownstreamStream.normalize_data(second, "/v1/responses", opts, state)
+
+      refute DownstreamStream.keepalive_allowed?(state)
+
+      assert {"\n\n", state} =
+               DownstreamStream.normalize_data("\n\n", "/v1/responses", opts, state)
+
+      assert DownstreamStream.keepalive_allowed?(state)
     end
   end
 
