@@ -44,4 +44,41 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReasonTest do
 
     assert TransportFailureReason.safe_exception(:timeout) == nil
   end
+
+  test "builds compact allowlisted transport failure metadata" do
+    metadata =
+      TransportFailureReason.transport_failure_metadata(
+        %Mint.TransportError{reason: :closed},
+        %{
+          phase: :receive,
+          pre_visible_output: false,
+          terminal_seen: false,
+          text_frame_count: 1
+        }
+      )
+
+    assert metadata == %{
+             "exception" => "Mint.TransportError",
+             "reason" => "closed",
+             "reason_class" => "Mint.TransportError",
+             "phase" => "receive",
+             "pre_visible_output" => false,
+             "terminal_seen" => false,
+             "text_frame_count" => 1
+           }
+  end
+
+  test "transport failure metadata does not persist arbitrary binary reasons" do
+    metadata =
+      TransportFailureReason.transport_failure_metadata(
+        "raw reason with token-like value secret-bearer-value",
+        %{phase: "send payload", pre_visible_output: true}
+      )
+
+    assert metadata == %{
+             "phase" => "send_payload",
+             "pre_visible_output" => true,
+             "reason_class" => "binary"
+           }
+  end
 end

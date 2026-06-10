@@ -3,6 +3,8 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
 
   @max_reason_length 96
 
+  @type transport_failure_metadata :: %{String.t() => String.t() | non_neg_integer() | boolean()}
+
   @spec safe_reason(term()) :: String.t() | nil
   def safe_reason(%Finch.TransportError{source: %Mint.TransportError{} = source}),
     do: safe_reason(source)
@@ -36,10 +38,74 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
   def safe_exception(%module{}) when is_atom(module), do: inspect(module)
   def safe_exception(_reason), do: nil
 
+  @spec transport_failure_metadata(term(), map()) :: transport_failure_metadata()
+  def transport_failure_metadata(reason, attrs) when is_map(attrs) do
+    %{
+      "exception" => safe_exception(reason),
+      "reason_class" => safe_reason_class(reason),
+      "reason" => safe_metadata_reason(reason),
+      "phase" => safe_phase(Map.get(attrs, :phase) || Map.get(attrs, "phase")),
+      "pre_visible_output" => safe_boolean(Map.get(attrs, :pre_visible_output)),
+      "terminal_seen" => safe_boolean(Map.get(attrs, :terminal_seen)),
+      "text_frame_count" => safe_non_negative_integer(Map.get(attrs, :text_frame_count))
+    }
+    |> compact_metadata()
+  end
+
   defp safe_tuple_reason(value) when is_atom(value), do: safe_reason(value)
   defp safe_tuple_reason(value) when is_tuple(value), do: safe_reason(value)
   defp safe_tuple_reason(value) when is_integer(value), do: Integer.to_string(value)
   defp safe_tuple_reason(_value), do: nil
+
+  defp safe_reason_class(%Finch.TransportError{source: %Mint.TransportError{} = source}),
+    do: safe_reason_class(source)
+
+  defp safe_reason_class(%Finch.HTTPError{source: %Mint.HTTPError{} = source}),
+    do: safe_reason_class(source)
+
+  defp safe_reason_class(%module{}) when is_atom(module), do: inspect(module)
+  defp safe_reason_class(reason) when is_atom(reason), do: Atom.to_string(reason)
+  defp safe_reason_class(reason) when is_binary(reason), do: "binary"
+
+  defp safe_reason_class(reason) when is_tuple(reason) do
+    reason
+    |> Tuple.to_list()
+    |> Enum.find_value(&safe_tuple_reason/1)
+  end
+
+  defp safe_reason_class(_reason), do: nil
+
+  defp safe_metadata_reason(%Finch.TransportError{source: %Mint.TransportError{} = source}),
+    do: safe_metadata_reason(source)
+
+  defp safe_metadata_reason(%Finch.HTTPError{source: %Mint.HTTPError{} = source}),
+    do: safe_metadata_reason(source)
+
+  defp safe_metadata_reason(%{__struct__: _module, reason: reason}),
+    do: safe_metadata_reason(reason)
+
+  defp safe_metadata_reason(reason) when is_atom(reason), do: safe_reason(reason)
+  defp safe_metadata_reason(reason) when is_tuple(reason), do: safe_reason(reason)
+  defp safe_metadata_reason(_reason), do: nil
+
+  defp safe_phase(phase) when is_atom(phase), do: phase |> Atom.to_string() |> safe_phase()
+
+  defp safe_phase(phase) when is_binary(phase) do
+    phase
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9_]+/, "_")
+    |> String.trim("_")
+    |> truncate_reason()
+    |> blank_to_nil()
+  end
+
+  defp safe_phase(_phase), do: nil
+
+  defp safe_boolean(value) when is_boolean(value), do: value
+  defp safe_boolean(_value), do: nil
+
+  defp safe_non_negative_integer(value) when is_integer(value) and value >= 0, do: value
+  defp safe_non_negative_integer(_value), do: nil
 
   defp truncate_reason(reason) when byte_size(reason) > @max_reason_length,
     do: binary_part(reason, 0, @max_reason_length)
@@ -48,4 +114,10 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
 
   defp blank_to_nil(""), do: nil
   defp blank_to_nil(value), do: value
+
+  defp compact_metadata(metadata) do
+    metadata
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
 end
