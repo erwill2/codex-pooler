@@ -360,6 +360,135 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   end
 
   @tag :responses_coercion
+  test "Chat translates Cline tool-call and tool-result message parts" do
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "messages" => [
+        %{
+          "role" => "assistant",
+          "content" => [
+            %{"type" => "text", "text" => "Synthetic assistant tool setup"},
+            %{
+              "type" => "tool-call",
+              "toolCallId" => "call_fixture_cline",
+              "toolName" => "run_commands",
+              "input" => %{"commands" => ["printf fixture"]}
+            }
+          ]
+        },
+        %{
+          "role" => "user",
+          "content" => [
+            %{
+              "type" => "tool-result",
+              "toolCallId" => "call_fixture_cline",
+              "toolName" => "run_commands",
+              "output" => [
+                %{"type" => "text", "text" => "synthetic tool stdout"},
+                %{"type" => "image_url", "image_url" => "https://example.com/sample.png"},
+                %{"type" => "image", "data" => "YWJj", "mediaType" => "image/jpeg"}
+              ],
+              "isError" => false
+            }
+          ]
+        }
+      ]
+    }
+
+    assert {:ok, result} = Chat.coerce(payload, collect_openai_response_stream: true)
+
+    assert [assistant_message, function_call, function_output] = result.payload["input"]
+
+    assert assistant_message == %{
+             "type" => "message",
+             "role" => "assistant",
+             "content" => [%{"type" => "output_text", "text" => "Synthetic assistant tool setup"}]
+           }
+
+    assert %{
+             "type" => "function_call",
+             "call_id" => "call_fixture_cline",
+             "name" => "run_commands",
+             "arguments" => arguments
+           } = function_call
+
+    assert Jason.decode!(arguments) == %{"commands" => ["printf fixture"]}
+
+    assert function_output == %{
+             "type" => "function_call_output",
+             "call_id" => "call_fixture_cline",
+             "output" => [
+               %{"type" => "input_text", "text" => "synthetic tool stdout"},
+               %{"type" => "input_image", "image_url" => "https://example.com/sample.png"},
+               %{"type" => "input_image", "image_url" => "data:image/jpeg;base64,YWJj"}
+             ]
+           }
+
+    refute inspect(result.payload["input"]) =~ "toolCallId"
+  end
+
+  @tag :responses_coercion
+  test "Chat preserves assistant tool_calls before Cline tool-result message parts" do
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "messages" => [
+        %{
+          "role" => "assistant",
+          "content" => "Synthetic assistant replay",
+          "tool_calls" => [
+            %{
+              "id" => "call_fixture_cline_replay",
+              "type" => "function",
+              "function" => %{
+                "name" => "execute_command",
+                "arguments" => "{\"command\":\"printf fixture\"}"
+              }
+            }
+          ]
+        },
+        %{
+          "role" => "user",
+          "content" => [
+            %{
+              "type" => "tool-result",
+              "toolCallId" => "call_fixture_cline_replay",
+              "toolName" => "execute_command",
+              "output" => %{"output" => "synthetic command output", "exitCode" => 0},
+              "isError" => false
+            }
+          ]
+        }
+      ]
+    }
+
+    assert {:ok, result} = Chat.coerce(payload, collect_openai_response_stream: true)
+
+    assert [assistant_message, function_call, function_output] = result.payload["input"]
+
+    assert assistant_message == %{
+             "type" => "message",
+             "role" => "assistant",
+             "content" => [%{"type" => "output_text", "text" => "Synthetic assistant replay"}]
+           }
+
+    assert function_call == %{
+             "type" => "function_call",
+             "call_id" => "call_fixture_cline_replay",
+             "name" => "execute_command",
+             "arguments" => "{\"command\":\"printf fixture\"}"
+           }
+
+    assert function_output == %{
+             "type" => "function_call_output",
+             "call_id" => "call_fixture_cline_replay",
+             "output" => "{\"exitCode\":0,\"output\":\"synthetic command output\"}"
+           }
+
+    refute inspect(result.payload["input"]) =~ "tool_calls"
+    refute inspect(result.payload["input"]) =~ "toolCallId"
+  end
+
+  @tag :responses_coercion
   test "Chat maps supported SDK controls instead of silently dropping them" do
     payload = %{
       "model" => "gpt-fixture-text",

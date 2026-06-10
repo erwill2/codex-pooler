@@ -170,6 +170,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
 
   defp validate_verbosity(_payload), do: :ok
 
+  defp valid_message?(%{"role" => "assistant", "tool_calls" => tool_calls} = message)
+       when is_list(tool_calls) do
+    valid_assistant_tool_message_content?(Map.get(message, "content")) and
+      valid_assistant_tool_calls?(tool_calls)
+  end
+
   defp valid_message?(%{"role" => role, "content" => content})
        when role in ["system", "user", "assistant", "developer", "tool"] do
     valid_content?(content)
@@ -216,7 +222,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   defp response_payload_from_messages(payload, messages) do
     base = %{
       "model" => payload["model"],
-      "input" => Enum.map(messages, &message_to_input_item/1)
+      "input" => Enum.flat_map(messages, &message_to_input_items/1)
     }
 
     with {:ok, base} <- maybe_put_tools(base, payload) do
@@ -239,37 +245,182 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
     end
   end
 
-  defp message_to_input_item(%{"role" => role, "content" => content} = message) do
-    %{"type" => "message", "role" => role, "content" => normalize_content(content)}
-    |> maybe_put(message, "name")
-    |> maybe_put(message, "tool_call_id")
+  defp message_to_input_items(%{"role" => "assistant", "tool_calls" => tool_calls} = message)
+       when is_list(tool_calls) do
+    assistant_tool_message_content_items(message) ++ assistant_tool_call_items(tool_calls)
   end
 
-  defp normalize_content(content) when is_binary(content) do
-    [%{"type" => "input_text", "text" => content}]
+  defp message_to_input_items(%{"role" => role, "content" => content} = message) do
+    content
+    |> content_parts()
+    |> expand_message_parts(role, message)
   end
 
-  defp normalize_content(content) when is_list(content),
-    do: Enum.map(content, &normalize_content_part/1)
+  defp assistant_tool_message_content_items(message) do
+    case Map.fetch(message, "content") do
+      {:ok, nil} -> []
+      {:ok, ""} -> []
+      {:ok, content} -> content |> content_parts() |> expand_message_parts("assistant", message)
+      :error -> []
+    end
+  end
 
-  defp normalize_content(%{} = content), do: [normalize_content_part(content)]
+  defp content_parts(content) when is_binary(content), do: [content]
+  defp content_parts(content) when is_list(content), do: content
+  defp content_parts(%{} = content), do: [content]
+  defp content_parts(content), do: [content]
 
-  defp normalize_content(content), do: content
+  defp expand_message_parts(parts, role, message) do
+    parts
+    |> Enum.reduce({[], []}, fn part, {items, pending_parts} ->
+      case special_content_item(part) do
+        nil ->
+          {items, pending_parts ++ [normalize_content_part(part, role)]}
 
-  defp normalize_content_part(%{"type" => "text", "text" => text}),
+        item ->
+          items = flush_message_item(items, pending_parts, role, message)
+          {items ++ [item], []}
+      end
+    end)
+    |> then(fn {items, pending_parts} ->
+      flush_message_item(items, pending_parts, role, message)
+    end)
+  end
+
+  defp flush_message_item(items, [], _role, _message), do: items
+
+  defp flush_message_item(items, pending_parts, role, message) do
+    item =
+      %{"type" => "message", "role" => role, "content" => pending_parts}
+      |> maybe_put(message, "name")
+      |> maybe_put(message, "tool_call_id")
+
+    items ++ [item]
+  end
+
+  defp normalize_content_part(text, "assistant") when is_binary(text),
+    do: %{"type" => "output_text", "text" => text}
+
+  defp normalize_content_part(text, _role) when is_binary(text),
     do: %{"type" => "input_text", "text" => text}
 
-  defp normalize_content_part(%{"type" => "image_url", "image_url" => image_url})
+  defp normalize_content_part(%{"type" => "text", "text" => text}, "assistant"),
+    do: %{"type" => "output_text", "text" => text}
+
+  defp normalize_content_part(%{"type" => "text", "text" => text}, _role),
+    do: %{"type" => "input_text", "text" => text}
+
+  defp normalize_content_part(%{"type" => "image_url", "image_url" => image_url}, _role)
        when is_binary(image_url),
        do: %{"type" => "input_image", "image_url" => image_url}
 
-  defp normalize_content_part(%{"type" => "image_url", "image_url" => %{"url" => image_url}})
+  defp normalize_content_part(
+         %{"type" => "image_url", "image_url" => %{"url" => image_url}},
+         _role
+       )
        when is_binary(image_url),
        do: %{"type" => "input_image", "image_url" => image_url}
 
-  defp normalize_content_part(%{"type" => "input_audio"} = part), do: part
+  defp normalize_content_part(%{"type" => "input_audio"} = part, _role), do: part
+  defp normalize_content_part(%{} = part, _role), do: part
+  defp normalize_content_part(content, _role), do: content
 
-  defp normalize_content_part(%{} = part), do: part
+  defp special_content_item(%{"type" => "tool-call"} = part), do: cline_tool_call_item(part)
+  defp special_content_item(%{"type" => "tool-result"} = part), do: cline_tool_result_item(part)
+  defp special_content_item(_part), do: nil
+
+  defp cline_tool_call_item(%{"toolCallId" => call_id, "toolName" => name, "input" => input})
+       when is_binary(call_id) and call_id != "" and is_binary(name) and name != "" do
+    %{
+      "type" => "function_call",
+      "call_id" => call_id,
+      "name" => name,
+      "arguments" => Jason.encode!(input)
+    }
+  end
+
+  defp cline_tool_call_item(part), do: part
+
+  defp cline_tool_result_item(%{"toolCallId" => call_id, "output" => output})
+       when is_binary(call_id) and call_id != "" do
+    %{
+      "type" => "function_call_output",
+      "call_id" => call_id,
+      "output" => normalize_cline_tool_result_output(output)
+    }
+  end
+
+  defp cline_tool_result_item(part), do: part
+
+  defp assistant_tool_call_items(tool_calls),
+    do: Enum.map(tool_calls, &assistant_tool_call_item/1)
+
+  defp assistant_tool_call_item(
+         %{"function" => %{"name" => name, "arguments" => arguments}} = item
+       ) do
+    %{
+      "type" => "function_call",
+      "call_id" => assistant_tool_call_id(item),
+      "name" => name,
+      "arguments" => arguments
+    }
+  end
+
+  defp assistant_tool_call_id(item) do
+    clean_string(Map.get(item, "call_id")) || clean_string(Map.get(item, "id"))
+  end
+
+  defp clean_string(value) when is_binary(value) do
+    value = String.trim(value)
+    if value == "", do: nil, else: value
+  end
+
+  defp clean_string(_value), do: nil
+
+  defp normalize_cline_tool_result_output(output) when is_binary(output), do: output
+
+  defp normalize_cline_tool_result_output(output) when is_list(output),
+    do: Enum.map(output, &normalize_cline_tool_result_output_part/1)
+
+  defp normalize_cline_tool_result_output(output), do: Jason.encode!(output)
+
+  defp normalize_cline_tool_result_output_part(part) when is_binary(part),
+    do: %{"type" => "input_text", "text" => part}
+
+  defp normalize_cline_tool_result_output_part(%{"type" => type, "text" => text})
+       when type in ["text", "input_text"] and is_binary(text),
+       do: %{"type" => "input_text", "text" => text}
+
+  defp normalize_cline_tool_result_output_part(%{"type" => "image_url", "image_url" => image_url})
+       when is_binary(image_url),
+       do: %{"type" => "input_image", "image_url" => image_url}
+
+  defp normalize_cline_tool_result_output_part(%{
+         "type" => "image_url",
+         "image_url" => %{"url" => image_url}
+       })
+       when is_binary(image_url),
+       do: %{"type" => "input_image", "image_url" => image_url}
+
+  defp normalize_cline_tool_result_output_part(%{
+         "type" => "input_image",
+         "image_url" => image_url
+       })
+       when is_binary(image_url),
+       do: %{"type" => "input_image", "image_url" => image_url}
+
+  defp normalize_cline_tool_result_output_part(%{
+         "type" => "image",
+         "data" => data,
+         "mediaType" => media_type
+       })
+       when is_binary(data) and is_binary(media_type),
+       do: %{"type" => "input_image", "image_url" => "data:#{media_type};base64,#{data}"}
+
+  defp normalize_cline_tool_result_output_part(%{"type" => "json", "value" => value}),
+    do: %{"type" => "input_text", "text" => Jason.encode!(value)}
+
+  defp normalize_cline_tool_result_output_part(part), do: part
 
   defp valid_content?(content) when is_binary(content), do: true
 
@@ -278,6 +429,21 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
 
   defp valid_content?(%{} = content), do: valid_content_part?(content)
   defp valid_content?(_content), do: false
+
+  defp valid_assistant_tool_message_content?(nil), do: true
+  defp valid_assistant_tool_message_content?(content), do: valid_content?(content)
+
+  defp valid_assistant_tool_calls?(tool_calls),
+    do: Enum.all?(tool_calls, &valid_assistant_tool_call?/1)
+
+  defp valid_assistant_tool_call?(
+         %{"function" => %{"name" => name, "arguments" => arguments}} = item
+       )
+       when is_binary(name) and name != "" and is_binary(arguments) do
+    assistant_tool_call_id(item) != nil
+  end
+
+  defp valid_assistant_tool_call?(_tool_call), do: false
 
   defp valid_content_part?(%{"type" => type, "text" => text})
        when type in ["text", "input_text"] and is_binary(text),
@@ -302,7 +468,67 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
        when is_binary(data) and is_binary(format),
        do: true
 
+  defp valid_content_part?(%{
+         "type" => "tool-call",
+         "toolCallId" => call_id,
+         "toolName" => name,
+         "input" => _input
+       })
+       when is_binary(call_id) and call_id != "" and is_binary(name) and name != "",
+       do: true
+
+  defp valid_content_part?(%{
+         "type" => "tool-result",
+         "toolCallId" => call_id,
+         "output" => output
+       })
+       when is_binary(call_id) and call_id != "",
+       do: valid_cline_tool_result_output?(output)
+
   defp valid_content_part?(_part), do: false
+
+  defp valid_cline_tool_result_output?(output) when is_binary(output), do: true
+
+  defp valid_cline_tool_result_output?(output) when is_list(output),
+    do: output != [] and Enum.all?(output, &valid_cline_tool_result_output_part?/1)
+
+  defp valid_cline_tool_result_output?(output) when is_map(output), do: true
+  defp valid_cline_tool_result_output?(_output), do: false
+
+  defp valid_cline_tool_result_output_part?(part) when is_binary(part), do: true
+
+  defp valid_cline_tool_result_output_part?(%{"type" => type, "text" => text})
+       when type in ["text", "input_text"] and is_binary(text),
+       do: true
+
+  defp valid_cline_tool_result_output_part?(%{"type" => "image_url", "image_url" => image_url})
+       when is_binary(image_url),
+       do: true
+
+  defp valid_cline_tool_result_output_part?(%{
+         "type" => "image_url",
+         "image_url" => %{"url" => image_url}
+       })
+       when is_binary(image_url),
+       do: true
+
+  defp valid_cline_tool_result_output_part?(%{
+         "type" => "input_image",
+         "image_url" => image_url
+       })
+       when is_binary(image_url),
+       do: true
+
+  defp valid_cline_tool_result_output_part?(%{
+         "type" => "image",
+         "data" => data,
+         "mediaType" => media_type
+       })
+       when is_binary(data) and is_binary(media_type),
+       do: true
+
+  defp valid_cline_tool_result_output_part?(%{"type" => "json", "value" => _value}), do: true
+  defp valid_cline_tool_result_output_part?(_part), do: false
 
   defp maybe_put_tools(acc, %{"tools" => tools}) when is_list(tools) do
     with {:ok, tools} <- translate_tools(tools) do
