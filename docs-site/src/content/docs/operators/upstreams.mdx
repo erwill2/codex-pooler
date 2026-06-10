@@ -41,6 +41,8 @@ The primary page action is `Import auth.json`. Use it when adding an account fro
 
 The dropdown beside the primary action contains `Invite account`. That action opens the invite flow for onboarding a person who will provide or operate an account through the browser UI.
 
+Invite onboarding uses OpenAI's Codex device-code authorization. Before accepting the invite, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions. If OpenAI blocks device-code approval, the invite may remain valid but the upstream will not become ready.
+
 The search box filters upstream cards by account label or safe metadata. The Pool filter narrows cards to accounts assigned to a specific Pool. The status filter narrows cards by lifecycle or readiness state.
 
 ## Account Cards

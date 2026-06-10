@@ -822,6 +822,15 @@ not keep using the same `auth.json` from another Codex install, machine, or
 automation unless you accept that provider refresh-token rotation can invalidate
 one copy and move the account to `reauth_required`.
 
+Hosted invite onboarding uses OpenAI's Codex device-code authorization. For a
+personal ChatGPT account, open `chatgpt.com`, go to Settings > Security, and
+enable `Enable device code authorization for Codex`. For workspace-managed
+accounts, ask a workspace admin to enable device-code login for Codex in the
+workspace permissions. OpenAI's
+[Codex authentication docs](https://developers.openai.com/codex/auth) describe
+this prerequisite. The invite can fail at the OpenAI approval step when
+device-code authorization is off.
+
 ```text
 Codex backend base URL: http://localhost:4000/backend-api/codex
 OpenAI SDK base URL:    http://localhost:4000/v1

@@ -110,6 +110,14 @@ The submit button stays disabled until the form is valid. When SMTP is not confi
 
 After a valid invite is created, the result dialog shows the one-time invite URL. Copy it immediately. That URL is not shown again in the invite table or audit history.
 
+## OpenAI Device Code Prerequisite
+
+Hosted invite onboarding uses OpenAI's Codex device-code authorization. Before opening the invite URL, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions.
+
+![ChatGPT Security setting for Codex device-code authorization](/operators/invites/openai-device-code-setting.png)
+
+OpenAI's [Codex authentication docs](https://developers.openai.com/codex/auth) describe this prerequisite. If device-code authorization is off, the Codex Pooler invite can still be active, but OpenAI can block the approval step and the upstream will not become ready.
+
 ## Invite States
 
 Invite lifecycle states are:
@@ -174,9 +182,10 @@ When onboarding is not working, check invites in this order:
 2. confirm the invite has not expired
 3. confirm the target Pool is correct
 4. confirm the account email is the intended Codex account email
-5. confirm SMTP is configured if the operator expected email delivery
-6. reissue the active invite email only when email delivery is available
-7. create a new invite when the old invite is expired or revoked
-8. use Audit logs to confirm who created, accepted, revoked, or reissued the invite
+5. confirm device-code login for Codex is enabled in ChatGPT Settings > Security or by the workspace admin
+6. confirm SMTP is configured if the operator expected email delivery
+7. reissue the active invite email only when email delivery is available
+8. create a new invite when the old invite is expired or revoked
+9. use Audit logs to confirm who created, accepted, revoked, or reissued the invite
 
 If the invite was accepted but no upstream appears ready, move to the Upstreams page and inspect the account's credential and quota state.
