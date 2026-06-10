@@ -114,7 +114,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   defp normalize_stream_event(type, decoded, state)
        when type in ["response.output_item.added", "response.output_item.done"] do
     state = sync_response_state(state, decoded)
-    tool_call_item_chunk(decoded["item"], state)
+    tool_call_item_chunk(decoded["item"], decoded, state)
   end
 
   defp normalize_stream_event("response.function_call_arguments.delta", decoded, state) do
@@ -162,14 +162,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   defp text_delta_chunk(delta, state),
     do: {chat_sse_chunk(%{"content" => delta}, nil, state), state}
 
-  defp tool_call_item_chunk(%{"type" => "function_call"} = item, state) do
-    index = tool_call_index(state, item)
+  defp tool_call_item_chunk(%{"type" => "function_call"} = item, context, state) do
+    index = tool_call_index(item, context)
 
     delta = %{
       "tool_calls" => [
         %{
           "index" => index,
-          "id" => tool_call_id(item),
+          "id" => tool_call_id(item, context, index),
           "type" => "function",
           "function" => %{
             "name" => decoded_string(item, "name") || "tool",
@@ -182,7 +182,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
     {chat_sse_chunk(delta, nil, state), state}
   end
 
-  defp tool_call_item_chunk(_item, state), do: {[], state}
+  defp tool_call_item_chunk(_item, _context, state), do: {[], state}
 
   defp tool_call_arguments_chunk(decoded, state) do
     index = Map.get(decoded, "output_index") || 0
@@ -406,10 +406,16 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   defp response_map(%{"response" => %{} = response}), do: response
   defp response_map(%{} = decoded), do: decoded
 
+  defp tool_call_id(item, context, index) do
+    decoded_string(item, "call_id") || decoded_string(item, "id") ||
+      decoded_string(context, "item_id") || "call_#{index}"
+  end
+
   defp tool_call_id(item), do: decoded_string(item, "call_id") || decoded_string(item, "id")
 
-  defp tool_call_index(_state, %{"output_index" => index}) when is_integer(index), do: index
-  defp tool_call_index(_state, _item), do: 0
+  defp tool_call_index(%{"output_index" => index}, _context) when is_integer(index), do: index
+  defp tool_call_index(_item, %{"output_index" => index}) when is_integer(index), do: index
+  defp tool_call_index(_item, _context), do: 0
 
   defp terminal_blocks?(blocks) do
     Enum.any?(blocks, fn

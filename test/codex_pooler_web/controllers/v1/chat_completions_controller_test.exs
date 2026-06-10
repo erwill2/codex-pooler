@@ -288,6 +288,74 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
   end
 
   @tag :streaming_chat
+  test "POST /v1/chat/completions streaming backfills tool call ids from item events", %{
+    conn: conn
+  } do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.created",
+           %{
+             "type" => "response.created",
+             "response" => %{"id" => "resp_chat_stream_tool", "status" => "in_progress"}
+           }},
+          {"response.output_item.added",
+           %{
+             "type" => "response.output_item.added",
+             "output_index" => 0,
+             "item_id" => "call_chat_stream_tool",
+             "item" => %{
+               "type" => "function_call",
+               "name" => "lookup_fixture",
+               "arguments" => ""
+             }
+           }},
+          {"response.function_call_arguments.delta",
+           %{
+             "type" => "response.function_call_arguments.delta",
+             "output_index" => 0,
+             "delta" => "{\"query\":\"fixture\"}"
+           }},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_chat_stream_tool",
+               "status" => "completed",
+               "usage" => %{"input_tokens" => 3, "output_tokens" => 4, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post(
+        "/v1/chat/completions",
+        chat_payload(setup)
+        |> Map.put("stream", true)
+        |> Map.put("tools", [function_tool()])
+      )
+
+    [tool_chunk | _rest] =
+      conn.resp_body
+      |> chat_chunks()
+      |> Enum.filter(&(get_in(&1, ["choices", Access.at(0), "delta", "tool_calls"]) != nil))
+
+    assert [tool_call] = get_in(tool_chunk, ["choices", Access.at(0), "delta", "tool_calls"])
+    assert tool_call["id"] == "call_chat_stream_tool"
+    assert tool_call["type"] == "function"
+    assert get_in(tool_call, ["function", "name"]) == "lookup_fixture"
+    assert is_binary(get_in(tool_call, ["function", "arguments"]))
+
+    refute conn.resp_body =~ ~s("id":null)
+    assert conn.resp_body =~ "data: [DONE]\n\n"
+  end
+
+  @tag :streaming_chat
   test "POST /v1/chat/completions streaming emits moderation-only chunks", %{conn: conn} do
     upstream =
       start_upstream(
@@ -872,5 +940,14 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     ~r/"id":"([^"]+)"/
     |> Regex.scan(body)
     |> Enum.map(fn [_match, id] -> id end)
+  end
+
+  defp chat_chunks(body) do
+    body
+    |> String.split("\n\n", trim: true)
+    |> Enum.filter(&String.starts_with?(&1, "data: "))
+    |> Enum.map(&String.replace_prefix(&1, "data: ", ""))
+    |> Enum.reject(&(&1 == "[DONE]"))
+    |> Enum.map(&Jason.decode!/1)
   end
 end
