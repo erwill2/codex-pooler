@@ -328,9 +328,8 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
     params =
       latest_settings
       |> SystemSettingsForm.group_only_params(form_params, group)
-      |> Map.put(:current_scope, socket.assigns.current_scope)
 
-    case InstanceSettings.update(latest_settings, params) do
+    case InstanceSettings.update(socket.assigns.current_scope, latest_settings, params) do
       {:ok, settings} ->
         saved_params = SystemSettingsForm.params_from_settings(settings)
 
@@ -379,6 +378,9 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
          |> assign(settings: latest_settings, form_params: form_params, smtp_test_status: nil)
          |> put_card_status(group, status)
          |> put_group_form(group, Map.put(changeset, :action, :validate))}
+
+      {:error, %{code: :capability_denied}} ->
+        {:noreply, owner_denied(socket)}
     end
   end
 

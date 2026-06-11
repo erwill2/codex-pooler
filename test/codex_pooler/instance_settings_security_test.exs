@@ -4,10 +4,13 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
   import Ecto.Query
   import Phoenix.LiveViewTest
 
+  alias CodexPooler.Accounts.Scope
+  alias CodexPooler.AccountsFixtures
   alias CodexPooler.Audit
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.InstanceSettings
   alias CodexPooler.InstanceSettings.Settings
+  alias CodexPooler.Pools.Membership
   alias CodexPooler.Repo
 
   setup :register_and_log_in_user
@@ -22,6 +25,67 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
     end)
 
     :ok
+  end
+
+  test "only owner scopes can update singleton settings through the context", %{
+    scope: owner_scope
+  } do
+    settings = InstanceSettings.ensure_singleton!()
+
+    assert {:ok, updated} =
+             InstanceSettings.update(owner_scope, %{
+               "files" => %{"upload_ttl_seconds" => 600}
+             })
+
+    assert updated.files.upload_ttl_seconds == 600
+
+    %{user: admin} =
+      AccountsFixtures.operator_fixture(owner_scope, %{
+        "email" => AccountsFixtures.unique_user_email()
+      })
+
+    admin_scope = Scope.for_user(admin)
+    assert admin_scope.roles == ["instance_admin"]
+
+    assert {:error, %{code: :capability_denied}} =
+             InstanceSettings.update(admin_scope, %{
+               "files" => %{"upload_ttl_seconds" => 900}
+             })
+
+    assert InstanceSettings.get!().files.upload_ttl_seconds == 600
+    assert InstanceSettings.get!().lock_version == updated.lock_version
+    refute InstanceSettings.get!().lock_version == settings.lock_version
+  end
+
+  test "system settings LiveView rechecks owner capability before saving", %{
+    conn: conn,
+    user: user
+  } do
+    settings = InstanceSettings.ensure_singleton!()
+    {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
+
+    {1, nil} =
+      Repo.update_all(
+        from(m in Membership,
+          where: m.user_id == ^user.id and m.role == "instance_owner" and m.status == "active"
+        ),
+        set: [status: "revoked", revoked_at: DateTime.utc_now()]
+      )
+
+    html =
+      view
+      |> element("#instance-settings-files-form")
+      |> render_submit(%{
+        "instance_settings" => %{
+          "files" => %{"upload_ttl_seconds" => "900"}
+        }
+      })
+
+    assert html =~ "Only instance owners can manage system settings"
+
+    current = InstanceSettings.get!()
+    assert current.files.upload_ttl_seconds == settings.files.upload_ttl_seconds
+    assert current.lock_version == settings.lock_version
   end
 
   test "mcp service updates are audited as non-secret setting changes only", %{scope: scope} do

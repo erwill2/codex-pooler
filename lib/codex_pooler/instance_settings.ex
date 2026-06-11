@@ -8,10 +8,11 @@ defmodule CodexPooler.InstanceSettings do
   alias CodexPooler.InstanceSettings.{Cache, Settings}
   alias CodexPooler.Mailer
   alias CodexPooler.Mailer.Config, as: MailerConfig
+  alias CodexPooler.Pools
   alias CodexPooler.Repo
 
   @type settings :: Settings.t()
-  @type update_result :: {:ok, settings()} | {:error, Ecto.Changeset.t()}
+  @type update_result :: {:ok, settings()} | {:error, Ecto.Changeset.t() | Pools.access_error()}
 
   @spec current() :: settings()
   def current, do: Cache.current()
@@ -43,7 +44,9 @@ defmodule CodexPooler.InstanceSettings do
 
   @spec update(settings() | Scope.t(), map()) :: update_result()
   def update(%Scope{} = scope, attrs) when is_map(attrs) do
-    __MODULE__.update(ensure_scoped_settings(scope), put_scope(attrs, scope))
+    with {:ok, _decision} <- Pools.require_capability(scope, Pools.capability(:pool_manage)) do
+      __MODULE__.update(ensure_scoped_settings(scope), put_scope(attrs, scope))
+    end
   end
 
   def update(%Settings{} = settings, attrs) when is_map(attrs) do
@@ -70,6 +73,13 @@ defmodule CodexPooler.InstanceSettings do
     |> case do
       {:ok, updated} -> {:ok, Settings.mark_loaded(updated, :database)}
       {:error, changeset} -> {:error, changeset}
+    end
+  end
+
+  @spec update(Scope.t(), settings(), map()) :: update_result()
+  def update(%Scope{} = scope, %Settings{} = settings, attrs) when is_map(attrs) do
+    with {:ok, _decision} <- Pools.require_capability(scope, Pools.capability(:pool_manage)) do
+      __MODULE__.update(settings, put_scope(attrs, scope))
     end
   end
 
