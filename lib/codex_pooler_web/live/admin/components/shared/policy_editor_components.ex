@@ -16,6 +16,7 @@ defmodule CodexPoolerWeb.Admin.PolicyEditorComponents do
   attr :step_event, :string, default: nil
   attr :backdrop_event, :string, default: nil
   attr :backdrop_label, :string, default: "close"
+  attr :docs_url, :string, default: "https://docs.codex-pooler.com"
   attr :rest, :global
 
   slot :inner_block, required: true
@@ -139,6 +140,7 @@ defmodule CodexPoolerWeb.Admin.PolicyEditorComponents do
           docs_link_role="policy-editor-docs-link"
           docs_link_id={"#{@id}-docs-link"}
           docs_icon_role="policy-editor-docs-icon"
+          docs_url={@docs_url}
         >
           <:actions>
             {render_slot(@actions)}

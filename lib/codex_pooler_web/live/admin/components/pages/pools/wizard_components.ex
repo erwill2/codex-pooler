@@ -17,6 +17,8 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
     %{id: "api-keys", label: "API keys", description: "Linked keys"}
   ]
 
+  @pool_docs_url "https://docs.codex-pooler.com/operators/pools/"
+
   @pool_wizard_step_ids Enum.map(@pool_wizard_steps, &to_string(&1.id))
 
   @pool_wizard_modes %{
@@ -75,6 +77,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
     assigns =
       assigns
       |> assign(pool_wizard_config(assigns.mode))
+      |> assign(:docs_url, @pool_docs_url)
       |> assign(:steps, @pool_wizard_steps)
 
     ~H"""
@@ -88,6 +91,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
       sections_label="Pool sections"
       step_event="pool_wizard_step"
       backdrop_event={@cancel_event}
+      docs_url={@docs_url}
     >
       <.form
         id={@form_id}

@@ -1594,7 +1594,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
   defp assert_policy_editor_docs_link(view, dialog_id) do
     assert has_element?(
              view,
-             "##{dialog_id}-footer [data-role='policy-editor-docs-link'][href='https://docs.codex-pooler.com'][target='_blank'][rel='noopener noreferrer'].text-xs",
+             "##{dialog_id}-footer [data-role='policy-editor-docs-link'][href='https://docs.codex-pooler.com/operators/pools/'][target='_blank'][rel='noopener noreferrer'].text-xs",
              "Docs"
            )
 
