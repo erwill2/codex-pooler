@@ -48,29 +48,52 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                SessionContinuity.filter_codex_session_assignment([setup.other_candidate], opts)
     end
 
-    test "keeps paused assignments generic" do
-      setup = pinned_assignment_setup(assignment_status: "paused")
+    test "returns pinned unavailable recovery for paused assignments" do
+      setup =
+        pinned_assignment_setup(
+          assignment_status: "paused",
+          identity_status: "active",
+          identity_metadata: %{}
+        )
+
       session = codex_session_fixture(setup, setup.pinned.assignment)
       opts = request_options_with_session(session)
 
       assert {:error, error} =
                SessionContinuity.filter_codex_session_assignment([setup.other_candidate], opts)
 
-      assert_session_assignment_unavailable(error)
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable")
     end
 
-    test "keeps deleted assignments generic" do
-      setup = pinned_assignment_setup(assignment_status: "deleted")
+    test "returns pinned unavailable recovery for deleted assignments" do
+      setup =
+        pinned_assignment_setup(
+          assignment_status: "deleted",
+          identity_status: "active",
+          identity_metadata: %{}
+        )
+
       session = codex_session_fixture(setup, setup.pinned.assignment)
       opts = request_options_with_session(session)
 
       assert {:error, error} =
                SessionContinuity.filter_codex_session_assignment([setup.other_candidate], opts)
 
-      assert_session_assignment_unavailable(error)
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable")
     end
 
-    test "keeps missing refresh token reauth generic" do
+    test "returns pinned unavailable recovery for inactive identities" do
+      setup = pinned_assignment_setup(identity_status: "paused")
+      session = codex_session_fixture(setup, setup.pinned.assignment)
+      opts = request_options_with_session(session)
+
+      assert {:error, error} =
+               SessionContinuity.filter_codex_session_assignment([setup.other_candidate], opts)
+
+      assert_pinned_continuation_unavailable(error, setup, "identity_unavailable")
+    end
+
+    test "returns pinned unavailable recovery for non-revoked reauth states" do
       setup = pinned_assignment_setup(token_refresh_reason_code: "missing_refresh_token")
       session = codex_session_fixture(setup, setup.pinned.assignment)
       opts = request_options_with_session(session)
@@ -78,10 +101,10 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       assert {:error, error} =
                SessionContinuity.filter_codex_session_assignment([setup.other_candidate], opts)
 
-      assert_session_assignment_unavailable(error)
+      assert_pinned_continuation_unavailable(error, setup, "identity_unavailable")
     end
 
-    test "keeps malformed token refresh metadata generic" do
+    test "returns pinned unavailable recovery for malformed token refresh metadata" do
       setup = pinned_assignment_setup(identity_metadata: %{"token_refresh" => "reauth_required"})
       session = codex_session_fixture(setup, setup.pinned.assignment)
       opts = request_options_with_session(session)
@@ -89,10 +112,10 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       assert {:error, error} =
                SessionContinuity.filter_codex_session_assignment([setup.other_candidate], opts)
 
-      assert_session_assignment_unavailable(error)
+      assert_pinned_continuation_unavailable(error, setup, "identity_unavailable")
     end
 
-    test "keeps generic reauth_required identity state without revoked refresh metadata generic" do
+    test "returns pinned unavailable recovery for generic reauth_required state" do
       setup =
         pinned_assignment_setup(
           identity_metadata: %{"token_refresh" => %{"status" => "reauth_required"}}
@@ -104,7 +127,7 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
       assert {:error, error} =
                SessionContinuity.filter_codex_session_assignment([setup.other_candidate], opts)
 
-      assert_session_assignment_unavailable(error)
+      assert_pinned_continuation_unavailable(error, setup, "identity_unavailable")
     end
   end
 
@@ -220,7 +243,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                  model
                )
 
-      assert_session_assignment_unavailable(error)
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable",
+        pin_reason: "previous_response_id"
+      )
     end
 
     test "soft-pins proxy stream continuations with bare accepted turn state" do
@@ -265,7 +290,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                  model
                )
 
-      assert_session_assignment_unavailable(error)
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable",
+        pin_reason: "live_upstream_websocket"
+      )
     end
 
     test "hard-pins accepted turn state backed by upstream websocket owner forwarding" do
@@ -293,7 +320,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                  model
                )
 
-      assert_session_assignment_unavailable(error)
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable",
+        pin_reason: "live_upstream_websocket"
+      )
     end
 
     test "keeps owner-forwarded websocket continuity soft without complete live owner state" do
@@ -368,7 +397,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
                  model
                )
 
-      assert_session_assignment_unavailable(error)
+      assert_pinned_continuation_unavailable(error, setup, "assignment_unavailable",
+        pin_reason: "file_affinity"
+      )
     end
 
     test "soft-pins proxy stream sessions after a same-model successful turn" do
@@ -653,15 +684,24 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuityTest do
     })
   end
 
-  defp assert_session_assignment_unavailable(error) do
+  defp assert_pinned_continuation_unavailable(error, setup, internal_reason, opts \\ []) do
+    pin_reason = Keyword.get(opts, :pin_reason, "codex_session_assignment")
+
     assert error.status == 503
-    assert error.code == "session_assignment_unavailable"
-
-    assert error.message ==
-             "the upstream assignment for this Codex session is not currently available"
-
+    assert error.code == "pinned_continuation_unavailable"
+    assert error.retryable == false
+    assert error.requires_new_upstream_session == true
+    assert error.recovery["kind"] == "restart_with_full_context"
     assert error.param == "model"
-    refute Map.has_key?(error, :recovery)
-    refute Map.has_key?(error, :continuity_denial)
+
+    assert error.continuity_denial == %{
+             "denial_family" => "pinned_continuation_unavailable",
+             "continuity_family" => "pinned_codex_session",
+             "pin_mode" => "hard",
+             "pin_reason" => pin_reason,
+             "internal_reason" => internal_reason,
+             "pool_upstream_assignment_id" => setup.pinned.assignment.id,
+             "upstream_identity_id" => setup.pinned.identity.id
+           }
   end
 end

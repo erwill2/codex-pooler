@@ -87,39 +87,47 @@ defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpersTest do
              GatewayControllerHelpers.request_opts(conn)
   end
 
-  test "send_error renders pinned continuation recovery header and body fields", %{conn: conn} do
-    conn =
-      GatewayControllerHelpers.send_error(
-        conn,
-        Contracts.pinned_continuation_reauth_required_error()
-      )
+  test "send_error renders pinned continuation recovery header and body fields" do
+    for error <- [
+          Contracts.pinned_continuation_reauth_required_error(),
+          Contracts.pinned_continuation_unavailable_error(%{
+            "internal_reason" => "quota_exhausted"
+          })
+        ] do
+      conn = GatewayControllerHelpers.send_error(Phoenix.ConnTest.build_conn(), error)
 
-    assert get_resp_header(conn, "x-codex-recovery-kind") == ["restart_with_full_context"]
+      assert get_resp_header(conn, "x-codex-recovery-kind") == ["restart_with_full_context"]
 
-    assert %{
-             "error" => %{
-               "code" => "pinned_continuation_reauth_required",
-               "retryable" => false,
-               "requires_new_upstream_session" => true,
-               "recovery_kind" => "restart_with_full_context",
-               "recovery" => recovery
-             }
-           } = json_response(conn, 503)
+      assert %{
+               "error" => %{
+                 "code" => code,
+                 "retryable" => false,
+                 "requires_new_upstream_session" => true,
+                 "recovery_kind" => "restart_with_full_context",
+                 "recovery" => recovery
+               }
+             } = json_response(conn, 503)
 
-    assert recovery["kind"] == "restart_with_full_context"
-    assert recovery["anchor_removal"]["body"] == ["previous_response_id"]
+      assert code in [
+               "pinned_continuation_reauth_required",
+               "pinned_continuation_unavailable"
+             ]
 
-    assert recovery["anchor_removal"]["headers"] == [
-             "x-codex-previous-response-id",
-             "x-codex-turn-state",
-             "x-codex-window-id",
-             "x-codex-session-id",
-             "session-id",
-             "x-session-id",
-             "x-session-affinity",
-             "session_id",
-             "x-codex-conversation-id"
-           ]
+      assert recovery["kind"] == "restart_with_full_context"
+      assert recovery["anchor_removal"]["body"] == ["previous_response_id"]
+
+      assert recovery["anchor_removal"]["headers"] == [
+               "x-codex-previous-response-id",
+               "x-codex-turn-state",
+               "x-codex-window-id",
+               "x-codex-session-id",
+               "session-id",
+               "x-session-id",
+               "x-session-affinity",
+               "session_id",
+               "x-codex-conversation-id"
+             ]
+    end
   end
 
   test "send_error leaves unrelated error shapes without recovery fields" do

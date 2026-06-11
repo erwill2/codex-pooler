@@ -202,17 +202,31 @@ defmodule CodexPooler.Jobs do
         discard_stale_account_reconciliation_jobs()
       end
 
-      active_pools_for_account_reconciliation()
-      |> Enum.map(&enqueue_account_reconciliations(&1, opts))
-      |> split_insert_results()
+      enqueue_account_reconciliation_for_active_pools_by_trigger(opts)
     end
   else
     def enqueue_account_reconciliation_for_active_pools(opts \\ []) do
       discard_stale_account_reconciliation_jobs()
 
-      active_pools_for_account_reconciliation()
-      |> Enum.map(&enqueue_account_reconciliations(&1, opts))
-      |> split_insert_results()
+      enqueue_account_reconciliation_for_active_pools_by_trigger(opts)
+    end
+  end
+
+  defp enqueue_account_reconciliation_for_active_pools_by_trigger(opts) do
+    trigger_kind = trigger_kind(opts)
+    opts = Keyword.put(opts, :trigger_kind, trigger_kind)
+
+    case trigger_kind do
+      "scheduled" ->
+        active_pools_for_account_reconciliation()
+        |> PoolAssignments.list_canonical_active_assignments_for_pools()
+        |> Enum.map(&UpstreamEnqueue.enqueue_scheduled_identity_account_reconciliation(&1, opts))
+        |> split_insert_results()
+
+      _trigger_kind ->
+        active_pools_for_account_reconciliation()
+        |> Enum.map(&enqueue_account_reconciliations(&1, opts))
+        |> split_insert_results()
     end
   end
 

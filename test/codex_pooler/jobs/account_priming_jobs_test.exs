@@ -117,7 +117,7 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
                  plaintext: refresh_token
                })
 
-      assert {:ok, result} = AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+      assert {:ok, result} = AccountReconciliation.run(pool.id, assignment.id, "account_link")
 
       assert result.assignment.metadata["quota_priming"]["status"] == "known"
       assert result.identity.id == identity.id

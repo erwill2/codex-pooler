@@ -2,6 +2,7 @@ defmodule CodexPooler.Gateway.Contracts do
   @moduledoc false
 
   @pinned_continuation_reauth_required_code "pinned_continuation_reauth_required"
+  @pinned_continuation_unavailable_code "pinned_continuation_unavailable"
   @restart_with_full_context_recovery_kind "restart_with_full_context"
   @continuation_anchor_body_fields ["previous_response_id"]
   @continuation_anchor_headers [
@@ -32,6 +33,7 @@ defmodule CodexPooler.Gateway.Contracts do
           required(:message) => String.t(),
           optional(:param) => String.t() | nil,
           optional(:candidate_exclusions) => [map()],
+          optional(:continuity_denial) => map(),
           optional(:quota_refresh_attempted) => boolean(),
           optional(:route_class) => String.t(),
           optional(:retryable) => boolean(),
@@ -85,9 +87,25 @@ defmodule CodexPooler.Gateway.Contracts do
     }
   end
 
+  @spec pinned_continuation_unavailable_error(map()) :: gateway_error()
+  def pinned_continuation_unavailable_error(continuity_metadata \\ %{}) do
+    %{
+      status: 503,
+      code: @pinned_continuation_unavailable_code,
+      message:
+        "Pinned continuation is not available. " <>
+          "Restart with full visible context and remove continuation anchors.",
+      param: "model",
+      retryable: false,
+      requires_new_upstream_session: true,
+      recovery: recovery_contract(),
+      continuity_denial: sanitize_continuity_metadata(continuity_metadata)
+    }
+  end
+
   @spec recovery_response_headers(gateway_error() | map()) :: response_headers()
   def recovery_response_headers(error) do
-    if pinned_continuation_reauth_required?(error) do
+    if hard_pinned_continuation_recovery?(error) do
       [{"x-codex-recovery-kind", @restart_with_full_context_recovery_kind}]
     else
       []
@@ -96,7 +114,7 @@ defmodule CodexPooler.Gateway.Contracts do
 
   @spec recovery_error_fields(gateway_error() | map()) :: client_recovery_fields() | %{}
   def recovery_error_fields(error) do
-    if pinned_continuation_reauth_required?(error) do
+    if hard_pinned_continuation_recovery?(error) do
       %{
         "retryable" => false,
         "requires_new_upstream_session" => true,
@@ -130,4 +148,34 @@ defmodule CodexPooler.Gateway.Contracts do
   end
 
   def pinned_continuation_reauth_required?(_error), do: false
+
+  @spec hard_pinned_continuation_recovery?(gateway_error() | map()) :: boolean()
+  def hard_pinned_continuation_recovery?(%{code: code}) do
+    to_string(code) in [
+      @pinned_continuation_reauth_required_code,
+      @pinned_continuation_unavailable_code
+    ]
+  end
+
+  def hard_pinned_continuation_recovery?(_error), do: false
+
+  @safe_continuity_metadata_keys ~w(
+    denial_family
+    continuity_family
+    pin_mode
+    pin_reason
+    internal_reason
+    pool_upstream_assignment_id
+    upstream_identity_id
+  )
+
+  defp sanitize_continuity_metadata(metadata) when is_map(metadata) do
+    metadata
+    |> Map.new(fn {key, value} -> {to_string(key), value} end)
+    |> Map.take(@safe_continuity_metadata_keys)
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp sanitize_continuity_metadata(_metadata), do: %{}
 end

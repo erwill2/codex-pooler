@@ -57,7 +57,11 @@ defmodule CodexPooler.Gateway.Routing.QuotaRefresh.Plan do
         {:ok, refreshed_candidates, Map.put(decision, "refreshed_stale_quota", true), route_state}
 
       {:refreshable_quota, _remaining_plan} ->
-        CandidateEligibility.quota_unavailable_error(exclusions, refreshable_candidates != [])
+        CandidateEligibility.quota_unavailable_error(
+          filter_input,
+          exclusions,
+          refreshable_candidates != []
+        )
     end
   end
 
@@ -71,7 +75,11 @@ defmodule CodexPooler.Gateway.Routing.QuotaRefresh.Plan do
         {:ok, refreshed_candidates, Map.put(decision, "refreshed_stale_quota", true)}
 
       {:refreshable_quota, _remaining_plan} ->
-        CandidateEligibility.quota_unavailable_error(exclusions, refreshable_candidates != [])
+        CandidateEligibility.quota_unavailable_error(
+          filter_input,
+          exclusions,
+          refreshable_candidates != []
+        )
     end
   end
 

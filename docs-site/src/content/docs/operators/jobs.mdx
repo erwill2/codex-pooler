@@ -73,8 +73,8 @@ The current worker groups are:
     </tr>
     <tr>
       <td>Account reconciliation</td>
-      <td>Checks upstream account assignments and readiness evidence.</td>
-      <td>Every minute, plus manual enqueue.</td>
+      <td>Checks upstream identity readiness evidence. Scheduled runs dedupe by upstream identity; manual and request-triggered runs stay assignment-specific.</td>
+      <td>Every minute, plus manual enqueue. Scheduled and request-triggered reconciliation do not run catalog sync directly.</td>
     </tr>
     <tr>
       <td>Alert evaluation</td>
@@ -236,7 +236,7 @@ The explorer table shows matching job rows. Completed rows are hidden by default
     </tr>
     <tr>
       <td>Target</td>
-      <td>Safe target summary when a job is tied to an account, Pool, API key, direct identity, or rollup date. System jobs can be blank.</td>
+      <td>Safe target summary when a job is tied to an account, Pool, API key, upstream identity, direct identity, assignment, or rollup date. Scheduled reconciliation rows show the upstream identity target instead of repeating one row per Pool assignment. System jobs can be blank.</td>
     </tr>
     <tr>
       <td>Last event</td>

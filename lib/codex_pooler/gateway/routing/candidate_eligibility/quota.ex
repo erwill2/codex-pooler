@@ -2,7 +2,9 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
   @moduledoc false
 
   alias CodexPooler.Catalog.Model
+  alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Routing.CandidateEligibility.FilterInput
+  alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
 
@@ -50,6 +52,32 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
   def quota_unavailable_error(exclusions, refresh_attempted?) when is_list(exclusions) do
     error_details = quota_unavailable_error_details(exclusions)
 
+    generic_quota_unavailable_error(error_details, exclusions, refresh_attempted?)
+  end
+
+  @spec quota_unavailable_error(FilterInput.t(), [map()], boolean()) ::
+          {:error, CodexPooler.Gateway.Routing.CandidateEligibility.gateway_error()}
+  def quota_unavailable_error(
+        %FilterInput{} = filter_input,
+        exclusions,
+        refresh_attempted?
+      )
+      when is_list(exclusions) do
+    error_details = quota_unavailable_error_details(exclusions)
+
+    case hard_pinned_quota_continuity_metadata(filter_input, exclusions, error_details.code) do
+      nil ->
+        generic_quota_unavailable_error(error_details, exclusions, refresh_attempted?)
+
+      continuity_metadata ->
+        {:error,
+         Contracts.pinned_continuation_unavailable_error(continuity_metadata)
+         |> Map.put(:candidate_exclusions, exclusions)
+         |> Map.put(:quota_refresh_attempted, refresh_attempted?)}
+    end
+  end
+
+  defp generic_quota_unavailable_error(error_details, exclusions, refresh_attempted?) do
     {:error,
      error(
        503,
@@ -61,6 +89,32 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
          quota_refresh_attempted: refresh_attempted?
        }
      )}
+  end
+
+  defp hard_pinned_quota_continuity_metadata(
+         %FilterInput{request_options: request_options, model: model},
+         exclusions,
+         internal_reason
+       ) do
+    with %{} = pin_metadata <- SessionContinuity.hard_pin_metadata(request_options, model),
+         %{} = target <- first_quota_exclusion_target(exclusions) do
+      Map.merge(pin_metadata, %{
+        "denial_family" => "pinned_continuation_unavailable",
+        "continuity_family" => "pinned_codex_session",
+        "internal_reason" => internal_reason,
+        "pool_upstream_assignment_id" => Map.get(target, :pool_upstream_assignment_id),
+        "upstream_identity_id" => Map.get(target, :upstream_identity_id)
+      })
+    else
+      _missing -> nil
+    end
+  end
+
+  defp first_quota_exclusion_target(exclusions) do
+    Enum.find(exclusions, fn exclusion ->
+      present?(Map.get(exclusion, :pool_upstream_assignment_id)) and
+        present?(Map.get(exclusion, :upstream_identity_id))
+    end)
   end
 
   defp classify_quota_candidates(%Model{} = model, candidates) do
@@ -313,6 +367,9 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
     ])
     |> Map.new(fn {key, value} -> {to_string(key), value} end)
   end
+
+  defp present?(value) when is_binary(value), do: String.trim(value) != ""
+  defp present?(_value), do: false
 
   defp error(status, code, message, param, metadata),
     do: Map.merge(%{status: status, code: code, message: message, param: param}, metadata)

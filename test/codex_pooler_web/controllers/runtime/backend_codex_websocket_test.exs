@@ -3210,7 +3210,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert {:ok, _assignment} =
              PoolAssignments.disable_pool_assignment(setup.assignment)
 
-    assert {:error, %{code: "session_assignment_unavailable", status: 503}} =
+    assert {:error, %{code: "pinned_continuation_unavailable", status: 503} = error} =
              execute_websocket_response(
                auth,
                Jason.encode!(%{
@@ -3222,6 +3222,20 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                fn frame -> send(self(), {:websocket_frame, :second, frame}) end
              )
 
+    assert error.retryable == false
+    assert error.requires_new_upstream_session == true
+    assert error.recovery["kind"] == "restart_with_full_context"
+
+    assert error.continuity_denial == %{
+             "denial_family" => "pinned_continuation_unavailable",
+             "continuity_family" => "pinned_codex_session",
+             "pin_mode" => "hard",
+             "pin_reason" => "previous_response_id",
+             "internal_reason" => "assignment_unavailable",
+             "pool_upstream_assignment_id" => setup.assignment.id,
+             "upstream_identity_id" => setup.identity.id
+           }
+
     refute_received {:websocket_frame, :second, _frame}
     assert FakeUpstream.count(second_upstream) == 0
 
@@ -3232,7 +3246,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
              )
 
     assert denied_request.status == "rejected"
-    assert denied_request.last_error_code == "session_assignment_unavailable"
+    assert denied_request.last_error_code == "pinned_continuation_unavailable"
     refute denied_request.last_error_code == "stream_incomplete"
 
     metadata_text = inspect(denied_request.request_metadata || %{})
@@ -3863,7 +3877,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     {:ok, upstream_websocket_session} = UpstreamWebsocketSession.start_link()
 
     try do
-      assert {:error, %{code: "quota_evidence_unavailable"}} =
+      assert {:error, %{code: "pinned_continuation_unavailable"} = error} =
                execute_websocket_response(
                  auth,
                  Jason.encode!(%{
@@ -3880,6 +3894,20 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                  },
                  fn frame -> send(self(), {:websocket_frame, frame}) end
                )
+
+      assert error.retryable == false
+      assert error.requires_new_upstream_session == true
+      assert error.recovery["kind"] == "restart_with_full_context"
+
+      assert error.continuity_denial == %{
+               "denial_family" => "pinned_continuation_unavailable",
+               "continuity_family" => "pinned_codex_session",
+               "pin_mode" => "hard",
+               "pin_reason" => "live_upstream_websocket",
+               "internal_reason" => "quota_evidence_unavailable",
+               "pool_upstream_assignment_id" => setup.assignment.id,
+               "upstream_identity_id" => setup.identity.id
+             }
     after
       UpstreamWebsocketSession.close(upstream_websocket_session)
     end
@@ -3892,7 +3920,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "rejected"
     assert request.transport == "websocket"
-    assert request.last_error_code == "quota_evidence_unavailable"
+    assert request.last_error_code == "pinned_continuation_unavailable"
   end
 
   test "HTTP response id continuity survives expired owner leases", %{conn: conn} do
@@ -4382,6 +4410,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     refute metadata_text =~ "upstream-token"
   end
 
+  @tag :hard_pinned_quota_recovery
   test "live upstream websocket session keeps exhausted continuity backend hard pinned" do
     sticky_upstream =
       start_upstream(
@@ -4429,7 +4458,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
 
     upstream_websocket_session = start_supervised!(UpstreamWebsocketSession)
 
-    assert {:error, %{code: "quota_exhausted", status: 503}} =
+    assert {:error, %{code: "pinned_continuation_unavailable", status: 503} = error} =
              execute_websocket_response(
                auth,
                Jason.encode!(%{
@@ -4448,6 +4477,20 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                fn frame -> send(self(), {:websocket_frame, frame}) end
              )
 
+    assert error.retryable == false
+    assert error.requires_new_upstream_session == true
+    assert error.recovery["kind"] == "restart_with_full_context"
+
+    assert error.continuity_denial == %{
+             "denial_family" => "pinned_continuation_unavailable",
+             "continuity_family" => "pinned_codex_session",
+             "pin_mode" => "hard",
+             "pin_reason" => "live_upstream_websocket",
+             "internal_reason" => "quota_exhausted",
+             "pool_upstream_assignment_id" => setup.assignment.id,
+             "upstream_identity_id" => setup.identity.id
+           }
+
     refute_received {:websocket_frame, _frame}
     assert FakeUpstream.count(sticky_upstream) == 0
     assert FakeUpstream.count(fallback_upstream) == 0
@@ -4461,7 +4504,18 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
 
     assert request.status == "rejected"
     assert request.transport == "websocket"
-    assert request.last_error_code == "quota_exhausted"
+    assert request.last_error_code == "pinned_continuation_unavailable"
+
+    assert %{
+             "denial_family" => "pinned_continuation_unavailable",
+             "pin_reason" => "live_upstream_websocket",
+             "internal_reason" => "quota_exhausted",
+             "pool_upstream_assignment_id" => assignment_id,
+             "upstream_identity_id" => identity_id
+           } = request.request_metadata["continuity_denial"]
+
+    assert assignment_id == setup.assignment.id
+    assert identity_id == setup.identity.id
     assert Repo.all(from(d in BridgeDemotion)) == []
     assert Repo.all(from(c in RoutingCircuitState)) == []
 

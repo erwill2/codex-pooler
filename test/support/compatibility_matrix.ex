@@ -611,6 +611,32 @@ defmodule CodexPooler.CompatibilityMatrix do
           ]
         }
       },
+      pinned_continuation_unavailable: %{
+        routes: [
+          %{method: :post, path: "/v1/responses"},
+          %{method: :get, path: "/v1/responses", transport: "websocket"}
+        ],
+        status: 503,
+        error_code: "pinned_continuation_unavailable",
+        recovery_kind: "restart_with_full_context",
+        examples: ["quota_exhausted", "assignment_unavailable", "identity_unavailable"],
+        hard_pin_fallback: false,
+        soft_pin_fallback: true,
+        anchor_removal: %{
+          body: ["previous_response_id"],
+          headers: [
+            "x-codex-previous-response-id",
+            "x-codex-turn-state",
+            "x-codex-window-id",
+            "x-codex-session-id",
+            "session-id",
+            "x-session-id",
+            "x-session-affinity",
+            "session_id",
+            "x-codex-conversation-id"
+          ]
+        }
+      },
       timeout_contract: %{
         route_specific_defaults_added: false,
         progress_receive_timeout_ms: 250,

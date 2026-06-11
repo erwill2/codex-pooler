@@ -469,6 +469,7 @@ defmodule CodexPooler.Jobs.ReadModel do
         discarded_at: unquote(job).discarded_at,
         cancelled_at: unquote(job).cancelled_at,
         target: %{
+          target_kind: fragment("?->>?", unquote(job).args, "target_kind"),
           pool_id: fragment("?->>?", unquote(job).args, "pool_id"),
           pool_name: unquote(pool).name,
           pool_slug: unquote(pool).slug,

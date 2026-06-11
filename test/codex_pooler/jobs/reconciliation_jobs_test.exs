@@ -185,6 +185,82 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
                )
     end
 
+    test "scheduled reconciliation skips direct catalog sync" do
+      future_reset = DateTime.add(DateTime.utc_now(), 300, :second)
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/codex/models" => {200, %{"models" => [%{"id" => "gpt-scheduled-skip"}]}}
+           }}
+        )
+
+      {pool, assignment} =
+        active_assignment_fixture(%{
+          "base_url" => FakeUpstream.url(upstream),
+          "quota_windows" => [
+            %{
+              "window_kind" => "primary",
+              "window_minutes" => 300,
+              "active_limit" => 100,
+              "credits" => 75,
+              "reset_at" => DateTime.to_iso8601(future_reset),
+              "source" => "local_reconciliation",
+              "freshness_state" => "fresh"
+            }
+          ]
+        })
+
+      assert {:ok, result} = AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+
+      assert result.status == :succeeded
+      assert result.catalog.status == :succeeded
+      assert result.catalog.code == "catalog_sync_skipped"
+
+      assert [] = Repo.all(SyncRun)
+      assert [] = Catalog.list_models(pool)
+      assert [] = FakeUpstream.requests(upstream)
+    end
+
+    test "gateway-triggered reconciliation skips direct catalog sync" do
+      future_reset = DateTime.add(DateTime.utc_now(), 300, :second)
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/codex/models" => {200, %{"models" => [%{"id" => "gpt-gateway-skip"}]}}
+           }}
+        )
+
+      {pool, assignment} =
+        active_assignment_fixture(%{
+          "base_url" => FakeUpstream.url(upstream),
+          "quota_windows" => [
+            %{
+              "window_kind" => "primary",
+              "window_minutes" => 300,
+              "active_limit" => 100,
+              "credits" => 75,
+              "reset_at" => DateTime.to_iso8601(future_reset),
+              "source" => "local_reconciliation",
+              "freshness_state" => "fresh"
+            }
+          ]
+        })
+
+      assert {:ok, result} = AccountReconciliation.run(pool.id, assignment.id, "gateway")
+
+      assert result.status == :succeeded
+      assert result.catalog.status == :succeeded
+      assert result.catalog.code == "catalog_sync_skipped"
+
+      assert [] = Repo.all(SyncRun)
+      assert [] = Catalog.list_models(pool)
+      assert [] = FakeUpstream.requests(upstream)
+    end
+
     test "refreshes quota windows when local-safe reconciliation data is valid" do
       future_reset = DateTime.add(DateTime.utc_now(), 300, :second)
 
@@ -254,19 +330,114 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert window.observed_at == DateTime.truncate(stale_observed_at, :microsecond)
     end
 
-    test "enqueues account reconciliation jobs for active pools" do
+    @tag :scheduled_identity_reconciliation
+    test "enqueues one scheduled account reconciliation job per active upstream identity" do
       {pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      later_created_at = DateTime.add(assignment.created_at, 60, :second)
+
+      {_second_pool, second_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Job assignment duplicate",
+          created_at: later_created_at
+        )
 
       assert {:ok, %{inserted: [job], conflicts: [], errors: []}} =
                Jobs.enqueue_account_reconciliation_for_active_pools(trigger_kind: "scheduled")
 
       assert job.args["pool_id"] == pool.id
       assert job.args["pool_upstream_assignment_id"] == assignment.id
+      assert job.args["upstream_identity_id"] == identity.id
       assert job.args["trigger_kind"] == "scheduled"
+      assert job.args["target_kind"] == "upstream_identity"
 
       assert [row] = Jobs.list_recent_account_reconciliation_jobs(pool)
       assert row.id == job.id
       assert row.args["pool_upstream_assignment_id"] == assignment.id
+
+      canonical_assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      sibling_assignment = Repo.get!(PoolUpstreamAssignment, second_assignment.id)
+      assert is_nil(canonical_assignment.metadata["last_reconciliation"])
+      assert is_nil(sibling_assignment.metadata["last_reconciliation"])
+    end
+
+    @tag :scheduled_identity_reconciliation
+    test "deduplicates incomplete scheduled reconciliation jobs by upstream identity" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      {_second_pool, _second_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Job assignment duplicate",
+          created_at: DateTime.add(assignment.created_at, 60, :second)
+        )
+
+      assert {:ok, %{inserted: [first_job], conflicts: [], errors: []}} =
+               Jobs.enqueue_account_reconciliation_for_active_pools(trigger_kind: "scheduled")
+
+      assert first_job.args["upstream_identity_id"] == identity.id
+      assert first_job.args["target_kind"] == "upstream_identity"
+
+      assert {:ok, %{inserted: [], conflicts: [conflict_job], errors: []}} =
+               Jobs.enqueue_account_reconciliation_for_active_pools(trigger_kind: "scheduled")
+
+      assert conflict_job.conflict?
+      assert conflict_job.id == first_job.id
+
+      {1, _rows} =
+        from(job in Oban.Job, where: job.id == ^first_job.id)
+        |> Repo.update_all(
+          set: [
+            state: "completed",
+            attempt: 1,
+            attempted_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
+            completed_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+          ]
+        )
+
+      assert {:ok, %{inserted: [later_job], conflicts: [], errors: []}} =
+               Jobs.enqueue_account_reconciliation_for_active_pools(trigger_kind: "scheduled")
+
+      assert later_job.id != first_job.id
+      assert later_job.args["upstream_identity_id"] == identity.id
+      assert later_job.args["pool_upstream_assignment_id"] == assignment.id
+    end
+
+    test "malformed active-pool trigger kind falls back to manual assignment fanout" do
+      {pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      {second_pool, second_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Malformed trigger duplicate",
+          created_at: DateTime.add(assignment.created_at, 60, :second)
+        )
+
+      assert {:ok, %{inserted: jobs, conflicts: [], errors: []}} =
+               Jobs.enqueue_account_reconciliation_for_active_pools(trigger_kind: :scheduled)
+
+      args = jobs |> Enum.map(& &1.args) |> Enum.sort_by(& &1["pool_id"])
+
+      assert args ==
+               Enum.sort_by(
+                 [
+                   %{
+                     "pool_id" => pool.id,
+                     "pool_upstream_assignment_id" => assignment.id,
+                     "trigger_kind" => "manual"
+                   },
+                   %{
+                     "pool_id" => second_pool.id,
+                     "pool_upstream_assignment_id" => second_assignment.id,
+                     "trigger_kind" => "manual"
+                   }
+                 ],
+                 & &1["pool_id"]
+               )
+
+      refute Enum.any?(jobs, &Map.has_key?(&1.args, "target_kind"))
+      refute Enum.any?(jobs, &Map.has_key?(&1.args, "upstream_identity_id"))
     end
 
     test "active-pool account reconciliation enqueue returns no work when development pause is enabled" do
@@ -454,6 +625,28 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       assert job.id == first_job.id
     end
+
+    test "manual reconciliation can target a non-canonical assignment for the same identity" do
+      {_canonical_pool, canonical_assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(canonical_assignment.upstream_identity_id)
+
+      {requested_pool, requested_assignment} =
+        active_assignment_for_identity_fixture(identity,
+          assignment_label: "Manual requested assignment",
+          created_at: DateTime.add(canonical_assignment.created_at, 60, :second)
+        )
+
+      assert {:ok, job} =
+               Jobs.enqueue_account_reconciliation(requested_pool, requested_assignment,
+                 trigger_kind: "manual"
+               )
+
+      assert job.args == %{
+               "pool_id" => requested_pool.id,
+               "pool_upstream_assignment_id" => requested_assignment.id,
+               "trigger_kind" => "manual"
+             }
+    end
   end
 
   defp publish_from_task(fun) when is_function(fun, 0) do
@@ -508,6 +701,24 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
              PoolAssignments.create_pool_assignment(pool, identity, %{
                assignment_label: "Job assignment",
                metadata: metadata
+             })
+
+    assert {:ok, assignment} =
+             PoolAssignments.activate_pool_assignment(assignment, %{
+               skip_quota_priming: true
+             })
+
+    {pool, assignment}
+  end
+
+  defp active_assignment_for_identity_fixture(identity, attrs) do
+    pool = Keyword.get(attrs, :pool, pool_fixture())
+
+    assert {:ok, assignment} =
+             PoolAssignments.create_pool_assignment(pool, identity, %{
+               assignment_label: Keyword.fetch!(attrs, :assignment_label),
+               created_at: Keyword.get(attrs, :created_at, DateTime.utc_now()),
+               metadata: Keyword.get(attrs, :metadata, %{})
              })
 
     assert {:ok, assignment} =

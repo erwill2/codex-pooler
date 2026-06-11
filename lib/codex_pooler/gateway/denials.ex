@@ -8,7 +8,8 @@ defmodule CodexPooler.Gateway.Denials do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.SessionContinuity
 
-  @pinned_continuation_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
+  @pinned_continuation_reauth_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
+  @pinned_continuation_unavailable_operator_action "wait for the pinned upstream to recover, then restart the client without continuation anchors"
 
   defmodule Context do
     @moduledoc false
@@ -151,12 +152,20 @@ defmodule CodexPooler.Gateway.Denials do
 
   defp continuity_denial_metadata(%{continuity_denial: metadata}) when is_map(metadata) do
     metadata
-    |> Map.put("operator_action", @pinned_continuation_operator_action)
+    |> Map.put(
+      "operator_action",
+      Map.get(metadata, "operator_action") || operator_action(metadata)
+    )
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
   end
 
   defp continuity_denial_metadata(_reason), do: nil
+
+  defp operator_action(%{"denial_family" => "pinned_continuation_unavailable"}),
+    do: @pinned_continuation_unavailable_operator_action
+
+  defp operator_action(_metadata), do: @pinned_continuation_reauth_operator_action
 
   defp requested_model(%Model{} = model, _payload, _endpoint), do: model.exposed_model_id
 

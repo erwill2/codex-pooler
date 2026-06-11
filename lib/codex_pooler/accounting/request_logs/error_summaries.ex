@@ -3,7 +3,8 @@ defmodule CodexPooler.Accounting.RequestLogs.ErrorSummaries do
 
   alias CodexPooler.Accounting
 
-  @pinned_continuation_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
+  @pinned_continuation_reauth_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
+  @pinned_continuation_unavailable_operator_action "wait for the pinned upstream to recover, then restart the client without continuation anchors"
 
   @spec build(map(), map(), [map()]) :: [map()]
   def build(request, metadata, attempts) do
@@ -53,11 +54,14 @@ defmodule CodexPooler.Accounting.RequestLogs.ErrorSummaries do
       code: Map.get(summary, "code") || Map.get(summary, "denial_family"),
       denial_family: Map.get(summary, "denial_family"),
       continuity_family: Map.get(summary, "continuity_family"),
+      pin_mode: Map.get(summary, "pin_mode"),
+      pin_reason: Map.get(summary, "pin_reason"),
+      internal_reason: Map.get(summary, "internal_reason"),
       upstream_lifecycle_family: Map.get(summary, "upstream_lifecycle_family"),
       token_refresh_reason_code_preview: Map.get(summary, "token_refresh_reason_code_preview"),
       pool_upstream_assignment_id: Map.get(summary, "pool_upstream_assignment_id"),
       upstream_identity_id: Map.get(summary, "upstream_identity_id"),
-      operator_action: Map.get(summary, "operator_action") || @pinned_continuation_operator_action
+      operator_action: Map.get(summary, "operator_action") || operator_action(summary)
     })
   end
 
@@ -155,6 +159,11 @@ defmodule CodexPooler.Accounting.RequestLogs.ErrorSummaries do
     |> Enum.reject(fn {_key, value} -> blank?(value) end)
     |> Map.new()
   end
+
+  defp operator_action(%{"denial_family" => "pinned_continuation_unavailable"}),
+    do: @pinned_continuation_unavailable_operator_action
+
+  defp operator_action(_summary), do: @pinned_continuation_reauth_operator_action
 
   defp blank?(value), do: is_nil(value) or String.trim(to_string(value)) == ""
 end

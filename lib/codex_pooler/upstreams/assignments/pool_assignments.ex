@@ -256,6 +256,50 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
     end
   end
 
+  @spec list_canonical_active_assignments_for_pools([Pool.t() | Ecto.UUID.t()]) :: [
+          PoolUpstreamAssignment.t()
+        ]
+  def list_canonical_active_assignments_for_pools(pool_refs) when is_list(pool_refs) do
+    pool_ids =
+      pool_refs
+      |> Enum.map(&pool_id/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    if pool_ids == [] do
+      []
+    else
+      ranked_query =
+        from assignment in PoolUpstreamAssignment,
+          join: identity in UpstreamIdentity,
+          on: identity.id == assignment.upstream_identity_id,
+          where:
+            assignment.pool_id in ^pool_ids and assignment.status == ^@assignment_active and
+              identity.status == ^@active,
+          windows: [
+            identity_partition: [
+              partition_by: assignment.upstream_identity_id,
+              order_by: [asc: assignment.created_at, asc: assignment.id]
+            ]
+          ],
+          select: %{
+            id: assignment.id,
+            row_number: over(row_number(), :identity_partition)
+          }
+
+      Repo.all(
+        from assignment in PoolUpstreamAssignment,
+          join: ranked_assignment in subquery(ranked_query),
+          on: ranked_assignment.id == assignment.id,
+          where: ranked_assignment.row_number == 1,
+          order_by: [asc: assignment.created_at, asc: assignment.id],
+          select: assignment
+      )
+    end
+  end
+
+  def list_canonical_active_assignments_for_pools(_pool_refs), do: []
+
   @spec list_pool_assignments_for_identity(identity_ref()) :: [PoolUpstreamAssignment.t()]
   def list_pool_assignments_for_identity(identity_or_id) do
     case identity_id(identity_or_id) do

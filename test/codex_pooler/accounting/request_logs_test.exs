@@ -14,6 +14,7 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
   alias CodexPooler.Repo
 
   @pinned_continuation_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
+  @pinned_continuation_unavailable_operator_action "wait for the pinned upstream to recover, then restart the client without continuation anchors"
 
   test "accounting reservations create empty request log facts" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
@@ -1264,6 +1265,96 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     refute inspected =~ auth_json
     refute inspected =~ provider_payload
     refute inspected =~ websocket_frame
+  end
+
+  test "request logs project pinned unavailable continuity denials with restart action" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    model = model_fixture(pool, %{exposed_model_id: "gpt-pinned-unavailable-log"})
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Pinned unavailable upstream",
+        assignment_label: "Pinned unavailable assignment"
+      })
+
+    opts =
+      RequestOptions.build(
+        [
+          transport: "http_json",
+          requested_model: "gpt-pinned-unavailable-log",
+          previous_response_id: "resp_safe_unavailable_anchor",
+          request_id: "safe-unavailable-correlation"
+        ],
+        "/backend-api/codex/responses",
+        %{
+          "model" => "gpt-pinned-unavailable-log",
+          "previous_response_id" => "resp_safe_unavailable_anchor",
+          "input" => "metadata only"
+        }
+      )
+
+    continuity_denial = %{
+      "denial_family" => "pinned_continuation_unavailable",
+      "continuity_family" => "pinned_codex_session",
+      "pin_mode" => "hard",
+      "pin_reason" => "previous_response_id",
+      "internal_reason" => "quota_exhausted",
+      "pool_upstream_assignment_id" => assignment.id,
+      "upstream_identity_id" => identity.id
+    }
+
+    reason = %{
+      code: "pinned_continuation_unavailable",
+      status: 503,
+      message: "restart with full visible context",
+      param: "model",
+      continuity_denial: continuity_denial
+    }
+
+    assert {:error, ^reason} =
+             Denials.log_gateway(%Denials.Context{
+               auth: %{pool: pool, api_key: api_key, key_prefix: api_key.key_prefix},
+               model: model,
+               reason: reason,
+               endpoint: "/backend-api/codex/responses",
+               payload: %{
+                 "model" => "gpt-pinned-unavailable-log",
+                 "previous_response_id" => "resp_safe_unavailable_anchor",
+                 "input" => "metadata only"
+               },
+               opts: opts
+             })
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+    assert log.status == "rejected"
+    assert log.denial_reason == "pinned_continuation_unavailable"
+
+    assert log.metadata["gateway_denial"] == %{
+             "code" => "pinned_continuation_unavailable",
+             "message" => "restart with full visible context",
+             "param" => "model"
+           }
+
+    assert log.metadata["continuity_denial"] ==
+             Map.put(
+               continuity_denial,
+               "operator_action",
+               @pinned_continuation_unavailable_operator_action
+             )
+
+    assert Enum.any?(log.errors, fn error ->
+             error.source == "metadata" and
+               error.kind == "continuity_denial" and
+               error.code == "pinned_continuation_unavailable" and
+               error.denial_family == "pinned_continuation_unavailable" and
+               error.continuity_family == "pinned_codex_session" and
+               error.pin_mode == "hard" and
+               error.pin_reason == "previous_response_id" and
+               error.internal_reason == "quota_exhausted" and
+               error.pool_upstream_assignment_id == assignment.id and
+               error.upstream_identity_id == identity.id and
+               error.operator_action == @pinned_continuation_unavailable_operator_action
+           end)
   end
 
   test "scoped request-log visibility keeps pinned denial rows inside assigned pools" do

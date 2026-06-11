@@ -149,6 +149,8 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
       {"failure_code", "failure"},
       {"denial_family", "denial_family"},
       {"continuity_family", "continuity_family"},
+      {"pin_reason", "pin_reason"},
+      {"internal_reason", "internal_reason"},
       {"upstream_lifecycle_family", "lifecycle"},
       {"token_refresh_reason_code_preview", "refresh_reason"},
       {"operator_action", "action"},
@@ -211,6 +213,8 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
         row
         |> maybe_put_value("denial_family", Map.get(denial, "denial_family"))
         |> maybe_put_value("continuity_family", Map.get(denial, "continuity_family"))
+        |> maybe_put_value("pin_reason", Map.get(denial, "pin_reason"))
+        |> maybe_put_value("internal_reason", Map.get(denial, "internal_reason"))
         |> maybe_put_value(
           "upstream_lifecycle_family",
           Map.get(denial, "upstream_lifecycle_family")

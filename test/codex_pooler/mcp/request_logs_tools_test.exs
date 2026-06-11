@@ -12,6 +12,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
   alias CodexPooler.Repo
 
   @pinned_continuation_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
+  @pinned_continuation_unavailable_operator_action "wait for the pinned upstream to recover, then restart the client without continuation anchors"
 
   setup do
     reset_bootstrap_state_fixture!()
@@ -1293,6 +1294,61 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert :ok = Redaction.assert_mcp_output_safe!(get_result)
   end
 
+  test "request-log tools expose pinned unavailable denial metadata without unsafe anchors", %{
+    auth: auth
+  } do
+    pool =
+      pool_fixture(%{slug: "mcp-pinned-unavailable", name: "MCP Pinned Unavailable"})
+
+    %{api_key: api_key} =
+      active_api_key_fixture(pool, %{display_name: "MCP pinned unavailable key"})
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Pinned unavailable upstream",
+        assignment_label: "Pinned unavailable assignment"
+      })
+
+    request = pinned_unavailable_denial_request_fixture(pool, api_key, assignment, identity)
+
+    assert {:ok, list_result} =
+             ToolDispatch.call(
+               "codex_pooler_list_request_logs",
+               %{"pool_id" => pool.id, "limit" => 10},
+               %{auth: auth}
+             )
+
+    assert list_result["isError"] == false
+    assert [%{"type" => "text", "text" => list_text}] = list_result["content"]
+    assert [list_item] = list_result["structuredContent"]["items"]
+    assert list_item["id"] == request.id
+    assert_pinned_unavailable_denial_mcp_item(list_item, assignment, identity)
+    assert list_text =~ "denial_family=pinned_continuation_unavailable"
+    assert list_text =~ "continuity_family=pinned_codex_session"
+    assert list_text =~ "pin_reason=previous_response_id"
+    assert list_text =~ "internal_reason=quota_exhausted"
+    assert list_text =~ "action=#{@pinned_continuation_unavailable_operator_action}"
+    assert_no_pinned_denial_mcp_leaks(list_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(list_result)
+
+    assert {:ok, get_result} =
+             ToolDispatch.call("codex_pooler_get_request_log", %{"id" => request.id}, %{
+               auth: auth
+             })
+
+    assert get_result["isError"] == false
+    assert [%{"type" => "text", "text" => get_text}] = get_result["content"]
+    assert %{"status" => "ok", "item" => get_item} = get_result["structuredContent"]
+    assert get_item["id"] == request.id
+    assert_pinned_unavailable_denial_mcp_item(get_item, assignment, identity)
+    assert get_text =~ "denial_family=pinned_continuation_unavailable"
+    assert get_text =~ "pin_reason=previous_response_id"
+    assert get_text =~ "internal_reason=quota_exhausted"
+    assert get_text =~ "action=#{@pinned_continuation_unavailable_operator_action}"
+    assert_no_pinned_denial_mcp_leaks(get_result)
+    assert :ok = Redaction.assert_mcp_output_safe!(get_result)
+  end
+
   test "scoped admin request-log tools keep pinned denial metadata inside assigned pools", %{
     user: owner
   } do
@@ -1463,6 +1519,45 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     })
   end
 
+  defp pinned_unavailable_denial_request_fixture(pool, api_key, assignment, identity) do
+    request_fixture(%{pool: pool, api_key: api_key}, %{
+      requested_model: "gpt-pinned-unavailable-mcp",
+      endpoint: "/backend-api/codex/responses",
+      transport: "http_json",
+      status: "rejected",
+      usage_status: "not_applicable",
+      correlation_id: "mcp-pinned-unavailable-#{System.unique_integer([:positive])}",
+      response_status_code: 503,
+      last_error_code: "pinned_continuation_unavailable",
+      request_metadata: %{
+        "gateway_denial" => %{
+          "code" => "pinned_continuation_unavailable",
+          "message" => "restart with full visible context"
+        },
+        "continuity_denial" =>
+          unavailable_continuity_denial_metadata(assignment, identity)
+          |> Map.merge(%{
+            "previous_response_id" => "resp_raw_anchor_mcp",
+            "previous-response-id" => %{
+              "id" => "resp_raw_nested_map_anchor_mcp",
+              "preview" => "resp_raw_nested_map_preview_mcp"
+            },
+            "previous response id" => [%{"id" => "resp_raw_nested_list_anchor_mcp"}],
+            "prompt" => Redaction.forbidden_sentinel!(:prompt),
+            "request_body" => Redaction.forbidden_sentinel!(:request_body),
+            "response_body" => Redaction.forbidden_sentinel!(:response_body),
+            "raw_idempotency_key" => Redaction.forbidden_sentinel!(:raw_idempotency_key),
+            "access_token" => Redaction.forbidden_sentinel!(:access_token),
+            "refresh_token" => Redaction.forbidden_sentinel!(:refresh_token),
+            "cookie" => Redaction.forbidden_sentinel!(:cookies),
+            "auth_json" => Redaction.forbidden_sentinel!(:upstream_auth_json),
+            "provider_payload" => Redaction.forbidden_sentinel!(:provider_payload),
+            "websocket_frame" => Redaction.forbidden_sentinel!(:websocket_frame)
+          })
+      }
+    })
+  end
+
   defp continuity_denial_metadata(assignment, identity) do
     %{
       "denial_family" => "pinned_continuation_reauth",
@@ -1472,6 +1567,19 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
       "pool_upstream_assignment_id" => assignment.id,
       "upstream_identity_id" => identity.id,
       "operator_action" => @pinned_continuation_operator_action
+    }
+  end
+
+  defp unavailable_continuity_denial_metadata(assignment, identity) do
+    %{
+      "denial_family" => "pinned_continuation_unavailable",
+      "continuity_family" => "pinned_codex_session",
+      "pin_mode" => "hard",
+      "pin_reason" => "previous_response_id",
+      "internal_reason" => "quota_exhausted",
+      "pool_upstream_assignment_id" => assignment.id,
+      "upstream_identity_id" => identity.id,
+      "operator_action" => @pinned_continuation_unavailable_operator_action
     }
   end
 
@@ -1510,6 +1618,65 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
                error["upstream_identity_id"] == identity.id and
                error["operator_action"] == @pinned_continuation_operator_action
            end)
+  end
+
+  defp assert_pinned_unavailable_denial_mcp_item(item, assignment, identity) do
+    assert item["denial_reason"] == "pinned_continuation_unavailable"
+
+    continuity_denial = item["metadata"]["continuity_denial"]
+    assert_pinned_unavailable_continuity_denial(continuity_denial, assignment, identity)
+    refute_pinned_denial_metadata_leaks(continuity_denial)
+
+    assert Enum.any?(item["errors"], &pinned_unavailable_denial_error?(&1, assignment, identity))
+  end
+
+  defp assert_pinned_unavailable_continuity_denial(continuity_denial, assignment, identity) do
+    assert continuity_denial["denial_family"] == "pinned_continuation_unavailable"
+    assert continuity_denial["continuity_family"] == "pinned_codex_session"
+    assert continuity_denial["pin_mode"] == "hard"
+    assert continuity_denial["pin_reason"] == "previous_response_id"
+    assert continuity_denial["internal_reason"] == "quota_exhausted"
+    assert continuity_denial["pool_upstream_assignment_id"] == assignment.id
+    assert continuity_denial["upstream_identity_id"] == identity.id
+
+    assert continuity_denial["operator_action"] ==
+             @pinned_continuation_unavailable_operator_action
+  end
+
+  defp refute_pinned_denial_metadata_leaks(continuity_denial) do
+    refute Map.has_key?(continuity_denial, "previous_response_id")
+    refute Map.has_key?(continuity_denial, "previous-response-id")
+    refute Map.has_key?(continuity_denial, "previous response id")
+    refute Map.has_key?(continuity_denial, "request_body")
+    refute Map.has_key?(continuity_denial, "response_body")
+    refute Map.has_key?(continuity_denial, "raw_idempotency_key")
+    refute Map.has_key?(continuity_denial, "access_token")
+    refute Map.has_key?(continuity_denial, "refresh_token")
+    refute Map.has_key?(continuity_denial, "cookie")
+    refute Map.has_key?(continuity_denial, "auth_json")
+    refute Map.has_key?(continuity_denial, "provider_payload")
+    refute Map.has_key?(continuity_denial, "websocket_frame")
+  end
+
+  defp pinned_unavailable_denial_error?(error, assignment, identity) do
+    assignment
+    |> pinned_unavailable_denial_error_fields(identity)
+    |> Enum.all?(fn {key, value} -> error[key] == value end)
+  end
+
+  defp pinned_unavailable_denial_error_fields(assignment, identity) do
+    %{
+      "kind" => "continuity_denial",
+      "code" => "pinned_continuation_unavailable",
+      "denial_family" => "pinned_continuation_unavailable",
+      "continuity_family" => "pinned_codex_session",
+      "pin_mode" => "hard",
+      "pin_reason" => "previous_response_id",
+      "internal_reason" => "quota_exhausted",
+      "pool_upstream_assignment_id" => assignment.id,
+      "upstream_identity_id" => identity.id,
+      "operator_action" => @pinned_continuation_unavailable_operator_action
+    }
   end
 
   defp assert_no_pinned_denial_mcp_leaks(result) do

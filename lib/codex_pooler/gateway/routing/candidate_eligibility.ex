@@ -286,6 +286,9 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   @spec quota_unavailable_error([map()], boolean()) :: {:error, gateway_error()}
   defdelegate quota_unavailable_error(exclusions, refresh_attempted?), to: Quota
 
+  @spec quota_unavailable_error(FilterInput.t(), [map()], boolean()) :: {:error, gateway_error()}
+  defdelegate quota_unavailable_error(input, exclusions, refresh_attempted?), to: Quota
+
   @spec filter_circuit_eligible_candidates(FilterInput.t()) ::
           {:ok, [candidate()]} | {:error, gateway_error()}
   def filter_circuit_eligible_candidates(%FilterInput{} = input) do

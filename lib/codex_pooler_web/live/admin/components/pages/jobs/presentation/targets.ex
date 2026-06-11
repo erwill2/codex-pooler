@@ -15,7 +15,15 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation.Targets do
 
   def job_target(_job), do: nil
 
+  defp job_target_variant(%{target_kind: "upstream_identity"}), do: :direct_identity
+
   defp job_target_variant(target) do
+    target
+    |> target_variant_candidates()
+    |> Enum.find_value(&present_target_variant/1)
+  end
+
+  defp target_variant_candidates(target) do
     [
       {:assignment, [target.assignment_label, target.assignment_id]},
       {:direct_identity, [target.direct_identity_label, target.upstream_identity_id]},
@@ -23,9 +31,10 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation.Targets do
       {:api_key, [target.api_key_label, target.api_key_id]},
       {:rollup, [target.rollup_date]}
     ]
-    |> Enum.find_value(fn {variant, values} ->
-      if target_variant_present?(values), do: variant
-    end)
+  end
+
+  defp present_target_variant({variant, values}) do
+    if target_variant_present?(values), do: variant
   end
 
   defp target_variant_present?(values) do

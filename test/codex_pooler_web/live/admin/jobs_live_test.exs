@@ -429,7 +429,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
         args: %{
           "pool_id" => pool.id,
           "pool_upstream_assignment_id" => assignment.id,
-          "trigger_kind" => "scheduled"
+          "trigger_kind" => "manual"
         },
         errors: [
           %{
@@ -439,9 +439,24 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
         ]
       )
 
-    refresh_job =
+    scheduled_identity_job =
       insert_job(
         2,
+        worker: AccountReconciliationWorker,
+        state: "available",
+        inserted_at: ~U[2026-05-04 10:00:30Z],
+        args: %{
+          "pool_id" => pool.id,
+          "pool_upstream_assignment_id" => assignment.id,
+          "upstream_identity_id" => identity.id,
+          "target_kind" => "upstream_identity",
+          "trigger_kind" => "scheduled"
+        }
+      )
+
+    refresh_job =
+      insert_job(
+        3,
         worker: TokenRefreshWorker,
         state: "completed",
         inserted_at: ~U[2026-05-04 10:01:00Z],
@@ -465,6 +480,24 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
              view,
              "#job-#{reconciliation_job.id} [data-role='target-secondary']",
              "Assignment: Example assignment · Pool: Diagnostics Pool · Status: active"
+           )
+
+    assert has_element?(
+             view,
+             "#job-#{scheduled_identity_job.id} [data-role='target-primary']",
+             "Account: Example upstream"
+           )
+
+    assert has_element?(
+             view,
+             "#job-#{scheduled_identity_job.id} [data-role='target-secondary']",
+             "Status: active"
+           )
+
+    refute has_element?(
+             view,
+             "#job-#{scheduled_identity_job.id} [data-role='target-secondary']",
+             "Assignment:"
            )
 
     assert has_element?(

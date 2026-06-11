@@ -8120,6 +8120,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute metadata_text =~ "upstream-token-soft-pinned-json"
   end
 
+  @tag :hard_pinned_quota_recovery
   test "POST /backend-api/codex/responses keeps previous_response_id hard pinned when pinned quota is exhausted",
        %{conn: conn} do
     fallback_upstream =
@@ -8167,16 +8168,25 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         "previous_response_id" => previous_response_id
       })
 
-    assert %{"error" => %{"code" => "quota_exhausted"}} = json_response(conn, 503)
+    assert_pinned_unavailable_recovery_response!(conn)
     assert FakeUpstream.count(pinned_upstream) == 0
     assert FakeUpstream.count(fallback_upstream) == 0
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "rejected"
-    assert request.last_error_code == "quota_exhausted"
+    assert request.last_error_code == "pinned_continuation_unavailable"
     assert Repo.aggregate(Attempt, :count) == 0
+
+    assert_pinned_unavailable_metadata!(
+      request,
+      pinned.assignment,
+      pinned.identity,
+      "previous_response_id",
+      "quota_exhausted"
+    )
   end
 
+  @tag :hard_pinned_quota_recovery
   test "POST /backend-api/codex/responses keeps file affinity hard pinned when quota is exhausted",
        %{conn: conn} do
     fallback_upstream =
@@ -8230,14 +8240,22 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         "input" => [%{"type" => "input_file", "file_id" => file_id}]
       })
 
-    assert %{"error" => %{"code" => "quota_exhausted"}} = json_response(conn, 503)
+    assert_pinned_unavailable_recovery_response!(conn)
     assert FakeUpstream.count(pinned_upstream) == 0
     assert FakeUpstream.count(fallback_upstream) == 0
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "rejected"
-    assert request.last_error_code == "quota_exhausted"
+    assert request.last_error_code == "pinned_continuation_unavailable"
     assert Repo.aggregate(Attempt, :count) == 0
+
+    assert_pinned_unavailable_metadata!(
+      request,
+      pinned.assignment,
+      pinned.identity,
+      "file_affinity",
+      "quota_exhausted"
+    )
 
     metadata_text = inspect(request.request_metadata)
     refute metadata_text =~ file_id
@@ -8245,6 +8263,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute metadata_text =~ "upstream-token-file-affinity-exhausted"
   end
 
+  @tag :hard_pinned_quota_recovery
   test "POST /backend-api/codex/responses refreshes hard previous-response stale quota before rejection",
        %{conn: conn} do
     reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
@@ -8300,14 +8319,22 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         "previous_response_id" => previous_response_id
       })
 
-    assert %{"error" => %{"code" => "quota_evidence_unavailable"}} = json_response(conn, 503)
+    assert_pinned_unavailable_recovery_response!(conn)
     assert [%{path: "/api/codex/usage"}] = FakeUpstream.requests(pinned_upstream)
     assert FakeUpstream.requests(fallback_upstream) == []
     assert Repo.aggregate(Attempt, :count) == 0
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.status == "rejected"
-    assert request.last_error_code == "quota_evidence_unavailable"
+    assert request.last_error_code == "pinned_continuation_unavailable"
+
+    assert_pinned_unavailable_metadata!(
+      request,
+      pinned.assignment,
+      pinned.identity,
+      "previous_response_id",
+      "quota_evidence_unavailable"
+    )
   end
 
   test "POST /backend-api/codex/responses refreshes hard file-affinity stale quota before fallback candidates",
@@ -9135,6 +9162,47 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
              "session_id",
              "x-codex-conversation-id"
            ]
+  end
+
+  defp assert_pinned_unavailable_recovery_response!(conn) do
+    assert get_resp_header(conn, "x-codex-recovery-kind") == ["restart_with_full_context"]
+
+    assert %{
+             "error" => %{
+               "code" => "pinned_continuation_unavailable",
+               "retryable" => false,
+               "requires_new_upstream_session" => true,
+               "recovery_kind" => "restart_with_full_context",
+               "recovery" => recovery
+             }
+           } = json_response(conn, 503)
+
+    assert recovery["kind"] == "restart_with_full_context"
+    assert recovery["anchor_removal"]["body"] == ["previous_response_id"]
+  end
+
+  defp assert_pinned_unavailable_metadata!(
+         request,
+         assignment,
+         identity,
+         pin_reason,
+         internal_reason
+       ) do
+    assert %{
+             "denial_family" => "pinned_continuation_unavailable",
+             "continuity_family" => "pinned_codex_session",
+             "pin_mode" => "hard",
+             "pin_reason" => ^pin_reason,
+             "internal_reason" => ^internal_reason,
+             "pool_upstream_assignment_id" => assignment_id,
+             "upstream_identity_id" => identity_id,
+             "operator_action" => operator_action
+           } = request.request_metadata["continuity_denial"]
+
+    assert assignment_id == assignment.id
+    assert identity_id == identity.id
+    assert is_binary(operator_action)
+    assert operator_action != ""
   end
 
   defp assert_file_assignment_conflict_without_recovery!(conn) do

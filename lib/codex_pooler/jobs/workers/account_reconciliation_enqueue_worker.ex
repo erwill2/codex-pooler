@@ -1,6 +1,6 @@
 defmodule CodexPooler.Jobs.AccountReconciliationEnqueueWorker do
   @moduledoc """
-  Periodically enqueues account reconciliation jobs for active Pool assignments.
+  Periodically enqueues account reconciliation jobs for active upstream identities.
   """
 
   use Oban.Worker,

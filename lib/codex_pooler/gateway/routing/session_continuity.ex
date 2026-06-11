@@ -190,7 +190,11 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
       )
       when is_binary(assignment_id) do
     if hard_pin_codex_session_assignment?(request_options, model) do
-      filter_codex_session_assignment(candidates, request_options)
+      filter_pinned_codex_session_assignment(
+        candidates,
+        request_options,
+        hard_pin_metadata(request_options, model)
+      )
     else
       {:ok, prefer_codex_session_assignment(candidates, assignment_id)}
     end
@@ -214,20 +218,34 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
         candidates,
         %RequestOptions{
           continuity: %{codex_session: %CodexSession{pool_upstream_assignment_id: assignment_id}}
-        }
+        } = request_options
       )
       when is_binary(assignment_id) do
+    filter_pinned_codex_session_assignment(candidates, request_options, %{})
+  end
+
+  def filter_codex_session_assignment(candidates, %RequestOptions{}), do: {:ok, candidates}
+
+  defp filter_pinned_codex_session_assignment(
+         candidates,
+         %RequestOptions{
+           continuity: %{codex_session: %CodexSession{pool_upstream_assignment_id: assignment_id}}
+         },
+         pin_metadata
+       )
+       when is_binary(assignment_id) do
     candidates =
       Enum.filter(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end)
 
     if candidates == [] do
-      {:error, pinned_session_assignment_unavailable_error(assignment_id)}
+      {:error, pinned_session_assignment_unavailable_error(assignment_id, pin_metadata || %{})}
     else
       {:ok, candidates}
     end
   end
 
-  def filter_codex_session_assignment(candidates, %RequestOptions{}), do: {:ok, candidates}
+  defp filter_pinned_codex_session_assignment(candidates, %RequestOptions{}, _pin_metadata),
+    do: {:ok, candidates}
 
   @type pin_mode :: :hard | :soft
   @type pin_reason ::
@@ -238,6 +256,17 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
           | :accepted_turn_state
           | :same_model_successful_turn
           | :codex_session_assignment
+
+  @spec hard_pin_metadata(RequestOptions.t(), Model.t()) :: map() | nil
+  def hard_pin_metadata(%RequestOptions{} = request_options, %Model{} = model) do
+    case classify_codex_session_pin(request_options, model) do
+      {:hard, reason} ->
+        %{"pin_mode" => "hard", "pin_reason" => Atom.to_string(reason)}
+
+      {:soft, _reason} ->
+        nil
+    end
+  end
 
   @spec hard_pin_codex_session_assignment?(RequestOptions.t(), Model.t()) :: boolean()
   defp hard_pin_codex_session_assignment?(%RequestOptions{} = request_options, %Model{} = model) do
@@ -361,8 +390,9 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
     pinned ++ fallback
   end
 
-  @spec pinned_session_assignment_unavailable_error(Ecto.UUID.t() | String.t()) :: gateway_error()
-  defp pinned_session_assignment_unavailable_error(assignment_id) do
+  @spec pinned_session_assignment_unavailable_error(Ecto.UUID.t() | String.t(), map()) ::
+          gateway_error()
+  defp pinned_session_assignment_unavailable_error(assignment_id, pin_metadata) do
     case persisted_pinned_reauth_assignment(assignment_id) do
       {:ok, %PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity, reason_code} ->
         Contracts.pinned_continuation_reauth_required_error()
@@ -372,13 +402,26 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
           pinned_reauth_continuity_metadata(assignment, identity, reason_code)
         )
 
+      {:unavailable, %PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity,
+       internal_reason} ->
+        Contracts.pinned_continuation_unavailable_error(
+          pinned_unavailable_continuity_metadata(
+            assignment,
+            identity,
+            internal_reason,
+            pin_metadata
+          )
+        )
+
       :error ->
         session_assignment_unavailable_error()
     end
   end
 
   @spec persisted_pinned_reauth_assignment(Ecto.UUID.t() | String.t()) ::
-          {:ok, PoolUpstreamAssignment.t(), UpstreamIdentity.t(), String.t()} | :error
+          {:ok, PoolUpstreamAssignment.t(), UpstreamIdentity.t(), String.t()}
+          | {:unavailable, PoolUpstreamAssignment.t(), UpstreamIdentity.t(), String.t()}
+          | :error
   defp persisted_pinned_reauth_assignment(assignment_id) when is_binary(assignment_id) do
     case Repo.one(
            from assignment in PoolUpstreamAssignment,
@@ -391,7 +434,8 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
         if revoked_refresh_token_pinned_reauth?(assignment, identity) do
           {:ok, assignment, identity, "refresh_token_revoked"}
         else
-          :error
+          {:unavailable, assignment, identity,
+           pinned_unavailable_internal_reason(assignment, identity)}
         end
 
       nil ->
@@ -435,6 +479,39 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
       "pool_upstream_assignment_id" => assignment.id,
       "upstream_identity_id" => identity.id
     }
+  end
+
+  @spec pinned_unavailable_continuity_metadata(
+          PoolUpstreamAssignment.t(),
+          UpstreamIdentity.t(),
+          String.t(),
+          map()
+        ) :: map()
+  defp pinned_unavailable_continuity_metadata(assignment, identity, internal_reason, pin_metadata) do
+    %{
+      "denial_family" => "pinned_continuation_unavailable",
+      "continuity_family" => "pinned_codex_session",
+      "pin_mode" => Map.get(pin_metadata, "pin_mode", "hard"),
+      "pin_reason" => Map.get(pin_metadata, "pin_reason", "codex_session_assignment"),
+      "internal_reason" => internal_reason,
+      "pool_upstream_assignment_id" => assignment.id,
+      "upstream_identity_id" => identity.id
+    }
+  end
+
+  @spec pinned_unavailable_internal_reason(PoolUpstreamAssignment.t(), UpstreamIdentity.t()) ::
+          String.t()
+  defp pinned_unavailable_internal_reason(assignment, identity) do
+    cond do
+      identity.status != UpstreamIdentity.active_status() ->
+        "identity_unavailable"
+
+      assignment.status != PoolUpstreamAssignment.active_status() ->
+        "assignment_unavailable"
+
+      true ->
+        "assignment_unavailable"
+    end
   end
 
   @spec session_assignment_unavailable_error() :: gateway_error()

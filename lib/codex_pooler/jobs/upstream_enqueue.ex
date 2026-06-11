@@ -76,6 +76,26 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
     end
   end
 
+  @spec enqueue_scheduled_identity_account_reconciliation(PoolUpstreamAssignment.t(), keyword()) ::
+          job_insert_result()
+  def enqueue_scheduled_identity_account_reconciliation(
+        %PoolUpstreamAssignment{} = assignment,
+        opts \\ []
+      ) do
+    %{
+      "pool_id" => assignment.pool_id,
+      "pool_upstream_assignment_id" => assignment.id,
+      "upstream_identity_id" => assignment.upstream_identity_id,
+      "trigger_kind" => Keyword.get(opts, :trigger_kind, "scheduled"),
+      "target_kind" => "upstream_identity"
+    }
+    |> AccountReconciliationWorker.new(
+      Options.job_options(opts, unique_keys: [:upstream_identity_id, :trigger_kind])
+    )
+    |> Oban.insert()
+    |> tap_job_status_event(assignment.pool_id, "account_reconciliation", "scheduled")
+  end
+
   defp tap_job_status_event(
          {:ok, %Oban.Job{conflict?: true}} = result,
          _pool_id,

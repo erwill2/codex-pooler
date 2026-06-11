@@ -16,6 +16,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
 
   @stale_after_seconds 25 * 60
   @successful_partial_codes ~w(catalog_sync_failed catalog_sync_in_progress)
+  @catalog_sync_skipped_triggers ~w(scheduled gateway)
   @paused UpstreamIdentity.paused_status()
   @reauth_required UpstreamIdentity.reauth_required_status()
   @assignment_paused PoolUpstreamAssignment.paused_status()
@@ -25,6 +26,8 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
 
   @spec run(term(), term(), term()) :: orchestration_result()
   def run(pool_id, assignment_id, trigger_kind) do
+    trigger_kind = normalize_trigger_kind(trigger_kind)
+
     if reason = skipped_reconciliation_target(pool_id, assignment_id) do
       result = %{
         status: :skipped,
@@ -44,7 +47,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
 
     case PoolReconciliation.reconcile_pool_account(pool_id, assignment_id) do
       {:ok, result} ->
-        catalog_step = reconcile_catalog(pool_id)
+        catalog_step = reconcile_catalog(pool_id, trigger_kind)
         status = summarize_status([result.health, result.quota, catalog_step])
 
         assignment =
@@ -223,6 +226,9 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
 
   defp skipped_reconciliation_reason(code, message), do: %{code: code, message: message}
 
+  defp normalize_trigger_kind(trigger_kind) when is_binary(trigger_kind), do: trigger_kind
+  defp normalize_trigger_kind(_trigger_kind), do: "manual"
+
   defp broadcast_job_result(pool_id, worker, {:ok, %{status: status}}) do
     Events.broadcast_job_status(pool_id, "job_status_updated", %{
       id: worker,
@@ -240,7 +246,12 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
     })
   end
 
-  defp reconcile_catalog(pool_id) do
+  defp reconcile_catalog(_pool_id, trigger_kind)
+       when trigger_kind in @catalog_sync_skipped_triggers do
+    step(:succeeded, "catalog_sync_skipped", "catalog sync is owned by catalog scheduler")
+  end
+
+  defp reconcile_catalog(pool_id, _trigger_kind) do
     case Catalog.sync_pool_catalog(pool_id, trigger_kind: "reconcile") do
       {:ok, _result} ->
         step(:succeeded, "catalog_refreshed", "catalog sync completed")
