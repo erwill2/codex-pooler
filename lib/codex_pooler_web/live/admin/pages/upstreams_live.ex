@@ -35,6 +35,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         auth_json_upload_limit_label: UpstreamAuthJsonImport.upload_limit_label(),
         importing_auth_json: false,
         oauth_linking: false,
+        oauth_link_mode: :link,
+        oauth_link_target_account: nil,
         oauth_link_form: oauth_link_form(),
         oauth_link_pool_id: "",
         oauth_link_flow: nil,
@@ -170,20 +172,53 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
      |> close_oauth_link_dialog()
      |> assign(
        oauth_linking: true,
+       oauth_link_mode: :link,
+       oauth_link_target_account: nil,
        oauth_link_form: oauth_link_form(pool_id),
        oauth_link_pool_id: pool_id
      )}
   end
 
-  def handle_event("validate_oauth_link_pool", %{"oauth_link" => oauth_params}, socket) do
-    pool_id = Map.get(oauth_params, "pool_id", "")
+  def handle_event("open_oauth_relink", %{"id" => identity_id}, socket) do
+    case find_account(socket.assigns.upstream_accounts, identity_id) do
+      nil ->
+        {:noreply, put_flash(socket, :error, "Upstream account was not found")}
 
-    {:noreply,
-     assign(socket,
-       oauth_link_pool_id: pool_id,
-       oauth_link_form: oauth_link_form(pool_id),
-       oauth_link_error: nil
-     )}
+      account ->
+        case oauth_relink_pool_id(account) do
+          {:ok, pool_id} ->
+            {:noreply,
+             socket
+             |> close_auth_json_dialog()
+             |> close_rename_account_dialog()
+             |> close_oauth_link_dialog()
+             |> assign(
+               oauth_linking: true,
+               oauth_link_mode: :relink,
+               oauth_link_target_account: account,
+               oauth_link_form: oauth_link_form(pool_id),
+               oauth_link_pool_id: pool_id
+             )}
+
+          {:error, message} ->
+            {:noreply, put_flash(socket, :error, message)}
+        end
+    end
+  end
+
+  def handle_event("validate_oauth_link_pool", %{"oauth_link" => oauth_params}, socket) do
+    if oauth_relink_mode?(socket) do
+      {:noreply, socket}
+    else
+      pool_id = Map.get(oauth_params, "pool_id", "")
+
+      {:noreply,
+       assign(socket,
+         oauth_link_pool_id: pool_id,
+         oauth_link_form: oauth_link_form(pool_id),
+         oauth_link_error: nil
+       )}
+    end
   end
 
   def handle_event("start_oauth_browser", params, socket) do
@@ -192,8 +227,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         {:noreply, assign_oauth_error(socket, OAuthCallback.safe_error(:unauthorized_pool))}
 
       pool ->
-        case Upstreams.start_browser_oauth(socket.assigns.current_scope, pool,
-               metadata: %{"source" => "admin_upstreams"}
+        case Upstreams.start_browser_oauth(
+               socket.assigns.current_scope,
+               pool,
+               oauth_start_opts(socket)
              ) do
           {:ok, %{flow: %OAuthFlow{} = flow, authorization_url: authorization_url}} ->
             {:noreply,
@@ -220,8 +257,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         {:noreply, assign_oauth_error(socket, OAuthCallback.safe_error(:unauthorized_pool))}
 
       pool ->
-        case Upstreams.start_device_oauth(socket.assigns.current_scope, pool,
-               metadata: %{"source" => "admin_upstreams"}
+        case Upstreams.start_device_oauth(
+               socket.assigns.current_scope,
+               pool,
+               oauth_start_opts(socket)
              ) do
           {:ok, %{flow: %OAuthFlow{} = flow}} ->
             {:noreply,
@@ -478,6 +517,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         auth_json_upload_limit_label={@auth_json_upload_limit_label}
         importing_auth_json={@importing_auth_json}
         oauth_linking={@oauth_linking}
+        oauth_link_mode={@oauth_link_mode}
+        oauth_link_target_account={@oauth_link_target_account}
         oauth_link_form={@oauth_link_form}
         oauth_link_flow={@oauth_link_flow}
         oauth_link_authorization_url={@oauth_link_authorization_url}
@@ -575,11 +616,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     |> assign(
       oauth_link_flow: flow,
       oauth_link_authorization_url: nil,
-      oauth_link_result: %{message: "OpenAI account linked"},
+      oauth_link_result: %{message: oauth_complete_message(socket)},
       oauth_link_error: nil,
       oauth_link_form: oauth_link_form(socket.assigns.oauth_link_pool_id)
     )
     |> reload_upstreams()
+  end
+
+  @spec oauth_complete_message(Phoenix.LiveView.Socket.t()) :: String.t()
+  defp oauth_complete_message(socket) do
+    if oauth_relink_mode?(socket), do: "OpenAI account relinked", else: "OpenAI account linked"
   end
 
   defp schedule_oauth_device_poll(
@@ -604,9 +650,45 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   defp selected_oauth_pool(socket, params) do
+    if oauth_relink_mode?(socket) do
+      selected_pool(socket.assigns.pools, socket.assigns.oauth_link_pool_id)
+    else
+      selected_oauth_link_pool(socket, params)
+    end
+  end
+
+  defp selected_oauth_link_pool(socket, params) do
     pool_id = oauth_link_pool_id_from_params(params) || socket.assigns.oauth_link_pool_id
     selected_pool(socket.assigns.pools, pool_id)
   end
+
+  @spec oauth_start_opts(Phoenix.LiveView.Socket.t()) :: keyword()
+  defp oauth_start_opts(socket) do
+    opts = [metadata: %{"source" => "admin_upstreams"}]
+
+    case socket.assigns.oauth_link_target_account do
+      %{identity: %{id: identity_id}} when is_binary(identity_id) ->
+        Keyword.put(opts, :upstream_identity_id, identity_id)
+
+      _account ->
+        opts
+    end
+  end
+
+  @spec oauth_relink_pool_id(map()) :: {:ok, String.t()} | {:error, String.t()}
+  defp oauth_relink_pool_id(%{identity: %{status: "deleted"}}),
+    do: {:error, "OAuth relink is not available: deleted accounts cannot be relinked"}
+
+  defp oauth_relink_pool_id(%{assignments: [%{pool_id: pool_id} | _assignments]})
+       when is_binary(pool_id),
+       do: {:ok, pool_id}
+
+  defp oauth_relink_pool_id(_account),
+    do: {:error, "OAuth relink is not available: assign this account to a visible Pool first"}
+
+  @spec oauth_relink_mode?(Phoenix.LiveView.Socket.t()) :: boolean()
+  defp oauth_relink_mode?(%{assigns: %{oauth_link_mode: :relink}}), do: true
+  defp oauth_relink_mode?(_socket), do: false
 
   defp oauth_link_pool_id_from_params(%{"oauth_link" => %{"pool_id" => pool_id}})
        when is_binary(pool_id),
@@ -748,6 +830,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     |> cancel_oauth_poll_timer()
     |> assign(
       oauth_linking: false,
+      oauth_link_mode: :link,
+      oauth_link_target_account: nil,
       oauth_link_form: oauth_link_form(),
       oauth_link_pool_id: "",
       oauth_link_flow: nil,

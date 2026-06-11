@@ -154,7 +154,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
       assign(assigns,
         recovery_eligible?: recovery_eligible?(assigns.account),
         recovery_default_pool_id: recovery_default_pool_id(assigns.account),
-        recovery_reinvite_path: recovery_reinvite_path(assigns.account)
+        recovery_reinvite_path: recovery_reinvite_path(assigns.account),
+        oauth_relink_available?: oauth_relink_available?(assigns.account),
+        oauth_relink_unavailable_reason: oauth_relink_unavailable_reason(assigns.account)
       )
 
     ~H"""
@@ -214,6 +216,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
             label="Replace auth.json"
             phx-click="open_import_auth_json"
             phx-value-pool-id={@recovery_default_pool_id}
+          />
+        </li>
+        <li>
+          <AdminComponents.dropdown_action_item
+            id={"oauth-relink-upstream-account-#{@account.identity.id}"}
+            icon="hero-link"
+            label="Relink account"
+            phx-click="open_oauth_relink"
+            phx-value-id={@account.identity.id}
+            disabled={!@oauth_relink_available?}
+            title={@oauth_relink_unavailable_reason}
           />
         </li>
         <li :if={@recovery_eligible?}>
@@ -309,7 +322,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
             Reason: {@account.reauth_reason_code}
           </p>
           <p class="text-xs font-medium text-base-content/75">
-            Recovery: use Replace auth.json to load fresh credentials, or Reinvite account when the operator needs to complete hosted sign-in again.
+            Recovery: use Relink account to complete OpenAI OAuth again, Replace auth.json to load fresh credentials, or Reinvite account when the operator needs to complete hosted sign-in again.
           </p>
         </div>
       </div>
@@ -598,6 +611,22 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
   end
 
   defp recovery_reinvite_path(_account), do: nil
+
+  @spec oauth_relink_available?(map()) :: boolean()
+  defp oauth_relink_available?(%{identity: %{status: status}, assignments: assignments})
+       when is_list(assignments),
+       do: status != "deleted" and assignments != []
+
+  defp oauth_relink_available?(_account), do: false
+
+  @spec oauth_relink_unavailable_reason(map()) :: String.t() | nil
+  defp oauth_relink_unavailable_reason(%{identity: %{status: "deleted"}}),
+    do: "Deleted accounts cannot be relinked."
+
+  defp oauth_relink_unavailable_reason(%{assignments: []}),
+    do: "Assign this account to a visible Pool before relinking."
+
+  defp oauth_relink_unavailable_reason(_account), do: nil
 
   @spec recovery_invite_params(map(), String.t()) :: map()
   defp recovery_invite_params(account, pool_id) do

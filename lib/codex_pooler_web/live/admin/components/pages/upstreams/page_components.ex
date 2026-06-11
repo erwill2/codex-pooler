@@ -22,6 +22,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :auth_json_upload_limit_label, :string, required: true
   attr :importing_auth_json, :boolean, required: true
   attr :oauth_linking, :boolean, required: true
+  attr :oauth_link_mode, :atom, default: :link, values: [:link, :relink]
+  attr :oauth_link_target_account, :map, default: nil
   attr :oauth_link_form, :any, required: true
   attr :oauth_link_flow, :map, default: nil
   attr :oauth_link_authorization_url, :string, default: nil
@@ -65,6 +67,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
       <.oauth_link_dialog
         oauth_linking={@oauth_linking}
+        oauth_link_mode={@oauth_link_mode}
+        oauth_link_target_account={@oauth_link_target_account}
         oauth_link_form={@oauth_link_form}
         oauth_link_flow={@oauth_link_flow}
         oauth_link_authorization_url={@oauth_link_authorization_url}
@@ -276,6 +280,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   end
 
   attr :oauth_linking, :boolean, required: true
+  attr :oauth_link_mode, :atom, default: :link, values: [:link, :relink]
+  attr :oauth_link_target_account, :map, default: nil
   attr :oauth_link_form, :any, required: true
   attr :oauth_link_flow, :map, default: nil
   attr :oauth_link_authorization_url, :string, default: nil
@@ -284,7 +290,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :pool_options, :list, required: true
 
   defp oauth_link_dialog(assigns) do
-    assigns = assign(assigns, :oauth_docs_url, @oauth_docs_url)
+    assigns =
+      assigns
+      |> assign(:oauth_docs_url, @oauth_docs_url)
+      |> assign(:oauth_dialog_title, oauth_dialog_title(assigns.oauth_link_mode))
+      |> assign(
+        :oauth_dialog_description,
+        oauth_dialog_description(assigns.oauth_link_mode, assigns.oauth_link_target_account)
+      )
+      |> assign(
+        :oauth_callback_submit_label,
+        oauth_callback_submit_label(assigns.oauth_link_mode)
+      )
 
     ~H"""
     <dialog :if={@oauth_linking} id="oauth-link-dialog" class="modal" open>
@@ -293,9 +310,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           <p class="text-sm font-semibold uppercase tracking-wide text-primary">
             OpenAI OAuth
           </p>
-          <h2 class="mt-1 text-2xl font-bold text-base-content">Link OpenAI account</h2>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">{@oauth_dialog_title}</h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            Choose a Pool and finish the OpenAI authorization flow.
+            {@oauth_dialog_description}
           </p>
         </div>
 
@@ -318,7 +335,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
             autocomplete="off"
             class="grid gap-4"
           >
-            <div class="grid gap-2">
+            <div
+              :if={oauth_relink_mode?(@oauth_link_mode)}
+              id="oauth-link-relink-target"
+              class="rounded-lg border border-base-300 bg-base-200/40 p-4 text-sm text-base-content"
+            >
+              <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
+                Account
+              </p>
+              <p class="mt-1 font-medium">{oauth_target_label(@oauth_link_target_account)}</p>
+            </div>
+
+            <div :if={!oauth_relink_mode?(@oauth_link_mode)} class="grid gap-2">
               <label
                 for="oauth_link_pool_id"
                 class="text-xs font-semibold uppercase tracking-wide text-base-content/60"
@@ -402,7 +430,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
               <AdminComponents.action_button
                 id="oauth-link-submit-callback"
                 icon="hero-check"
-                label="Complete link"
+                label={@oauth_callback_submit_label}
                 type="submit"
                 variant={:primary}
               />
@@ -551,4 +579,32 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
   defp oauth_dialog_dismiss_label(%{status: "completed"}), do: "Close"
   defp oauth_dialog_dismiss_label(_flow), do: "Cancel"
+
+  defp oauth_dialog_title(:relink), do: "Relink OpenAI account"
+  defp oauth_dialog_title(_mode), do: "Link OpenAI account"
+
+  defp oauth_dialog_description(:relink, account) do
+    "Finish the OpenAI authorization flow to relink #{oauth_target_label(account)}."
+  end
+
+  defp oauth_dialog_description(_mode, _account),
+    do: "Choose a Pool and finish the OpenAI authorization flow."
+
+  defp oauth_callback_submit_label(:relink), do: "Complete relink"
+  defp oauth_callback_submit_label(_mode), do: "Complete link"
+
+  defp oauth_relink_mode?(:relink), do: true
+  defp oauth_relink_mode?(_mode), do: false
+
+  defp oauth_target_label(%{label: label}) when is_binary(label) and label != "", do: label
+
+  defp oauth_target_label(%{identity: %{account_label: label}})
+       when is_binary(label) and label != "",
+       do: label
+
+  defp oauth_target_label(%{identity: %{chatgpt_account_id: account_id}})
+       when is_binary(account_id) and account_id != "",
+       do: account_id
+
+  defp oauth_target_label(_account), do: "selected account"
 end

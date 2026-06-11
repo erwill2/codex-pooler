@@ -349,6 +349,100 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     end
   end
 
+  test "relinks upstream account from the account card dropdown through browser OAuth", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "oauth-relink-card-ui", name: "OAuth Relink Card UI"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        chatgpt_account_id: "acct_card_relink",
+        account_label: "Card Relink Codex",
+        identity_status: "reauth_required",
+        identity_metadata: blocked_auth_metadata("failed")
+      })
+
+    access_token = runtime_secret("oauth-card-relink-access")
+    refresh_token = runtime_secret("oauth-card-relink-refresh")
+    id_token = oauth_id_token("acct_card_relink")
+
+    provider =
+      start_oauth_provider!(%{
+        "/oauth/token" =>
+          {200,
+           FakeOpenAIAuthProvider.token_response(
+             access_token: access_token,
+             refresh_token: refresh_token,
+             id_token: id_token
+           )}
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    assert has_element?(
+             view,
+             "#oauth-relink-upstream-account-#{identity.id}",
+             "Relink account"
+           )
+
+    view
+    |> element("#oauth-relink-upstream-account-#{identity.id}")
+    |> render_click()
+
+    assert has_element?(view, "#oauth-link-dialog", "Relink OpenAI account")
+    assert has_element?(view, "#oauth-link-relink-target", "Card Relink Codex")
+    refute has_element?(view, "#oauth_link_pool_id")
+
+    view
+    |> element("#oauth-link-browser-start")
+    |> render_click()
+
+    assert has_element?(view, "#oauth-link-authorization-url")
+    assert has_element?(view, "#oauth-link-submit-callback", "Complete relink")
+
+    authorization_url = authorization_url_from_view(view)
+
+    callback_url =
+      provider_callback_url(authorization_state(authorization_url), "browser-relink-card-code")
+
+    view
+    |> element("#oauth-link-callback-form")
+    |> render_submit(%{"oauth_link" => %{"callback_url" => callback_url}})
+
+    assert has_element?(view, "#oauth-link-status", "OpenAI account relinked")
+    assert has_element?(view, "#oauth-link-cancel", "Close")
+    assert has_element?(view, "#upstream-account-#{identity.id}")
+
+    flow = Repo.one!(OAuthFlow)
+    assert flow.purpose == "relink"
+    assert flow.upstream_identity_id == identity.id
+    assert flow.result_upstream_identity_id == identity.id
+
+    assert Repo.get!(UpstreamIdentity, identity.id).chatgpt_account_id == "acct_card_relink"
+
+    assert [token_request] = FakeOpenAIAuthProvider.requests(provider)
+
+    assert FakeOpenAIAuthProvider.decode_form_request(token_request)["code"] ==
+             "browser-relink-card-code"
+
+    html = render(view)
+
+    for raw_value <- [
+          access_token,
+          refresh_token,
+          id_token,
+          callback_url,
+          "browser-relink-card-code"
+        ] do
+      refute html =~ raw_value
+    end
+  end
+
   test "browser OAuth callback errors stay safe and keep the raw callback out of HTML", %{
     conn: conn,
     scope: scope
@@ -2928,6 +3022,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
       assert has_element?(
                view,
+               "#oauth-relink-upstream-account-#{identity.id}",
+               "Relink account"
+             )
+
+      assert has_element?(view, "#oauth-relink-upstream-account-#{identity.id} .hero-link")
+
+      assert has_element?(
+               view,
                "#reinvite-upstream-account-#{identity.id}[href*='create=1'][href*='pool_id=#{pool.id}'][href*='invited_email=#{encoded_email}']",
                "Reinvite account"
              )
@@ -2976,6 +3078,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       |> Enum.find(&(&1.status == "reauth_required"))
 
     warning_selector = "#upstream-account-#{reauth_identity.id}-reauth-warning"
+    assert has_element?(view, warning_selector, "Relink account")
     assert has_element?(view, warning_selector, "Replace auth.json")
     assert has_element?(view, warning_selector, "Reinvite account")
   end
@@ -2997,7 +3100,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       )
 
     assert no_assignment_html =~ ~s(id="replace-auth-json-upstream-account-#{no_assignment_id}")
+    assert no_assignment_html =~ ~s(id="oauth-relink-upstream-account-#{no_assignment_id}")
     assert no_assignment_html =~ ~s(id="reinvite-upstream-account-#{no_assignment_id}")
+
+    assert no_assignment_html =~
+             ~r/<button[^>]+id="oauth-relink-upstream-account-#{no_assignment_id}"[^>]+ disabled(?:[\s=>])/
 
     assert no_assignment_html =~
              ~r/<button[^>]+id="reinvite-upstream-account-#{no_assignment_id}"[^>]+disabled/
@@ -3013,6 +3120,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       )
 
     refute deleted_html =~ "replace-auth-json-upstream-account-#{deleted_id}"
+    assert deleted_html =~ ~s(id="oauth-relink-upstream-account-#{deleted_id}")
+
+    assert deleted_html =~
+             ~r/<button[^>]+id="oauth-relink-upstream-account-#{deleted_id}"[^>]+ disabled(?:[\s=>])/
+
     refute deleted_html =~ "reinvite-upstream-account-#{deleted_id}"
 
     usable_id = Ecto.UUID.generate()
@@ -3033,6 +3145,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       )
 
     refute usable_html =~ "replace-auth-json-upstream-account-#{usable_id}"
+    assert usable_html =~ ~s(id="oauth-relink-upstream-account-#{usable_id}")
+
+    refute usable_html =~
+             ~r/<button[^>]+id="oauth-relink-upstream-account-#{usable_id}"[^>]+ disabled(?:[\s=>])/
+
     refute usable_html =~ "reinvite-upstream-account-#{usable_id}"
 
     %{identity: invalid_email_identity} =
@@ -3104,6 +3221,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, warning_selector, "excluded from routing")
     assert has_element?(view, warning_selector, "Refresh token was revoked or expired")
     assert has_element?(view, warning_selector, "refresh_token_revoked")
+    assert has_element?(view, warning_selector, "Relink account")
     assert has_element?(view, warning_selector, "Replace auth.json")
     assert has_element?(view, warning_selector, "Reinvite account")
   end
