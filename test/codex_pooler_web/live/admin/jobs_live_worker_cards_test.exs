@@ -978,7 +978,13 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
     card = worker_card_selector(:token_refresh)
 
-    assert has_element?(view, "#{card} [data-role='next-run']", "On demand")
+    assert has_element?(
+             view,
+             "#{card} [data-role='schedule'] [data-role='cadence-label']",
+             "Every 15 min"
+           )
+
+    assert has_element?(view, "#{card} [data-role='next-run']")
     assert has_element?(view, "#{card} [data-role='next-run'] .hero-clock")
 
     assert has_element?(

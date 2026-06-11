@@ -73,8 +73,12 @@ jobs_schedule = [
     title: "Token refresh",
     description: "Access-token renewal",
     icon: "hero-key",
-    workers: [CodexPooler.Jobs.TokenRefreshWorker],
-    cadence: %{label: "On demand", cron: nil}
+    workers: [
+      CodexPooler.Jobs.TokenRefreshWorker,
+      CodexPooler.Jobs.TokenRefreshEnqueueWorker
+    ],
+    scheduled_worker: CodexPooler.Jobs.TokenRefreshEnqueueWorker,
+    cadence: %{label: "Every 15 min", cron: "*/15 * * * *"}
   },
   %{
     key: :daily_rollup_rebuild,

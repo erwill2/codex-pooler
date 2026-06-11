@@ -3,7 +3,13 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
 
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Jobs
-  alias CodexPooler.Jobs.{RuntimeStateCleanupWorker, TokenRefreshWorker}
+
+  alias CodexPooler.Jobs.{
+    RuntimeStateCleanupWorker,
+    TokenRefreshEnqueueWorker,
+    TokenRefreshWorker
+  }
+
   alias CodexPooler.Repo
   alias CodexPoolerWeb.Admin.JobsReadModel
 
@@ -85,6 +91,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     worker_option_values = Enum.map(filter_options.worker, & &1.value)
     assert "" in worker_option_values
     assert worker_name(RuntimeStateCleanupWorker) in worker_option_values
+    assert worker_name(TokenRefreshEnqueueWorker) in worker_option_values
     assert worker_name(TokenRefreshWorker) in worker_option_values
 
     assert filter_options.queue |> Enum.map(& &1.value) == ["", "critical", "jobs"]
@@ -251,7 +258,10 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     admin_scope = Scope.for_user(admin, ["instance_admin"])
 
     worker_groups = [
-      %{key: :token_refresh, workers: [worker_name(TokenRefreshWorker)]},
+      %{
+        key: :token_refresh,
+        workers: [worker_name(TokenRefreshWorker), worker_name(TokenRefreshEnqueueWorker)]
+      },
       %{key: :runtime_cleanup, workers: [worker_name(RuntimeStateCleanupWorker)]}
     ]
 

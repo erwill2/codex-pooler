@@ -326,7 +326,7 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
             Schedule
           </dt>
           <dd
-            :if={@card.cadence_label == @card.next_run}
+            :if={@card.on_demand}
             data-role="cadence-label"
             class="truncate text-base-content/60"
             title={@card.cadence_label}
@@ -334,7 +334,7 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
             On demand
           </dd>
           <dd
-            :if={@card.cadence_label != @card.next_run}
+            :if={!@card.on_demand}
             data-role="cadence-label"
             class="truncate text-base-content/60"
             title={@card.cadence_label}

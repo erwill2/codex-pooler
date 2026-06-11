@@ -19,6 +19,7 @@ defmodule CodexPooler.JobsTest do
     DailyRollupRebuildWorker,
     PricingImportWorker,
     RuntimeStateCleanupWorker,
+    TokenRefreshEnqueueWorker,
     TokenRefreshWorker
   }
 
@@ -47,6 +48,7 @@ defmodule CodexPooler.JobsTest do
                {"0 * * * *", PricingImportWorker},
                {"* * * * *", AccountReconciliationEnqueueWorker},
                {"*/5 * * * *", AlertEvaluationEnqueueWorker},
+               {"*/15 * * * *", TokenRefreshEnqueueWorker},
                {"17 0 * * *", DailyRollupRebuildEnqueueWorker},
                {"*/15 * * * *", RuntimeStateCleanupWorker}
              ]
@@ -59,9 +61,15 @@ defmodule CodexPooler.JobsTest do
              }
 
       assert Enum.find(worker_groups, &(&1.key == :token_refresh)).cadence == %{
-               label: "On demand",
-               cron: nil
+               label: "Every 15 min",
+               cron: "*/15 * * * *"
              }
+
+      assert Enum.find(worker_groups, &(&1.key == :token_refresh)).workers ==
+               [
+                 "CodexPooler.Jobs.TokenRefreshWorker",
+                 "CodexPooler.Jobs.TokenRefreshEnqueueWorker"
+               ]
 
       assert Enum.find(worker_groups, &(&1.key == :pricing_import)).cadence == %{
                label: "Hourly",
@@ -113,6 +121,8 @@ defmodule CodexPooler.JobsTest do
              }) == 8
 
       assert TokenRefreshWorker.timeout(%Oban.Job{}) == :timer.seconds(45)
+      assert worker_max_attempts(TokenRefreshEnqueueWorker, %{}) == 1
+      assert TokenRefreshEnqueueWorker.timeout(%Oban.Job{}) == :timer.seconds(30)
 
       assert worker_max_attempts(RuntimeStateCleanupWorker, %{}) == 3
       assert RuntimeStateCleanupWorker.timeout(%Oban.Job{}) == :timer.minutes(5)
@@ -264,6 +274,59 @@ defmodule CodexPooler.JobsTest do
     test "rejects malformed token refresh refs with tagged errors" do
       assert {:error, :upstream_identity_id_required} = Jobs.enqueue_token_refresh(%{})
       assert {:error, :upstream_identity_id_required} = Jobs.enqueue_token_refresh(nil)
+      assert [] = all_enqueued(worker: TokenRefreshWorker)
+    end
+
+    test "scheduled enqueue worker succeeds without candidates" do
+      assert :ok = perform_job(TokenRefreshEnqueueWorker, %{})
+      assert [] = all_enqueued(worker: TokenRefreshWorker)
+    end
+
+    test "scheduled enqueue worker succeeds when every target job conflicts" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, identity} =
+               IdentityLifecycle.update_upstream_identity(identity, %{status: "refresh_due"})
+
+      assert {:ok, first_job} = Jobs.enqueue_token_refresh(identity, trigger_kind: "manual")
+
+      assert :ok = perform_job(TokenRefreshEnqueueWorker, %{})
+
+      assert [job] = all_enqueued(worker: TokenRefreshWorker)
+      assert job.id == first_job.id
+      assert job.args["trigger_kind"] == "manual"
+    end
+
+    test "scheduled enqueue worker returns a sanitized error count when target inserts fail" do
+      sensitive_error = "raw-provider-payload-do-not-render"
+
+      original_config = Application.get_env(:codex_pooler, TokenRefreshEnqueueWorker)
+
+      on_exit(fn ->
+        case original_config do
+          nil -> Application.delete_env(:codex_pooler, TokenRefreshEnqueueWorker)
+          config -> Application.put_env(:codex_pooler, TokenRefreshEnqueueWorker, config)
+        end
+      end)
+
+      Application.put_env(:codex_pooler, TokenRefreshEnqueueWorker,
+        enqueue_fun: fn opts ->
+          assert Keyword.fetch!(opts, :trigger_kind) == "scheduled"
+
+          {:ok,
+           %{
+             inserted: [],
+             conflicts: [],
+             errors: [sensitive_error, %{refresh_token: sensitive_error}]
+           }}
+        end
+      )
+
+      result = perform_job(TokenRefreshEnqueueWorker, %{})
+
+      assert {:error, {:enqueue_failed, 2}} = result
+      refute inspect(result) =~ sensitive_error
       assert [] = all_enqueued(worker: TokenRefreshWorker)
     end
   end

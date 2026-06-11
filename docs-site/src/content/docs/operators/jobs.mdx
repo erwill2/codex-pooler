@@ -83,8 +83,8 @@ The current worker groups are:
     </tr>
     <tr>
       <td>Token refresh</td>
-      <td>Refreshes access-token material for a specific upstream identity.</td>
-      <td>On demand only. This card does not expose `Enqueue Now` because the job requires a target.</td>
+      <td>Runs scheduled recovery for recoverable upstream identities and keeps manual refresh target-specific.</td>
+      <td>Every 15 minutes for `refresh_due` identities and cooled-down `refresh_failed` identities. The card does not expose `Enqueue Now` because manual refresh still requires a target upstream identity.</td>
     </tr>
     <tr>
       <td>Daily rollup rebuild</td>

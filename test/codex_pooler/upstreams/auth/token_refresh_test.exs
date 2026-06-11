@@ -707,6 +707,56 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefreshTest do
       assert Repo.get!(UpstreamIdentity, identity.id).status == "reauth_required"
     end
 
+    test "worker success does not enqueue another token refresh job" do
+      refresh_token = secret("refresh", "no-self-enqueue")
+      new_access_token = secret("access", "no-self-enqueue")
+
+      upstream =
+        start_path_upstream(%{
+          "/oauth/token" => {200, %{"access_token" => new_access_token}}
+        })
+
+      identity =
+        refreshable_identity_fixture("refresh_due", %{"base_url" => FakeUpstream.url(upstream)})
+
+      active_assignment_for_identity!(identity)
+      store_secret!(identity, "refresh_token", refresh_token)
+
+      before_count = Repo.aggregate(Oban.Job, :count)
+      assert {:ok, job} = Jobs.enqueue_token_refresh(identity, trigger_kind: "manual")
+      assert Repo.aggregate(Oban.Job, :count) == before_count + 1
+
+      assert :ok = perform_job(TokenRefreshWorker, job.args)
+
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "active"
+      assert Repo.aggregate(Oban.Job, :count) == before_count + 1
+
+      assert [persisted_job] =
+               Repo.all(
+                 from oban_job in Oban.Job,
+                   where:
+                     oban_job.worker == ^worker_name(TokenRefreshWorker) and
+                       fragment("?->>?", oban_job.args, "upstream_identity_id") == ^identity.id
+               )
+
+      assert persisted_job.id == job.id
+      refute inspect(Repo.all(Oban.Job)) =~ refresh_token
+      refute inspect(Repo.all(Oban.Job)) =~ new_access_token
+    end
+
+    test "reauth-required identities from missing refresh tokens are not scheduled again" do
+      identity = refreshable_identity_fixture("refresh_due")
+      active_assignment_for_identity!(identity)
+
+      assert :discard = perform_job(TokenRefreshWorker, %{"upstream_identity_id" => identity.id})
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "reauth_required"
+
+      assert {:ok, %{inserted: [], conflicts: [], errors: []}} =
+               Jobs.enqueue_scheduled_token_refreshes(now: DateTime.utc_now())
+
+      assert [] = all_enqueued(worker: TokenRefreshWorker)
+    end
+
     test "worker snoozes when another non-stale refresh attempt is already in progress" do
       upstream =
         start_path_upstream(%{
@@ -832,6 +882,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefreshTest do
     assert {:ok, _secret} =
              Upstreams.store_encrypted_secret(identity, %{secret_kind: kind, plaintext: plaintext})
   end
+
+  defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
 
   defp start_path_upstream(routes) do
     {:ok, upstream} = FakeUpstream.start_link({:path_json, routes})

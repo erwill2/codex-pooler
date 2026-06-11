@@ -127,6 +127,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
       next_run: next_run.label,
       next_run_title: next_run.title,
       cadence_label: next_run.cadence_label,
+      on_demand: !is_binary(group.cadence.cron),
       attempts: if(latest_job, do: format_attempts(latest_job), else: "0/-"),
       active_markers: active_markers,
       failure_markers: failure_markers,

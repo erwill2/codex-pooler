@@ -18,6 +18,7 @@ defmodule CodexPooler.Jobs do
     ReadModel,
     RuntimeStateCleanup,
     RuntimeStateCleanupWorker,
+    TokenRefreshRecovery,
     UpstreamEnqueue
   }
 
@@ -177,6 +178,17 @@ defmodule CodexPooler.Jobs do
   @spec enqueue_token_refresh(identity_ref(), keyword()) :: job_insert_result()
   def enqueue_token_refresh(identity_or_id, opts \\ []) do
     UpstreamEnqueue.enqueue_token_refresh(identity_or_id, opts)
+  end
+
+  @spec enqueue_scheduled_token_refreshes(keyword()) :: batch_insert_result()
+  def enqueue_scheduled_token_refreshes(opts \\ []) do
+    opts = Keyword.put(opts, :trigger_kind, scheduled_token_refresh_trigger_kind(opts))
+
+    opts
+    |> TokenRefreshRecovery.list_candidates()
+    |> Enum.map(&UpstreamEnqueue.enqueue_token_refresh(&1, opts))
+    |> Enum.reverse()
+    |> split_insert_results()
   end
 
   @spec list_recent_token_refresh_jobs(identity_ref(), keyword()) :: [job_summary()]
@@ -371,6 +383,13 @@ defmodule CodexPooler.Jobs do
     case Keyword.get(opts, :trigger_kind, "manual") do
       value when is_binary(value) -> value
       _value -> "manual"
+    end
+  end
+
+  defp scheduled_token_refresh_trigger_kind(opts) do
+    case Keyword.get(opts, :trigger_kind, "scheduled") do
+      value when is_binary(value) -> value
+      _value -> "scheduled"
     end
   end
 
