@@ -33,6 +33,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:upstream_identity_id) => Ecto.UUID.t(),
           required(:pool_id) => Ecto.UUID.t(),
           required(:assignment_label) => String.t(),
+          optional(:stored_assignment_label) => String.t() | nil,
           required(:status) => String.t(),
           required(:health_status) => String.t(),
           required(:eligibility_status) => String.t(),
@@ -208,8 +209,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     ]
   end
 
-  defp assignment_search_terms(assignments) do
-    Enum.flat_map(assignments, &[&1.assignment_label, &1.pool_label])
+  defp assignment_search_terms(assignments) when is_list(assignments) do
+    Enum.flat_map(assignments, &assignment_search_terms/1)
+  end
+
+  defp assignment_search_terms(assignment) do
+    [
+      assignment.assignment_label,
+      Map.get(assignment, :stored_assignment_label),
+      assignment.pool_label
+    ]
   end
 
   defp active_assignment_snapshots(pools, pool_lookup) do
@@ -228,6 +237,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       upstream_identity_id: assignment.upstream_identity_id,
       pool_id: assignment.pool_id,
       assignment_label: assignment.assignment_label || "Pool assignment",
+      stored_assignment_label: present_string(assignment.assignment_label),
       status: assignment.status,
       health_status: assignment.health_status,
       eligibility_status: assignment.eligibility_status,
@@ -249,16 +259,22 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   defp quota_priming_label(%PoolUpstreamAssignment{} = assignment) do
     status = quota_priming_status(assignment)
 
+    quota_priming_label(status)
+  end
+
+  defp quota_priming_label(status) when is_binary(status) do
     Map.get(@quota_priming_labels, status, String.replace(status, "_", " "))
   end
 
   defp account_snapshot(identity, assignments, token_burns, datetime_preferences) do
     quota_windows = QuotaWindows.list_quota_windows(identity)
+    quota_readiness = quota_readiness(quota_windows)
+    identity_assignments = identity_assignments(identity, assignments, quota_readiness)
     refresh_job = identity |> Jobs.list_recent_token_refresh_jobs(limit: 1) |> List.first()
 
     %{
       identity: identity,
-      label: identity.account_label || identity.chatgpt_account_id || "Upstream account",
+      label: account_label(identity),
       workspace_ref: workspace_ref(identity.workspace_id),
       workspace_label: safe_workspace_label(identity.workspace_label),
       plan_label: account_plan_label(identity),
@@ -277,10 +293,61 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       reauth_reason_code: reauth_reason_code(identity),
       reauth_reason_message: reauth_reason_message(identity),
       token_burn: Map.fetch!(token_burns, identity.id),
-      assignments: Map.get(assignments, identity.id, []),
-      quota_readiness: quota_readiness(quota_windows),
+      assignments: identity_assignments,
+      quota_readiness: quota_readiness,
       quota_limits: quota_limit_rows(quota_windows, datetime_preferences)
     }
+  end
+
+  defp identity_assignments(identity, assignments, quota_readiness) do
+    assignments
+    |> Map.get(identity.id, [])
+    |> Enum.map(&identity_assignment(&1, identity, quota_readiness))
+  end
+
+  defp identity_assignment(assignment, identity, quota_readiness) do
+    assignment
+    |> Map.put(:assignment_label, assignment_display_label(identity, assignment))
+    |> maybe_put_current_quota_priming(quota_readiness)
+  end
+
+  defp assignment_display_label(identity, assignment) do
+    current_label = account_label(identity)
+
+    stored_label =
+      present_string(Map.get(assignment, :stored_assignment_label)) ||
+        present_string(Map.get(assignment, :assignment_label))
+
+    cond do
+      is_nil(stored_label) -> current_label
+      stale_account_identifier_label?(stored_label, current_label) -> current_label
+      true -> stored_label
+    end
+  end
+
+  defp stale_account_identifier_label?(stored_label, current_label) do
+    stored_label != current_label and account_identifier_label?(stored_label)
+  end
+
+  defp account_identifier_label?(label) do
+    String.match?(label, ~r/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/) or
+      String.starts_with?(label, ["acct_", "acct-"])
+  end
+
+  defp maybe_put_current_quota_priming(assignment, %{state: "ready"}) do
+    put_quota_priming(assignment, "known")
+  end
+
+  defp maybe_put_current_quota_priming(assignment, %{state: "weekly_only_probe"}) do
+    put_quota_priming(assignment, "weekly_only_probe")
+  end
+
+  defp maybe_put_current_quota_priming(assignment, _quota_readiness), do: assignment
+
+  defp put_quota_priming(assignment, status) do
+    assignment
+    |> Map.put(:quota_priming_status, status)
+    |> Map.put(:quota_priming_label, quota_priming_label(status))
   end
 
   defp token_burn_summaries([]), do: %{}
@@ -683,6 +750,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   end
 
   defp workspace_ref(_workspace_id), do: "legacy"
+
+  defp account_label(identity) do
+    present_string(identity.account_label) ||
+      present_string(identity.chatgpt_account_id) ||
+      "Upstream account"
+  end
 
   defp account_plan_label(%{plan_label: label}) when is_binary(label) and label != "", do: label
 

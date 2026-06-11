@@ -916,6 +916,77 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     refute has_element?(view, "#{card} [data-role='failed-worker-marker']")
   end
 
+  test "identity-resolved account reconciliation failures do not render selected failure panels",
+       %{
+         conn: conn
+       } do
+    pool =
+      pool_fixture(%{
+        name: "Identity Selected Recovered Pool",
+        slug: "identity-selected-recovered-pool"
+      })
+
+    recovery_pool =
+      pool_fixture(%{
+        name: "Identity Selected Recovery Pool",
+        slug: "identity-selected-recovery-pool"
+      })
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "identity-recovered@example.com",
+        assignment_label: "Identity recovered account"
+      })
+
+    failing_job =
+      insert_job(
+        1,
+        worker: AccountReconciliationWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 1,
+        inserted_at: ~U[2026-05-04 10:00:00Z],
+        discarded_at: ~U[2026-05-04 10:00:30Z],
+        args: %{
+          "pool_id" => pool.id,
+          "pool_upstream_assignment_id" => assignment.id,
+          "trigger_kind" => "scheduled"
+        },
+        errors: [
+          %{
+            "attempt" => 1,
+            "error" =>
+              "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+          }
+        ]
+      )
+
+    insert_job(
+      2,
+      worker: AccountReconciliationWorker,
+      state: "completed",
+      attempt: 1,
+      max_attempts: 1,
+      inserted_at: ~U[2026-05-04 10:01:00Z],
+      completed_at: ~U[2026-05-04 10:01:30Z],
+      args: %{
+        "pool_id" => recovery_pool.id,
+        "upstream_identity_id" => identity.id,
+        "target_kind" => "upstream_identity",
+        "trigger_kind" => "scheduled"
+      }
+    )
+
+    assert {:error, {:live_redirect, %{to: "/admin/jobs?show_completed=true"}}} =
+             live(conn, ~p"/admin/jobs?failure_job_id=#{failing_job.id}&show_completed=true")
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs?show_completed=true")
+
+    card = worker_card_selector(:account_reconciliation)
+    refute has_element?(view, "#{card} [data-role='worker-failure-panel']")
+    refute has_element?(view, "#{card} [data-role='failed-worker-marker']")
+  end
+
   test "map-shaped oban errors use operator-facing copy", %{conn: conn} do
     insert_job(
       1,

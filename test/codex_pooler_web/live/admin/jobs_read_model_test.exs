@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
   alias CodexPooler.Jobs
 
   alias CodexPooler.Jobs.{
+    AccountReconciliationWorker,
     RuntimeStateCleanupWorker,
     TokenRefreshEnqueueWorker,
     TokenRefreshWorker
@@ -14,6 +15,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
   alias CodexPoolerWeb.Admin.JobsReadModel
 
   import CodexPooler.AccountsFixtures
+  import CodexPooler.PoolerFixtures
 
   setup do
     Repo.delete_all(Oban.Job)
@@ -180,6 +182,211 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     assert projection.overview.buckets.active_failure.count == 1
     assert Enum.map(projection.explorer.items, & &1.id) == [unresolved_failure.id]
     refute Enum.any?(projection.explorer.items, &(&1.id == resolved_failure.id))
+  end
+
+  test "default projection resolves account reconciliation failures by upstream identity" do
+    pool = pool_fixture(%{name: "Identity Reconcile Pool", slug: "identity-reconcile-pool"})
+
+    recovery_pool =
+      pool_fixture(%{name: "Identity Recovery Pool", slug: "identity-recovery-pool"})
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Resolved identity account",
+        assignment_label: "Resolved identity assignment"
+      })
+
+    insert_job(1,
+      worker: AccountReconciliationWorker,
+      state: "discarded",
+      attempt: 1,
+      max_attempts: 1,
+      inserted_at: ~U[2026-06-02 10:00:00Z],
+      discarded_at: ~U[2026-06-02 10:01:00Z],
+      args: %{
+        "pool_id" => pool.id,
+        "pool_upstream_assignment_id" => assignment.id,
+        "trigger_kind" => "scheduled"
+      },
+      errors: [
+        %{
+          "attempt" => 1,
+          "error" =>
+            "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+        }
+      ]
+    )
+
+    insert_job(2,
+      worker: AccountReconciliationWorker,
+      state: "discarded",
+      attempt: 1,
+      max_attempts: 1,
+      inserted_at: ~U[2026-06-02 10:02:00Z],
+      discarded_at: ~U[2026-06-02 10:03:00Z],
+      args: %{
+        "pool_id" => pool.id,
+        "pool_upstream_assignment_id" => assignment.id,
+        "trigger_kind" => "scheduled"
+      },
+      errors: [
+        %{
+          "attempt" => 1,
+          "error" =>
+            "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, %{code: :pool_account_not_reconcilable, message: \"active pool assignment was not found for reconciliation\"}}"
+        }
+      ]
+    )
+
+    insert_job(3,
+      worker: AccountReconciliationWorker,
+      state: "completed",
+      attempt: 1,
+      max_attempts: 1,
+      inserted_at: ~U[2026-06-02 10:05:00Z],
+      completed_at: ~U[2026-06-02 10:06:00Z],
+      args: %{
+        "pool_id" => recovery_pool.id,
+        "upstream_identity_id" => identity.id,
+        "target_kind" => "upstream_identity",
+        "trigger_kind" => "scheduled"
+      }
+    )
+
+    unresolved_pool =
+      pool_fixture(%{name: "Unresolved Identity Pool", slug: "unresolved-identity-pool"})
+
+    unresolved_recovery_pool =
+      pool_fixture(%{
+        name: "Unresolved Recovery Pool",
+        slug: "unresolved-recovery-pool"
+      })
+
+    %{identity: unresolved_identity, assignment: unresolved_assignment} =
+      upstream_assignment_fixture(unresolved_pool, %{
+        account_label: "Unresolved identity account",
+        assignment_label: "Unresolved identity assignment"
+      })
+
+    unresolved_failure =
+      insert_job(4,
+        worker: AccountReconciliationWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 1,
+        inserted_at: ~U[2026-06-02 10:07:00Z],
+        discarded_at: ~U[2026-06-02 10:08:00Z],
+        args: %{
+          "pool_id" => unresolved_pool.id,
+          "pool_upstream_assignment_id" => unresolved_assignment.id,
+          "trigger_kind" => "scheduled"
+        },
+        errors: [
+          %{
+            "attempt" => 1,
+            "error" =>
+              "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: catalog_sync_failed\"}"
+          }
+        ]
+      )
+
+    insert_job(5,
+      worker: AccountReconciliationWorker,
+      state: "completed",
+      attempt: 1,
+      max_attempts: 1,
+      inserted_at: ~U[2026-06-02 10:10:00Z],
+      completed_at: ~U[2026-06-02 10:11:00Z],
+      args: %{
+        "pool_id" => unresolved_recovery_pool.id,
+        "upstream_identity_id" => unresolved_identity.id,
+        "target_kind" => "upstream_identity",
+        "trigger_kind" => "scheduled"
+      }
+    )
+
+    projection =
+      JobsReadModel.load(:system,
+        params: %{},
+        now: ~U[2026-06-02 10:30:00Z]
+      )
+
+    assert projection.overview.actionable_count == 1
+    assert Enum.map(projection.explorer.items, & &1.id) == [unresolved_failure.id]
+
+    assert Enum.map(
+             projection.worker_jobs_by_group.account_reconciliation.unresolved_failures,
+             & &1.id
+           ) == [unresolved_failure.id]
+  end
+
+  test "default projection excludes stale reauth-required account reconciliation failures" do
+    pool = pool_fixture(%{name: "Reauth Pool", slug: "reauth-pool"})
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Stale reauth account",
+        assignment_label: "Stale reauth assignment",
+        identity_status: "reauth_required"
+      })
+
+    stale_failure =
+      insert_job(1,
+        worker: AccountReconciliationWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 1,
+        inserted_at: ~U[2026-06-02 10:00:00Z],
+        discarded_at: ~U[2026-06-02 10:01:00Z],
+        args: %{
+          "pool_id" => pool.id,
+          "pool_upstream_assignment_id" => assignment.id,
+          "trigger_kind" => "scheduled"
+        },
+        errors: [
+          %{
+            "attempt" => 1,
+            "error" =>
+              "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+          }
+        ]
+      )
+
+    identity_scoped_failure =
+      insert_job(2,
+        worker: AccountReconciliationWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 1,
+        inserted_at: ~U[2026-06-02 10:02:00Z],
+        discarded_at: ~U[2026-06-02 10:03:00Z],
+        args: %{
+          "pool_id" => pool.id,
+          "upstream_identity_id" => identity.id,
+          "target_kind" => "upstream_identity",
+          "trigger_kind" => "scheduled"
+        },
+        errors: [
+          %{
+            "attempt" => 1,
+            "error" =>
+              "** (Oban.PerformError) CodexPooler.Jobs.AccountReconciliationWorker failed with {:error, \"account reconciliation partial: quota_refresh_auth_unavailable\"}"
+          }
+        ]
+      )
+
+    projection =
+      JobsReadModel.load(:system,
+        params: %{},
+        now: ~U[2026-06-02 10:30:00Z]
+      )
+
+    assert projection.overview.actionable_count == 0
+    assert projection.overview.status == :empty
+    assert projection.explorer.items == []
+    assert projection.worker_jobs_by_group.account_reconciliation.latest_failure == nil
+    refute projected_job_id?(projection, stale_failure.id)
+    refute projected_job_id?(projection, identity_scoped_failure.id)
   end
 
   test "keeps invalid URL filter warnings while applying safe defaults" do

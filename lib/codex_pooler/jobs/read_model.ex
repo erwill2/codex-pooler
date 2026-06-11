@@ -21,6 +21,7 @@ defmodule CodexPooler.Jobs.ReadModel do
   @admin_jobs_max_limit 50
   @explorer_page_size 20
   @completed_state "completed"
+  @identity_recovered_reconciliation_error_pattern "quota_refresh_auth_unavailable|pool_account_not_reconcilable"
   @overview_action_buckets [:active_failure, :retry_pressure, :stuck_executing, :backlog_pressure]
   @sensitive_projection_keys [:args, :meta, :errors, "args", "meta", "errors"]
 
@@ -419,24 +420,31 @@ defmodule CodexPooler.Jobs.ReadModel do
   defp ranked_latest_worker_jobs_query(group_worker_rows, opts) do
     group_worker_types = %{group_index: :integer, worker: :string}
 
-    ranked_query =
+    query =
       from job in Oban.Job,
         join: group_worker in values(group_worker_rows, group_worker_types),
-        on: job.worker == group_worker.worker,
-        windows: [
-          group_partition: [
-            partition_by: group_worker.group_index,
-            order_by: [desc: job.inserted_at, desc: job.id]
-          ]
-        ],
-        select: %{
-          id: job.id,
-          group_index: group_worker.group_index,
-          row_number: over(row_number(), :group_partition)
-        }
+        on: job.worker == group_worker.worker
+
+    ranked_query =
+      query
+      |> maybe_where_states(opts)
+      |> exclude_terminal_reauth_reconciliation_failures()
+      |> then(fn queryable ->
+        from [job, group_worker_row] in queryable,
+          windows: [
+            group_partition: [
+              partition_by: group_worker_row.group_index,
+              order_by: [desc: job.inserted_at, desc: job.id]
+            ]
+          ],
+          select: %{
+            id: job.id,
+            group_index: group_worker_row.group_index,
+            row_number: over(row_number(), :group_partition)
+          }
+      end)
 
     ranked_query
-    |> maybe_where_states(opts)
     |> subquery()
     |> then(fn ranked ->
       from ranked_job in ranked,
@@ -622,40 +630,19 @@ defmodule CodexPooler.Jobs.ReadModel do
   defp grouped_unresolved_failure_worker_jobs_query(group_worker_rows) do
     group_worker_types = %{group_index: :integer, worker: :string}
 
-    from job in Oban.Job,
-      join: group_worker in values(group_worker_rows, group_worker_types),
-      on: job.worker == group_worker.worker,
-      where: job.state in ^failure_states(),
-      where:
-        fragment(
-          """
-          NOT EXISTS (
-            SELECT 1
-            FROM oban_jobs resolved
-            WHERE resolved.worker = ?
-              AND resolved.state = 'completed'
-              AND (
-                resolved.inserted_at > ?
-                OR (resolved.inserted_at = ? AND resolved.id > ?)
-              )
-              AND COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
-              AND COALESCE(resolved.args->>'pool_upstream_assignment_id', '') = COALESCE(?->>'pool_upstream_assignment_id', '')
-              AND COALESCE(resolved.args->>'upstream_identity_id', '') = COALESCE(?->>'upstream_identity_id', '')
-              AND COALESCE(resolved.args->>'api_key_id', '') = COALESCE(?->>'api_key_id', '')
-              AND COALESCE(resolved.args->>'rollup_date', '') = COALESCE(?->>'rollup_date', '')
-          )
-          """,
-          job.worker,
-          job.inserted_at,
-          job.inserted_at,
-          job.id,
-          job.args,
-          job.args,
-          job.args,
-          job.args,
-          job.args
-        ),
-      select: %{id: job.id, group_index: group_worker.group_index}
+    query =
+      from job in Oban.Job,
+        join: group_worker in values(group_worker_rows, group_worker_types),
+        on: job.worker == group_worker.worker,
+        where: job.state in ^failure_states()
+
+    query
+    |> exclude_terminal_reauth_reconciliation_failures()
+    |> exclude_resolved_failure_matches()
+    |> then(fn queryable ->
+      from [job, group_worker_row] in queryable,
+        select: %{id: job.id, group_index: group_worker_row.group_index}
+    end)
   end
 
   defp reject_reauth_required_grouped_reconciliation_failures(grouped_jobs) do
@@ -935,37 +922,167 @@ defmodule CodexPooler.Jobs.ReadModel do
     |> exclude_resolved_failure_jobs_query()
   end
 
-  defp exclude_resolved_failure_jobs_query(queryable) do
-    from job in queryable,
-      where:
-        job.state not in ^failure_states() or
-          fragment(
-            """
-            NOT EXISTS (
-              SELECT 1
-              FROM oban_jobs resolved
-              WHERE resolved.worker = ?
-                AND resolved.state = 'completed'
-                AND (
-                  resolved.inserted_at > ?
-                  OR (resolved.inserted_at = ? AND resolved.id > ?)
-                )
-                AND COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
+  defmacrop later_resolved_failure_absent?(
+              job,
+              account_reconciliation_worker,
+              identity_recovered_reconciliation_error_pattern
+            ) do
+    quote do
+      fragment(
+        """
+        NOT EXISTS (
+          SELECT 1
+          FROM oban_jobs resolved
+          LEFT JOIN pool_upstream_assignments resolved_assignment
+            ON resolved_assignment.id::text =
+              resolved.args->>'pool_upstream_assignment_id'
+          LEFT JOIN pool_upstream_assignments failed_assignment
+            ON failed_assignment.id::text =
+              ?->>'pool_upstream_assignment_id'
+          WHERE resolved.worker = ?
+            AND resolved.state = 'completed'
+            AND (
+              resolved.inserted_at > ?
+              OR (resolved.inserted_at = ? AND resolved.id > ?)
+            )
+            AND (
+              (
+                COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
                 AND COALESCE(resolved.args->>'pool_upstream_assignment_id', '') = COALESCE(?->>'pool_upstream_assignment_id', '')
                 AND COALESCE(resolved.args->>'upstream_identity_id', '') = COALESCE(?->>'upstream_identity_id', '')
                 AND COALESCE(resolved.args->>'api_key_id', '') = COALESCE(?->>'api_key_id', '')
                 AND COALESCE(resolved.args->>'rollup_date', '') = COALESCE(?->>'rollup_date', '')
+              )
+              OR (
+                ? = ?
+                AND COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
+                AND COALESCE(
+                  resolved.args->>'upstream_identity_id',
+                  resolved_assignment.upstream_identity_id::text
+                ) = COALESCE(
+                  ?->>'upstream_identity_id',
+                  failed_assignment.upstream_identity_id::text
+                )
+                AND COALESCE(
+                  ?->>'upstream_identity_id',
+                  failed_assignment.upstream_identity_id::text
+                ) IS NOT NULL
+              )
+              OR (
+                ? = ?
+                AND ?::text ~ ?
+                AND COALESCE(
+                  resolved.args->>'upstream_identity_id',
+                  resolved_assignment.upstream_identity_id::text
+                ) = COALESCE(
+                  ?->>'upstream_identity_id',
+                  failed_assignment.upstream_identity_id::text
+                )
+                AND COALESCE(
+                  ?->>'upstream_identity_id',
+                  failed_assignment.upstream_identity_id::text
+                ) IS NOT NULL
+              )
+            )
+        )
+        """,
+        unquote(job).args,
+        unquote(job).worker,
+        unquote(job).inserted_at,
+        unquote(job).inserted_at,
+        unquote(job).id,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).worker,
+        unquote(account_reconciliation_worker),
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).worker,
+        unquote(account_reconciliation_worker),
+        unquote(job).errors,
+        unquote(identity_recovered_reconciliation_error_pattern),
+        unquote(job).args,
+        unquote(job).args
+      )
+    end
+  end
+
+  defp exclude_resolved_failure_jobs_query(queryable) do
+    account_reconciliation_worker = worker_name(AccountReconciliationWorker)
+
+    identity_recovered_reconciliation_error_pattern =
+      @identity_recovered_reconciliation_error_pattern
+
+    queryable
+    |> exclude_terminal_reauth_reconciliation_failures()
+    |> then(fn queryable ->
+      from job in queryable,
+        where:
+          job.state not in ^failure_states() or
+            later_resolved_failure_absent?(
+              job,
+              ^account_reconciliation_worker,
+              ^identity_recovered_reconciliation_error_pattern
+            )
+    end)
+  end
+
+  defp exclude_resolved_failure_matches(queryable) do
+    account_reconciliation_worker = worker_name(AccountReconciliationWorker)
+
+    identity_recovered_reconciliation_error_pattern =
+      @identity_recovered_reconciliation_error_pattern
+
+    from job in queryable,
+      where:
+        later_resolved_failure_absent?(
+          job,
+          ^account_reconciliation_worker,
+          ^identity_recovered_reconciliation_error_pattern
+        )
+  end
+
+  defp exclude_terminal_reauth_reconciliation_failures(queryable) do
+    account_reconciliation_worker = worker_name(AccountReconciliationWorker)
+    failure_states = failure_states()
+    assignment_reauth_required = PoolUpstreamAssignment.reauth_required_status()
+    identity_reauth_required = UpstreamIdentity.reauth_required_status()
+
+    from job in queryable,
+      where:
+        job.state not in ^failure_states or job.worker != ^account_reconciliation_worker or
+          not fragment(
+            """
+            EXISTS (
+              SELECT 1
+              FROM pool_upstream_assignments account_reconciliation_assignment
+              LEFT JOIN upstream_identities account_reconciliation_assignment_identity
+                ON account_reconciliation_assignment_identity.id =
+                  account_reconciliation_assignment.upstream_identity_id
+              WHERE account_reconciliation_assignment.id::text =
+                ?->>'pool_upstream_assignment_id'
+                AND (
+                  account_reconciliation_assignment.status = ?
+                  OR account_reconciliation_assignment_identity.status = ?
+                )
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM upstream_identities account_reconciliation_direct_identity
+              WHERE account_reconciliation_direct_identity.id::text =
+                ?->>'upstream_identity_id'
+                AND account_reconciliation_direct_identity.status = ?
             )
             """,
-            job.worker,
-            job.inserted_at,
-            job.inserted_at,
-            job.id,
             job.args,
+            ^assignment_reauth_required,
+            ^identity_reauth_required,
             job.args,
-            job.args,
-            job.args,
-            job.args
+            ^identity_reauth_required
           )
   end
 

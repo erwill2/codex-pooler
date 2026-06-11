@@ -43,6 +43,72 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, "#upstream-refresh-data")
   end
 
+  test "cockpit uses current identity label and quota readiness for shared assignments", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, source_pool} =
+      Pools.create_pool(scope, %{slug: "shared-stale-source", name: "Shared Stale Source"})
+
+    {:ok, target_pool} =
+      Pools.create_pool(scope, %{slug: "shared-stale-target", name: "Shared Stale Target"})
+
+    %{identity: identity, assignment: stale_assignment} =
+      upstream_assignment_fixture(source_pool, %{
+        account_label: "Current Shared Codex",
+        assignment_label: "old-shared-label@example.com",
+        assignment_metadata: %{
+          "quota_priming" => %{
+            "status" => "failed",
+            "reason" => %{
+              "code" => "quota_refresh_auth_unavailable",
+              "message" => "old local failure"
+            }
+          }
+        }
+      })
+
+    assert {:ok, fresh_assignment} =
+             PoolAssignments.create_pool_assignment(target_pool, identity, %{
+               assignment_label: "another-old-shared-label@example.com",
+               metadata: %{"quota_priming" => %{"status" => "known"}}
+             })
+
+    upsert_quota_window!(identity, %{
+      window_kind: "primary",
+      window_minutes: 300,
+      active_limit: 100,
+      credits: 75,
+      used_percent: Decimal.new("25"),
+      reset_at: DateTime.add(DateTime.utc_now(), 4, :hour)
+    })
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+    assignments_by_id = Map.new(cockpit.assignments.items, &{&1.id, &1})
+
+    assert Map.fetch!(assignments_by_id, stale_assignment.id).assignment_label ==
+             "Current Shared Codex"
+
+    assert Map.fetch!(assignments_by_id, stale_assignment.id).quota_priming_status == "known"
+    assert Map.fetch!(assignments_by_id, stale_assignment.id).quota_priming_label == "Quota known"
+
+    assert Map.fetch!(assignments_by_id, fresh_assignment.id).assignment_label ==
+             "Current Shared Codex"
+
+    assert cockpit.charts.quota_health.kpis.assignment_count == 2
+    assert cockpit.charts.quota_health.kpis.routing_usable_count == 2
+
+    {:ok, view, html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    stale_selector = "#upstream-assignment-#{stale_assignment.id}"
+
+    assert has_element?(view, stale_selector, "Current Shared Codex")
+    assert has_element?(view, stale_selector, "Quota known")
+    assert has_element?(view, stale_selector, "Quota fresh")
+
+    refute html =~ "old-shared-label@example.com"
+    refute html =~ "another-old-shared-label@example.com"
+  end
+
   @tag :route_navigation
   test "upstream index links to cockpit with the upstream identity id", %{
     conn: conn,
