@@ -110,13 +110,13 @@ The submit button stays disabled until the form is valid. When SMTP is not confi
 
 After a valid invite is created, the result dialog shows the one-time invite URL. Copy it immediately. That URL is not shown again in the invite table or audit history.
 
-## OpenAI Device Code Prerequisite
+## OpenAI Device-Code Setup
 
-Hosted invite onboarding uses OpenAI's Codex device-code authorization. Before opening the invite URL, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions. Browser OAuth linking from `/admin/upstreams` is a separate operator-managed path and does not depend on this device-code setting.
+Hosted invite onboarding uses OpenAI's Codex device-code authorization. This setup is only needed for invite onboarding and the OAuth device-code fallback; browser OAuth linking from `/admin/upstreams` does not depend on it. Before opening the invite URL, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions.
 
 ![ChatGPT Security setting for Codex device-code authorization](/operators/invites/openai-device-code-setting.png)
 
-OpenAI's [Codex authentication docs](https://developers.openai.com/codex/auth) describe this prerequisite. If device-code authorization is off, the Codex Pooler invite can still be active, but OpenAI can block the approval step and the upstream will not become ready.
+OpenAI's [Codex authentication docs](https://developers.openai.com/codex/auth) describe device-code login. If device-code authorization is off, the Codex Pooler invite can still be active, but OpenAI can block the approval step and the upstream will not become ready.
 
 ## Invite States
 

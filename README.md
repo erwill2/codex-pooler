@@ -829,14 +829,14 @@ automation unless you accept that provider refresh-token rotation can invalidate
 one copy and move the account to `reauth_required`.
 
 Hosted invite onboarding and the OAuth device-code fallback use OpenAI's Codex
-device-code authorization. For a personal ChatGPT account, open `chatgpt.com`,
-go to Settings > Security, and enable
+device-code authorization. This setup is only needed for hosted invites and the
+OAuth device-code fallback; browser OAuth linking does not depend on it. For a
+personal ChatGPT account, open `chatgpt.com`, go to Settings > Security, and enable
 `Enable device code authorization for Codex`. For workspace-managed accounts,
 ask a workspace admin to enable device-code login for Codex in the workspace
-permissions. Browser OAuth linking does not depend on that setting. OpenAI's
-[Codex authentication docs](https://developers.openai.com/codex/auth) describe
-this prerequisite. The invite or fallback flow can fail at the OpenAI approval
-step when device-code authorization is off.
+permissions. OpenAI's [Codex authentication docs](https://developers.openai.com/codex/auth)
+describe device-code login. The invite or fallback flow can fail at the OpenAI
+approval step when device-code authorization is off.
 
 ```text
 Codex backend base URL: http://localhost:4000/backend-api/codex

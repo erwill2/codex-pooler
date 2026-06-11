@@ -43,7 +43,7 @@ The page header exposes the account onboarding actions as separate buttons:
 
 Prefer `OAuth` for new operator-managed upstream accounts when browser authorization is practical. It stores resulting credential material through encrypted upstream secret storage and keeps the admin surface metadata-only.
 
-Invite onboarding and the OAuth device-code fallback use OpenAI's Codex device-code authorization. Before using those paths, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions. Browser OAuth linking does not depend on the device-code setting. If OpenAI blocks device-code approval, the invite or fallback flow may remain pending but the upstream will not become ready.
+Invite onboarding and the OAuth device-code fallback use OpenAI's Codex device-code authorization. This setup is only for those device-code paths; browser OAuth linking does not depend on it. Before using an invite or fallback flow, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions. If OpenAI blocks device-code approval, the invite or fallback flow may remain pending but the upstream will not become ready.
 
 The search box filters upstream cards by account label or safe metadata. The Pool filter narrows cards to accounts assigned to a specific Pool. The status filter narrows cards by lifecycle or readiness state.
 
