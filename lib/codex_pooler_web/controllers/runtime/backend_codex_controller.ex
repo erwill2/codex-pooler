@@ -11,7 +11,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
   alias CodexPooler.RouteClass
   alias CodexPoolerWeb.Runtime.ControlPlaneJson
   alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.V1.PublicGatewayResult
+  alias CodexPoolerWeb.Runtime.PublicGatewayResult
 
   def models(conn, _params) do
     serve_models(conn, "/backend-api/codex/models")
@@ -346,8 +346,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
 
   defp read_control_plane_body(conn, :no_body), do: {:ok, "", conn}
 
-  defp read_control_plane_body(conn, {:json, route}) do
-    ControlPlaneJson.read_body(conn, route)
+  defp read_control_plane_body(conn, {:json, _contract} = body_mode) do
+    ControlPlaneJson.read_body(conn, body_mode)
   end
 
   defp read_control_plane_body(conn, :sdp) do

@@ -1,7 +1,7 @@
 defmodule CodexPooler.ControlPlaneRoutes do
   @moduledoc false
 
-  @type body_mode :: :no_body | :sdp | {:json, atom()}
+  @type body_mode :: :no_body | :sdp | {:json, :object | :object_or_array}
   @type route :: %{
           required(:method) => atom(),
           required(:local_path) => String.t(),
@@ -23,42 +23,42 @@ defmodule CodexPooler.ControlPlaneRoutes do
       local_path: "/backend-api/codex/thread/goal/get",
       upstream_path: "/codex/thread/goal/get",
       action: :thread_goal_get_post,
-      body_mode: {:json, :thread_goal_get}
+      body_mode: {:json, :object}
     },
     %{
       method: :post,
       local_path: "/backend-api/codex/thread/goal/set",
       upstream_path: "/codex/thread/goal/set",
       action: :thread_goal_set,
-      body_mode: {:json, :thread_goal_set}
+      body_mode: {:json, :object}
     },
     %{
       method: :post,
       local_path: "/backend-api/codex/thread/goal/clear",
       upstream_path: "/codex/thread/goal/clear",
       action: :thread_goal_clear,
-      body_mode: {:json, :thread_goal_clear}
+      body_mode: {:json, :object}
     },
     %{
       method: :post,
       local_path: "/backend-api/codex/analytics-events/events",
       upstream_path: "/codex/analytics-events/events",
       action: :analytics_events,
-      body_mode: {:json, :analytics_events}
+      body_mode: {:json, :object_or_array}
     },
     %{
       method: :post,
       local_path: "/backend-api/codex/memories/trace_summarize",
       upstream_path: "/codex/memories/trace_summarize",
       action: :memories_trace_summarize,
-      body_mode: {:json, :memories_trace_summarize}
+      body_mode: {:json, :object}
     },
     %{
       method: :post,
       local_path: "/backend-api/codex/alpha/search",
       upstream_path: "/alpha/search",
       action: :alpha_search,
-      body_mode: {:json, :alpha_search}
+      body_mode: {:json, :object}
     },
     %{
       method: :post,
@@ -72,7 +72,7 @@ defmodule CodexPooler.ControlPlaneRoutes do
       local_path: "/backend-api/codex/safety/arc",
       upstream_path: "/codex/safety/arc",
       action: :safety_arc,
-      body_mode: {:json, :safety_arc}
+      body_mode: {:json, :object}
     },
     %{
       method: :get,

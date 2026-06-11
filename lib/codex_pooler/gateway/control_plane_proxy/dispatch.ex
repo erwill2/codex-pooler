@@ -187,7 +187,7 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy.Dispatch do
     TransportEnvelope.headers(identity, token, base_headers, include_user_agent?: true)
   end
 
-  defp upstream_content_type(%ProxyRequest{body_mode: {:json, _route}}), do: "application/json"
+  defp upstream_content_type(%ProxyRequest{body_mode: {:json, _contract}}), do: "application/json"
   defp upstream_content_type(%ProxyRequest{body_mode: :sdp}), do: "application/sdp"
   defp upstream_content_type(_request), do: nil
 

@@ -25,7 +25,7 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy do
       :request_opts
     ]
 
-    @type body_mode :: :no_body | :sdp | {:json, atom()}
+    @type body_mode :: :no_body | :sdp | {:json, :object | :object_or_array}
     @type t :: %__MODULE__{
             local_endpoint: String.t(),
             upstream_endpoint: String.t(),

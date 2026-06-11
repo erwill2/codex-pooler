@@ -5,7 +5,7 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.V1.PublicGatewayResult
+  alias CodexPoolerWeb.Runtime.PublicGatewayResult
 
   @type auth :: CodexPooler.Access.auth_context()
   @type conn :: Plug.Conn.t()
