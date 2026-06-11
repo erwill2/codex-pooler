@@ -1,16 +1,16 @@
-defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest do
+defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest do
   use ExUnit.Case, async: false
 
   alias CodexPooler.FakeUpstream
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Request
-  alias CodexPooler.Gateway.Transports.Websocket.WebSocketFrameWriter
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketFrameWriter
 
   @timeouts %{connect_timeout_ms: 1_000, receive_timeout_ms: 1_000}
 
   test "reused request returns unavailable error when session process is gone" do
-    {:ok, session} = UpstreamWebSocketSession.start_link([])
-    :ok = UpstreamWebSocketSession.close(session)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    :ok = UpstreamWebsocketSession.close(session)
 
     request = %Request{
       url: "https://example.com/backend-api/codex/responses",
@@ -22,7 +22,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
     }
 
     assert {:error, %{body: "", headers: [], reason: :upstream_websocket_session_unavailable}} =
-             UpstreamWebSocketSession.request(session, request)
+             UpstreamWebsocketSession.request(session, request)
   end
 
   test "frame writer preserves websocket send failure reason and updated state" do
@@ -45,7 +45,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
     end
 
     assert {:error, :synthetic_write_failure, updated_state} =
-             WebSocketFrameWriter.send_frame(
+             WebsocketFrameWriter.send_frame(
                state,
                {:pong, "codex-pooler"},
                stream_request_body
@@ -89,7 +89,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
          ]}
       )
 
-    {:ok, session} = UpstreamWebSocketSession.start_link([])
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
 
     request =
       %Request{
@@ -106,17 +106,17 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
         message_mapper: nil
       }
 
-    request_task = Task.async(fn -> UpstreamWebSocketSession.request(session, request) end)
+    request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
     assert_receive {:fake_upstream_chunk_sent, 1}, 1_000
     assert_receive {:fake_upstream_chunk_barrier, 1, barrier_pid, ^first_release_ref}, 1_000
 
     assert {:current_stacktrace, stacktrace} = Process.info(session, :current_stacktrace)
-    assert stack_has_mfa?(stacktrace, UpstreamWebSocketSession, :await_sent_request, 2)
+    assert stack_has_mfa?(stacktrace, UpstreamWebsocketSession, :await_sent_request, 2)
 
     send_task =
       Task.async(fn ->
-        UpstreamWebSocketSession.send_request_frame(
+        UpstreamWebsocketSession.send_request_frame(
           session,
           Jason.encode!(%{"type" => "response.processed", "response_id" => "resp_ws_mailbox"})
         )
@@ -159,7 +159,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
         )
       )
 
-    {:ok, session} = UpstreamWebSocketSession.start_link([])
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
 
     request = %Request{
       url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
@@ -175,7 +175,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
       message_mapper: nil
     }
 
-    request_task = Task.async(fn -> UpstreamWebSocketSession.request(session, request) end)
+    request_task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
 
     assert_receive {:upstream_websocket_frame, created_frame}, 1_000
     assert %{"type" => "response.created"} = Jason.decode!(created_frame)
@@ -213,7 +213,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
         ]
 
     upstream = start_upstream(FakeUpstream.sse_stream(events))
-    {:ok, session} = UpstreamWebSocketSession.start_link([])
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
 
     request = %Request{
       url: FakeUpstream.url(upstream) <> "/backend-api/codex/responses",
@@ -230,7 +230,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
     }
 
     assert {:ok, %{body: retained_body, terminal: "response.completed", status: 200}} =
-             UpstreamWebSocketSession.request(session, request)
+             UpstreamWebsocketSession.request(session, request)
 
     written_frames =
       1..length(events)
@@ -275,7 +275,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSessionTest 
       message_mapper: nil
     }
 
-    result = UpstreamWebSocketSession.request_once(request)
+    result = UpstreamWebsocketSession.request_once(request)
 
     assert {:error,
             %{

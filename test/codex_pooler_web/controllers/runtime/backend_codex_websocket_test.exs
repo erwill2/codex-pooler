@@ -25,7 +25,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
 
   alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
   alias CodexPooler.Gateway.Service
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Pools
   alias CodexPooler.Repo
@@ -1980,16 +1980,16 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     previous_env =
       Application.get_env(
         :codex_pooler,
-        UpstreamWebSocketSession,
+        UpstreamWebsocketSession,
         []
       )
 
-    Application.put_env(:codex_pooler, UpstreamWebSocketSession, keepalive_interval_ms: 20)
+    Application.put_env(:codex_pooler, UpstreamWebsocketSession, keepalive_interval_ms: 20)
 
     on_exit(fn ->
       Application.put_env(
         :codex_pooler,
-        UpstreamWebSocketSession,
+        UpstreamWebsocketSession,
         previous_env
       )
     end)
@@ -3860,7 +3860,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
     {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "live-ws-quota"})
     pin_session_to_assignment!(session, setup.assignment)
-    {:ok, upstream_websocket_session} = UpstreamWebSocketSession.start_link()
+    {:ok, upstream_websocket_session} = UpstreamWebsocketSession.start_link()
 
     try do
       assert {:error, %{code: "quota_evidence_unavailable"}} =
@@ -3881,7 +3881,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                  fn frame -> send(self(), {:websocket_frame, frame}) end
                )
     after
-      UpstreamWebSocketSession.close(upstream_websocket_session)
+      UpstreamWebsocketSession.close(upstream_websocket_session)
     end
 
     refute_received {:websocket_frame, _frame}
@@ -4427,7 +4427,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
       |> Ecto.Changeset.change(%{pool_upstream_assignment_id: setup.assignment.id})
       |> Repo.update!()
 
-    upstream_websocket_session = start_supervised!(UpstreamWebSocketSession)
+    upstream_websocket_session = start_supervised!(UpstreamWebsocketSession)
 
     assert {:error, %{code: "quota_exhausted", status: 503}} =
              execute_websocket_response(

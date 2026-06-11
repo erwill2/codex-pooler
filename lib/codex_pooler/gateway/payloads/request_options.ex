@@ -13,6 +13,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   alias __MODULE__.TimeoutConfig
   alias __MODULE__.Transport
   alias __MODULE__.UsageAuthentication
+  alias __MODULE__.WebsocketOwnerContext
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.RouteClass
 
@@ -134,6 +135,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :upstream_endpoint,
     :upstream_identity_id,
     :upstream_websocket_session,
+    :websocket_owner,
     :websocket_owner_downstream_epoch,
     :websocket_owner_downstream,
     :websocket_owner_forwarding_enabled?,
@@ -270,7 +272,11 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   @spec put_transport(t(), keyword()) :: t()
   def put_transport(%__MODULE__{} = options, updates) when is_list(updates) do
-    updates = updates |> Map.new() |> normalize_transport_updates()
+    updates =
+      updates
+      |> Map.new()
+      |> normalize_transport_updates(options.transport.websocket_owner)
+
     %{options | transport: struct!(options.transport, updates)}
   end
 
@@ -418,16 +424,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       websocket_writer: Map.get(opts, :websocket_writer),
       forwarded_metadata_headers: forwarded_headers(Map.get(opts, :forwarded_headers, [])),
       upstream_websocket_session: Map.get(opts, :upstream_websocket_session),
-      websocket_owner_forwarding_enabled?:
-        Map.get(opts, :websocket_owner_forwarding_enabled?, false) == true,
-      websocket_owner_session: Map.get(opts, :websocket_owner_session),
-      websocket_owner_lease_token: Map.get(opts, :websocket_owner_lease_token),
-      websocket_owner_downstream: Map.get(opts, :websocket_owner_downstream),
-      websocket_owner_downstream_epoch:
-        optional_positive_integer(Map.get(opts, :websocket_owner_downstream_epoch)),
-      websocket_owner_proxy_instance_id: Map.get(opts, :websocket_owner_proxy_instance_id),
-      websocket_owner_instance_id: Map.get(opts, :websocket_owner_instance_id),
-      websocket_owner_forwarder_opts: websocket_owner_forwarder_opts(opts),
+      websocket_owner: websocket_owner_context(opts),
       route_class: classify_route_class(opts, endpoint, payload)
     }
   end
@@ -534,6 +531,74 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
         optional_non_negative_integer(Map.get(opts, :finalize_retry_interval_ms))
     }
   end
+
+  defp websocket_owner_context(opts) do
+    websocket_owner_context(%WebsocketOwnerContext{}, opts)
+  end
+
+  defp websocket_owner_context(%WebsocketOwnerContext{} = current_owner, opts) do
+    opts = Map.new(opts)
+
+    current_owner
+    |> maybe_replace_websocket_owner_context(Map.get(opts, :websocket_owner))
+    |> struct!(websocket_owner_updates(opts))
+  end
+
+  defp maybe_replace_websocket_owner_context(_current_owner, %WebsocketOwnerContext{} = owner),
+    do: owner
+
+  defp maybe_replace_websocket_owner_context(current_owner, owner_opts) when is_map(owner_opts),
+    do: websocket_owner_context(current_owner, owner_opts)
+
+  defp maybe_replace_websocket_owner_context(current_owner, _owner_opts), do: current_owner
+
+  defp websocket_owner_updates(opts) do
+    %{}
+    |> maybe_put_websocket_owner_update(
+      :enabled?,
+      Map.get(opts, :websocket_owner_forwarding_enabled?, Map.get(opts, :enabled?)),
+      &(&1 == true)
+    )
+    |> maybe_put_websocket_owner_update(
+      :session,
+      Map.get(opts, :websocket_owner_session, Map.get(opts, :session))
+    )
+    |> maybe_put_websocket_owner_update(
+      :lease_token,
+      Map.get(opts, :websocket_owner_lease_token, Map.get(opts, :lease_token))
+    )
+    |> maybe_put_websocket_owner_update(
+      :downstream,
+      Map.get(opts, :websocket_owner_downstream, Map.get(opts, :downstream))
+    )
+    |> maybe_put_websocket_owner_update(
+      :downstream_epoch,
+      Map.get(opts, :websocket_owner_downstream_epoch, Map.get(opts, :downstream_epoch)),
+      &optional_positive_integer/1
+    )
+    |> maybe_put_websocket_owner_update(
+      :proxy_instance_id,
+      Map.get(opts, :websocket_owner_proxy_instance_id, Map.get(opts, :proxy_instance_id))
+    )
+    |> maybe_put_websocket_owner_update(
+      :owner_instance_id,
+      Map.get(opts, :websocket_owner_instance_id, Map.get(opts, :owner_instance_id))
+    )
+    |> maybe_put_websocket_owner_update(
+      :forwarder_opts,
+      Map.get(opts, :websocket_owner_forwarder_opts, Map.get(opts, :forwarder_opts)),
+      &websocket_owner_forwarder_opts/1
+    )
+  end
+
+  defp maybe_put_websocket_owner_update(updates, key, value, normalizer \\ & &1)
+  defp maybe_put_websocket_owner_update(updates, _key, nil, _normalizer), do: updates
+
+  defp maybe_put_websocket_owner_update(updates, key, value, normalizer),
+    do: Map.put(updates, key, normalizer.(value))
+
+  defp websocket_owner_forwarder_opts(values) when is_list(values), do: values
+  defp websocket_owner_forwarder_opts(_value), do: []
 
   defp extra(opts) do
     Map.drop(opts, @known_opt_keys)
@@ -672,13 +737,6 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   defp openai_surface(_compatibility), do: nil
 
-  defp websocket_owner_forwarder_opts(opts) do
-    case Map.get(opts, :websocket_owner_forwarder_opts) do
-      values when is_list(values) -> values
-      _value -> []
-    end
-  end
-
   defp normalize_continuity_updates(updates) do
     updates
     |> normalize_update(:bridge_owner_lease_ttl_seconds, &optional_positive_integer/1)
@@ -686,8 +744,32 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     |> normalize_update(:session_header_source, &normalized_session_header_source/1)
   end
 
-  defp normalize_transport_updates(updates) do
-    normalize_update(updates, :forwarded_metadata_headers, &forwarded_headers/1)
+  defp normalize_transport_updates(updates, %WebsocketOwnerContext{} = current_owner) do
+    {owner_updates, transport_updates} =
+      Map.split(updates, [
+        :websocket_owner,
+        :websocket_owner_forwarding_enabled?,
+        :websocket_owner_session,
+        :websocket_owner_lease_token,
+        :websocket_owner_downstream,
+        :websocket_owner_downstream_epoch,
+        :websocket_owner_proxy_instance_id,
+        :websocket_owner_instance_id,
+        :websocket_owner_forwarder_opts
+      ])
+
+    transport_updates =
+      normalize_update(transport_updates, :forwarded_metadata_headers, &forwarded_headers/1)
+
+    if map_size(owner_updates) == 0 do
+      transport_updates
+    else
+      Map.put(
+        transport_updates,
+        :websocket_owner,
+        websocket_owner_context(current_owner, owner_updates)
+      )
+    end
   end
 
   defp normalize_file_bridge_updates(updates) do

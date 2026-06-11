@@ -4319,7 +4319,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
           end)
 
         case {count, upstream_payload} do
-          {1, %CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Request{}} ->
+          {1, %CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request{}} ->
             writer.(Jason.encode!(%{"id" => "resp_owner_queue_first", "object" => "response"}))
             :ok
 
@@ -4332,7 +4332,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
               5_000 -> exit(:chained_owner_upstream_timeout)
             end
 
-          {3, %CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Request{}} ->
+          {3, %CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request{}} ->
             send(test_pid, {:chained_owner_upstream_tool_started, release_ref})
             writer.(Jason.encode!(%{"id" => "resp_owner_queue_tool", "object" => "response"}))
             :ok

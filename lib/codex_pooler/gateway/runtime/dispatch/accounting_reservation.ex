@@ -165,10 +165,12 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
 
   defp owner_forwarding_metadata(%RequestOptions{
          transport: %{
-           websocket_owner_forwarding_enabled?: true,
-           websocket_owner_downstream_epoch: downstream_epoch,
-           websocket_owner_proxy_instance_id: proxy_instance_id,
-           websocket_owner_instance_id: owner_instance_id
+           websocket_owner: %{
+             enabled?: true,
+             downstream_epoch: downstream_epoch,
+             proxy_instance_id: proxy_instance_id,
+             owner_instance_id: owner_instance_id
+           }
          }
        }) do
     %{

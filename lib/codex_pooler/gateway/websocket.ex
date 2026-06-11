@@ -12,7 +12,7 @@ defmodule CodexPooler.Gateway.Websocket do
   alias CodexPooler.Gateway.Transports.Admission
 
   alias CodexPooler.Gateway.Transports.Websocket.{
-    UpstreamWebSocketSession,
+    UpstreamWebsocketSession,
     WebsocketOwnerContract,
     WebsocketOwnerForwarder,
     WebsocketOwnerSession
@@ -64,7 +64,7 @@ defmodule CodexPooler.Gateway.Websocket do
 
   defp prepare_local_websocket_session(auth, opts) do
     with {:ok, session} <- start_codex_session(auth, opts),
-         {:ok, upstream_websocket_session} <- UpstreamWebSocketSession.start_link() do
+         {:ok, upstream_websocket_session} <- UpstreamWebsocketSession.start_link() do
       {:ok, %{codex_session: session, upstream_websocket_session: upstream_websocket_session}}
     end
   end
@@ -440,7 +440,7 @@ defmodule CodexPooler.Gateway.Websocket do
   end
 
   @spec close_websocket_session(pid() | term()) :: :ok
-  def close_websocket_session(pid) when is_pid(pid), do: UpstreamWebSocketSession.close(pid)
+  def close_websocket_session(pid) when is_pid(pid), do: UpstreamWebsocketSession.close(pid)
   def close_websocket_session(_session), do: :ok
 
   @spec register_codex_session_continuity(
@@ -544,7 +544,7 @@ defmodule CodexPooler.Gateway.Websocket do
   end
 
   defp owner_downstream_target(%RequestOptions{
-         transport: %{websocket_owner_downstream: %{pid: pid, correlation_id: correlation_id}}
+         transport: %{websocket_owner: %{downstream: %{pid: pid, correlation_id: correlation_id}}}
        })
        when is_pid(pid) and is_binary(correlation_id) do
     %{pid: pid, correlation_id: correlation_id}
@@ -594,7 +594,9 @@ defmodule CodexPooler.Gateway.Websocket do
     )
   end
 
-  defp owner_forwarder_opts(%RequestOptions{transport: %{websocket_owner_forwarder_opts: opts}})
+  defp owner_forwarder_opts(%RequestOptions{
+         transport: %{websocket_owner: %{forwarder_opts: opts}}
+       })
        when is_list(opts),
        do: opts
 
@@ -609,7 +611,7 @@ defmodule CodexPooler.Gateway.Websocket do
   end
 
   defp maybe_put_owner_upstream(start_opts, %RequestOptions{
-         transport: %{websocket_owner_forwarder_opts: opts}
+         transport: %{websocket_owner: %{forwarder_opts: opts}}
        }) do
     case Keyword.get(opts, :upstream) do
       nil -> start_opts

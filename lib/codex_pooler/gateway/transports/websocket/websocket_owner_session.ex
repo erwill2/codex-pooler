@@ -9,7 +9,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Finalization.{Interruption, Metadata}
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
 
   @registry __MODULE__.Registry
@@ -139,12 +139,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     submit_upstream(owner, downstream, payload)
   end
 
-  @spec submit_request(GenServer.server(), downstream(), UpstreamWebSocketSession.Request.t()) ::
+  @spec submit_request(GenServer.server(), downstream(), UpstreamWebsocketSession.Request.t()) ::
           :ok
           | {:ok, term()}
-          | {:error, UpstreamWebSocketSession.request_failure()}
+          | {:error, UpstreamWebsocketSession.request_failure()}
           | {:error, WebsocketOwnerContract.owner_error() | term()}
-  def submit_request(owner, downstream, %UpstreamWebSocketSession.Request{} = request)
+  def submit_request(owner, downstream, %UpstreamWebsocketSession.Request{} = request)
       when is_map(downstream) do
     submit_upstream(owner, downstream, request)
   end
@@ -646,11 +646,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   defp upstream_boundary(opts) do
     Keyword.get_lazy(opts, :upstream, fn ->
       %{
-        start: fn -> UpstreamWebSocketSession.start_link([]) end,
+        start: fn -> UpstreamWebsocketSession.start_link([]) end,
         send: fn upstream_pid, upstream_payload, writer ->
           send_owner_upstream(upstream_pid, upstream_payload, writer)
         end,
-        close: &UpstreamWebSocketSession.close/1
+        close: &UpstreamWebsocketSession.close/1
       }
     end)
   end
@@ -687,16 +687,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   end
 
   defp send_owner_upstream(upstream_pid, payload, _writer) when is_binary(payload) do
-    case UpstreamWebSocketSession.send_request_frame(upstream_pid, payload) do
+    case UpstreamWebsocketSession.send_request_frame(upstream_pid, payload) do
       {:ok, :sent} -> :ok
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp send_owner_upstream(upstream_pid, %UpstreamWebSocketSession.Request{} = request, writer) do
+  defp send_owner_upstream(upstream_pid, %UpstreamWebsocketSession.Request{} = request, writer) do
     request = %{request | writer: writer}
 
-    case UpstreamWebSocketSession.request(upstream_pid, request) do
+    case UpstreamWebsocketSession.request(upstream_pid, request) do
       {:ok, result} ->
         {:ok, result}
 

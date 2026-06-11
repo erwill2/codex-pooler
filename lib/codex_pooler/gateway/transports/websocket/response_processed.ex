@@ -8,7 +8,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ResponseProcessed do
   alias CodexPooler.Gateway.Persistence.CodexSession
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata, as: FinalizationMetadata
-  alias CodexPooler.Gateway.Transports.Streaming.WebSocketCodec
+  alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
   alias CodexPooler.Gateway.Transports.UpstreamDispatch
   alias CodexPooler.RouteClass
 
@@ -33,7 +33,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ResponseProcessed do
     case UpstreamDispatch.forward_response_processed(payload, request_options) do
       :ok ->
         with :ok <- record_processed_ack(auth, payload, request_options) do
-          {:ok, WebSocketCodec.ack_result()}
+          {:ok, WebsocketCodec.ack_result()}
         end
 
       {:error, reason} ->
@@ -76,10 +76,12 @@ defmodule CodexPooler.Gateway.Transports.Websocket.ResponseProcessed do
 
   defp websocket_owner_forwarding_metadata(%RequestOptions{
          transport: %{
-           websocket_owner_forwarding_enabled?: true,
-           websocket_owner_downstream_epoch: downstream_epoch,
-           websocket_owner_proxy_instance_id: proxy_instance_id,
-           websocket_owner_instance_id: owner_instance_id
+           websocket_owner: %{
+             enabled?: true,
+             downstream_epoch: downstream_epoch,
+             proxy_instance_id: proxy_instance_id,
+             owner_instance_id: owner_instance_id
+           }
          }
        }) do
     %{

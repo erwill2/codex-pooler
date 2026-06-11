@@ -1,4 +1,4 @@
-defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.ReceiveState do
+defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ReceiveState do
   @moduledoc false
 
   defstruct [
@@ -18,9 +18,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Rece
           writer: (binary() -> any()),
           timeouts: map(),
           message_mapper:
-            CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.message_mapper(),
+            CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.message_mapper(),
           frame_observer:
-            CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Request.frame_observer(),
+            CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request.frame_observer(),
           terminal_upstream_error_code: String.t() | nil,
           downstream_output_started?: boolean(),
           terminal_seen?: boolean(),

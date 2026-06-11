@@ -7,7 +7,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession}
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
@@ -247,7 +247,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     {:ok, downstream} =
       WebsocketOwnerSession.attach_downstream(owner, downstream_target("request-result"))
 
-    request = %UpstreamWebSocketSession.Request{
+    request = %UpstreamWebsocketSession.Request{
       url: "https://example.com/backend-api/codex/responses",
       headers: [],
       payload: "request-frame",
@@ -299,7 +299,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     {:ok, second_downstream} =
       WebsocketOwnerSession.attach_downstream(owner, downstream_target("second-request"))
 
-    request = %UpstreamWebSocketSession.Request{
+    request = %UpstreamWebsocketSession.Request{
       url: "https://example.com/backend-api/codex/responses",
       headers: [],
       payload: "stale-request-frame",

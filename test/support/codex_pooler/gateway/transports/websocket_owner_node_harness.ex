@@ -18,7 +18,7 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness do
   end
 
   defp maybe_request_result(
-         %CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Request{},
+         %CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request{},
          messages,
          true
        ) do

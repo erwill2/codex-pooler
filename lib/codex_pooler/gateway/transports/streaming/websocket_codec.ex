@@ -1,9 +1,10 @@
-defmodule CodexPooler.Gateway.Transports.Streaming.WebSocketCodec do
+defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   @moduledoc """
   Conversion helpers for Codex public websocket frames and upstream stream data.
   """
 
   alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.Payloads.ToolResultShape
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
@@ -88,6 +89,26 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebSocketCodec do
   def warmup_payload?(%{"generate" => false}), do: true
   def warmup_payload?(_payload), do: false
 
+  @spec request_row_producing_response_payload?(term()) :: boolean()
+  def request_row_producing_response_payload?(payload) when is_binary(payload) do
+    case decode_payload(payload) do
+      {:ok, decoded} -> request_row_producing_response_payload(decoded)
+      {:error, _reason} -> false
+    end
+  end
+
+  def request_row_producing_response_payload?(_payload), do: false
+
+  @spec continuity_ordered_payload?(term()) :: boolean()
+  def continuity_ordered_payload?(payload) when is_binary(payload) do
+    case decode_payload(payload) do
+      {:ok, decoded} -> continuity_ordered_payload(decoded)
+      {:error, _reason} -> false
+    end
+  end
+
+  def continuity_ordered_payload?(_payload), do: false
+
   @spec stream_messages(Ecto.UUID.t() | %{optional(:id) => Ecto.UUID.t()}, term()) :: [binary()]
   def stream_messages(request, data) do
     {messages, _buffer} = stream_messages(request, data, "")
@@ -142,4 +163,28 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebSocketCodec do
 
     if StreamProtocol.valid_json?(data), do: [data], else: []
   end
+
+  defp request_row_producing_response_payload(%{"type" => "response.processed"}), do: true
+  defp request_row_producing_response_payload(%{"generate" => false}), do: false
+  defp request_row_producing_response_payload(%{"type" => "response.create"}), do: true
+
+  defp request_row_producing_response_payload(%{"model" => model}) when is_binary(model),
+    do: String.trim(model) != ""
+
+  defp request_row_producing_response_payload(_payload), do: false
+
+  defp continuity_ordered_payload(%{"type" => "response.processed"}), do: true
+
+  defp continuity_ordered_payload(
+         %{"type" => "response.create", "previous_response_id" => previous_response_id} =
+           payload
+       )
+       when is_binary(previous_response_id) do
+    payload
+    |> Map.get("input")
+    |> ToolResultShape.items()
+    |> Enum.any?()
+  end
+
+  defp continuity_ordered_payload(_payload), do: false
 end

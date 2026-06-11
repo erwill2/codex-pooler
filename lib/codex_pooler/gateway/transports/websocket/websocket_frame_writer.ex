@@ -1,4 +1,4 @@
-defmodule CodexPooler.Gateway.Transports.Websocket.WebSocketFrameWriter do
+defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketFrameWriter do
   @moduledoc false
 
   @type state :: %{

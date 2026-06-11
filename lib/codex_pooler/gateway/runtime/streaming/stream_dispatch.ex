@@ -16,7 +16,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
   alias CodexPooler.Gateway.Runtime.Streaming.Types, as: StreamTypes
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamRelay
-  alias CodexPooler.Gateway.Transports.Streaming.WebSocketCodec
+  alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
 
   @sse_keepalive_frame ": keepalive\n\n"
 
@@ -137,7 +137,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
         normalize_stream_data(response_context, state, data, &visible_websocket_data?/1)
 
       {messages, websocket_sse_buffer} =
-        WebSocketCodec.stream_messages(request, data, websocket_sse_buffer(state))
+        WebsocketCodec.stream_messages(request, data, websocket_sse_buffer(state))
 
       Enum.each(messages, writer)
 

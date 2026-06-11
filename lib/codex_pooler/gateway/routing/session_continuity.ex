@@ -303,10 +303,12 @@ defmodule CodexPooler.Gateway.Routing.SessionContinuity do
 
   @spec live_owner_forwarded_websocket?(Transport.t()) :: boolean()
   defp live_owner_forwarded_websocket?(transport) do
-    transport.websocket_owner_forwarding_enabled? == true and
-      match?(%CodexSession{}, transport.websocket_owner_session) and
-      is_binary(clean_string(transport.websocket_owner_lease_token)) and
-      websocket_owner_downstream?(transport.websocket_owner_downstream)
+    owner = transport.websocket_owner
+
+    owner.enabled? == true and
+      match?(%CodexSession{}, owner.session) and
+      is_binary(clean_string(owner.lease_token)) and
+      websocket_owner_downstream?(owner.downstream)
   end
 
   @spec websocket_owner_downstream?(term()) :: boolean()

@@ -1,4 +1,4 @@
-defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.ConnectionUpgrade do
+defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ConnectionUpgrade do
   @moduledoc false
 
   @spec connect_state(map(), term(), binary(), Mint.Types.headers(), map()) ::

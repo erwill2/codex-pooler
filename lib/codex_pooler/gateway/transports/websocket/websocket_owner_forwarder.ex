@@ -10,7 +10,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
 
   alias CodexPooler.Gateway.Persistence.CodexSession
   alias CodexPooler.Gateway.Persistence.SessionContinuity
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Repo
@@ -27,7 +27,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
           request_id: binary()
         ]
   @type submit_error ::
-          WebsocketOwnerContract.owner_error() | UpstreamWebSocketSession.request_failure()
+          WebsocketOwnerContract.owner_error() | UpstreamWebsocketSession.request_failure()
 
   @spec submit_frame(
           CodexSession.t(),
@@ -51,7 +51,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
           CodexSession.t(),
           binary(),
           WebsocketOwnerSession.downstream(),
-          UpstreamWebSocketSession.Request.t(),
+          UpstreamWebsocketSession.Request.t(),
           submit_opts()
         ) ::
           :ok | {:ok, term()} | {:error, submit_error()}
@@ -63,7 +63,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
         opts \\ []
       )
       when is_binary(owner_lease_token) and is_map(downstream) and
-             is_struct(request, UpstreamWebSocketSession.Request) do
+             is_struct(request, UpstreamWebsocketSession.Request) do
     with :ok <- SessionContinuity.validate_owner_token(session, owner_lease_token),
          {:ok, owner} <- resolve_owner(session, opts) do
       dispatch_submit_request(owner, session.id, downstream, request, opts)
@@ -141,13 +141,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
   @spec remote_submit_request(
           binary(),
           WebsocketOwnerSession.downstream(),
-          UpstreamWebSocketSession.Request.t(),
+          UpstreamWebsocketSession.Request.t(),
           submit_opts()
         ) ::
           :ok | {:ok, term()} | {:error, WebsocketOwnerContract.owner_error()}
   def remote_submit_request(codex_session_id, downstream, request, opts \\ [])
       when is_binary(codex_session_id) and is_map(downstream) and
-             is_struct(request, UpstreamWebSocketSession.Request) do
+             is_struct(request, UpstreamWebsocketSession.Request) do
     with {:ok, {owner_pid, downstream}} <- ensure_remote_owner(codex_session_id, downstream, opts) do
       WebsocketOwnerSession.submit_request(owner_pid, downstream, request)
     end
@@ -263,7 +263,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
 
   defp recover_remote_owner(codex_session_id, downstream, opts) do
     with %CodexSession{} = session <- Repo.get(CodexSession, codex_session_id),
-         :ok <- local_owner_session?(session, opts),
+         :ok <- require_local_owner_session(session, opts),
          {:ok, owner_pid} <- start_recovered_remote_owner(session, opts),
          {:ok, downstream} <- attach_recovered_downstream(owner_pid, downstream) do
       {:ok, {owner_pid, downstream}}
@@ -273,7 +273,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
     end
   end
 
-  defp local_owner_session?(
+  defp require_local_owner_session(
          %CodexSession{
            owner_instance_id: owner_instance_id,
            owner_lease_token: token
@@ -284,7 +284,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder do
     if owner_instance_id == local_node_string(opts), do: :ok, else: {:error, :owner_unavailable}
   end
 
-  defp local_owner_session?(%CodexSession{}, _opts), do: {:error, :owner_unavailable}
+  defp require_local_owner_session(%CodexSession{}, _opts), do: {:error, :owner_unavailable}
 
   defp start_recovered_remote_owner(%CodexSession{} = session, opts) do
     start_opts = [

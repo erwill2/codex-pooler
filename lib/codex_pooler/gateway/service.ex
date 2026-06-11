@@ -22,7 +22,7 @@ defmodule CodexPooler.Gateway.Service do
   alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt
-  alias CodexPooler.Gateway.Transports.Streaming.WebSocketCodec
+  alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
   alias CodexPooler.Gateway.Transports.Websocket.ResponseProcessed
   alias CodexPooler.Repo
   alias CodexPooler.RouteClass
@@ -256,7 +256,7 @@ defmodule CodexPooler.Gateway.Service do
     with {:ok, payload} <- decode_websocket_payload(raw_payload),
          {:ok, result} <-
            execute_websocket_payload(auth, payload, opts, push_frame) do
-      WebSocketCodec.deliver_result(result, push_frame)
+      WebsocketCodec.deliver_result(result, push_frame)
     end
   end
 
@@ -266,11 +266,11 @@ defmodule CodexPooler.Gateway.Service do
 
   defp execute_websocket_payload(auth, payload, opts, push_frame) do
     cond do
-      WebSocketCodec.response_processed_payload?(payload) ->
+      WebsocketCodec.response_processed_payload?(payload) ->
         ResponseProcessed.handle(auth, payload, opts)
 
-      WebSocketCodec.warmup_payload?(payload) ->
-        {:ok, WebSocketCodec.warmup_result()}
+      WebsocketCodec.warmup_payload?(payload) ->
+        {:ok, WebsocketCodec.warmup_result()}
 
       true ->
         with {:ok, coerced} <- coerce_websocket_response_payload(payload, opts) do
@@ -501,7 +501,7 @@ defmodule CodexPooler.Gateway.Service do
   defp register_codex_continuity(_opts, _payload, _body), do: :ok
 
   defp decode_websocket_payload(payload) do
-    case WebSocketCodec.decode_payload(payload) do
+    case WebsocketCodec.decode_payload(payload) do
       {:ok, decoded} ->
         {:ok, decoded}
 

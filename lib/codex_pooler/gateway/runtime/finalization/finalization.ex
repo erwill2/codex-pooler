@@ -15,7 +15,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     SettlementAttrs,
     SideEffects,
     Streaming,
-    WebSocket
+    Websocket
   }
 
   alias CodexPooler.Gateway.Runtime.Routing.RouteLifecycle
@@ -152,7 +152,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
           completed_websocket_finalization()
         ) :: {:ok, map()} | {:error, map()}
   defdelegate finalize_completed_websocket_response(context, finalization),
-    to: WebSocket,
+    to: Websocket,
     as: :finalize_completed
 
   @spec finalize_terminal_websocket_response(
@@ -160,13 +160,13 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
           terminal_websocket_finalization()
         ) :: {:ok, map()} | {:error, map()}
   defdelegate finalize_terminal_websocket_response(context, finalization),
-    to: WebSocket,
+    to: Websocket,
     as: :finalize_terminal
 
   @spec finalize_failed_websocket_response(DispatchContext.t(), failed_websocket_finalization()) ::
           {:error, map()}
   defdelegate finalize_failed_websocket_response(context, finalization),
-    to: WebSocket,
+    to: Websocket,
     as: :finalize_failed
 
   @spec finalize_stream_success(binary(), ResponseContext.t(), callbacks()) ::

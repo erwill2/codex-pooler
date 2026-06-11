@@ -9,7 +9,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
 
   use Plug.Router
 
-  alias __MODULE__.WebSocket
+  alias __MODULE__.Websocket
 
   @default_host "127.0.0.1"
   @default_port 4058
@@ -338,7 +338,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
     case selected_profile(conn) do
       {:ok, profile} ->
         conn
-        |> WebSockAdapter.upgrade(WebSocket, %{profile: profile}, [])
+        |> WebSockAdapter.upgrade(Websocket, %{profile: profile}, [])
         |> halt()
 
       {:error, message} ->
@@ -564,7 +564,7 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstream do
     end
   end
 
-  defmodule WebSocket do
+  defmodule Websocket do
     @moduledoc false
 
     alias CodexPooler.Dev.GatewayPerfFakeUpstream

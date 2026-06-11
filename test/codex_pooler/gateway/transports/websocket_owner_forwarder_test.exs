@@ -6,7 +6,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
   import ExUnit.CaptureLog
 
   alias CodexPooler.Gateway.Persistence.CodexSession
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
@@ -92,7 +92,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
       |> Keyword.put(:local_node_string, remote_node_string)
       |> Keyword.put(:upstream, upstream)
 
-    request = %UpstreamWebSocketSession.Request{
+    request = %UpstreamWebsocketSession.Request{
       url: "https://example.com/backend-api/codex/responses",
       headers: [],
       payload: "request-frame",
@@ -115,7 +115,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
 
     assert_receive {:websocket_owner_harness_upstream_started, upstream_pid}
 
-    assert [%UpstreamWebSocketSession.Request{payload: "request-frame"}] =
+    assert [%UpstreamWebsocketSession.Request{payload: "request-frame"}] =
              WebsocketOwnerNodeHarness.fake_upstream_frames(upstream_pid)
 
     assert_receive {:websocket_owner_frame, "corr-recovered-owner", 1, {:data, ^terminal_frame}}
@@ -142,7 +142,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
         calls: %{remote_node => {:return, {:error, structured_error}}}
       )
 
-    request = %UpstreamWebSocketSession.Request{
+    request = %UpstreamWebsocketSession.Request{
       url: "https://example.com/backend-api/codex/responses",
       headers: [],
       payload: "request-frame",

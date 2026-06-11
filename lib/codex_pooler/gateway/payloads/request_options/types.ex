@@ -23,22 +23,43 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.RequestMetadata do
         }
 end
 
+defmodule CodexPooler.Gateway.Payloads.RequestOptions.WebsocketOwnerContext do
+  @moduledoc false
+
+  defstruct [
+    :session,
+    :lease_token,
+    :downstream,
+    :downstream_epoch,
+    :proxy_instance_id,
+    :owner_instance_id,
+    enabled?: false,
+    forwarder_opts: []
+  ]
+
+  @type t :: %__MODULE__{
+          enabled?: boolean(),
+          session: term(),
+          lease_token: String.t() | nil,
+          downstream: map() | nil,
+          downstream_epoch: pos_integer() | nil,
+          proxy_instance_id: String.t() | nil,
+          owner_instance_id: String.t() | nil,
+          forwarder_opts: keyword()
+        }
+end
+
 defmodule CodexPooler.Gateway.Payloads.RequestOptions.Transport do
   @moduledoc false
+
+  alias CodexPooler.Gateway.Payloads.RequestOptions.WebsocketOwnerContext
 
   defstruct [
     :transport,
     :upstream_endpoint,
     :websocket_writer,
     :upstream_websocket_session,
-    :websocket_owner_forwarding_enabled?,
-    :websocket_owner_session,
-    :websocket_owner_lease_token,
-    :websocket_owner_downstream,
-    :websocket_owner_downstream_epoch,
-    :websocket_owner_proxy_instance_id,
-    :websocket_owner_instance_id,
-    :websocket_owner_forwarder_opts,
+    :websocket_owner,
     :route_class,
     forwarded_metadata_headers: []
   ]
@@ -51,14 +72,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Transport do
           websocket_writer: websocket_writer(),
           forwarded_metadata_headers: [{String.t(), String.t()}],
           upstream_websocket_session: term(),
-          websocket_owner_forwarding_enabled?: boolean(),
-          websocket_owner_session: term(),
-          websocket_owner_lease_token: String.t() | nil,
-          websocket_owner_downstream: map() | nil,
-          websocket_owner_downstream_epoch: pos_integer() | nil,
-          websocket_owner_proxy_instance_id: String.t() | nil,
-          websocket_owner_instance_id: String.t() | nil,
-          websocket_owner_forwarder_opts: keyword(),
+          websocket_owner: WebsocketOwnerContext.t(),
           route_class: String.t() | nil
         }
 end

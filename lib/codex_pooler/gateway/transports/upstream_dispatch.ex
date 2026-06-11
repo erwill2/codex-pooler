@@ -10,7 +10,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.TransportFailureReason
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
   alias CodexPooler.RouteClass
@@ -224,7 +224,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
     timeouts = request_options.timeout_config
     message_mapper = &StreamProtocol.canonicalize_codex_responses_json_message/1
 
-    upstream_request = %UpstreamWebSocketSession.Request{
+    upstream_request = %UpstreamWebsocketSession.Request{
       url: url,
       headers: headers,
       payload: payload_body,
@@ -264,12 +264,12 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   defp direct_websocket_request(request_options, upstream_request, identity, request) do
     case request_options.transport.upstream_websocket_session do
       pid when is_pid(pid) ->
-        result = UpstreamWebSocketSession.request(pid, upstream_request)
+        result = UpstreamWebsocketSession.request(pid, upstream_request)
 
         record_upstream_websocket_body(result, identity, request)
 
       _pid ->
-        UpstreamWebSocketSession.request_once(upstream_request)
+        UpstreamWebsocketSession.request_once(upstream_request)
         |> record_upstream_websocket_body(identity, request)
     end
   end
@@ -299,7 +299,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   defp forward_response_processed_direct(payload, request_options) do
     with pid when is_pid(pid) <- request_options.transport.upstream_websocket_session,
          {:ok, :sent} <-
-           UpstreamWebSocketSession.send_request_frame(
+           UpstreamWebsocketSession.send_request_frame(
              pid,
              Jason.encode!(response_processed_upstream_payload(payload))
            ) do
@@ -316,14 +316,14 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   @spec owner_transport(RequestOptions.t()) :: owner_transport()
   defp owner_transport(
          %RequestOptions{
-           transport: %{websocket_owner_forwarding_enabled?: true}
+           transport: %{websocket_owner: %{enabled?: true}}
          } = request_options
        ) do
     owner_forwarded_transport(request_options)
   end
 
   defp owner_transport(%RequestOptions{transport: transport}) do
-    if owner_transport_bundle_present?(transport),
+    if owner_transport_bundle_present?(transport.websocket_owner),
       do: {:error, :owner_forwarding_disabled},
       else: :local
   end
@@ -331,13 +331,15 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   defp owner_forwarded_transport(%RequestOptions{
          continuity: %{codex_session: continuity_session},
          transport: %{
-           websocket_owner_session: owner_session,
-           websocket_owner_lease_token: owner_lease_token,
-           websocket_owner_downstream: downstream,
-           websocket_owner_downstream_epoch: downstream_epoch,
-           websocket_owner_proxy_instance_id: proxy_instance_id,
-           websocket_owner_instance_id: owner_instance_id,
-           websocket_owner_forwarder_opts: forwarder_opts
+           websocket_owner: %{
+             session: owner_session,
+             lease_token: owner_lease_token,
+             downstream: downstream,
+             downstream_epoch: downstream_epoch,
+             proxy_instance_id: proxy_instance_id,
+             owner_instance_id: owner_instance_id,
+             forwarder_opts: forwarder_opts
+           }
          }
        }) do
     with :ok <- validate_owner_sessions(continuity_session, owner_session, owner_lease_token),
@@ -400,13 +402,13 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
 
   defp validate_owner_forwarder_opts(_forwarder_opts), do: {:error, :stale_owner}
 
-  defp owner_transport_bundle_present?(transport) do
-    not is_nil(transport.websocket_owner_session) or
-      clean_binary?(transport.websocket_owner_lease_token) or
-      is_map(transport.websocket_owner_downstream) or
-      is_integer(transport.websocket_owner_downstream_epoch) or
-      clean_binary?(transport.websocket_owner_proxy_instance_id) or
-      clean_binary?(transport.websocket_owner_instance_id)
+  defp owner_transport_bundle_present?(owner) do
+    not is_nil(owner.session) or
+      clean_binary?(owner.lease_token) or
+      is_map(owner.downstream) or
+      is_integer(owner.downstream_epoch) or
+      clean_binary?(owner.proxy_instance_id) or
+      clean_binary?(owner.owner_instance_id)
   end
 
   defp owner_downstream?(%{pid: pid, correlation_id: correlation_id}),

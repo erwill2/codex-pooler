@@ -1,4 +1,4 @@
-defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession do
+defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   @moduledoc false
 
   use GenServer
@@ -6,10 +6,10 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession do
   alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.TransportFailureReason
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.ConnectionUpgrade
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.ReceiveState
-  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession.Request
-  alias CodexPooler.Gateway.Transports.Websocket.WebSocketFrameWriter
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ConnectionUpgrade
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ReceiveState
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketFrameWriter
 
   @default_keepalive_interval_ms 25_000
   @type response_headers :: [{binary(), binary()}]
@@ -623,7 +623,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebSocketSession do
     end
   end
 
-  defp send_frame(state, frame), do: WebSocketFrameWriter.send_frame(state, frame)
+  defp send_frame(state, frame), do: WebsocketFrameWriter.send_frame(state, frame)
 
   defp terminal_type(text) do
     case Jason.decode(text) do

@@ -4,11 +4,10 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   @behaviour WebSock
 
   alias CodexPooler.Gateway.Contracts
-  alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Payloads.ToolResultShape
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata, as: FinalizationMetadata
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Websocket
   alias CodexPoolerWeb.WebsocketConnectionLogger
@@ -512,31 +511,11 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
   @spec request_row_producing_response_payload?(term()) :: boolean()
   defp request_row_producing_response_payload?(payload) when is_binary(payload) do
-    case Jason.decode(payload) do
-      {:ok, %{"type" => "response.processed"}} -> true
-      {:ok, %{"generate" => false}} -> false
-      {:ok, %{"type" => "response.create"}} -> true
-      {:ok, %{"model" => model}} when is_binary(model) and model != "" -> true
-      _payload -> false
-    end
+    WebsocketCodec.request_row_producing_response_payload?(payload)
   end
 
   defp continuity_ordered_payload?(payload) when is_binary(payload) do
-    case Jason.decode(payload) do
-      {:ok, %{"type" => "response.processed"}} ->
-        true
-
-      {:ok,
-       %{"type" => "response.create", "previous_response_id" => previous_response_id} = decoded}
-      when is_binary(previous_response_id) ->
-        decoded
-        |> Map.get("input")
-        |> ToolResultShape.items()
-        |> Enum.any?()
-
-      _payload ->
-        false
-    end
+    WebsocketCodec.continuity_ordered_payload?(payload)
   end
 
   defp owner_forwarded_socket?(state), do: is_map(Map.get(state, :websocket_owner_downstream))
@@ -781,47 +760,10 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp run_response(parent, auth, payload, opts) do
-    with {:ok, payload, opts} <- maybe_coerce_public_v1_response_create(payload, opts) do
-      Websocket.run_websocket_response(auth, payload, opts, fn data ->
-        send(parent, {:codex_response_chunk, data})
-      end)
-    end
+    Websocket.run_websocket_response(auth, payload, opts, fn data ->
+      send(parent, {:codex_response_chunk, data})
+    end)
   end
-
-  defp maybe_coerce_public_v1_response_create(payload, %RequestOptions{} = opts)
-       when is_binary(payload) do
-    with true <- public_openai_responses_websocket?(opts),
-         {:ok, %{} = decoded} <- Jason.decode(payload),
-         true <- public_v1_response_create_frame?(decoded) do
-      decoded
-      |> Map.delete("type")
-      |> Responses.coerce(opts)
-      |> case do
-        {:ok, %{payload: coerced_payload, request_options: request_options}} ->
-          websocket_payload = Map.put_new(coerced_payload, "generate", true)
-          {:ok, Jason.encode!(websocket_payload), request_options}
-
-        {:error, reason} ->
-          {:error, reason}
-      end
-    else
-      false -> {:ok, payload, opts}
-      {:error, _reason} -> {:ok, payload, opts}
-    end
-  end
-
-  defp public_v1_response_create_frame?(%{"type" => "response.create"} = payload),
-    do: not Map.has_key?(payload, "generate")
-
-  defp public_v1_response_create_frame?(_payload), do: false
-
-  defp public_openai_responses_websocket?(%RequestOptions{
-         openai_compatibility: %{source_endpoint: "/v1/responses"},
-         transport: %{transport: "websocket"}
-       }),
-       do: true
-
-  defp public_openai_responses_websocket?(_opts), do: false
 
   defp response_task_failure do
     {:error,

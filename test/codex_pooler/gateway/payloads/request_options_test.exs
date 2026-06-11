@@ -72,15 +72,15 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.continuity.session_header == "local-session"
       assert options.continuity.session_header_source == "x-session-affinity"
       assert options.transport.upstream_websocket_session == self()
-      assert options.transport.websocket_owner_forwarding_enabled?
-      assert options.transport.websocket_owner_session == %{id: "owner-session"}
+      assert options.transport.websocket_owner.enabled?
+      assert options.transport.websocket_owner.session == %{id: "owner-session"}
 
-      assert options.transport.websocket_owner_downstream == %{
+      assert options.transport.websocket_owner.downstream == %{
                pid: self(),
                correlation_id: "corr"
              }
 
-      assert options.transport.websocket_owner_downstream_epoch == 2
+      assert options.transport.websocket_owner.downstream_epoch == 2
       assert options.extra == %{}
     end
 
@@ -666,14 +666,14 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       options =
         RequestOptions.build(%{}, "/backend-api/codex/responses", %{"model" => "example-model"})
 
-      refute options.transport.websocket_owner_forwarding_enabled?
       assert options.transport.upstream_websocket_session == nil
-      assert options.transport.websocket_owner_session == nil
-      assert options.transport.websocket_owner_lease_token == nil
-      assert options.transport.websocket_owner_downstream == nil
-      assert options.transport.websocket_owner_downstream_epoch == nil
-      assert options.transport.websocket_owner_proxy_instance_id == nil
-      assert options.transport.websocket_owner_instance_id == nil
+      refute options.transport.websocket_owner.enabled?
+      assert options.transport.websocket_owner.session == nil
+      assert options.transport.websocket_owner.lease_token == nil
+      assert options.transport.websocket_owner.downstream == nil
+      assert options.transport.websocket_owner.downstream_epoch == nil
+      assert options.transport.websocket_owner.proxy_instance_id == nil
+      assert options.transport.websocket_owner.owner_instance_id == nil
       assert options.continuity.owner_instance_id == nil
       assert options.extra == %{}
     end
@@ -698,14 +698,14 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
           %{"model" => "example-model"}
         )
 
-      assert options.transport.websocket_owner_forwarding_enabled?
-      assert options.transport.websocket_owner_session == owner_session
-      assert options.transport.websocket_owner_lease_token == "lease-token-not-logged"
-      assert options.transport.websocket_owner_downstream == downstream
-      assert options.transport.websocket_owner_downstream_epoch == 3
-      assert options.transport.websocket_owner_proxy_instance_id == "proxy-node@example"
-      assert options.transport.websocket_owner_instance_id == "owner-node@example"
-      assert options.transport.websocket_owner_forwarder_opts == [timeout: 123]
+      assert options.transport.websocket_owner.enabled?
+      assert options.transport.websocket_owner.session == owner_session
+      assert options.transport.websocket_owner.lease_token == "lease-token-not-logged"
+      assert options.transport.websocket_owner.downstream == downstream
+      assert options.transport.websocket_owner.downstream_epoch == 3
+      assert options.transport.websocket_owner.proxy_instance_id == "proxy-node@example"
+      assert options.transport.websocket_owner.owner_instance_id == "owner-node@example"
+      assert options.transport.websocket_owner.forwarder_opts == [timeout: 123]
       assert options.extra == %{}
     end
 

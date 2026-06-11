@@ -10,6 +10,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
+  @enforce_keys [:visible_model]
   defstruct [
     :visible_model,
     visible_model_context: %{},

@@ -243,7 +243,7 @@ defmodule CodexPooler.FakeUpstream do
 
     WebSockAdapter.upgrade(
       conn,
-      CodexPooler.FakeUpstream.WebSocket,
+      CodexPooler.FakeUpstream.Websocket,
       %{pid: pid, mode: Agent.get(pid, & &1.mode), headers: conn.req_headers},
       []
     )
@@ -276,7 +276,7 @@ defmodule CodexPooler.FakeUpstream do
   defp handle_websocket(pid, conn, mode) do
     WebSockAdapter.upgrade(
       conn,
-      CodexPooler.FakeUpstream.WebSocket,
+      CodexPooler.FakeUpstream.Websocket,
       %{pid: pid, mode: mode, headers: conn.req_headers},
       []
     )
@@ -715,7 +715,7 @@ defmodule CodexPooler.FakeUpstream do
     :exit, _ -> :ok
   end
 
-  defmodule WebSocket do
+  defmodule Websocket do
     @moduledoc false
 
     @behaviour WebSock

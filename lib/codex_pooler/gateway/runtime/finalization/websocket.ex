@@ -1,4 +1,4 @@
-defmodule CodexPooler.Gateway.Runtime.Finalization.WebSocket do
+defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
   @moduledoc false
 
   alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
