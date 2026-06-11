@@ -111,14 +111,14 @@ These endpoints keep Codex backend semantics and do not translate through the pu
       <td>Model metadata served from Pool/catalog state</td>
       <td>No Codex request translation</td>
       <td>Supported</td>
-      <td>Lists models visible to the authenticated Pool.</td>
+      <td>Lists models visible to the authenticated Pool, including backend Codex metadata such as context windows and optional <code>comp_hash</code>.</td>
     </tr>
     <tr>
       <td><code>POST /backend-api/codex/responses</code></td>
-      <td><code>/backend-api/codex/responses</code></td>
+      <td><code>/backend-api/codex/responses</code>, or <code>/backend-api/codex/responses/compact</code> for terminal compaction triggers</td>
       <td>No; backend payload is proxied through gateway normalization</td>
       <td>Supported</td>
-      <td>Primary Codex Responses route for JSON and SSE work. Known locally unsupported SDK controls are rejected or stripped by scope before upstream dispatch.</td>
+      <td>Primary Codex Responses route for JSON and SSE work. A valid terminal <code>compaction_trigger</code> bridges through compact handling and returns backend Responses SSE with encrypted compaction output. Known locally unsupported SDK controls are rejected or stripped by scope before upstream dispatch.</td>
     </tr>
     <tr>
       <td><code>GET /backend-api/codex/responses</code></td>
@@ -171,14 +171,14 @@ Some Codex clients use `/backend-api/codex/v1` as their base URL. Codex Pooler e
       <td><code>/backend-api/codex/models</code></td>
       <td>No</td>
       <td>Supported</td>
-      <td>Alias for backend model listing.</td>
+      <td>Alias for backend model listing, including backend-only fields such as optional <code>comp_hash</code>.</td>
     </tr>
     <tr>
       <td><code>POST /backend-api/codex/v1/responses</code></td>
-      <td><code>/backend-api/codex/responses</code></td>
+      <td><code>/backend-api/codex/responses</code>, or <code>/backend-api/codex/responses/compact</code> for terminal compaction triggers</td>
       <td>No</td>
       <td>Supported</td>
-      <td>Alias for backend Responses. Prompt-cache routing locality can apply here.</td>
+      <td>Alias for backend Responses. Prompt-cache routing locality can apply here. Terminal compaction triggers follow the canonical compact bridge.</td>
     </tr>
     <tr>
       <td><code>GET /backend-api/codex/v1/responses</code></td>
@@ -385,14 +385,14 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td>OpenAI-shaped model metadata from Pool/catalog state</td>
       <td>No upstream Codex request</td>
       <td>Supported</td>
-      <td>Returns an OpenAI-shaped model list for the authenticated Pool.</td>
+      <td>Returns an OpenAI-shaped model list for the authenticated Pool. Backend-only fields such as <code>comp_hash</code> are omitted.</td>
     </tr>
     <tr>
       <td><code>POST /v1/responses</code></td>
       <td><code>/backend-api/codex/responses</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>OpenAI Responses payloads are coerced to Codex-compatible work. Streaming responses use the public Responses stream adapter.</td>
+      <td>OpenAI Responses payloads are coerced to Codex-compatible work. System/developer input-message text is lifted into top-level instructions. Streaming responses use the public Responses stream adapter, and early terminal errors emit first without synthetic success prefixes.</td>
     </tr>
     <tr>
       <td><code>GET /v1/responses</code></td>
@@ -406,7 +406,7 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td><code>/backend-api/codex/responses</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>Chat Completions payloads are coerced to Codex Responses work and normalized back to Chat Completions shape.</td>
+      <td>Chat Completions payloads are coerced to Codex Responses work and normalized back to Chat Completions shape. Early streaming terminal errors emit one public error chunk before any assistant role chunk.</td>
     </tr>
     <tr>
       <td><code>GET /v1/usage</code></td>
@@ -596,13 +596,15 @@ Prompt-cache routing locality is a local routing hint. It can apply on `POST /ba
 
 Continuity headers are also local routing inputs. Codex Pooler chooses them in this order:
 
-1. `x-codex-session-id`
-2. `session-id`
-3. `x-session-affinity`
-4. `session_id`
-5. `x-codex-conversation-id`
+1. `x-codex-window-id`
+2. `x-codex-session-id`
+3. `session-id`
+4. `x-session-id`
+5. `x-session-affinity`
+6. `session_id`
+7. `x-codex-conversation-id`
 
-`session-id` and `x-session-affinity` are not forwarded upstream. If a pinned continuation points at an upstream account that now requires reauthentication, `/v1/responses` HTTP and websocket requests fail closed with a recovery hint to restart with full context and remove stale continuation anchors.
+`session-id`, `x-session-id`, and `x-session-affinity` are not forwarded upstream. If a pinned continuation points at an upstream account that now requires reauthentication, `/v1/responses` HTTP and websocket requests fail closed with a recovery hint to restart with full context and remove stale continuation anchors.
 
 ## Related references
 

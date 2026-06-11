@@ -97,4 +97,6 @@ Codex Pooler provides narrow OpenAI-compatible `/v1` support for selected SDK ro
 
 `GET /v1/responses` is narrow Responses websocket compatibility, not `/v1/realtime` support. `/v1/realtime` and OpenAI Realtime SDK websocket or session routes are unsupported.
 
+Continuity headers such as `session-id`, `x-session-id`, and `x-session-affinity` are local routing inputs only and are not forwarded upstream.
+
 Unsupported `/v1` routes return deterministic OpenAI-shaped unsupported endpoint errors when explicitly routed. Don't treat Codex Pooler as full OpenAI API parity.

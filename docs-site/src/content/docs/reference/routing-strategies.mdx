@@ -122,13 +122,15 @@ Session-bound requests are different. If a request belongs to an existing Codex 
 
 Continuity headers are local routing inputs. Codex Pooler reads them in this order:
 
-1. `x-codex-session-id`
-2. `session-id`
-3. `x-session-affinity`
-4. `session_id`
-5. `x-codex-conversation-id`
+1. `x-codex-window-id`
+2. `x-codex-session-id`
+3. `session-id`
+4. `x-session-id`
+5. `x-session-affinity`
+6. `session_id`
+7. `x-codex-conversation-id`
 
-`session-id` and `x-session-affinity` aren't forwarded upstream. They help Codex Pooler find the local routing state only.
+`session-id`, `x-session-id`, and `x-session-affinity` aren't forwarded upstream. They help Codex Pooler find the local routing state only.
 
 If the pinned upstream assignment is no longer eligible, Codex Pooler doesn't silently move that session to a different account. The user should check the upstream's lifecycle state, reauth status, Pool assignment, model support, quota evidence, and route health.
 

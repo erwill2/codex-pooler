@@ -113,6 +113,8 @@ The OpenAI-compatible `/v1` surface supports or translates selected routes only:
 
 The `/v1` surface is compatibility over Codex routing, not a separate OpenAI engine. Supported requests still require a Pool API key and a Pool with eligible upstream capacity for the requested model.
 
+`POST /v1/responses` lifts system and developer input-message text into top-level `instructions` before dispatching to Codex-compatible work. Streaming `/v1/responses` and `/v1/chat/completions` return early upstream terminal errors as the first public SSE event or data chunk, without synthetic assistant/success prefixes. Non-streaming failures remain OpenAI-shaped JSON errors.
+
 ## Routed but unsupported boundaries
 
 These `/v1` routes are unsupported and may return deterministic OpenAI-shaped unsupported endpoint errors when explicitly routed:
@@ -163,6 +165,8 @@ No. `/v1/realtime` and OpenAI Realtime SDK websocket or session routes are unsup
 ### Does `/v1/responses/compact` work?
 
 No. `POST /v1/responses/compact` is routed only so clients receive a deterministic OpenAI-shaped `unsupported_endpoint` error. Codex backend-compatible compact requests should use `POST /backend-api/codex/responses/compact`.
+
+Codex backend clients that send a terminal `compaction_trigger` to `POST /backend-api/codex/responses` or `/backend-api/codex/v1/responses` are bridged through the backend compact route and receive backend Responses SSE compaction output.
 
 ### Can I use the same key for `/v1` and `/mcp`?
 
