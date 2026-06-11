@@ -173,7 +173,7 @@ defmodule CodexPoolerWeb.Admin.InviteCreationDialog do
           </:actions>
         </AdminComponents.dialog_footer>
       </div>
-      <form method="dialog" class="modal-backdrop">
+      <form id="pool-invite-dialog-backdrop" method="dialog" class="modal-backdrop">
         <button type="button" phx-click="cancel_create_invite">close</button>
       </form>
     </dialog>
