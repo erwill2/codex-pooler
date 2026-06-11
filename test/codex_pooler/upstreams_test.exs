@@ -15,6 +15,7 @@ defmodule CodexPooler.UpstreamsTest do
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.{CodexAuth, CodexAuthJson, TokenRefresh}
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
+  alias CodexPooler.Upstreams.TokenLinking
 
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Quota.Charts.Measurements
@@ -666,12 +667,19 @@ defmodule CodexPooler.UpstreamsTest do
       assert identity.chatgpt_account_id == "acct_fixture_auth_json"
       assert identity.account_email == "fixture-user@example.com"
       assert identity.account_label == "fixture-user@example.com"
+      assert identity.onboarding_method == "import"
       assert identity.plan_label == "pro"
+      assert identity.auth_verified_at
+      assert identity.auth_fresh_at
       assert identity.metadata["account_email"] == "fixture-user@example.com"
       assert identity.metadata["auth_json_imported"] == true
       assert identity.metadata["access_token_expires_at"]
       assert assignment.pool_id == pool.id
+      assert assignment.assignment_label == identity.account_label
       assert assignment.status == "active"
+      assert assignment.health_status == "active"
+      assert assignment.eligibility_status == "eligible"
+      assert assignment.metadata["onboarding_method"] == "import"
 
       assert {:ok, ^access_token} =
                Secrets.decrypt_active_secret(identity, "access_token")
@@ -681,6 +689,9 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert active_secret_count("access_token") == 1
       assert active_secret_count("refresh_token") == 1
+      refute inspect(identity.metadata) =~ access_token
+      refute inspect(identity.metadata) =~ refresh_token
+      refute inspect(identity.metadata) =~ auth_json
       refute inspect(result) =~ access_token
       refute inspect(result) =~ refresh_token
       refute inspect(result) =~ auth_json
@@ -696,6 +707,94 @@ defmodule CodexPooler.UpstreamsTest do
       refute inspect(event) =~ access_token
       refute inspect(event) =~ refresh_token
       refute inspect(event) =~ auth_json
+    end
+
+    test "shared token linking boundary preserves import semantics for normalized attrs" do
+      Repo.delete_all(Oban.Job)
+
+      scope = fixture_owner_scope()
+
+      {:ok, pool} =
+        Pools.create_pool(scope, %{
+          slug: "token-linking-import",
+          name: "Token Linking Import"
+        })
+
+      access_token = runtime_secret("token-linking-access")
+      refresh_token = runtime_secret("token-linking-refresh")
+
+      attrs = %{
+        chatgpt_account_id: "acct_token_linking_import",
+        account_identifier: "acct_token_linking_import",
+        account_email: "token-linking@example.com",
+        account_label: "token-linking@example.com",
+        workspace_id: "ws_token_linking",
+        workspace_label: "Token Linking Workspace",
+        seat_type: "team-seat",
+        plan_label: "team",
+        token: access_token,
+        refresh_token: refresh_token,
+        access_token_expires_at:
+          DateTime.utc_now() |> DateTime.add(3600, :second) |> DateTime.truncate(:microsecond),
+        import_metadata: %{
+          "account_email" => "token-linking@example.com",
+          "auth_json_imported" => true
+        }
+      }
+
+      assert {:ok,
+              %{
+                status: :created,
+                identity: identity,
+                assignment: assignment,
+                secret_status: :present
+              } = result} =
+               TokenLinking.link_tokens(scope, pool, attrs,
+                 onboarding_method: "import",
+                 audit_action: "upstream_account.import",
+                 broadcast_reason: "upstream_account_imported",
+                 quota_trigger_kind: "account_link",
+                 token_refresh_trigger_kind: "auth_json_import"
+               )
+
+      assert identity.chatgpt_account_id == "acct_token_linking_import"
+      assert identity.account_email == "token-linking@example.com"
+      assert identity.workspace_id == "ws_token_linking"
+      assert identity.workspace_label == "Token Linking Workspace"
+      assert identity.seat_type == "team-seat"
+      assert identity.onboarding_method == "import"
+      assert identity.plan_label == "team"
+      assert identity.metadata["auth_json_imported"] == true
+      assert identity.metadata["token_refresh"]["status"] == "imported"
+      assert identity.metadata["token_refresh"]["trigger_kind"] == "auth_json_import"
+
+      assert assignment.pool_id == pool.id
+      assert assignment.upstream_identity_id == identity.id
+      assert assignment.status == "active"
+      assert assignment.health_status == "active"
+      assert assignment.eligibility_status == "eligible"
+      assert assignment.metadata["onboarding_method"] == "import"
+
+      assert {:ok, ^access_token} = Secrets.decrypt_active_secret(identity, "access_token")
+      assert {:ok, ^refresh_token} = Secrets.decrypt_active_secret(identity, "refresh_token")
+      assert active_secret_count("access_token") == 1
+      assert active_secret_count("refresh_token") == 1
+
+      assert [event] = audit_events("upstream_account.import", identity.id)
+      assert event.actor_user_id == scope.user.id
+      assert event.pool_id == pool.id
+      assert event.details["pool_assignment_ids"] == [assignment.id]
+      assert event.details["result_status"] == "created"
+      assert event.details["credential_status"] == "present"
+
+      assert [job] = all_enqueued(worker: AccountReconciliationWorker)
+      assert job.args["pool_id"] == pool.id
+      assert job.args["pool_upstream_assignment_id"] == assignment.id
+      assert job.args["trigger_kind"] == "account_link"
+
+      refute inspect(result) =~ access_token
+      refute inspect(result) =~ refresh_token
+      refute inspect(result) =~ "id_token"
     end
 
     test "reimporting an existing account preserves the operator label" do

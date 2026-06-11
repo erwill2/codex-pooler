@@ -12,6 +12,7 @@ defmodule CodexPooler.Upstreams do
 
   alias CodexPooler.Upstreams.{
     Import,
+    OAuthFlows,
     Secrets,
     TokenRefreshEnqueue
   }
@@ -22,6 +23,7 @@ defmodule CodexPooler.Upstreams do
 
   alias CodexPooler.Upstreams.Schemas.{
     EncryptedSecret,
+    OAuthFlow,
     PoolUpstreamAssignment,
     UpstreamIdentity
   }
@@ -39,6 +41,9 @@ defmodule CodexPooler.Upstreams do
   @type secret_result ::
           {:ok, EncryptedSecret.t() | binary()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
   @type import_result :: {:ok, map()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  @type oauth_flow_start_result :: OAuthFlows.start_result()
+  @type oauth_flow_completion_result :: OAuthFlows.completion_result()
+  @type oauth_flow_summary :: OAuthFlows.safe_flow_summary()
 
   @spec list_upstream_identities(keyword()) :: [UpstreamIdentity.t()]
   def list_upstream_identities(opts \\ []) do
@@ -114,6 +119,38 @@ defmodule CodexPooler.Upstreams do
 
   @spec import_codex_auth_json(term(), term(), binary()) :: import_result()
   defdelegate import_codex_auth_json(scope, pool, content), to: Import
+
+  @spec start_browser_oauth(Scope.t(), Pool.t(), keyword()) :: oauth_flow_start_result()
+  defdelegate start_browser_oauth(scope, pool, opts \\ []), to: OAuthFlows
+
+  @spec start_device_oauth(Scope.t(), Pool.t(), keyword()) :: oauth_flow_start_result()
+  defdelegate start_device_oauth(scope, pool, opts \\ []), to: OAuthFlows
+
+  @spec complete_browser_oauth(Scope.t(), Ecto.UUID.t(), String.t()) ::
+          oauth_flow_completion_result()
+  defdelegate complete_browser_oauth(scope, flow_id, callback_url), to: OAuthFlows
+
+  @spec poll_device_oauth(Scope.t(), Ecto.UUID.t()) :: oauth_flow_completion_result()
+  defdelegate poll_device_oauth(scope, flow_id), to: OAuthFlows
+
+  @spec cancel_oauth_flow(Scope.t(), Ecto.UUID.t()) ::
+          {:ok, OAuthFlow.t()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
+  defdelegate cancel_oauth_flow(scope, flow_id), to: OAuthFlows
+
+  @spec expire_oauth_flows(DateTime.t()) :: %{
+          expired: non_neg_integer(),
+          deleted: non_neg_integer()
+        }
+  defdelegate expire_oauth_flows(now), to: OAuthFlows
+
+  @spec cleanup_oauth_flows(DateTime.t()) :: %{
+          expired: non_neg_integer(),
+          deleted: non_neg_integer()
+        }
+  defdelegate cleanup_oauth_flows(now), to: OAuthFlows
+
+  @spec list_visible_oauth_flow_summaries(Scope.t(), keyword()) :: [oauth_flow_summary()]
+  defdelegate list_visible_oauth_flow_summaries(scope, opts \\ []), to: OAuthFlows
 
   @spec rename_account_for_scope(Scope.t(), identity_ref(), map()) :: lifecycle_result()
   defdelegate rename_account_for_scope(scope, identity_or_id, attrs), to: AccountLifecycle

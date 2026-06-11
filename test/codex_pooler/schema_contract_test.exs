@@ -25,7 +25,7 @@ defmodule CodexPooler.SchemaContractTest do
   alias CodexPooler.Pools.{OperatorPoolAssignment, RoutingSettings}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota
-  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+  alias CodexPooler.Upstreams.Schemas.{OAuthFlow, UpstreamIdentity}
 
   @expected_tables ~w(
     account_quota_windows alert_channels alert_delivery_attempts alert_incident_receipts alert_incident_targets alert_incidents
@@ -34,7 +34,7 @@ defmodule CodexPooler.SchemaContractTest do
     encrypted_secrets gateway_idempotency_keys instance_settings invite_acceptances invites ledger_entries memberships
     models operator_pool_assignments platform_bootstrap_state pricing_snapshots recovery_codes request_log_facts requests routing_circuit_states
     sessions sync_runs pools pool_routing_settings pool_upstream_assignments totp_settings
-    upstream_identities users
+    upstream_identities upstream_oauth_flows users
   )
 
   @schema_modules [
@@ -77,6 +77,7 @@ defmodule CodexPooler.SchemaContractTest do
     RoutingSettings,
     Quota.AccountQuotaWindow,
     CodexPooler.Upstreams.Schemas.EncryptedSecret,
+    OAuthFlow,
     CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment,
     UpstreamIdentity
   ]
@@ -137,7 +138,11 @@ defmodule CodexPooler.SchemaContractTest do
           "alert_incident_targets_incident_rule_pool_uq",
           "alert_delivery_attempts_incident_channel_attempt_uq",
           "alert_incident_targets_rule_pool_idx",
-          "alert_delivery_attempts_retry_lookup_idx"
+          "alert_delivery_attempts_retry_lookup_idx",
+          "upstream_oauth_flows_state_token_hash_uq",
+          "upstream_oauth_flows_pool_status_expires_idx",
+          "upstream_oauth_flows_identity_status_expires_idx",
+          "upstream_oauth_flows_requested_status_inserted_idx"
         ] do
       assert Map.has_key?(indexes, name)
     end
@@ -276,6 +281,18 @@ defmodule CodexPooler.SchemaContractTest do
     assert constraints["alert_delivery_attempts_status_check"] =~ "'pending'"
     assert constraints["alert_delivery_attempts_status_check"] =~ "'discarded'"
     assert constraints["alert_delivery_attempts_max_attempts_check"] =~ "max_attempts = 5"
+    assert constraints["upstream_oauth_flows_flow_kind_check"] =~ "'browser'"
+    assert constraints["upstream_oauth_flows_flow_kind_check"] =~ "'device'"
+    assert constraints["upstream_oauth_flows_purpose_check"] =~ "'link'"
+    assert constraints["upstream_oauth_flows_purpose_check"] =~ "'relink'"
+    assert constraints["upstream_oauth_flows_status_check"] =~ "'pending'"
+    assert constraints["upstream_oauth_flows_status_check"] =~ "'completed'"
+    assert constraints["upstream_oauth_flows_status_check"] =~ "'failed'"
+    assert constraints["upstream_oauth_flows_status_check"] =~ "'cancelled'"
+    assert constraints["upstream_oauth_flows_status_check"] =~ "'expired'"
+    assert constraints["upstream_oauth_flows_metadata_shape_check"] =~ "jsonb_typeof(metadata)"
+    assert constraints["upstream_oauth_flows_interval_seconds_check"] =~ "interval_seconds > 0"
+    assert constraints["upstream_oauth_flows_state_hash_shape_check"] =~ "octet_length"
   end
 
   test "preserves JSONB, decimal-compatible money/rate fields, and integer token counters" do
@@ -312,6 +329,10 @@ defmodule CodexPooler.SchemaContractTest do
     assert column_type("codex_files", "pool_upstream_assignment_id") == "uuid"
     assert column_type("codex_files", "upstream_identity_id") == "uuid"
     assert column_type("upstream_identities", "account_email") == "text"
+    assert column_type("upstream_oauth_flows", "state_token_hash") == "bytea"
+    assert column_type("upstream_oauth_flows", "code_verifier_ciphertext") == "bytea"
+    assert column_type("upstream_oauth_flows", "device_auth_id_ciphertext") == "bytea"
+    assert column_type("upstream_oauth_flows", "metadata") == "jsonb"
 
     assert column_type("pricing_snapshots", "input_token_micros") == "numeric(30,9)"
     assert column_type("pricing_snapshots", "request_base_micros") == "numeric(30,9)"
@@ -391,6 +412,10 @@ defmodule CodexPooler.SchemaContractTest do
     assert fk_action("alert_incident_targets_pool_id_fkey") == {"c", "a"}
     assert fk_action("alert_delivery_attempts_incident_id_fkey") == {"c", "a"}
     assert fk_action("alert_delivery_attempts_channel_id_fkey") == {"c", "a"}
+    assert fk_action("upstream_oauth_flows_pool_id_fkey") == {"c", "a"}
+    assert fk_action("upstream_oauth_flows_upstream_identity_id_fkey") == {"n", "a"}
+    assert fk_action("upstream_oauth_flows_requested_by_user_id_fkey") == {"a", "a"}
+    assert fk_action("upstream_oauth_flows_result_upstream_identity_id_fkey") == {"n", "a"}
   end
 
   test "alert storage tables preserve the metadata-only alerting contract" do

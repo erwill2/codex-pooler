@@ -12,14 +12,24 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   alias CodexPooler.Events
   alias CodexPooler.Events.Event
   alias CodexPooler.Events.PostgresBridge
+  alias CodexPooler.FakeOpenAIAuthProvider
   alias CodexPooler.Jobs.TokenRefreshWorker
   alias CodexPooler.Mailer
   alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Auth.CodexAuth
+  alias CodexPooler.Upstreams.OAuthFlows
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.PrimingState
-  alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, PoolUpstreamAssignment, UpstreamIdentity}
+
+  alias CodexPooler.Upstreams.Schemas.{
+    EncryptedSecret,
+    OAuthFlow,
+    PoolUpstreamAssignment,
+    UpstreamIdentity
+  }
+
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.UpstreamAccountCard
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
@@ -134,23 +144,30 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     refute has_element?(view, "#upstream-account-form")
     refute has_element?(view, "#upstream-account-submit")
-    assert has_element?(view, "#upstream-page-actions.join")
+    assert has_element?(view, "#upstream-page-actions.grid")
 
     assert has_element?(
              view,
-             "#upstream-page-create-invite-action[href='/admin/invites?create=1'].btn.btn-primary.join-item",
-             "Invite account"
+             "#upstream-page-create-invite-action[href='/admin/invites?create=1'][aria-label='Invite account'].btn.btn-secondary",
+             "Invite"
            )
-
-    assert has_element?(view, "#upstream-page-actions-menu[aria-label='More upstream actions']")
 
     assert has_element?(
              view,
-             "#upstream-page-actions-menu-items #upstream-page-import-auth-json-action",
-             "Import auth.json"
+             "#upstream-page-actions > #upstream-page-import-auth-json-action[aria-label='Import auth.json'].btn.btn-accent",
+             "Import"
            )
+
+    assert has_element?(
+             view,
+             "#upstream-page-actions > #upstream-page-oauth-link-action[aria-label='Link OpenAI account'].btn.btn-primary",
+             "OAuth"
+           )
+
+    refute has_element?(view, "#upstream-page-actions-menu")
 
     assert upstream_page_action_order(render(view)) == [
+             "upstream-page-oauth-link-action",
              "upstream-page-create-invite-action",
              "upstream-page-import-auth-json-action"
            ]
@@ -170,6 +187,349 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
            )
 
     refute has_element?(view, "#upstream-add-capacity-card")
+  end
+
+  test "page read model exposes safe OAuth flow summaries without transient secrets", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "oauth-flow-summaries", name: "OAuth Flow Summaries"})
+
+    assert {:ok, %{flow: browser_flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool,
+               metadata: %{"source" => "admin_upstreams_test"}
+             )
+
+    device_auth_id = runtime_secret("oauth-flow-device-auth-id")
+
+    assert {:ok, device_flow} =
+             OAuthFlows.create_oauth_flow(%{
+               pool_id: pool.id,
+               requested_by_user_id: scope.user.id,
+               flow_kind: "device",
+               purpose: "link",
+               status: "pending",
+               device_auth_id: device_auth_id,
+               device_user_code: "ABCD-EFGH",
+               verification_uri: "https://auth.example.com/device",
+               interval_seconds: 7,
+               poll_after_at: DateTime.add(DateTime.utc_now(), 7, :second),
+               expires_at: DateTime.add(DateTime.utc_now(), 10, :minute),
+               metadata: %{"raw_provider_payload" => runtime_secret("oauth-flow-provider")}
+             })
+
+    oauth_flows =
+      UpstreamAccountsReadModel.oauth_flow_state(
+        scope,
+        [pool],
+        DateTimeDisplay.preferences_for_user(scope.user)
+      )
+
+    assert oauth_flows.count == 2
+
+    browser_summary = flow_summary(oauth_flows, browser_flow.id)
+    assert browser_summary.flow_kind == "browser"
+    assert browser_summary.purpose == "link"
+    assert browser_summary.status == "pending"
+    assert browser_summary.status_label == "Browser authorization pending"
+    assert browser_summary.authorization_url == nil
+    assert browser_summary.device == nil
+
+    device_summary = flow_summary(oauth_flows, device_flow.id)
+    assert device_summary.flow_kind == "device"
+    assert device_summary.device.user_code == "ABCD-EFGH"
+    assert device_summary.device.verification_uri == "https://auth.example.com/device"
+    assert device_summary.device.interval_seconds == 7
+
+    refute Map.has_key?(browser_summary, :state_token_hash)
+    refute Map.has_key?(browser_summary, :code_verifier_ciphertext)
+    refute Map.has_key?(device_summary, :device_auth_id_ciphertext)
+    refute inspect(oauth_flows) =~ authorization_url
+    refute inspect(oauth_flows) =~ device_auth_id
+    refute inspect(oauth_flows) =~ "raw_provider_payload"
+    refute inspect(oauth_flows) =~ "code_verifier"
+    refute inspect(oauth_flows) =~ "device_auth_id"
+
+    {{:ok, view, html}, repo_queries} =
+      capture_repo_queries(fn -> live(conn, ~p"/admin/upstreams") end)
+
+    refute has_element?(view, "#upstream-oauth-flow-state")
+    refute Enum.any?(repo_queries, &(&1.source == "upstream_oauth_flows"))
+
+    refute html =~ authorization_url
+    refute html =~ device_auth_id
+    refute html =~ "raw_provider_payload"
+    refute html =~ "code_verifier"
+    refute html =~ "device_auth_id"
+  end
+
+  test "links upstream account through browser OAuth dialog without rendering token secrets", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "oauth-browser-ui", name: "OAuth Browser UI"})
+
+    access_token = runtime_secret("oauth-browser-access")
+    refresh_token = runtime_secret("oauth-browser-refresh")
+    id_token = oauth_id_token("acct_admin_browser")
+
+    provider =
+      start_oauth_provider!(%{
+        "/oauth/token" =>
+          {200,
+           FakeOpenAIAuthProvider.token_response(
+             access_token: access_token,
+             refresh_token: refresh_token,
+             id_token: id_token
+           )}
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    open_oauth_link_dialog(view)
+    assert has_element?(view, "#oauth-link-dialog")
+    assert_oauth_dialog_docs_link(view, "oauth-link-dialog-footer")
+
+    assert has_element?(
+             view,
+             "#oauth_link_pool_id option[value='#{pool.id}']",
+             "OAuth Browser UI"
+           )
+
+    assert has_element?(view, "#oauth-link-browser-start")
+    assert has_element?(view, "#oauth-link-device-start")
+
+    select_oauth_link_pool(view, pool.id)
+
+    view
+    |> element("#oauth-link-browser-start")
+    |> render_click()
+
+    assert has_element?(view, "#oauth-link-authorization-url")
+    assert has_element?(view, "#oauth-link-callback-url")
+    assert has_element?(view, "#oauth-link-submit-callback")
+
+    authorization_url = authorization_url_from_view(view)
+
+    callback_url =
+      provider_callback_url(authorization_state(authorization_url), "browser-admin-ui-code")
+
+    view
+    |> element("#oauth-link-callback-form")
+    |> render_submit(%{"oauth_link" => %{"callback_url" => callback_url}})
+
+    assert has_element?(view, "#oauth-link-status", "OpenAI account linked")
+    assert has_element?(view, "#oauth-link-cancel", "Close")
+
+    identity = Repo.one!(UpstreamIdentity)
+    assert identity.chatgpt_account_id == "acct_admin_browser"
+    assert has_element?(view, "#upstream-account-#{identity.id}")
+
+    assert [token_request] = FakeOpenAIAuthProvider.requests(provider)
+
+    assert FakeOpenAIAuthProvider.decode_form_request(token_request)["code"] ==
+             "browser-admin-ui-code"
+
+    html = render(view)
+
+    for raw_value <- [
+          access_token,
+          refresh_token,
+          id_token,
+          callback_url,
+          "browser-admin-ui-code"
+        ] do
+      refute html =~ raw_value
+    end
+  end
+
+  test "browser OAuth callback errors stay safe and keep the raw callback out of HTML", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "oauth-browser-error-ui", name: "OAuth Browser Error UI"})
+
+    start_oauth_provider!(%{"/oauth/token" => {200, FakeOpenAIAuthProvider.token_response()}})
+
+    raw_code = runtime_secret("oauth-browser-wrong-state-code")
+    raw_callback_url = callback_url("wrong-state", raw_code)
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    open_oauth_link_dialog(view)
+    select_oauth_link_pool(view, pool.id)
+
+    view
+    |> element("#oauth-link-browser-start")
+    |> render_click()
+
+    view
+    |> element("#oauth-link-callback-form")
+    |> render_submit(%{"oauth_link" => %{"callback_url" => raw_callback_url}})
+
+    assert has_element?(
+             view,
+             "#oauth-link-error",
+             "OAuth callback state does not match a pending flow"
+           )
+
+    assert Repo.aggregate(UpstreamIdentity, :count) == 0
+
+    html = render(view)
+    refute html =~ raw_callback_url
+    refute html =~ raw_code
+  end
+
+  test "links upstream account through device OAuth polling without rendering hidden provider values",
+       %{
+         conn: conn,
+         scope: scope
+       } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "oauth-device-ui", name: "OAuth Device UI"})
+
+    device_auth_id = runtime_secret("oauth-device-auth-id")
+    authorization_code = runtime_secret("oauth-device-authorization-code")
+    code_verifier = runtime_secret("oauth-device-code-verifier")
+    access_token = runtime_secret("oauth-device-access")
+    refresh_token = runtime_secret("oauth-device-refresh")
+    id_token = oauth_id_token("acct_admin_device")
+
+    provider =
+      start_oauth_provider!(
+        device_routes(%{
+          "/api/accounts/deviceauth/usercode" =>
+            {200,
+             FakeOpenAIAuthProvider.device_code_response(
+               device_auth_id: device_auth_id,
+               user_code: "CODE-UI",
+               interval: 5,
+               expires_at: DateTime.add(DateTime.utc_now(), 600, :second) |> DateTime.to_iso8601()
+             )},
+          "/api/accounts/deviceauth/token" =>
+            {200,
+             FakeOpenAIAuthProvider.authorization_code_response(
+               authorization_code: authorization_code,
+               code_verifier: code_verifier
+             )},
+          "/oauth/token" =>
+            {200,
+             FakeOpenAIAuthProvider.token_response(
+               access_token: access_token,
+               refresh_token: refresh_token,
+               id_token: id_token
+             )}
+        })
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    open_oauth_link_dialog(view)
+    select_oauth_link_pool(view, pool.id)
+
+    view
+    |> element("#oauth-link-device-start")
+    |> render_click()
+
+    assert has_element?(view, "#oauth-link-device-code", "CODE-UI")
+
+    assert has_element?(
+             view,
+             "#oauth-link-device-code",
+             FakeOpenAIAuthProvider.url(provider) <> "/codex/device"
+           )
+
+    flow = Repo.one!(OAuthFlow)
+    send(view.pid, {:poll_oauth_device, flow.id})
+    _ = :sys.get_state(view.pid)
+
+    assert has_element?(view, "#oauth-link-status", "OpenAI account linked")
+    assert has_element?(view, "#oauth-link-cancel", "Close")
+
+    identity = Repo.one!(UpstreamIdentity)
+    assert identity.chatgpt_account_id == "acct_admin_device"
+    assert has_element?(view, "#upstream-account-#{identity.id}")
+
+    html = render(view)
+
+    for raw_value <- [
+          device_auth_id,
+          authorization_code,
+          code_verifier,
+          access_token,
+          refresh_token,
+          id_token
+        ] do
+      refute html =~ raw_value
+    end
+  end
+
+  test "OAuth link cancel marks the pending flow cancelled and closes the dialog", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "oauth-cancel-ui", name: "OAuth Cancel UI"})
+    start_oauth_provider!(%{"/oauth/token" => {200, FakeOpenAIAuthProvider.token_response()}})
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    open_oauth_link_dialog(view)
+    select_oauth_link_pool(view, pool.id)
+
+    view
+    |> element("#oauth-link-browser-start")
+    |> render_click()
+
+    flow = Repo.one!(OAuthFlow)
+    assert has_element?(view, "#oauth-link-cancel", "Cancel")
+
+    view
+    |> element("#oauth-link-cancel")
+    |> render_click()
+
+    assert Repo.get!(OAuthFlow, flow.id).status == "cancelled"
+    refute has_element?(view, "#oauth-link-dialog")
+    assert Repo.aggregate(UpstreamIdentity, :count) == 0
+  end
+
+  test "OAuth link rejects tampered pool selection outside visible pools", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, _pool} =
+      Pools.create_pool(scope, %{slug: "oauth-pool-tamper-ui", name: "OAuth Pool Tamper UI"})
+
+    start_oauth_provider!(%{"/oauth/token" => {200, FakeOpenAIAuthProvider.token_response()}})
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    open_oauth_link_dialog(view)
+    select_oauth_link_pool(view, Ecto.UUID.generate())
+
+    view
+    |> element("#oauth-link-browser-start")
+    |> render_click()
+
+    assert has_element?(view, "#oauth-link-error")
+    assert Repo.aggregate(OAuthFlow, :count) == 0
   end
 
   test "distinguishes sibling workspace slots on upstream account cards", %{
@@ -3005,6 +3365,86 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     |> render_click()
   end
 
+  defp open_oauth_link_dialog(view) do
+    view
+    |> element("#upstream-page-oauth-link-action")
+    |> render_click()
+  end
+
+  defp select_oauth_link_pool(view, pool_id) do
+    view
+    |> element("#oauth-link-start-form")
+    |> render_change(%{"oauth_link" => %{"pool_id" => pool_id}})
+  end
+
+  defp start_oauth_provider!(routes) do
+    {:ok, provider} = FakeOpenAIAuthProvider.start_link(routes)
+    Application.put_env(:codex_pooler, CodexAuth, issuer: FakeOpenAIAuthProvider.url(provider))
+    on_exit(fn -> FakeOpenAIAuthProvider.stop(provider) end)
+    provider
+  end
+
+  defp device_routes(extra_routes) do
+    Map.merge(
+      %{
+        "/api/accounts/deviceauth/usercode" =>
+          {200,
+           FakeOpenAIAuthProvider.device_code_response(
+             device_auth_id: "device-auth-ui",
+             user_code: "CODE-UI",
+             interval: 5,
+             expires_at: DateTime.add(DateTime.utc_now(), 600, :second) |> DateTime.to_iso8601()
+           )}
+      },
+      extra_routes
+    )
+  end
+
+  defp oauth_id_token(account_id) do
+    FakeOpenAIAuthProvider.id_token(%{
+      "email" => "#{account_id}@example.com",
+      "https://api.openai.com/auth" => %{
+        "chatgpt_account_id" => account_id,
+        "chatgpt_user_id" => "user_#{account_id}",
+        "chatgpt_plan_type" => "team",
+        "workspace_id" => "workspace-admin-ui",
+        "workspace_label" => "Admin UI Workspace",
+        "seat_type" => "team-seat"
+      }
+    })
+  end
+
+  defp authorization_url_from_view(view) do
+    case Regex.run(~r/id="oauth-link-authorization-url"[^>]*href="([^"]+)"/, render(view)) do
+      [_match, authorization_url] -> String.replace(authorization_url, "&amp;", "&")
+      _missing -> flunk("missing OAuth authorization URL")
+    end
+  end
+
+  defp authorization_state(authorization_url) do
+    authorization_url
+    |> URI.parse()
+    |> Map.fetch!(:query)
+    |> URI.decode_query()
+    |> Map.fetch!("state")
+  end
+
+  defp callback_url(state, code) do
+    "http://localhost:1455/auth/callback?" <>
+      URI.encode_query(%{"state" => state, "code" => code})
+  end
+
+  defp provider_callback_url(state, code) do
+    "http://localhost:1455/auth/callback?" <>
+      URI.encode_query([
+        {"code", code},
+        {"scope",
+         "openid profile email offline_access api.connectors.read api.connectors.invoke"},
+        {"provider_extra", "ignored"},
+        {"state", state}
+      ])
+  end
+
   defp execute_scheduled_upstreams_reload(view) do
     state = :sys.get_state(view.pid)
     timer = state.socket.assigns[:upstreams_reload_timer]
@@ -3015,8 +3455,41 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     _ = :sys.get_state(view.pid)
   end
 
+  defp flow_summary(oauth_flows, flow_id) do
+    Enum.find(oauth_flows.items, &(&1.id == flow_id)) || flunk("missing OAuth flow summary")
+  end
+
+  defp configure_upstream_secret_key! do
+    previous = Application.get_env(:codex_pooler, CodexPooler.Upstreams)
+
+    Application.put_env(:codex_pooler, CodexPooler.Upstreams,
+      upstream_secret_key: Base.encode64(:crypto.hash(:sha256, "test-upstream-secret-key")),
+      upstream_secret_key_version: "test-v1"
+    )
+
+    on_exit(fn ->
+      if previous do
+        Application.put_env(:codex_pooler, CodexPooler.Upstreams, previous)
+      else
+        Application.delete_env(:codex_pooler, CodexPooler.Upstreams)
+      end
+    end)
+  end
+
+  defp restore_codex_auth_config! do
+    previous = Application.get_env(:codex_pooler, CodexAuth)
+
+    on_exit(fn ->
+      if previous do
+        Application.put_env(:codex_pooler, CodexAuth, previous)
+      else
+        Application.delete_env(:codex_pooler, CodexAuth)
+      end
+    end)
+  end
+
   defp upstream_page_action_order(html) do
-    ~r/id="(upstream-page-(?:create-invite|import-auth-json)-action)"/
+    ~r/id="(upstream-page-(?:create-invite|import-auth-json|oauth-link)-action)"/
     |> Regex.scan(html, capture: :all_but_first)
     |> List.flatten()
   end
@@ -3033,6 +3506,58 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              "##{footer_id}-docs-link [data-role='admin-dialog-docs-icon']"
            )
   end
+
+  defp assert_oauth_dialog_docs_link(view, footer_id) do
+    assert has_element?(
+             view,
+             "##{footer_id} [data-role='admin-dialog-docs-link'][href='https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking'][target='_blank'][rel='noopener noreferrer'].text-xs",
+             "Docs"
+           )
+
+    assert has_element?(
+             view,
+             "##{footer_id}-docs-link [data-role='admin-dialog-docs-icon']"
+           )
+  end
+
+  def handle_repo_query_event(_event, _measurements, metadata, {handler_id, test_pid}) do
+    if metadata[:repo] == Repo do
+      send(test_pid, {handler_id, %{source: normalize_repo_query_value(metadata[:source])}})
+    end
+  end
+
+  defp capture_repo_queries(fun) when is_function(fun, 0) do
+    test_pid = self()
+    handler_id = {__MODULE__, test_pid, System.unique_integer([:positive])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        &__MODULE__.handle_repo_query_event/4,
+        {handler_id, test_pid}
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_query_events(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_query_events(handler_id, events) do
+    receive do
+      {^handler_id, event} ->
+        drain_repo_query_events(handler_id, [event | events])
+    after
+      10 -> Enum.reverse(events)
+    end
+  end
+
+  defp normalize_repo_query_value(value) when is_binary(value), do: value
+  defp normalize_repo_query_value(value) when is_atom(value), do: Atom.to_string(value)
+  defp normalize_repo_query_value(value), do: to_string(value)
 
   defp audit_events(action, target_id) do
     Repo.all(

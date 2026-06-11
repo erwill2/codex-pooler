@@ -1,18 +1,21 @@
 defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   use CodexPoolerWeb.ConnCase, async: false
 
+  import Ecto.Query
   import Phoenix.LiveViewTest
   import CodexPooler.PoolerFixtures
 
   alias CodexPooler.Audit
   alias CodexPooler.Events
+  alias CodexPooler.FakeOpenAIAuthProvider
   alias CodexPooler.Pools
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
+  alias CodexPooler.Upstreams.Auth.CodexAuth
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
-  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+  alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, OAuthFlow, UpstreamIdentity}
   alias CodexPoolerWeb.Admin.UpstreamCockpitReadModel
   alias CodexPoolerWeb.DateTimeDisplay
 
@@ -62,6 +65,405 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
              view,
              "#upstream-account-#{identity.id}-mail[href='/admin/upstreams/#{assignment.id}']"
            )
+  end
+
+  test "cockpit read model exposes safe OAuth relink summaries without transient secrets", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "cockpit-oauth-flows", name: "Cockpit OAuth Flows"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{account_label: "Cockpit OAuth Account"})
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool,
+               upstream_identity: identity,
+               metadata: %{"source" => "admin_cockpit_test"}
+             )
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+    assert cockpit.oauth_flows.count == 1
+
+    summary = hd(cockpit.oauth_flows.items)
+    assert summary.id == flow.id
+    assert summary.flow_kind == "browser"
+    assert summary.purpose == "relink"
+    assert summary.status == "pending"
+    assert summary.status_label == "Browser authorization pending"
+    assert summary.authorization_url == nil
+    assert summary.upstream_identity_id == identity.id
+
+    refute Map.has_key?(summary, :state_token_hash)
+    refute Map.has_key?(summary, :code_verifier_ciphertext)
+    refute inspect(cockpit.oauth_flows) =~ authorization_url
+    refute inspect(cockpit.oauth_flows) =~ "admin_cockpit_test"
+    refute inspect(cockpit.oauth_flows) =~ "code_verifier"
+
+    {:ok, view, html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    assert has_element?(view, "#upstream-cockpit-oauth-flow-state")
+
+    assert has_element?(
+             view,
+             "#upstream-cockpit-oauth-flow-#{flow.id}",
+             "Browser authorization pending"
+           )
+
+    assert has_element?(view, "#upstream-cockpit-oauth-flow-#{flow.id}", "relink")
+    refute html =~ authorization_url
+    refute html =~ "admin_cockpit_test"
+    refute html =~ "code_verifier"
+  end
+
+  test "relinks cockpit account through browser OAuth dialog without rendering token secrets", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "cockpit-oauth-browser-ui", name: "Cockpit OAuth Browser"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Cockpit Browser OAuth",
+        chatgpt_account_id: "acct_cockpit_browser_ui",
+        workspace_id: "workspace-cockpit-ui",
+        workspace_label: "Cockpit Workspace"
+      })
+
+    access_token = runtime_secret("cockpit-oauth-browser-access")
+    refresh_token = runtime_secret("cockpit-oauth-browser-refresh")
+    id_token = oauth_id_token("acct_cockpit_browser_ui", "workspace-cockpit-ui")
+
+    provider =
+      start_oauth_provider!(%{
+        "/oauth/token" =>
+          {200,
+           FakeOpenAIAuthProvider.token_response(
+             access_token: access_token,
+             refresh_token: refresh_token,
+             id_token: id_token
+           )}
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    open_oauth_relink_dialog(view, identity.id)
+    assert has_element?(view, "#oauth-relink-dialog")
+    assert_oauth_dialog_docs_link(view, "oauth-relink-dialog-footer")
+    assert has_element?(view, "#oauth-relink-browser-start")
+    assert has_element?(view, "#oauth-relink-device-start")
+
+    view
+    |> element("#oauth-relink-browser-start")
+    |> render_click()
+
+    assert has_element?(view, "#oauth-relink-authorization-url")
+    assert has_element?(view, "#oauth-relink-callback-url")
+    assert has_element?(view, "#oauth-relink-submit-callback")
+
+    authorization_url = oauth_relink_authorization_url_from_view(view)
+    callback_url = callback_url(authorization_state(authorization_url), "cockpit-browser-code")
+
+    view
+    |> element("#oauth-relink-callback-form")
+    |> render_submit(%{"oauth_relink" => %{"callback_url" => callback_url}})
+
+    assert has_element?(view, "#oauth-relink-status", "OpenAI account relinked")
+    assert has_element?(view, "#oauth-relink-cancel", "Close")
+    assert Repo.aggregate(UpstreamIdentity, :count) == 1
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+    assert reloaded.chatgpt_account_id == "acct_cockpit_browser_ui"
+    assert reloaded.status == "active"
+    assert active_secret_count("access_token") == 1
+    assert active_secret_count("refresh_token") == 1
+
+    assert [token_request] = FakeOpenAIAuthProvider.requests(provider)
+
+    assert FakeOpenAIAuthProvider.decode_form_request(token_request)["code"] ==
+             "cockpit-browser-code"
+
+    html = render(view)
+
+    for raw_value <- [access_token, refresh_token, id_token, callback_url, "cockpit-browser-code"] do
+      refute html =~ raw_value
+    end
+  end
+
+  test "relinks cockpit account through device OAuth polling without rendering provider secrets",
+       %{
+         conn: conn,
+         scope: scope
+       } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "cockpit-oauth-device-ui", name: "Cockpit OAuth Device"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Cockpit Device OAuth",
+        chatgpt_account_id: "acct_cockpit_device_ui",
+        workspace_id: "workspace-cockpit-ui",
+        workspace_label: "Cockpit Workspace"
+      })
+
+    device_auth_id = runtime_secret("cockpit-oauth-device-auth-id")
+    authorization_code = runtime_secret("cockpit-oauth-device-authorization-code")
+    code_verifier = runtime_secret("cockpit-oauth-device-code-verifier")
+    access_token = runtime_secret("cockpit-oauth-device-access")
+    refresh_token = runtime_secret("cockpit-oauth-device-refresh")
+    id_token = oauth_id_token("acct_cockpit_device_ui", "workspace-cockpit-ui")
+
+    provider =
+      start_oauth_provider!(
+        device_routes(%{
+          "/api/accounts/deviceauth/usercode" =>
+            {200,
+             FakeOpenAIAuthProvider.device_code_response(
+               device_auth_id: device_auth_id,
+               user_code: "COCKPIT-CODE",
+               interval: 5,
+               expires_at: DateTime.add(DateTime.utc_now(), 600, :second) |> DateTime.to_iso8601()
+             )},
+          "/api/accounts/deviceauth/token" =>
+            {200,
+             FakeOpenAIAuthProvider.authorization_code_response(
+               authorization_code: authorization_code,
+               code_verifier: code_verifier
+             )},
+          "/oauth/token" =>
+            {200,
+             FakeOpenAIAuthProvider.token_response(
+               access_token: access_token,
+               refresh_token: refresh_token,
+               id_token: id_token
+             )}
+        })
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    open_oauth_relink_dialog(view, identity.id)
+
+    view
+    |> element("#oauth-relink-device-start")
+    |> render_click()
+
+    assert has_element?(view, "#oauth-relink-device-code", "COCKPIT-CODE")
+
+    assert has_element?(
+             view,
+             "#oauth-relink-device-code",
+             FakeOpenAIAuthProvider.url(provider) <> "/codex/device"
+           )
+
+    flow = Repo.one!(OAuthFlow)
+    send(view.pid, {:poll_oauth_relink_device, flow.id})
+    _ = :sys.get_state(view.pid)
+
+    assert has_element?(view, "#oauth-relink-status", "OpenAI account relinked")
+    assert has_element?(view, "#oauth-relink-cancel", "Close")
+    assert Repo.aggregate(UpstreamIdentity, :count) == 1
+    assert Repo.get!(UpstreamIdentity, identity.id).status == "active"
+    assert active_secret_count("access_token") == 1
+    assert active_secret_count("refresh_token") == 1
+
+    html = render(view)
+
+    for raw_value <- [
+          device_auth_id,
+          authorization_code,
+          code_verifier,
+          access_token,
+          refresh_token,
+          id_token
+        ] do
+      refute html =~ raw_value
+    end
+  end
+
+  test "cockpit OAuth relink rejects mismatched identity claims safely", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "cockpit-oauth-mismatch", name: "Cockpit OAuth Mismatch"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Cockpit Mismatch OAuth",
+        chatgpt_account_id: "acct_cockpit_mismatch_target",
+        workspace_id: "workspace-cockpit-ui"
+      })
+
+    access_token = runtime_secret("cockpit-oauth-mismatch-access")
+    refresh_token = runtime_secret("cockpit-oauth-mismatch-refresh")
+    id_token = oauth_id_token("acct_cockpit_mismatch_other", "workspace-cockpit-ui")
+
+    start_oauth_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: access_token,
+           refresh_token: refresh_token,
+           id_token: id_token
+         )}
+    })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    open_oauth_relink_dialog(view, identity.id)
+
+    view
+    |> element("#oauth-relink-browser-start")
+    |> render_click()
+
+    authorization_url = oauth_relink_authorization_url_from_view(view)
+    callback_url = callback_url(authorization_state(authorization_url), "cockpit-mismatch-code")
+
+    view
+    |> element("#oauth-relink-callback-form")
+    |> render_submit(%{"oauth_relink" => %{"callback_url" => callback_url}})
+
+    assert has_element?(
+             view,
+             "#oauth-relink-error",
+             "OAuth account does not match the selected upstream account"
+           )
+
+    assert Repo.get!(UpstreamIdentity, identity.id).chatgpt_account_id ==
+             "acct_cockpit_mismatch_target"
+
+    assert active_secret_count("access_token") == 0
+    assert active_secret_count("refresh_token") == 0
+    assert Repo.one!(OAuthFlow).status == "failed"
+
+    html = render(view)
+
+    for raw_value <- [
+          access_token,
+          refresh_token,
+          id_token,
+          callback_url,
+          "cockpit-mismatch-code"
+        ] do
+      refute html =~ raw_value
+    end
+  end
+
+  test "cockpit OAuth relink cancel marks pending flow cancelled and closes the dialog", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "cockpit-oauth-cancel", name: "Cockpit OAuth Cancel"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Cockpit Cancel OAuth",
+        chatgpt_account_id: "acct_cockpit_cancel",
+        workspace_id: "workspace-cockpit-ui"
+      })
+
+    start_oauth_provider!(%{"/oauth/token" => {200, FakeOpenAIAuthProvider.token_response()}})
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    open_oauth_relink_dialog(view, identity.id)
+
+    view
+    |> element("#oauth-relink-browser-start")
+    |> render_click()
+
+    flow = Repo.one!(OAuthFlow)
+    assert has_element?(view, "#oauth-relink-cancel", "Cancel")
+
+    view
+    |> element("#oauth-relink-cancel")
+    |> render_click()
+
+    assert Repo.get!(OAuthFlow, flow.id).status == "cancelled"
+    refute has_element?(view, "#oauth-relink-dialog")
+    assert active_secret_count("access_token") == 0
+    assert active_secret_count("refresh_token") == 0
+  end
+
+  test "cockpit OAuth relink reports expired browser flow without linking secrets", %{
+    conn: conn,
+    scope: scope
+  } do
+    configure_upstream_secret_key!()
+    restore_codex_auth_config!()
+
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "cockpit-oauth-expired", name: "Cockpit OAuth Expired"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Cockpit Expired OAuth",
+        chatgpt_account_id: "acct_cockpit_expired",
+        workspace_id: "workspace-cockpit-ui"
+      })
+
+    access_token = runtime_secret("cockpit-oauth-expired-access")
+    refresh_token = runtime_secret("cockpit-oauth-expired-refresh")
+    id_token = oauth_id_token("acct_cockpit_expired", "workspace-cockpit-ui")
+
+    start_oauth_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: access_token,
+           refresh_token: refresh_token,
+           id_token: id_token
+         )}
+    })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    open_oauth_relink_dialog(view, identity.id)
+
+    view
+    |> element("#oauth-relink-browser-start")
+    |> render_click()
+
+    authorization_url = oauth_relink_authorization_url_from_view(view)
+    flow = Repo.one!(OAuthFlow)
+
+    flow
+    |> Ecto.Changeset.change(expires_at: DateTime.add(DateTime.utc_now(), -1, :second))
+    |> Repo.update!()
+
+    callback_url = callback_url(authorization_state(authorization_url), "cockpit-expired-code")
+
+    view
+    |> element("#oauth-relink-callback-form")
+    |> render_submit(%{"oauth_relink" => %{"callback_url" => callback_url}})
+
+    assert has_element?(view, "#oauth-relink-error", "OAuth flow has expired")
+    assert Repo.get!(OAuthFlow, flow.id).status == "expired"
+    assert active_secret_count("access_token") == 0
+    assert active_secret_count("refresh_token") == 0
+
+    html = render(view)
+
+    for raw_value <- [access_token, refresh_token, id_token, callback_url, "cockpit-expired-code"] do
+      refute html =~ raw_value
+    end
   end
 
   @tag :auth_not_found
@@ -2785,10 +3187,124 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   defp runtime_secret(label),
     do: Enum.join(["admin", label, "secret", "do", "not", "render"], "-")
 
+  defp active_secret_count(secret_kind) do
+    Repo.aggregate(
+      from(secret in EncryptedSecret,
+        where: secret.secret_kind == ^secret_kind and secret.status == "active"
+      ),
+      :count
+    )
+  end
+
+  defp open_oauth_relink_dialog(view, identity_id) do
+    view
+    |> element("#cockpit-oauth-relink-upstream-account-#{identity_id}")
+    |> render_click()
+  end
+
+  defp start_oauth_provider!(routes) do
+    {:ok, provider} = FakeOpenAIAuthProvider.start_link(routes)
+    Application.put_env(:codex_pooler, CodexAuth, issuer: FakeOpenAIAuthProvider.url(provider))
+    on_exit(fn -> FakeOpenAIAuthProvider.stop(provider) end)
+    provider
+  end
+
+  defp device_routes(extra_routes) do
+    Map.merge(
+      %{
+        "/api/accounts/deviceauth/usercode" =>
+          {200,
+           FakeOpenAIAuthProvider.device_code_response(
+             device_auth_id: "cockpit-device-auth-ui",
+             user_code: "COCKPIT-CODE",
+             interval: 5,
+             expires_at: DateTime.add(DateTime.utc_now(), 600, :second) |> DateTime.to_iso8601()
+           )}
+      },
+      extra_routes
+    )
+  end
+
+  defp oauth_id_token(account_id, workspace_id) do
+    FakeOpenAIAuthProvider.id_token(%{
+      "email" => "#{account_id}@example.com",
+      "https://api.openai.com/auth" => %{
+        "chatgpt_account_id" => account_id,
+        "chatgpt_user_id" => "user_#{account_id}",
+        "chatgpt_plan_type" => "team",
+        "workspace_id" => workspace_id,
+        "workspace_label" => "Cockpit Workspace",
+        "seat_type" => "team-seat"
+      }
+    })
+  end
+
+  defp oauth_relink_authorization_url_from_view(view) do
+    case Regex.run(~r/id="oauth-relink-authorization-url"[^>]*href="([^"]+)"/, render(view)) do
+      [_match, authorization_url] -> String.replace(authorization_url, "&amp;", "&")
+      _missing -> flunk("missing OAuth relink authorization URL")
+    end
+  end
+
+  defp authorization_state(authorization_url) do
+    authorization_url
+    |> URI.parse()
+    |> Map.fetch!(:query)
+    |> URI.decode_query()
+    |> Map.fetch!("state")
+  end
+
+  defp callback_url(state, code) do
+    "http://localhost:1455/auth/callback?" <>
+      URI.encode_query(%{"state" => state, "code" => code})
+  end
+
+  defp configure_upstream_secret_key! do
+    previous = Application.get_env(:codex_pooler, CodexPooler.Upstreams)
+
+    Application.put_env(:codex_pooler, CodexPooler.Upstreams,
+      upstream_secret_key: Base.encode64(:crypto.hash(:sha256, "test-upstream-secret-key")),
+      upstream_secret_key_version: "test-v1"
+    )
+
+    on_exit(fn ->
+      if previous do
+        Application.put_env(:codex_pooler, CodexPooler.Upstreams, previous)
+      else
+        Application.delete_env(:codex_pooler, CodexPooler.Upstreams)
+      end
+    end)
+  end
+
+  defp restore_codex_auth_config! do
+    previous = Application.get_env(:codex_pooler, CodexAuth)
+
+    on_exit(fn ->
+      if previous do
+        Application.put_env(:codex_pooler, CodexAuth, previous)
+      else
+        Application.delete_env(:codex_pooler, CodexAuth)
+      end
+    end)
+  end
+
   defp assert_admin_dialog_docs_link(view, footer_id) do
     assert has_element?(
              view,
              "##{footer_id} [data-role='admin-dialog-docs-link'][href='https://docs.codex-pooler.com'][target='_blank'][rel='noopener noreferrer'].text-xs",
+             "Docs"
+           )
+
+    assert has_element?(
+             view,
+             "##{footer_id}-docs-link [data-role='admin-dialog-docs-icon']"
+           )
+  end
+
+  defp assert_oauth_dialog_docs_link(view, footer_id) do
+    assert has_element?(
+             view,
+             "##{footer_id} [data-role='admin-dialog-docs-link'][href='https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking'][target='_blank'][rel='noopener noreferrer'].text-xs",
              "Docs"
            )
 

@@ -81,6 +81,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:quota_readiness) => quota_readiness(),
           required(:quota_limits) => [quota_limit_row()]
         }
+  @type oauth_flow_state :: %{
+          required(:items) => [Upstreams.oauth_flow_summary()],
+          required(:count) => non_neg_integer(),
+          required(:pending_count) => non_neg_integer(),
+          required(:empty?) => boolean(),
+          required(:degraded?) => boolean()
+        }
 
   @spec list_visible_accounts(term(), [term()]) :: [account_snapshot()]
   def list_visible_accounts(scope, pools) when is_list(pools) do
@@ -112,10 +119,52 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     |> apply_filters(filters)
   end
 
+  @spec oauth_flow_state(term(), [term()], DateTimeDisplay.preferences(), keyword()) ::
+          oauth_flow_state()
+  def oauth_flow_state(scope, pools, datetime_preferences, opts \\ [])
+
+  def oauth_flow_state(scope, pools, _datetime_preferences, opts) when is_list(pools) do
+    items =
+      Upstreams.list_visible_oauth_flow_summaries(
+        scope,
+        opts
+        |> Keyword.put(:pool_ids, pool_ids(pools))
+        |> Keyword.put_new(:limit, 50)
+      )
+
+    %{
+      items: items,
+      count: length(items),
+      pending_count: Enum.count(items, &(&1.status == "pending")),
+      empty?: items == [],
+      degraded?: false
+    }
+  end
+
+  def oauth_flow_state(_scope, _pools, _datetime_preferences, _opts),
+    do: empty_oauth_flow_state()
+
+  @spec empty_oauth_flow_state() :: oauth_flow_state()
+  def empty_oauth_flow_state do
+    %{items: [], count: 0, pending_count: 0, empty?: true, degraded?: false}
+  end
+
   defp apply_filters(accounts, filters) do
     accounts
     |> filter_by_status(Map.get(filters, "status"))
     |> filter_by_query(Map.get(filters, "query"))
+  end
+
+  defp pool_ids(pools) do
+    pools
+    |> Enum.map(fn
+      %{id: id} when is_binary(id) -> id
+      %{pool_id: pool_id} when is_binary(pool_id) -> pool_id
+      pool_id when is_binary(pool_id) -> pool_id
+      _pool -> nil
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
   end
 
   defp filter_by_status(accounts, status) when is_binary(status) and status != "" do

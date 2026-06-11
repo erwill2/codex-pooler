@@ -228,4 +228,47 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
 
     assert html_response(conn, 404) =~ "Not Found"
   end
+
+  test "OpenAI OAuth upstream linking has no hosted callback or admin JSON route" do
+    routes =
+      CodexPoolerWeb.Router
+      |> Phoenix.Router.routes()
+      |> Enum.map(&{&1.verb, &1.path, &1.plug, &1.plug_opts})
+
+    route_set =
+      routes
+      |> Enum.map(fn {verb, path, _plug, _opts} -> {verb, path} end)
+      |> MapSet.new()
+
+    assert {:get, "/admin/upstreams"} in route_set
+    assert {:get, "/admin/upstreams/:id"} in route_set
+
+    for {_verb, path, _plug, _opts} <- routes do
+      refute path in [
+               "/auth/callback",
+               "/oauth/callback",
+               "/admin/upstreams/oauth/callback",
+               "/api/admin/upstreams/oauth/callback"
+             ]
+
+      refute String.starts_with?(path, "/api/admin")
+      refute String.starts_with?(path, "/dashboard")
+    end
+
+    assert html_response(
+             get(build_conn(), "/auth/callback?state=example-state&code=example-code"),
+             404
+           ) =~ "Not Found"
+  end
+
+  test "operator docs document OpenAI OAuth linking without a hosted callback route" do
+    operator_docs = File.read!("docs-site/src/content/docs/operators/upstreams.mdx")
+
+    assert operator_docs =~ "OpenAI OAuth upstream linking"
+    assert operator_docs =~ "manual callback workflow"
+    assert operator_docs =~ "device-code fallback"
+    assert operator_docs =~ "there is no hosted OAuth callback route"
+    assert operator_docs =~ "Safe OAuth troubleshooting codes"
+    assert operator_docs =~ "never paste callback URLs, authorization codes, tokens, cookies"
+  end
 end

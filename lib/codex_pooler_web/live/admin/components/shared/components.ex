@@ -186,13 +186,13 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :docs_link_role, :string, default: "admin-dialog-docs-link"
   attr :docs_link_id, :string, default: nil
   attr :docs_icon_role, :string, default: "admin-dialog-docs-icon"
+  attr :docs_url, :string, default: @docs_url
 
   slot :actions, required: true
 
   def dialog_footer(assigns) do
     assigns =
       assigns
-      |> assign(:docs_url, @docs_url)
       |> assign(:resolved_docs_link_id, assigns.docs_link_id || "#{assigns.id}-docs-link")
 
     ~H"""

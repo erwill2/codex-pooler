@@ -5,7 +5,10 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
 
   @issuer "https://auth.openai.com"
   @client_id "app_EMoamEEZ73f0CkXaXp7hrann"
+  @browser_redirect_uri "http://localhost:1455/auth/callback"
   @device_redirect_uri "https://auth.openai.com/deviceauth/callback"
+  @authorization_scope "openid profile email offline_access api.connectors.read api.connectors.invoke"
+  @oauth_originator "codex_cli_rs"
 
   @type auth_error :: %{
           required(:code) => atom(),
@@ -48,6 +51,68 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
   @type token_info_response :: {:ok, token_info()} | {:error, auth_error()}
   @type refresh_opts :: keyword()
   @type auth_client :: module()
+  @type pkce_pair :: %{
+          required(:code_verifier) => String.t(),
+          required(:code_challenge) => String.t()
+        }
+
+  @spec generate_pkce_pair() :: pkce_pair()
+  def generate_pkce_pair do
+    verifier = 64 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    %{code_verifier: verifier, code_challenge: pkce_challenge(verifier)}
+  end
+
+  @spec pkce_challenge(String.t()) :: String.t()
+  def pkce_challenge(verifier) when is_binary(verifier) do
+    verifier
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.url_encode64(padding: false)
+  end
+
+  @spec build_browser_authorization_url(String.t(), String.t()) :: String.t()
+  def build_browser_authorization_url(state, code_challenge)
+      when is_binary(state) and is_binary(code_challenge) do
+    query =
+      URI.encode_query(%{
+        "response_type" => "code",
+        "client_id" => client_id(),
+        "redirect_uri" => browser_redirect_uri(),
+        "scope" => authorization_scope(),
+        "code_challenge" => code_challenge,
+        "code_challenge_method" => "S256",
+        "state" => state,
+        "id_token_add_organizations" => "true",
+        "codex_cli_simplified_flow" => "true",
+        "originator" => oauth_originator()
+      })
+
+    issuer() |> String.trim_trailing("/") |> Kernel.<>("/oauth/authorize?#{query}")
+  end
+
+  @spec exchange_authorization_code(String.t(), String.t(), String.t()) :: token_response()
+  def exchange_authorization_code(code, code_verifier, redirect_uri \\ browser_redirect_uri()) do
+    cond do
+      blank_string?(code) ->
+        auth_error(
+          :codex_oauth_invalid_authorization_code,
+          "Codex OAuth authorization code is invalid",
+          400
+        )
+
+      blank_string?(code_verifier) ->
+        auth_error(
+          :codex_oauth_invalid_code_verifier,
+          "Codex OAuth code verifier is invalid",
+          400
+        )
+
+      blank_string?(redirect_uri) ->
+        auth_error(:codex_oauth_invalid_redirect_uri, "Codex OAuth redirect URI is invalid", 400)
+
+      true ->
+        client().exchange_authorization_code(code, code_verifier, redirect_uri)
+    end
+  end
 
   @spec request_device_code() :: device_code_response()
   def request_device_code do
@@ -93,8 +158,17 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
   @spec client_id() :: String.t()
   def client_id, do: @client_id
 
+  @spec authorization_scope() :: String.t()
+  def authorization_scope, do: @authorization_scope
+
+  @spec browser_redirect_uri() :: String.t()
+  def browser_redirect_uri, do: @browser_redirect_uri
+
   @spec device_redirect_uri() :: String.t()
   def device_redirect_uri, do: @device_redirect_uri
+
+  @spec oauth_originator() :: String.t()
+  def oauth_originator, do: @oauth_originator
 
   @spec issuer() :: String.t()
   def issuer do
@@ -109,6 +183,11 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
     |> Application.get_env(__MODULE__, [])
     |> Keyword.get(:client, __MODULE__.HTTPClient)
   end
+
+  defp blank_string?(value), do: !is_binary(value) or String.trim(value) == ""
+
+  defp auth_error(code, message, status),
+    do: {:error, %{code: code, message: message, status: status}}
 
   defp workspace_id_claim_keys,
     do: ~w(workspace_id chatgpt_workspace_id organization_id org_id tenant_id)
@@ -156,6 +235,12 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
     @moduledoc false
 
     alias CodexPooler.Upstreams.Auth.CodexAuth
+
+    @spec exchange_authorization_code(String.t(), String.t(), String.t()) ::
+            CodexAuth.token_response()
+    def exchange_authorization_code(code, verifier, redirect_uri) do
+      request_tokens_for_authorization_code(code, verifier, redirect_uri)
+    end
 
     @spec request_device_code() :: CodexAuth.device_code_response()
     def request_device_code do
@@ -241,8 +326,8 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
         {:ok, _response} ->
           auth_error(:codex_oauth_exchange_failed, "Codex token exchange failed", 502)
 
-        {:error, reason} ->
-          auth_error(:codex_auth_transient, Exception.message(reason), 502)
+        {:error, _reason} ->
+          auth_error(:codex_auth_transient, "Codex token exchange failed", 502)
       end
     end
 

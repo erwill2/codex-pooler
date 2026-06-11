@@ -112,7 +112,7 @@ After a valid invite is created, the result dialog shows the one-time invite URL
 
 ## OpenAI Device Code Prerequisite
 
-Hosted invite onboarding uses OpenAI's Codex device-code authorization. Before opening the invite URL, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions.
+Hosted invite onboarding uses OpenAI's Codex device-code authorization. Before opening the invite URL, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions. Browser OAuth linking from `/admin/upstreams` is a separate operator-managed path and does not depend on this device-code setting.
 
 ![ChatGPT Security setting for Codex device-code authorization](/operators/invites/openai-device-code-setting.png)
 

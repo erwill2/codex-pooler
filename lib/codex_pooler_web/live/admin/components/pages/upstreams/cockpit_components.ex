@@ -8,11 +8,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
   alias CodexPoolerWeb.Admin.UpstreamAuthJsonDialog
   alias CodexPoolerWeb.DateTimeDisplay
 
+  @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"
+
   attr :cockpit, :map, required: true
   attr :auth_json_form, :any, required: true
   attr :auth_json_upload_limit_label, :string, required: true
   attr :dialog_pool_options, :list, required: true
   attr :importing_auth_json, :boolean, required: true
+  attr :oauth_relinking, :boolean, required: true
+  attr :oauth_relink_form, :any, required: true
+  attr :oauth_relink_flow, :map, default: nil
+  attr :oauth_relink_authorization_url, :string, default: nil
+  attr :oauth_relink_result, :map, default: nil
+  attr :oauth_relink_error, :map, default: nil
   attr :renaming_account, :map, default: nil
   attr :rename_account_form, :any, default: nil
   attr :deleting_account, :map, default: nil
@@ -34,11 +42,21 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
         upload_limit_label={@auth_json_upload_limit_label}
       />
 
+      <.oauth_relink_dialog
+        oauth_relinking={@oauth_relinking}
+        oauth_relink_form={@oauth_relink_form}
+        oauth_relink_flow={@oauth_relink_flow}
+        oauth_relink_authorization_url={@oauth_relink_authorization_url}
+        oauth_relink_result={@oauth_relink_result}
+        oauth_relink_error={@oauth_relink_error}
+      />
+
       <.rename_account_dialog account={@renaming_account} form={@rename_account_form} />
       <.delete_account_dialog account={@deleting_account} form={@delete_account_form} />
 
       <.identity_summary cockpit={@cockpit} />
       <.status_summary cockpit={@cockpit} />
+      <.oauth_flow_state cockpit={@cockpit} datetime_preferences={@datetime_preferences} />
       <.assignments_section cockpit={@cockpit} />
       <.quota_section cockpit={@cockpit} datetime_preferences={@datetime_preferences} />
       <.request_section cockpit={@cockpit} />
@@ -63,6 +81,86 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
         <span>Upstreams</span>
       </.link>
     </div>
+    """
+  end
+
+  attr :cockpit, :map, required: true
+  attr :datetime_preferences, :map, required: true
+
+  defp oauth_flow_state(assigns) do
+    assigns = assign(assigns, :oauth_flows, assigns.cockpit.oauth_flows)
+
+    ~H"""
+    <section
+      :if={!@oauth_flows.empty?}
+      id="upstream-cockpit-oauth-flow-state"
+      class="grid gap-3 border-y border-base-300 bg-base-100/60 py-4"
+    >
+      <div>
+        <h2 class="text-sm font-semibold uppercase tracking-wide text-base-content/70">
+          OAuth activity
+        </h2>
+        <p class="text-xs text-base-content/60">
+          {@oauth_flows.pending_count} pending of {@oauth_flows.count}
+        </p>
+      </div>
+
+      <div class="grid gap-2 md:grid-cols-2">
+        <article
+          :for={flow <- @oauth_flows.items}
+          id={"upstream-cockpit-oauth-flow-#{flow.id}"}
+          data-flow-kind={flow.flow_kind}
+          data-flow-status={flow.status}
+          class="grid gap-2 rounded-lg border border-base-300 bg-base-100 p-4"
+        >
+          <div class="flex flex-wrap items-start justify-between gap-2">
+            <div class="min-w-0">
+              <p class="font-medium text-base-content">{flow.status_label}</p>
+              <p class="text-xs text-base-content/60">
+                {flow.flow_kind} · {flow.purpose}
+              </p>
+            </div>
+            <span class="badge badge-outline badge-sm">{flow.status}</span>
+          </div>
+
+          <dl class="grid gap-1 text-xs text-base-content/70">
+            <div>
+              <dt class="sr-only">Expires</dt>
+              <dd>expires {format_oauth_flow_time(flow.expires_at, @datetime_preferences)}</dd>
+            </div>
+            <div :if={flow.poll_after_at}>
+              <dt class="sr-only">Next poll</dt>
+              <dd>next poll {format_oauth_flow_time(flow.poll_after_at, @datetime_preferences)}</dd>
+            </div>
+            <div :if={flow.device}>
+              <dt class="sr-only">Device code</dt>
+              <dd>device code {flow.device.user_code}</dd>
+            </div>
+            <div :if={flow.device && flow.device.verification_uri}>
+              <dt class="sr-only">Verification URL</dt>
+              <dd>
+                <a
+                  href={flow.device.verification_uri}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="link link-primary break-all"
+                >
+                  {flow.device.verification_uri}
+                </a>
+              </dd>
+            </div>
+            <div :if={flow.error}>
+              <dt class="sr-only">Error</dt>
+              <dd>{flow.error.message || flow.error.code}</dd>
+            </div>
+            <div :if={flow.result_identity}>
+              <dt class="sr-only">Completed identity</dt>
+              <dd>{flow.result_identity.label}</dd>
+            </div>
+          </dl>
+        </article>
+      </div>
+    </section>
     """
   end
 
@@ -421,6 +519,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
           phx-value-id={@cockpit.identity.id}
           phx-value-pool-id={default_pool_id(@cockpit)}
         />
+        <.cockpit_action_button
+          id={"cockpit-oauth-relink-upstream-account-#{@cockpit.identity.id}"}
+          label="OAuth relink"
+          icon="hero-link"
+          action={@cockpit.actions.oauth_relink}
+          variant={:primary}
+          phx-click="open_oauth_relink"
+          phx-value-id={@cockpit.identity.id}
+        />
         <.cockpit_reinvite_link cockpit={@cockpit} />
         <.cockpit_action_button
           id={"cockpit-delete-upstream-account-#{@cockpit.identity.id}"}
@@ -516,6 +623,148 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
         </div>
       </dl>
     </section>
+    """
+  end
+
+  attr :oauth_relinking, :boolean, required: true
+  attr :oauth_relink_form, :any, required: true
+  attr :oauth_relink_flow, :map, default: nil
+  attr :oauth_relink_authorization_url, :string, default: nil
+  attr :oauth_relink_result, :map, default: nil
+  attr :oauth_relink_error, :map, default: nil
+
+  defp oauth_relink_dialog(assigns) do
+    assigns = assign(assigns, :oauth_docs_url, @oauth_docs_url)
+
+    ~H"""
+    <dialog :if={@oauth_relinking} id="oauth-relink-dialog" class="modal" open>
+      <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
+        <div class="border-b border-base-300 px-6 py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-primary">
+            OpenAI OAuth
+          </p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">Relink OpenAI account</h2>
+          <p class="mt-2 text-sm leading-6 text-base-content/70">
+            Reconnect this upstream identity with browser authorization or a device code.
+          </p>
+        </div>
+
+        <div class="grid gap-5 p-6">
+          <div :if={@oauth_relink_result} id="oauth-relink-status" class="alert alert-success">
+            <.icon name="hero-check-circle" class="size-5" />
+            <span>{@oauth_relink_result.message}</span>
+          </div>
+
+          <div :if={@oauth_relink_error} id="oauth-relink-error" class="alert alert-error">
+            <.icon name="hero-exclamation-triangle" class="size-5" />
+            <span>{@oauth_relink_error.message}</span>
+          </div>
+
+          <div :if={oauth_relink_start_visible?(@oauth_relink_flow)} class="flex flex-wrap gap-2">
+            <AdminComponents.action_button
+              id="oauth-relink-browser-start"
+              icon="hero-arrow-top-right-on-square"
+              label="Browser"
+              phx-click="start_oauth_relink_browser"
+              variant={:primary}
+            />
+            <AdminComponents.action_button
+              id="oauth-relink-device-start"
+              icon="hero-device-phone-mobile"
+              label="Device code"
+              phx-click="start_oauth_relink_device"
+            />
+          </div>
+
+          <section
+            :if={oauth_relink_browser_flow?(@oauth_relink_flow, @oauth_relink_authorization_url)}
+            class="grid gap-4 rounded-lg border border-base-300 bg-base-200/40 p-4"
+          >
+            <a
+              id="oauth-relink-authorization-url"
+              href={@oauth_relink_authorization_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              class="btn btn-primary w-full justify-start gap-2 text-left"
+            >
+              <.icon name="hero-arrow-top-right-on-square" class="size-4 shrink-0" />
+              <span class="truncate">Open OpenAI authorization</span>
+            </a>
+
+            <.form
+              id="oauth-relink-callback-form"
+              for={@oauth_relink_form}
+              phx-submit="submit_oauth_relink_callback"
+              autocomplete="off"
+              class="grid gap-3"
+            >
+              <div class="grid gap-2">
+                <label
+                  for="oauth-relink-callback-url"
+                  class="text-xs font-semibold uppercase tracking-wide text-base-content/60"
+                >
+                  Callback URL
+                </label>
+                <input
+                  id="oauth-relink-callback-url"
+                  name={@oauth_relink_form[:callback_url].name}
+                  value=""
+                  type="url"
+                  autocomplete="off"
+                  class="input input-bordered w-full"
+                />
+              </div>
+
+              <AdminComponents.action_button
+                id="oauth-relink-submit-callback"
+                icon="hero-check"
+                label="Complete relink"
+                type="submit"
+                variant={:primary}
+              />
+            </.form>
+          </section>
+
+          <section
+            :if={oauth_relink_device_flow?(@oauth_relink_flow)}
+            id="oauth-relink-device-code"
+            class="grid gap-3 rounded-lg border border-base-300 bg-base-200/40 p-4"
+          >
+            <div class="grid gap-1">
+              <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
+                Device code
+              </p>
+              <p class="font-mono text-2xl font-bold tracking-widest text-base-content">
+                {@oauth_relink_flow.device_user_code}
+              </p>
+            </div>
+            <a
+              :if={@oauth_relink_flow.verification_uri}
+              href={@oauth_relink_flow.verification_uri}
+              target="_blank"
+              rel="noopener noreferrer"
+              class="link link-primary break-all text-sm"
+            >
+              {@oauth_relink_flow.verification_uri}
+            </a>
+          </section>
+        </div>
+
+        <AdminComponents.dialog_footer id="oauth-relink-dialog-footer" docs_url={@oauth_docs_url}>
+          <:actions>
+            <AdminComponents.action_button
+              id="oauth-relink-cancel"
+              icon="hero-x-mark"
+              label={oauth_relink_dialog_dismiss_label(@oauth_relink_flow)}
+              phx-click="cancel_oauth_relink"
+            />
+          </:actions>
+        </AdminComponents.dialog_footer>
+      </div>
+      <form method="dialog" class="modal-backdrop">
+        <button type="button" phx-click="cancel_oauth_relink">close</button>
+      </form>
+    </dialog>
     """
   end
 
@@ -1185,6 +1434,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
   defp format_reset_at(%DateTime{} = reset_at, datetime_preferences),
     do: DateTimeDisplay.format_datetime(reset_at, datetime_preferences)
 
+  defp format_oauth_flow_time(%DateTime{} = timestamp, datetime_preferences),
+    do: DateTimeDisplay.format_datetime(timestamp, datetime_preferences)
+
+  defp format_oauth_flow_time(_timestamp, _datetime_preferences), do: "not reported"
+
   defp compact_float(value) when is_float(value) do
     decimals = if value < 10 and value != Float.round(value, 0), do: 2, else: 1
 
@@ -1284,6 +1538,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
     |> String.replace("_", " ")
     |> String.capitalize()
   end
+
+  defp oauth_relink_start_visible?(nil), do: true
+  defp oauth_relink_start_visible?(%{status: "pending"}), do: false
+  defp oauth_relink_start_visible?(%{status: "completed"}), do: false
+  defp oauth_relink_start_visible?(_flow), do: true
+
+  defp oauth_relink_browser_flow?(%{flow_kind: "browser", status: "pending"}, authorization_url)
+       when is_binary(authorization_url),
+       do: String.trim(authorization_url) != ""
+
+  defp oauth_relink_browser_flow?(_flow, _authorization_url), do: false
+
+  defp oauth_relink_device_flow?(%{flow_kind: "device", status: "pending"}), do: true
+  defp oauth_relink_device_flow?(_flow), do: false
+
+  defp oauth_relink_dialog_dismiss_label(%{status: "completed"}), do: "Close"
+  defp oauth_relink_dialog_dismiss_label(_flow), do: "Cancel"
 
   defp pluralize_count(1, singular, _plural), do: "1 #{singular}"
   defp pluralize_count(count, _singular, plural), do: "#{count || 0} #{plural}"

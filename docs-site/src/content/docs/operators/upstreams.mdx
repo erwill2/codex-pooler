@@ -1,6 +1,6 @@
 ---
 title: Upstreams
-description: Understand the admin Upstreams page, account cards, auth.json import, quota readiness, and account recovery actions.
+description: Understand the admin Upstreams page, account cards, OpenAI OAuth linking, auth.json import, quota readiness, and account recovery actions.
 ---
 
 The Upstreams page is the operator surface for Codex account capacity. An upstream is an account identity that Codex Pooler can assign to one or more Pools and consider for runtime routing when it is active, fresh, compatible, and inside usable quota windows.
@@ -14,7 +14,7 @@ Use this page when you need to answer:
 5. how recent token usage compares with observed quota windows
 6. which account actions are available without exposing raw credentials
 
-The page is metadata-only after import. It shows operator labels, workspace and plan badges, safe status labels, quota-window evidence, token counters, assignment counts, and links to related logs. It does not show prompts, responses, files, websocket frames, bearer tokens, refresh tokens, provider cookies, or stored Codex `auth.json` contents.
+The page is metadata-only after linking or import. It shows operator labels, workspace and plan badges, safe status labels, quota-window evidence, token counters, assignment counts, and links to related logs. It does not show prompts, responses, files, websocket frames, bearer tokens, refresh tokens, provider cookies, OAuth provider payloads, or stored Codex `auth.json` contents.
 
 ![Upstreams page overview](/operators/upstreams/upstreams-overview.png)
 
@@ -24,7 +24,7 @@ An upstream account is not a client credential. Clients authenticate with Pool A
 
 An upstream controls:
 
-1. encrypted account credentials imported from Codex `auth.json`
+1. encrypted account credentials linked through OpenAI OAuth or imported from Codex `auth.json`
 2. account lifecycle state, such as active, paused, refresh due, or reauth required
 3. Pool assignments that make the account available to routing boundaries
 4. quota and token freshness evidence used by route eligibility
@@ -35,13 +35,15 @@ Routing still happens at request time. A visible active upstream can be skipped 
 
 ## Page Actions
 
-The primary page action is `Import auth.json`. Use it when adding an account from Codex CLI or Codex Desktop credentials.
+The page header exposes the account onboarding actions as separate buttons:
 
-![Upstreams page action menu](/operators/upstreams/upstreams-page-actions-menu.png)
+1. `OAuth`, for linking a new upstream account through OpenAI authorization without handling `auth.json`
+2. `Invite`, for onboarding a person who will provide or operate an account through the browser UI
+3. `Import`, for adding an account from Codex CLI or Codex Desktop `auth.json` credentials
 
-The dropdown beside the primary action contains `Invite account`. That action opens the invite flow for onboarding a person who will provide or operate an account through the browser UI.
+Prefer `OAuth` for new operator-managed upstream accounts when browser authorization is practical. It stores resulting credential material through encrypted upstream secret storage and keeps the admin surface metadata-only.
 
-Invite onboarding uses OpenAI's Codex device-code authorization. Before accepting the invite, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions. If OpenAI blocks device-code approval, the invite may remain valid but the upstream will not become ready.
+Invite onboarding and the OAuth device-code fallback use OpenAI's Codex device-code authorization. Before using those paths, a personal ChatGPT account should have `Enable device code authorization for Codex` enabled in ChatGPT Settings > Security. Workspace-managed accounts may need a workspace admin to enable device-code login for Codex in workspace permissions. Browser OAuth linking does not depend on the device-code setting. If OpenAI blocks device-code approval, the invite or fallback flow may remain pending but the upstream will not become ready.
 
 The search box filters upstream cards by account label or safe metadata. The Pool filter narrows cards to accounts assigned to a specific Pool. The status filter narrows cards by lifecycle or readiness state.
 
@@ -116,7 +118,7 @@ Common upstream states are:
     </tr>
     <tr>
       <td>Reauth required</td>
-      <td>The account needs operator recovery before it can route work again. Import replacement credentials or reinvite the account when those actions are available.</td>
+      <td>The account needs operator recovery before it can route work again. Relink with OpenAI OAuth, import replacement credentials, or reinvite the account when those actions are available.</td>
     </tr>
     <tr>
       <td>Quota exhausted</td>
@@ -129,7 +131,7 @@ Readiness is intentionally conservative. If quota evidence is missing, stale, or
 
 ## Import auth.json
 
-Click `Import auth.json` to open the upstream credentials dialog.
+Click `Import` to open the upstream credentials dialog when an existing Codex `auth.json` is the right source of account credentials.
 
 ![Import auth.json dialog](/operators/upstreams/upstreams-import-auth-json-dialog.png)
 
@@ -144,6 +146,110 @@ The upload accepts small auth files only. The current UI states a 64 KB limit.
 After import, Codex Pooler becomes the refresh-token authority for that account lineage. Do not keep using the same `auth.json` from another Codex install, machine, or automation. Provider refresh-token rotation can invalidate one copy and move the account into `reauth_required`.
 
 The dialog footer keeps docs on the left and the submit actions on the right. `Cancel` closes without importing. `Import auth.json` stores the credential material through encrypted upstream secret storage.
+
+## OpenAI OAuth Upstream Linking
+
+OpenAI OAuth upstream linking is an authenticated admin workflow. Use
+`OAuth` on `/admin/upstreams` to link a new OpenAI upstream account to a selected Pool. Use
+`/admin/upstreams/:id` to relink or reconnect the exact upstream identity shown
+in the cockpit. Relink checks the returned account and workspace claims against
+the target identity before replacing encrypted credential material.
+
+The browser manual callback workflow is:
+
+1. open the OAuth link or relink dialog
+2. choose `Browser`
+3. open the generated OpenAI authorization URL
+4. complete OpenAI authorization in the browser
+5. paste the resulting local callback URL back into the admin dialog
+6. submit the callback form and wait for the success or safe error state
+7. use `Close` after the dialog reports that the account was linked or relinked
+
+The local callback URL is consumed only by the already-authenticated admin page,
+and there is no hosted OAuth callback route, no public `/auth/callback`, and no
+`/api/admin/*` or dashboard JSON API for this workflow.
+
+Use the device-code fallback when browser authorization is not practical. The
+dialog shows the user code and verification URL while the flow is pending, and
+the page polls only while the operator keeps the dialog open. Device-code
+authorization must be enabled for Codex on the OpenAI account or workspace. If
+device authorization is unavailable or denied, use the browser workflow or ask
+the workspace admin to enable Codex device-code login.
+
+Operators should never paste callback URLs, authorization codes, tokens, cookies,
+raw auth.json, OpenAI provider payloads, or local credential files into docs,
+tickets, logs, or evidence. The admin UI may show the one-time authorization URL
+or device user code during a pending flow, but persisted flow summaries, audit
+metadata, request logs, tests, and docs stay metadata-only.
+
+Safe OAuth troubleshooting codes:
+
+<table>
+  <thead>
+    <tr>
+      <th>Code</th>
+      <th>Operator action</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>invalid_callback_url</code></td>
+      <td>Paste the full localhost callback URL from the browser address bar.</td>
+    </tr>
+    <tr>
+      <td><code>invalid_callback_origin</code></td>
+      <td>Use only the <code>http://localhost:1455/auth/callback</code> URL produced by the OpenAI flow.</td>
+    </tr>
+    <tr>
+      <td><code>missing_state</code></td>
+      <td>Restart the OAuth flow from the admin dialog.</td>
+    </tr>
+    <tr>
+      <td><code>duplicate_callback_param</code></td>
+      <td>Restart the OAuth flow and paste the unedited callback URL.</td>
+    </tr>
+    <tr>
+      <td><code>missing_callback_result</code></td>
+      <td>Restart the OAuth flow because the callback did not include a usable result.</td>
+    </tr>
+    <tr>
+      <td><code>provider_denied</code></td>
+      <td>The OpenAI authorization was denied; restart only if the account should be connected.</td>
+    </tr>
+    <tr>
+      <td><code>invalid_state</code></td>
+      <td>Restart from the current admin dialog; an old or unrelated callback was pasted.</td>
+    </tr>
+    <tr>
+      <td><code>expired_flow</code></td>
+      <td>Start a new OAuth flow.</td>
+    </tr>
+    <tr>
+      <td><code>flow_not_pending</code></td>
+      <td>Close the stale dialog state, start a fresh OAuth link or relink flow, and use the latest callback URL.</td>
+    </tr>
+    <tr>
+      <td><code>stale_flow</code></td>
+      <td>A newer flow superseded this one; use the latest dialog state.</td>
+    </tr>
+    <tr>
+      <td><code>token_exchange_failed</code></td>
+      <td>Retry once, then inspect OpenAI availability and sanitized provider status.</td>
+    </tr>
+    <tr>
+      <td><code>identity_mismatch</code></td>
+      <td>Relink with the same OpenAI account and workspace shown in the cockpit.</td>
+    </tr>
+    <tr>
+      <td><code>identity_conflict</code></td>
+      <td>Resolve the duplicate or ambiguous upstream identity before retrying.</td>
+    </tr>
+    <tr>
+      <td><code>unauthorized_pool</code></td>
+      <td>Confirm the operator can manage the selected Pool.</td>
+    </tr>
+  </tbody>
+</table>
 
 ## Card Action Menu
 
@@ -208,7 +314,7 @@ Clicking an account label opens the upstream cockpit.
 
 ![Upstream cockpit overview](/operators/upstreams/upstreams-cockpit-overview.png)
 
-The cockpit is the focused detail view for one account. The top summary shows identity state, quota posture, request posture, stored account identifier hash, lifecycle badges, token freshness, and quota freshness.
+The cockpit is the focused detail view for one account. The top summary shows identity state, quota posture, request posture, stored account identifier hash, lifecycle badges, token freshness, and quota freshness. It also exposes `OAuth relink` for reconnecting the selected upstream identity through OpenAI OAuth when the account needs fresh credential material.
 
 Use it when the card says an account is degraded, stale, exhausted, or needs recovery. The detail page provides more space for assignment posture, quota health, recent events, and related links without exposing raw account secrets.
 
@@ -226,4 +332,4 @@ When an upstream is not routing as expected, check it in this order:
 8. use Request logs filtered by Pool or upstream metadata to confirm whether traffic selected this account
 9. use Audit logs when lifecycle, assignment, import, pause, or rename actions changed recently
 
-If an account remains inactive after import or refresh, treat `reauth_required` as a credential-lineage problem first. Importing the same stale `auth.json` again may not recover it if another machine already rotated the refresh token.
+If an account remains inactive after linking, import, or refresh, treat `reauth_required` as a credential-lineage problem first. Prefer OAuth relink when browser authorization is practical. Importing the same stale `auth.json` again may not recover it if another machine already rotated the refresh token.

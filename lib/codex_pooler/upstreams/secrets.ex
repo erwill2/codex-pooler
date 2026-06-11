@@ -8,17 +8,13 @@ defmodule CodexPooler.Upstreams.Secrets do
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.EncryptedSecret
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+  alias CodexPooler.Upstreams.SecretBox
 
   @active "active"
   @deleted UpstreamIdentity.deleted_status()
   @refresh_due UpstreamIdentity.refresh_due_status()
   @reauth_required UpstreamIdentity.reauth_required_status()
   @superseded "superseded"
-  @secret_key_env "CODEX_POOLER_UPSTREAM_SECRET_KEY"
-  @secret_key_bytes 32
-  @secret_nonce_bytes 12
-  @invalid_secret_key_message "#{@secret_key_env} must be 32 raw bytes or base64-encoded 32 bytes"
-
   @type lifecycle_error :: %{required(:code) => atom(), required(:message) => String.t()}
   @type identity_ref :: UpstreamIdentity.t() | Ecto.UUID.t()
   @type secret_result ::
@@ -153,10 +149,7 @@ defmodule CodexPooler.Upstreams.Secrets do
 
   @spec validate_upstream_secret_key!(binary() | nil) :: :ok
   def validate_upstream_secret_key!(configured_key) do
-    case decode_upstream_secret_key(configured_key) do
-      {:ok, _key} -> :ok
-      {:error, _reason} -> raise @invalid_secret_key_message
-    end
+    SecretBox.validate_secret_key!(configured_key)
   end
 
   @spec revoke_active_secrets(Ecto.UUID.t(), DateTime.t()) :: {non_neg_integer(), nil | [term()]}
@@ -196,82 +189,54 @@ defmodule CodexPooler.Upstreams.Secrets do
     attrs = atomize_attrs(attrs)
     secret_kind = attrs |> Map.fetch!(:secret_kind) |> normalize_token()
 
-    with {:ok, key} <- upstream_secret_key() do
-      key_version = Map.get(attrs, :key_version) || upstream_secret_key_version()
-      nonce = :crypto.strong_rand_bytes(@secret_nonce_bytes)
-
-      aad = %{
+    aad =
+      %{
         "algorithm" => "AES-256-GCM",
-        "key_env" => @secret_key_env,
+        "key_env" => SecretBox.configured_key_env(),
         "upstream_identity_id" => identity.id,
-        "secret_kind" => secret_kind,
-        "key_version" => key_version
+        "secret_kind" => secret_kind
       }
+      |> maybe_put_key_version(Map.get(attrs, :key_version))
 
-      {ciphertext, tag} =
-        :crypto.crypto_one_time_aead(
-          :aes_256_gcm,
-          key,
-          nonce,
-          plaintext,
-          aad_binary(aad),
-          true
-        )
-
-      ciphertext = IO.iodata_to_binary(ciphertext)
-      tag = IO.iodata_to_binary(tag)
-
+    with {:ok, encrypted} <- SecretBox.encrypt_fields(plaintext, aad) do
       {:ok,
        attrs
        |> Map.drop([:plaintext, :secret, "plaintext", "secret"])
        |> Map.merge(%{
          secret_kind: secret_kind,
-         key_version: key_version,
-         ciphertext: tag <> ciphertext,
-         nonce: nonce,
-         aad: aad
+         key_version: encrypted.key_version,
+         ciphertext: encrypted.ciphertext,
+         nonce: encrypted.nonce,
+         aad: encrypted.aad
        })}
     end
   end
 
   defp decrypt_upstream_secret(%EncryptedSecret{} = secret) do
-    with {:ok, key} <- upstream_secret_key(),
-         <<tag::binary-size(16), ciphertext::binary>> <- secret.ciphertext,
-         plaintext when is_binary(plaintext) <-
-           :crypto.crypto_one_time_aead(
-             :aes_256_gcm,
-             key,
-             secret.nonce,
-             ciphertext,
-             aad_binary(secret.aad),
-             tag,
-             false
-           ) do
-      {:ok, plaintext}
-    else
-      :error ->
+    case SecretBox.decrypt_fields(%{
+           ciphertext: secret.ciphertext,
+           nonce: secret.nonce,
+           aad: secret.aad
+         }) do
+      {:ok, plaintext} ->
+        {:ok, plaintext}
+
+      {:error, %{code: :upstream_secret_decryption_failed}} ->
         {:error,
          lifecycle_error(
            :upstream_secret_decryption_failed,
            "upstream secret could not be decrypted"
          )}
 
-      false ->
-        {:error,
-         lifecycle_error(
-           :upstream_secret_decryption_failed,
-           "upstream secret could not be decrypted"
-         )}
-
-      {:error, _reason} = error ->
-        error
-
-      _invalid ->
+      {:error, %{code: :upstream_secret_invalid_ciphertext}} ->
         {:error,
          lifecycle_error(
            :upstream_secret_invalid_ciphertext,
            "upstream secret ciphertext is invalid"
          )}
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -289,74 +254,6 @@ defmodule CodexPooler.Upstreams.Secrets do
            "plaintext upstream secret is required"
          )}
     end
-  end
-
-  defp upstream_secret_key do
-    configured =
-      :codex_pooler
-      |> Application.get_env(CodexPooler.Upstreams, [])
-      |> Keyword.get(:upstream_secret_key)
-
-    configured = configured || System.get_env(@secret_key_env)
-
-    cond do
-      is_binary(configured) ->
-        decode_upstream_secret_key(configured)
-
-      local_secret_key_fallback?() ->
-        {:ok, :crypto.hash(:sha256, "codex-pooler-local-upstream-secret-key")}
-
-      true ->
-        {:error,
-         lifecycle_error(
-           :upstream_secret_key_missing,
-           "#{@secret_key_env} must be configured before storing upstream secrets"
-         )}
-    end
-  end
-
-  defp upstream_secret_key_version do
-    :codex_pooler
-    |> Application.get_env(CodexPooler.Upstreams, [])
-    |> Keyword.get(:upstream_secret_key_version, "v1")
-  end
-
-  defp decode_upstream_secret_key(key) when byte_size(key) == @secret_key_bytes, do: {:ok, key}
-
-  defp decode_upstream_secret_key(key) when is_binary(key) do
-    case Base.decode64(key) do
-      {:ok, decoded} when byte_size(decoded) == @secret_key_bytes ->
-        {:ok, decoded}
-
-      _invalid ->
-        {:error,
-         lifecycle_error(
-           :upstream_secret_key_invalid,
-           @invalid_secret_key_message
-         )}
-    end
-  end
-
-  defp decode_upstream_secret_key(_key) do
-    {:error,
-     lifecycle_error(
-       :upstream_secret_key_invalid,
-       @invalid_secret_key_message
-     )}
-  end
-
-  defp local_secret_key_fallback? do
-    # Reason: Mix is optional at release runtime, so call it only after ensure_loaded?.
-    # credo:disable-for-lines:3 Credo.Check.Refactor.Apply
-    Code.ensure_loaded?(Mix) and
-      apply(Mix, :env, []) in [:dev, :test]
-  end
-
-  defp aad_binary(aad) when is_map(aad) do
-    aad
-    |> Map.to_list()
-    |> Enum.sort_by(fn {key, _value} -> key end)
-    |> :erlang.term_to_binary()
   end
 
   defp parse_optional_datetime(%DateTime{} = datetime), do: datetime
@@ -399,6 +296,9 @@ defmodule CodexPooler.Upstreams.Secrets do
   end
 
   defp normalize_token(value), do: value
+
+  defp maybe_put_key_version(aad, nil), do: aad
+  defp maybe_put_key_version(aad, key_version), do: Map.put(aad, "key_version", key_version)
 
   defp lifecycle_error(code, message), do: %{code: code, message: message}
 

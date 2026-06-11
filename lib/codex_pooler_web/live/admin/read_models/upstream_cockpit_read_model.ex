@@ -14,6 +14,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
   alias CodexPoolerWeb.Admin.UpstreamQuotaReadiness
+  alias CodexPoolerWeb.DateTimeDisplay
 
   @reactivatable_statuses ~w(paused refresh_due refresh_failed)
   @recovery_statuses ~w(paused refresh_due refresh_failed reauth_required)
@@ -197,6 +198,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:reactivate) => action(),
           required(:refresh_token) => action(),
           required(:replace_auth_json) => action(),
+          required(:oauth_relink) => action(),
           required(:reinvite) => action(),
           required(:delete) => action(),
           required(:empty?) => boolean(),
@@ -217,6 +219,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:disabled_identity?) => boolean(),
           required(:reauth_required?) => boolean()
         }
+  @type oauth_flow_state :: UpstreamAccountsReadModel.oauth_flow_state()
   @type t :: %{
           required(:identity) => safe_identity(),
           required(:header) => header(),
@@ -224,6 +227,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:charts) => charts(),
           required(:recent_events) => recent_events(),
           required(:actions) => actions(),
+          required(:oauth_flows) => oauth_flow_state(),
           required(:sections) => sections(),
           required(:flags) => flags()
         }
@@ -260,6 +264,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     charts = charts(flags, quota_health, request_health, pool_contribution)
     recent_events = recent_events(account.identity, scope)
     actions = actions(account)
+    oauth_flows = oauth_flows(account, scope)
     sections = sections(flags, assignments, charts, recent_events, actions)
 
     %{
@@ -269,9 +274,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       charts: charts,
       recent_events: recent_events,
       actions: actions,
+      oauth_flows: oauth_flows,
       sections: sections,
       flags: flags
     }
+  end
+
+  defp oauth_flows(_account, nil), do: UpstreamAccountsReadModel.empty_oauth_flow_state()
+
+  defp oauth_flows(%{identity: %UpstreamIdentity{} = identity, assignments: assignments}, scope) do
+    pools = Enum.map(assignments, &%{id: &1.pool_id})
+
+    UpstreamAccountsReadModel.oauth_flow_state(
+      scope,
+      pools,
+      DateTimeDisplay.preferences_for_user(scope.user),
+      upstream_identity_ids: [identity.id]
+    )
   end
 
   defp safe_identity(%{identity: %UpstreamIdentity{} = identity} = account) do
@@ -870,6 +889,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           "token refresh is unavailable"
         ),
       replace_auth_json: action(recovery_eligible?, "credential replacement is not needed"),
+      oauth_relink:
+        action(
+          status != "deleted" and account.assignments != [],
+          "OAuth relink requires a Pool assignment"
+        ),
       reinvite:
         action(
           recovery_eligible? and account.assignments != [],
