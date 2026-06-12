@@ -178,31 +178,6 @@ operator MCP entry, change its `url` to `https://codex-pooler.example.com/mcp`.
 </details>
 
 <details>
-<summary><img src=".github/assets/openhands-favicon.png" alt="OpenHands logo" width="16" height="16"> OpenHands</summary>
-
-OpenHands CLI can use Codex Pooler through the narrow OpenAI-compatible `/v1`
-surface. Keep the Pool API key in the environment, set the OpenHands base URL to
-`/v1`, and use the OpenAI model prefix that OpenHands expects.
-
-```bash
-export LLM_API_KEY=<pool-api-key>
-export LLM_BASE_URL=http://localhost:4000/v1
-export LLM_MODEL=openai/gpt-5.5
-
-uvx --python 3.12 --from openhands openhands \
-  --headless \
-  --override-with-envs \
-  -t 'Check the repository and summarize what you can do.'
-```
-
-For deployed instances, change `LLM_BASE_URL` to
-`https://codex-pooler.example.com/v1`. The model name should stay
-`openai/gpt-5.5` so OpenHands selects its OpenAI-compatible provider path while
-Codex Pooler routes the request through the assigned Pool.
-
-</details>
-
-<details>
 <summary><img src=".github/assets/codex-cli-favicon.png" alt="OpenAI logo" width="16" height="16"> Codex <code>~/.codex/config.toml</code></summary>
 
 ![Codex Pooler Codex CLI integration](.github/assets/codex-pooler-codex.png)
@@ -734,6 +709,31 @@ configured a provider with fill-in-the-middle autocomplete support. Codex
 Pooler's `customai` setup is for Windmill chat, script/flow/app generation,
 fixes, summaries, metadata generation, and form-filling features that use chat
 completion style requests.
+
+</details>
+
+<details>
+<summary><img src=".github/assets/openhands-favicon.png" alt="OpenHands logo" width="16" height="16"> OpenHands</summary>
+
+OpenHands CLI can use Codex Pooler through the narrow OpenAI-compatible `/v1`
+surface. Keep the Pool API key in the environment, set the OpenHands base URL to
+`/v1`, and use the OpenAI model prefix that OpenHands expects.
+
+```bash
+export LLM_API_KEY=<pool-api-key>
+export LLM_BASE_URL=http://localhost:4000/v1
+export LLM_MODEL=openai/gpt-5.5
+
+uvx --python 3.12 --from openhands openhands \
+  --headless \
+  --override-with-envs \
+  -t 'Check the repository and summarize what you can do.'
+```
+
+For deployed instances, change `LLM_BASE_URL` to
+`https://codex-pooler.example.com/v1`. The model name should stay
+`openai/gpt-5.5` so OpenHands selects its OpenAI-compatible provider path while
+Codex Pooler routes the request through the assigned Pool.
 
 </details>
 
