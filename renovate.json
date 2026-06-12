@@ -17,7 +17,7 @@
   ],
   "constraints": {
     "elixir": "1.20.0",
-    "erlang": "28.5"
+    "erlang": "28.5.0.2"
   },
   "labels": [
     "dependencies"
@@ -67,6 +67,7 @@
       "matchPackageNames": [
         "elixir",
         "elixir-lang/elixir",
+        "containerbase/erlang-prebuild",
         "erlang",
         "erlang/otp"
       ],
@@ -150,16 +151,15 @@
     },
     {
       "customType": "regex",
-      "description": "Update Renovate Erlang artifact constraint",
+      "description": "Update Renovate Erlang artifact prebuild constraint",
       "managerFilePatterns": [
         "/(^|/)renovate\\.json$/"
       ],
       "matchStrings": [
-        "(?<prefix>\"erlang\"\\s*:\\s*\")(?<currentValue>\\d+\\.\\d+(?:\\.\\d+)?)(?<suffix>\")"
+        "(?<prefix>\"erlang\"\\s*:\\s*\")(?<currentValue>\\d+\\.\\d+\\.\\d+\\.\\d+)(?<suffix>\")"
       ],
-      "depNameTemplate": "erlang/otp",
-      "datasourceTemplate": "github-tags",
-      "extractVersionTemplate": "^OTP-(?<version>\\d+\\.\\d+(?:\\.\\d+)?)$",
+      "depNameTemplate": "containerbase/erlang-prebuild",
+      "datasourceTemplate": "github-releases",
       "versioningTemplate": "semver-coerced",
       "autoReplaceStringTemplate": "{{{prefix}}}{{{newValue}}}{{{suffix}}}"
     },
