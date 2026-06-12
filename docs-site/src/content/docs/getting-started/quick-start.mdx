@@ -1,6 +1,12 @@
 ---
 title: Quick Start
 description: Start Codex Pooler locally with Docker Compose, create the first owner, add upstream capacity, issue a Pool API key, and test runtime URLs.
+head:
+  - tag: script
+    attrs:
+      type: application/ld+json
+    content: |
+      {"@context":"https://schema.org","@type":"HowTo","name":"Start Codex Pooler locally","description":"Start Codex Pooler with Docker Compose, create the first owner, create a Pool, add an upstream account, create a Pool API key, and point a client at /backend-api/codex or /v1.","tool":[{"@type":"HowToTool","name":"Docker with Compose"},{"@type":"HowToTool","name":"Git"},{"@type":"HowToTool","name":"openssl"}],"step":[{"@type":"HowToStep","name":"Start Codex Pooler","text":"Clone the repository, generate local secrets with scripts/self-host/generate-env.sh, pull images, and start the Docker Compose stack."},{"@type":"HowToStep","name":"Create the owner account","text":"Open http://localhost:4000, complete the bootstrap screen, and sign in as the instance owner."},{"@type":"HowToStep","name":"Create a Pool","text":"Open http://localhost:4000/admin/pools and create the Pool that clients will authenticate against."},{"@type":"HowToStep","name":"Add an upstream account","text":"Open http://localhost:4000/admin/upstreams and link, import, or invite a Codex account, then assign it to the Pool when needed."},{"@type":"HowToStep","name":"Create a Pool API key","text":"Open http://localhost:4000/admin/api-keys, create a key for the Pool, copy it once, and store it in the client environment."},{"@type":"HowToStep","name":"Point a client at the gateway","text":"Use http://localhost:4000/backend-api/codex for Codex backend clients, http://localhost:4000/v1 for selected OpenAI-compatible SDK clients, and http://localhost:4000/mcp only for operator metadata with an operator MCP token."}]}
 ---
 
 Use this guide to get from a fresh checkout to a local Pool API key you can put in a Codex or OpenAI-compatible client.

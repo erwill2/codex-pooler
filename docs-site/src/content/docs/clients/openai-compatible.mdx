@@ -1,11 +1,19 @@
 ---
 title: OpenAI-Compatible SDKs
 description: Configure selected OpenAI SDK-compatible clients through Codex Pooler's narrow /v1 surface, Pool API keys, supported routes, and unsupported boundaries.
+head:
+  - tag: script
+    attrs:
+      type: application/ld+json
+    content: |
+      {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Can I use the official OpenAI SDK with Codex Pooler?","acceptedAnswer":{"@type":"Answer","text":"Yes, for selected SDK routes. Set the SDK base_url or baseURL to https://codex-pooler.example.com/v1, use a Pool API key as the bearer credential, and keep requests on supported route shapes such as responses, chat completions, models, usage, files, audio transcription, and image generation or edits."}},{"@type":"Question","name":"Should Codex backend clients use /v1?","acceptedAnswer":{"@type":"Answer","text":"No. Codex backend-compatible clients should use /backend-api/codex. The /v1 surface is for selected OpenAI SDK-compatible clients and translates supported requests into Codex-compatible work."}},{"@type":"Question","name":"Does /v1 support OpenAI Realtime?","acceptedAnswer":{"@type":"Answer","text":"No. /v1/realtime and OpenAI Realtime SDK websocket or session routes are unsupported. GET /v1/responses is narrow Responses websocket compatibility only, not OpenAI Realtime support."}},{"@type":"Question","name":"Does /v1/responses/compact work?","acceptedAnswer":{"@type":"Answer","text":"No. POST /v1/responses/compact is routed only so clients receive a deterministic OpenAI-shaped unsupported_endpoint error. Codex backend-compatible compact requests should use POST /backend-api/codex/responses/compact."}},{"@type":"Question","name":"Can I use the same key for /v1 and /mcp?","acceptedAnswer":{"@type":"Answer","text":"No. /v1 uses Pool API keys for runtime work. /mcp uses operator-owned MCP bearer tokens for metadata-only lookup. Keep those credentials separate in client configuration and storage."}}]}
 ---
 
 Codex Pooler provides narrow OpenAI-compatible `/v1` support for selected SDK routes. It translates supported requests into Codex-compatible work, then sends them through the same Pool routing, limit checks, account selection, and accounting path used by Codex backend clients.
 
 It doesn't provide full OpenAI API parity.
+
+For a short citable summary, see [OpenAI-compatible Codex gateway](/discovery/openai-compatible-codex-gateway/).
 
 ## What OpenAI-Compatible Means Here
 
