@@ -72,7 +72,18 @@
         "erlang/otp"
       ],
       "groupName": "Elixir/Erlang toolchain",
-      "groupSlug": "elixir-erlang-toolchain"
+      "groupSlug": "elixir-erlang-toolchain",
+      "minimumGroupSize": 2
+    },
+    {
+      "description": "Use Docker-compatible custom updates for mise Elixir pins",
+      "matchManagers": [
+        "mise"
+      ],
+      "matchPackageNames": [
+        "elixir"
+      ],
+      "enabled": false
     },
     {
       "description": "Keep Renovate Mix artifacts on Elixir releases installable by containerbase",
@@ -144,6 +155,19 @@
         "image: '(?<depName>postgres):(?<currentValue>[^']+)'"
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Update mise Elixir OTP 28 version from Docker tag compatibility",
+      "managerFilePatterns": [
+        "/(^|/)mise\\.toml$/"
+      ],
+      "matchStrings": [
+        "(?<prefix>elixir\\s*=\\s*\")(?<currentValue>\\d+\\.\\d+\\.\\d+-otp-28)(?<suffix>\")"
+      ],
+      "depNameTemplate": "elixir",
+      "datasourceTemplate": "docker",
+      "autoReplaceStringTemplate": "{{{prefix}}}{{{newValue}}}{{{suffix}}}"
     },
     {
       "customType": "regex",
