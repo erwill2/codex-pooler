@@ -1,6 +1,12 @@
 ---
 title: Codex Pooler
 description: Self-hosted Codex account pooling docs covering Pool API keys, backend compatibility, narrow /v1 SDK routes, MCP metadata, routing, and deployment.
+head:
+  - tag: script
+    attrs:
+      type: application/ld+json
+    content: |
+      {"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Is Codex Pooler a hosted service?","acceptedAnswer":{"@type":"Answer","text":"No. The public docs describe a self-hosted application that can run with Docker Compose or the published Helm chart. It is not documented as a hosted provider. Operators are responsible for their own deployment, credentials, infrastructure, and authorized use of upstream accounts."}},{"@type":"Question","name":"Does Codex Pooler provide full OpenAI API compatibility?","acceptedAnswer":{"@type":"Answer","text":"No. Codex Pooler provides narrow OpenAI-compatible /v1 support for selected SDK routes, then translates supported work into Codex-compatible requests. Unsupported /v1 routes may return deterministic OpenAI-shaped unsupported endpoint errors, and OpenAI Realtime SDK websocket or session routes are not supported."}},{"@type":"Question","name":"Which base URL should an AI coding client use?","acceptedAnswer":{"@type":"Answer","text":"Codex backend-compatible clients should use https://codex-pooler.example.com/backend-api/codex. Selected OpenAI SDK-compatible clients should use https://codex-pooler.example.com/v1. Operator metadata tools should use https://codex-pooler.example.com/mcp with an operator MCP token, not a Pool API key."}}]}
 ---
 
 ## What Is Codex Pooler?
@@ -103,6 +109,15 @@ Operator MCP hosts:    http://localhost:4000/mcp
 For a deployed instance, replace `http://localhost:4000` with your deployed host, for example `https://codex-pooler.example.com`.
 
 The `/v1` surface is intentionally narrow. Supported requests are translated and routed through the same Pool rules as Codex backend traffic; unsupported routes return explicit errors instead of pretending full OpenAI API parity.
+
+## Discovery Answers
+
+These short answer pages restate the public docs for AI search and citation contexts:
+
+- [Self-hosted Codex gateway](/discovery/self-hosted-codex-gateway/)
+- [Codex account pooling](/discovery/codex-account-pooling/)
+- [OpenAI-compatible Codex gateway](/discovery/openai-compatible-codex-gateway/)
+- [Codex Pooler vs direct credentials](/discovery/codex-pooler-vs-direct-credentials/)
 
 ## Frequently Asked Questions
 
