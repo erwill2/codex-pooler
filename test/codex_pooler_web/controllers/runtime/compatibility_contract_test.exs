@@ -208,6 +208,10 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert responses_chat.contract =~ "terminal compaction_trigger backend payloads bridge"
       assert responses_chat.contract =~ "/backend-api/codex/responses/compact"
       assert responses_chat.contract =~ "malformed trigger placement is rejected before dispatch"
+      assert responses_chat.contract =~ "backend regular HTTP Responses and compact routes"
+      assert responses_chat.contract =~ "x-codex-window-id"
+      assert responses_chat.contract =~ "x-codex-installation-id"
+      assert responses_chat.contract =~ "public /v1 and websocket header lanes do not"
       assert responses_chat.contract =~ "context-overflow recovery stays client/upstream-owned"
       assert responses_chat.contract =~ "no server-side hidden replay"
       assert responses_chat.contract =~ "stored prompt/frame reconstruction"
@@ -249,6 +253,28 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                  stores_websocket_frames: false,
                  client_action: "restart_with_full_context"
                }
+             }
+
+      assert fixture.backend_regular_metadata_forwarding == %{
+               routes: [
+                 "/backend-api/codex/responses",
+                 "/backend-api/codex/v1/responses",
+                 "/backend-api/codex/responses/compact",
+                 "/backend-api/codex/v1/responses/compact"
+               ],
+               forwarded_headers: [
+                 "x-codex-turn-metadata",
+                 "x-codex-window-id",
+                 "x-codex-parent-thread-id",
+                 "x-codex-installation-id",
+                 "x-openai-subagent"
+               ],
+               not_forwarded_on: [
+                 "/v1/responses",
+                 "backend_websocket_response.create",
+                 "public_v1_websocket_response.create"
+               ],
+               privacy: "raw_values_not_persisted"
              }
     end
 

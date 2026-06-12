@@ -2,6 +2,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.SSE do
   @moduledoc false
 
   alias CodexPooler.Gateway.OpenAICompatibility.Error
+  alias CodexPooler.Gateway.OpenAICompatibility.PublicResponse
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
   @spec response_from_sse(binary()) :: {:ok, map()} | {:error, Error.reason()}
@@ -48,22 +49,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.SSE do
     )
   end
 
-  defp terminal_error(_event, %{"status" => status}) when status in ["completed", "in_progress"],
-    do: nil
+  defp terminal_error(_event, %{"status" => status})
+       when status in ["completed", "in_progress", "incomplete"],
+       do: nil
 
   defp terminal_error(event, response) do
     error = response["error"] || event["error"]
 
     case error do
       %{} = error ->
-        status = if Map.get(error, "type") == "invalid_request_error", do: 400, else: 502
+        status = PublicResponse.terminal_error_status(error)
+        normalized = PublicResponse.normalize_error(error, status: status)
 
         {:error,
          Error.reason(
            status,
-           Map.get(error, "code") || "upstream_error",
-           Map.get(error, "message") || "upstream response failed",
-           Map.get(error, "param")
+           normalized["code"] || "upstream_error",
+           normalized["message"] || "upstream request failed",
+           normalized["param"]
          )}
 
       _other ->

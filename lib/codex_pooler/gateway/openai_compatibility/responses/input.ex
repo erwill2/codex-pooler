@@ -703,28 +703,25 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
     end
   end
 
-  defp validate_function_call_output(output) when is_binary(output), do: :ok
+  defp validate_function_call_output(output), do: validate_json_value(output)
 
-  defp validate_function_call_output(output) when is_list(output) do
-    validate_each(output, &validate_function_call_output_part/1)
+  defp validate_json_value(value)
+       when is_binary(value) or is_integer(value) or is_float(value) or is_boolean(value) or
+              is_nil(value),
+       do: :ok
+
+  defp validate_json_value(value) when is_list(value),
+    do: validate_each(value, &validate_json_value/1)
+
+  defp validate_json_value(%{} = value) do
+    if Enum.all?(Map.keys(value), &is_binary/1) do
+      value |> Map.values() |> validate_each(&validate_json_value/1)
+    else
+      {:error, Error.invalid_request("input item shape is not translatable", "input")}
+    end
   end
 
-  defp validate_function_call_output(_output),
-    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
-
-  defp validate_function_call_output_part(%{"type" => "input_text", "text" => text} = part)
-       when is_binary(text) do
-    validate_exact_item_keys(part, ["type", "text"])
-  end
-
-  defp validate_function_call_output_part(
-         %{"type" => "input_image", "image_url" => image_url} = part
-       )
-       when is_binary(image_url) do
-    validate_exact_item_keys(part, ["type", "image_url"])
-  end
-
-  defp validate_function_call_output_part(_part),
+  defp validate_json_value(_value),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp validate_optional_id(%{"id" => id}) when is_binary(id), do: validate_nonblank(id)

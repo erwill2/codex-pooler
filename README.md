@@ -959,6 +959,19 @@ translated into Codex-compatible calls, then routed through the same Pool rules,
 limit checks, accounting, and account selection path. `/v1/realtime` and OpenAI
 Realtime SDK websocket or session routes are not supported.
 
+Public `/v1` responses preserve client-facing OpenAI shapes where possible:
+
+- `/v1/chat/completions` returns content-filter stops as
+  `finish_reason: "content_filter"`; max-output fallbacks still use the
+  `finish_reason: "length"` shape.
+- Server-class upstream, gateway, or provider failures redact provider and
+  internal text. Clients receive safe generic server errors such as
+  `upstream request failed`, while explicit local validation failures remain
+  `invalid_request_error` responses with safe details.
+- `/v1/files` direct uploads accept only public HTTPS upstream `upload_url`
+  values. Loopback, private, reserved, NAT64, userinfo, non-HTTPS, and raw
+  control or whitespace URLs are rejected before the direct PUT.
+
 Continuity headers are local routing inputs. Codex Pooler chooses them in this
 order: `x-codex-window-id` > `x-codex-session-id` > `session-id` >
 `x-session-id` > `x-session-affinity` > `session_id` >
@@ -968,6 +981,13 @@ value is hashed before it becomes a local persisted session key. Local timing
 regressions showed `/v1/responses` HTTP streaming and Responses websocket paths
 stay inside the observed client budgets with the existing stream timeout
 settings, so no new route-specific timeout defaults are required.
+
+Backend regular HTTP Responses and compact routes forward only the approved
+lineage metadata headers upstream: `x-codex-turn-metadata`,
+`x-codex-window-id`, `x-codex-parent-thread-id`,
+`x-codex-installation-id`, and `x-openai-subagent`. Public `/v1/responses` and
+websocket request headers do not use that backend-only forwarding lane, and raw
+metadata values are not persisted.
 
 ## Operator MCP Service
 

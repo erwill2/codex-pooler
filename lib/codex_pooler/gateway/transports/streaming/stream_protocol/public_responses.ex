@@ -1,6 +1,7 @@
 defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponses do
   @moduledoc false
 
+  alias CodexPooler.Gateway.OpenAICompatibility.PublicResponse
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
@@ -189,9 +190,35 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
   defp normalize_public_event(type, %{} = decoded) do
     if terminal_event?(type) do
       normalize_terminal_output_items(decoded)
+      |> normalize_terminal_errors()
     else
       decoded
     end
+  end
+
+  defp normalize_terminal_errors(%{} = decoded) do
+    decoded
+    |> normalize_top_level_error()
+    |> normalize_response_error()
+  end
+
+  defp normalize_top_level_error(%{"error" => %{} = error} = decoded),
+    do: Map.put(decoded, "error", normalize_terminal_error(error))
+
+  defp normalize_top_level_error(decoded), do: decoded
+
+  defp normalize_response_error(%{"response" => %{"error" => %{} = error} = response} = decoded) do
+    Map.put(
+      decoded,
+      "response",
+      Map.put(response, "error", normalize_terminal_error(error))
+    )
+  end
+
+  defp normalize_response_error(decoded), do: decoded
+
+  defp normalize_terminal_error(error) do
+    PublicResponse.normalize_error(error, status: PublicResponse.terminal_error_status(error))
   end
 
   defp normalize_terminal_output_items(%{"response" => %{} = response} = decoded) do

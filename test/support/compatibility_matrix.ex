@@ -75,7 +75,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :responses_chat,
       contract:
-        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path; chat completions use messages when present and fall back to top-level input only when messages is absent or empty, with omitted fallback instructions defaulting to a blank string; request-shaped additional_tools input items are preserved as non-executable input, never merged into executable tools, and never used to satisfy tool_choice; Responses namespace tool definitions are accepted only for non-empty namespace name/description values and nested function tools; Responses truncation accepts auto and disabled locally but is not forwarded upstream; terminal compaction_trigger backend payloads bridge through /backend-api/codex/responses/compact with compact accounting and backend Responses SSE compaction output, while malformed trigger placement is rejected before dispatch; context-overflow recovery stays client/upstream-owned with no server-side hidden replay or stored prompt/frame reconstruction; Hermes assistant replay may include safe assistant status metadata; OpenClaw assistant replay drops thinking metadata and normalizes text before upstream dispatch; safe OpenAI Responses fields, prompt-cache locality, SDK-control rejection, and backend-only control stripping stay scope-specific"
+        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path; chat completions use messages when present and fall back to top-level input only when messages is absent or empty, with omitted fallback instructions defaulting to a blank string; request-shaped additional_tools input items are preserved as non-executable input, never merged into executable tools, and never used to satisfy tool_choice; Responses namespace tool definitions are accepted only for non-empty namespace name/description values and nested function tools; Responses truncation accepts auto and disabled locally but is not forwarded upstream; terminal compaction_trigger backend payloads bridge through /backend-api/codex/responses/compact with compact accounting and backend Responses SSE compaction output, while malformed trigger placement is rejected before dispatch; backend regular HTTP Responses and compact routes forward only approved lineage metadata headers, including x-codex-window-id and x-codex-installation-id, while public /v1 and websocket header lanes do not; context-overflow recovery stays client/upstream-owned with no server-side hidden replay or stored prompt/frame reconstruction; Hermes assistant replay may include safe assistant status metadata; OpenClaw assistant replay drops thinking metadata and normalizes text before upstream dispatch; safe OpenAI Responses fields, prompt-cache locality, SDK-control rejection, and backend-only control stripping stay scope-specific"
     },
     %{
       slug: :backend_v1_alias_surface,
@@ -258,7 +258,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :v1_supported_surface,
       contract:
-        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, include narrow GET /v1/responses Responses websocket compatibility only, exclude broad /v1/realtime routes, consume continuity headers using the documented local precedence without forwarding session-id, x-session-id, or x-session-affinity upstream, fail closed for pinned /v1/responses continuations whose upstream account needs revoked-refresh-token reauthentication with the shared restart_with_full_context recovery guidance, allow prompt-cache routing locality only on POST responses and chat completions, accept Responses truncation auto and disabled locally without forwarding it upstream, lift Responses system/developer input-message text into top-level instructions, emit early public streaming terminal errors without synthetic success prefixes, translate chat-style role=tool continuation messages and Hermes assistant tool-call replays into Responses function_call/function_call_output input items before validation, accept safe Hermes assistant replay status values, translate OpenClaw assistant thinking replays before validation, and keep chat input fallback, Responses additional_tools support narrow and non-executable, and Responses namespace-tool support narrow"
+        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, include narrow GET /v1/responses Responses websocket compatibility only, exclude broad /v1/realtime routes, consume continuity headers using the documented local precedence without forwarding session-id, x-session-id, or x-session-affinity upstream, fail closed for pinned /v1/responses continuations whose upstream account needs revoked-refresh-token reauthentication with the shared restart_with_full_context recovery guidance, allow prompt-cache routing locality only on POST responses and chat completions, accept Responses truncation auto and disabled locally without forwarding it upstream, lift Responses system/developer input-message text into top-level instructions, emit early public streaming terminal errors without synthetic success prefixes, redact server-class/internal/upstream public /v1 errors while preserving invalid_request_error validation details, map Responses content_filter/content-filter incomplete reasons to chat finish_reason content_filter while other incomplete reasons remain length, forward structured tool-result/function_call_output payloads unchanged, translate chat-style role=tool continuation messages and Hermes assistant tool-call replays into Responses function_call/function_call_output input items before validation, accept safe Hermes assistant replay status values, translate OpenClaw assistant thinking replays before validation, and keep chat input fallback, Responses additional_tools support narrow and non-executable, and Responses namespace-tool support narrow"
     },
     %{
       slug: :v1_unsupported_public_surface,
@@ -375,6 +375,27 @@ defmodule CodexPooler.CompatibilityMatrix do
           stores_websocket_frames: false,
           client_action: "restart_with_full_context"
         }
+      },
+      backend_regular_metadata_forwarding: %{
+        routes: [
+          "/backend-api/codex/responses",
+          "/backend-api/codex/v1/responses",
+          "/backend-api/codex/responses/compact",
+          "/backend-api/codex/v1/responses/compact"
+        ],
+        forwarded_headers: [
+          "x-codex-turn-metadata",
+          "x-codex-window-id",
+          "x-codex-parent-thread-id",
+          "x-codex-installation-id",
+          "x-openai-subagent"
+        ],
+        not_forwarded_on: [
+          "/v1/responses",
+          "backend_websocket_response.create",
+          "public_v1_websocket_response.create"
+        ],
+        privacy: "raw_values_not_persisted"
       },
       json: %{
         "model" => "gpt-fixture-text",
@@ -550,6 +571,24 @@ defmodule CodexPooler.CompatibilityMatrix do
         chat_omits_done_before_output: true,
         late_failures_retry: false,
         non_stream_errors: "json_error"
+      },
+      public_error_redaction: %{
+        server_class_surfaces: ["responses_json", "responses_sse_terminal", "chat_streaming"],
+        server_class_message: "upstream request failed",
+        server_class_type: "server_error",
+        server_class_code: ["safe_upstream_code", "upstream_error"],
+        preserves_invalid_request_error_details: true
+      },
+      chat_finish_reasons: %{
+        content_filter_incomplete_reasons: ["content_filter", "content-filter"],
+        content_filter_finish_reason: "content_filter",
+        other_incomplete_finish_reason: "length"
+      },
+      structured_tool_results: %{
+        accepted_outputs: ["nested_json_map", "nested_json_list", "long_string_values"],
+        forwarded_unchanged: true,
+        projection_mode: "shape_counts_and_hashed_previews_only",
+        raw_echo_allowed: false
       },
       chat_style_tool_continuation: %{
         input_role: "tool",

@@ -382,7 +382,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Chat do
   defp normalize_cline_tool_result_output(output) when is_list(output),
     do: Enum.map(output, &normalize_cline_tool_result_output_part/1)
 
-  defp normalize_cline_tool_result_output(output), do: Jason.encode!(output)
+  defp normalize_cline_tool_result_output(output), do: output
 
   defp normalize_cline_tool_result_output_part(part) when is_binary(part),
     do: %{"type" => "input_text", "text" => part}

@@ -50,6 +50,9 @@ defmodule CodexPooler.MCP.RedactionTest do
           :prompt,
           :request_body,
           :response_body,
+          :raw_tool_command,
+          :raw_tool_output,
+          :raw_tool_file_output,
           :multipart_body,
           :websocket_frame,
           :raw_idempotency_key,
@@ -61,7 +64,21 @@ defmodule CodexPooler.MCP.RedactionTest do
       assert category in categories
       sentinel = Redaction.forbidden_sentinel!(category)
       assert is_binary(sentinel)
-      assert sentinel =~ "TASK5_"
+      assert sentinel =~ ~r/TASK[57]_/
+    end
+  end
+
+  test "helpers reject raw structured tool command and output sentinels" do
+    for category <- [:raw_tool_command, :raw_tool_output, :raw_tool_file_output] do
+      sentinel = Redaction.forbidden_sentinel!(category)
+
+      assert_raise ExUnit.AssertionError, ~r/#{category}/, fn ->
+        Redaction.assert_structured_content_safe!(%{"tool_result" => %{"value" => sentinel}})
+      end
+
+      assert_raise ExUnit.AssertionError, ~r/#{category}/, fn ->
+        Redaction.assert_text_content_safe!("metadata summary #{sentinel}")
+      end
     end
   end
 

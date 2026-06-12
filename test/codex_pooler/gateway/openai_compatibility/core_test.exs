@@ -520,11 +520,59 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert function_output == %{
              "type" => "function_call_output",
              "call_id" => "call_fixture_cline_replay",
-             "output" => "{\"exitCode\":0,\"output\":\"synthetic command output\"}"
+             "output" => %{"exitCode" => 0, "output" => "synthetic command output"}
            }
 
     refute inspect(result.payload["input"]) =~ "tool_calls"
     refute inspect(result.payload["input"]) =~ "toolCallId"
+  end
+
+  @tag :structured_tool_result_pass_through
+  test "Chat forwards structured Cline tool-result output unchanged" do
+    structured_output = structured_tool_result_output()
+
+    payload = %{
+      "model" => "gpt-fixture-text",
+      "messages" => [
+        %{
+          "role" => "assistant",
+          "tool_calls" => [
+            %{
+              "id" => "call_fixture_cline_structured",
+              "type" => "function",
+              "function" => %{
+                "name" => "execute_command",
+                "arguments" => "{\"command\":\"synthetic\"}"
+              }
+            }
+          ],
+          "content" => "Synthetic assistant replay"
+        },
+        %{
+          "role" => "user",
+          "content" => [
+            %{
+              "type" => "tool-result",
+              "toolCallId" => "call_fixture_cline_structured",
+              "toolName" => "execute_command",
+              "output" => structured_output,
+              "isError" => false
+            }
+          ]
+        }
+      ]
+    }
+
+    assert {:ok, result} = Chat.coerce(payload, collect_openai_response_stream: true)
+    assert [_assistant_message, _function_call, function_output] = result.payload["input"]
+    assert function_output["type"] == "function_call_output"
+    assert function_output["call_id"] == "call_fixture_cline_structured"
+
+    assert_payload_equal_no_echo!(
+      function_output["output"],
+      structured_output,
+      "structured Cline tool-result output was not forwarded unchanged"
+    )
   end
 
   @tag :responses_coercion
@@ -1432,7 +1480,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         %{
           "type" => "function_call_output",
           "call_id" => "call_fixture",
-          "output" => [%{"type" => "output_text", "text" => "bad"}]
+          "output" => %{"bad" => self()}
         },
         %{"type" => "local_shell_call", "call_id" => "call_fixture"},
         %{"type" => "mcp_approval_response", "call_id" => "call_fixture", "output" => "bad"},
@@ -1457,7 +1505,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       end)
     end
 
-    test "structured function_call_output preserves string behavior and rejects unsupported image refs" do
+    test "structured function_call_output preserves string and JSON output behavior" do
       assert {:ok, %{payload: string_payload}} =
                Responses.coerce(%{
                  "model" => "gpt-fixture-text",
@@ -1472,19 +1520,52 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
       assert [%{"output" => "synthetic string output"}] = string_payload["input"]
 
-      assert {:error, %{status: 400, code: "unsupported_input_image_format", param: "input"}} =
+      structured_output = [
+        %{"type" => "input_image", "image_url" => "sediment://file_fixture"}
+      ]
+
+      assert {:ok, %{payload: structured_payload}} =
                Responses.coerce(%{
                  "model" => "gpt-fixture-text",
                  "input" => [
                    %{
                      "type" => "function_call_output",
                      "call_id" => "call_fixture",
-                     "output" => [
-                       %{"type" => "input_image", "image_url" => "sediment://file_fixture"}
-                     ]
+                     "output" => structured_output
                    }
                  ]
                })
+
+      assert [%{"output" => ^structured_output}] = structured_payload["input"]
+    end
+
+    @tag :structured_tool_result_pass_through
+    test "structured function_call_output forwards nested JSON output unchanged" do
+      structured_output = structured_tool_result_output()
+
+      assert {:ok, %{payload: payload}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "previous_response_id" => "resp_fixture_structured_previous",
+                 "input" => [
+                   %{
+                     "type" => "function_call_output",
+                     "call_id" => "call_fixture_structured",
+                     "output" => structured_output
+                   }
+                 ]
+               })
+
+      assert payload["previous_response_id"] == "resp_fixture_structured_previous"
+
+      assert [%{"type" => "function_call_output", "call_id" => "call_fixture_structured"} = item] =
+               payload["input"]
+
+      assert_payload_equal_no_echo!(
+        item["output"],
+        structured_output,
+        "structured Responses function_call_output was not forwarded unchanged"
+      )
     end
 
     test "tool-result input normalization returns explicit results without raising" do
@@ -2877,6 +2958,30 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
 
   defp upload_metadata do
     %{"filename" => "fixture.txt", "content_type" => "text/plain", "bytes" => 12}
+  end
+
+  defp structured_tool_result_output do
+    %{
+      "command" => "TASK7_RAW_TOOL_COMMAND_SENTINEL run private command",
+      "exit_code" => 0,
+      "files" => [
+        %{
+          "path" => "sample-output.txt",
+          "content" => "TASK7_RAW_TOOL_OUTPUT_SENTINEL\n" <> String.duplicate("line\n", 200)
+        }
+      ],
+      "nested" => %{
+        "list" => [
+          %{"stdout_preview" => String.duplicate("TASK7_LONG_NESTED_VALUE_", 40)},
+          %{"secret_like" => "TASK7_SECRET_LIKE_TOOL_SENTINEL"}
+        ],
+        "ok" => true
+      }
+    }
+  end
+
+  defp assert_payload_equal_no_echo!(actual, expected, message) do
+    unless actual == expected, do: flunk(message)
   end
 
   defp unsupported_value("conversation"), do: "conv_fixture"

@@ -28,12 +28,14 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   alias CodexPooler.Accounting.{Attempt, DailyRollup, Request, RequestLogs}
   alias CodexPooler.Events
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.OperationalSettings
 
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn, SessionContinuity}
 
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.Runtime.PublicGatewayResult
   alias Ecto.Adapters.SQL.Sandbox
 
   @websocket_frame_timeout 1_000
@@ -46,6 +48,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     |> put_req_header("x-codex-turn-metadata", "turn-metadata-redacted")
     |> put_req_header("x-codex-window-id", "window-redacted")
     |> put_req_header("x-codex-parent-thread-id", "thread-redacted")
+    |> put_req_header("x-codex-installation-id", "installation-redacted")
     |> put_req_header("x-openai-subagent", "subagent-redacted")
     |> put_req_header("x-codex-extra", "extra-redacted")
     |> put_req_header("x-openai-extra", "extra-redacted")
@@ -1163,6 +1166,93 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert Repo.aggregate(Attempt, :count) == 1
   end
 
+  @tag :structured_tool_result_pass_through
+  test "POST /v1/responses forwards structured tool output unchanged and keeps projections shape-only",
+       %{conn: conn} do
+    setup_runtime_ingress_override(%OperationalSettings{gateway_debug?: true})
+
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_http_structured_tool_result",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+    previous_response_id = "resp_v1_http_structured_previous"
+    tool_call_id = "call_v1_http_structured_tool"
+    structured_output = structured_tool_result_output()
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "previous_response_id" => previous_response_id,
+        "store" => false,
+        "input" => [
+          %{"type" => "item_reference", "id" => "msg_v1_http_structured_reference"},
+          %{
+            "type" => "function_call_output",
+            "call_id" => tool_call_id,
+            "output" => structured_output
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_v1_http_structured_tool_result", "object" => "response"} =
+             json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["previous_response_id"] == previous_response_id
+    assert captured.json["stream"] == true
+    assert captured.json["store"] == false
+
+    assert Enum.map(captured.json["input"], & &1["type"]) == [
+             "item_reference",
+             "function_call_output"
+           ]
+
+    assert Enum.at(captured.json["input"], 1)["call_id"] == tool_call_id
+
+    assert_payload_equal_no_echo!(
+      Enum.at(captured.json["input"], 1)["output"],
+      structured_output,
+      "structured function_call_output output was not forwarded unchanged"
+    )
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.endpoint == "/backend-api/codex/responses"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+
+    assert get_in(attempt.response_metadata, [
+             "gateway_debug",
+             "shape",
+             "client",
+             "entries",
+             "tool_result_count"
+           ]) == 1
+
+    assert get_in(attempt.response_metadata, [
+             "gateway_debug",
+             "items",
+             "tool_result_types"
+           ]) == ["function_call_output"]
+
+    projection_text =
+      inspect({request.request_metadata, attempt.response_metadata, RequestLogs.list(setup.pool)})
+
+    assert_no_sentinel_echo!(projection_text, structured_tool_result_sentinels())
+    refute projection_text =~ previous_response_id
+    refute projection_text =~ tool_call_id
+  end
+
   @tag :tool_result_previous_response
   test "POST /v1/responses keeps store false replay item ids at the raw Responses boundary", %{
     conn: conn
@@ -1844,6 +1934,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     end
   end
 
+  @tag :installation_id_metadata
   test "POST /v1/responses does not forward public metadata headers upstream", %{conn: conn} do
     upstream =
       start_upstream(
@@ -1886,6 +1977,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute Map.has_key?(captured_headers, "x-codex-turn-metadata")
     refute Map.has_key?(captured_headers, "x-codex-window-id")
     refute Map.has_key?(captured_headers, "x-codex-parent-thread-id")
+    refute Map.has_key?(captured_headers, "x-codex-installation-id")
     refute Map.has_key?(captured_headers, "x-openai-subagent")
     refute Map.has_key?(captured_headers, "x-codex-extra")
     refute Map.has_key?(captured_headers, "x-openai-extra")
@@ -1897,21 +1989,180 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert request.endpoint == "/backend-api/codex/responses"
   end
 
-  test "POST /v1/responses normalizes upstream JSON errors", %{conn: conn} do
+  @tag :invalid_request_error
+  test "POST /v1/responses preserves local validation errors before dispatch", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+    unsafe_value = "LOCAL_RESPONSES_VALIDATION_SENTINEL"
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic local validation response",
+        "max_output_tokens" => unsafe_value
+      })
+
+    assert %{"error" => error} = json_response(conn, 400)
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_request"
+    assert error["message"] == "max_output_tokens must be a positive integer"
+    assert error["param"] == "max_output_tokens"
+    refute conn.resp_body =~ unsafe_value
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  @tag :provider_invalid_request_redaction
+  test "POST /v1/responses JSON redacts provider-origin invalid_request_error bodies", %{
+    conn: conn
+  } do
+    cases = [
+      {401, "invalid_api_key", "provider_key",
+       "provider 401 leaked https://provider.internal.example/auth?key=sk-secret account acct_123"},
+      {403, "insufficient_quota", "organization",
+       "provider 403 leaked org org-secret and https://provider.internal.example/quota"},
+      {400, "context_length_exceeded", "input",
+       "provider 400 echoed prompt SENTINEL_PROMPT_CONTEXT and file file-secret.txt"}
+    ]
+
+    Enum.each(cases, fn {status, code, param, provider_message} ->
+      response =
+        PublicGatewayResult.send(
+          recycle(conn),
+          {:ok,
+           %{
+             status: status,
+             raw_body:
+               Jason.encode!(%{
+                 "error" => provider_invalid_request_error(code, provider_message, param)
+               })
+           }},
+          fn decoded -> decoded end
+        )
+
+      assert %{"error" => error} = json_response(response, status)
+      assert error["message"] == "upstream request failed"
+      assert error["type"] == "server_error"
+      assert error["code"] == code
+      refute Map.has_key?(error, "param")
+      refute response.resp_body =~ provider_message
+      refute response.resp_body =~ param
+      refute response.resp_body =~ "provider.internal.example"
+      refute response.resp_body =~ "sk-secret"
+      refute response.resp_body =~ "acct_123"
+      refute response.resp_body =~ "org-secret"
+      refute response.resp_body =~ "SENTINEL_PROMPT_CONTEXT"
+      refute response.resp_body =~ "file-secret.txt"
+    end)
+  end
+
+  @tag :provider_invalid_request_redaction
+  test "POST /v1/responses streaming redacts provider-origin invalid_request_error", %{conn: conn} do
+    provider_message =
+      "provider 400 leaked https://provider.internal.example/context?key=sk-secret and prompt SENTINEL_STREAM"
+
+    upstream_error =
+      provider_invalid_request_error("context_length_exceeded", provider_message, "input")
+
     upstream =
       start_upstream(
         FakeUpstream.sse_stream([
           {"response.failed",
            %{
              "type" => "response.failed",
-             "error" => %{
-               "type" => "invalid_request_error",
-               "code" => "invalid_request_error",
-               "message" => "synthetic upstream validation"
-             },
-             "response" => %{"id" => "resp_v1_failed", "status" => "failed"}
+             "error" => upstream_error,
+             "response" => %{
+               "id" => "resp_v1_stream_provider_invalid_request",
+               "status" => "failed",
+               "error" => upstream_error
+             }
            }}
         ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic provider invalid request stream",
+        "stream" => true
+      })
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+    assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
+
+    for error <- [data["error"], get_in(data, ["response", "error"])] do
+      assert error["message"] == "upstream request failed"
+      assert error["type"] == "server_error"
+      assert error["code"] == "context_length_exceeded"
+      refute Map.has_key?(error, "param")
+    end
+
+    refute conn.resp_body =~ provider_message
+    refute conn.resp_body =~ "provider.internal.example"
+    refute conn.resp_body =~ "sk-secret"
+    refute conn.resp_body =~ "SENTINEL_STREAM"
+    refute conn.resp_body =~ "\"param\""
+    refute conn.resp_body =~ "event: response.created\n"
+    refute conn.resp_body =~ "event: response.output_text.delta\n"
+    assert FakeUpstream.count(upstream) == 1
+  end
+
+  @tag :server_error_redaction
+  test "POST /v1/responses SSE collection redacts safe-looking terminal 502 errors" do
+    provider_message =
+      "provider failed at https://upstream.internal.example/internal/rate?token=secret"
+
+    upstream_error = safe_looking_upstream_error(provider_message)
+
+    body =
+      "event: response.failed\n" <>
+        "data: " <>
+        Jason.encode!(%{
+          "type" => "response.failed",
+          "error" => upstream_error,
+          "response" => %{
+            "id" => "resp_v1_collect_safe_looking_server_failed",
+            "status" => "failed",
+            "error" => upstream_error
+          }
+        }) <>
+        "\n\n"
+
+    assert {:error, error} = Responses.response_from_sse(body)
+    assert error.status == 502
+    assert error.message == "upstream request failed"
+    assert error.code == "rate_limit_exceeded"
+    assert error.param == nil
+    refute inspect(error) =~ "provider failed"
+    refute inspect(error) =~ "upstream.internal.example"
+    refute inspect(error) =~ "/internal/rate"
+    refute inspect(error) =~ "provider_stack"
+  end
+
+  @tag :server_error_redaction
+  test "POST /v1/responses JSON redacts server-class upstream errors", %{conn: conn} do
+    provider_message =
+      "provider failed at https://upstream.internal.example/internal/responses?token=secret"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.http_500_json_error(%{
+          "error" => %{
+            "type" => "server_error",
+            "code" => "server_error",
+            "message" => provider_message,
+            "param" => "provider_stack"
+          }
+        })
       )
 
     setup = gateway_setup(upstream)
@@ -1924,15 +2175,198 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         "input" => "synthetic rejected response"
       })
 
-    assert %{"error" => error} = json_response(conn, 400)
-    assert error["type"] == "invalid_request_error"
-    assert error["code"] == "invalid_request_error"
-    assert error["message"] == "synthetic upstream validation"
+    assert %{"error" => error} = json_response(conn, 500)
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
+    assert error["code"] in ["server_error", "upstream_error"]
+    refute Map.has_key?(error, "param")
+    refute conn.resp_body =~ "provider failed"
+    refute conn.resp_body =~ "upstream.internal.example"
+    refute conn.resp_body =~ "/internal/responses"
+    refute conn.resp_body =~ "provider_stack"
     assert FakeUpstream.count(upstream) == 1
+  end
+
+  @tag :server_error_redaction
+  test "POST /v1/responses JSON redacts 429 provider API errors", %{conn: conn} do
+    provider_message =
+      "provider failed at https://upstream.internal.example/internal/rate?token=secret-sentinel-429"
+
+    conn =
+      PublicGatewayResult.send(
+        conn,
+        {:ok,
+         %{
+           status: 429,
+           raw_body: Jason.encode!(%{"error" => safe_looking_upstream_error(provider_message)})
+         }},
+        fn decoded -> decoded end
+      )
+
+    assert %{"error" => error} = json_response(conn, 429)
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
+    assert error["code"] in ["rate_limit_exceeded", "upstream_error"]
+    refute Map.has_key?(error, "param")
+    refute conn.resp_body =~ "provider failed"
+    refute conn.resp_body =~ "upstream.internal.example"
+    refute conn.resp_body =~ "/internal/rate"
+    refute conn.resp_body =~ "secret-sentinel-429"
+    refute conn.resp_body =~ "provider_stack"
+  end
+
+  @tag :server_error_redaction
+  test "POST /v1/responses gateway 500 errors redact safe-looking provider messages", %{
+    conn: conn
+  } do
+    provider_message =
+      "provider failed at https://upstream.internal.example/internal/gateway?token=secret"
+
+    conn =
+      PublicGatewayResult.send(
+        conn,
+        {:error,
+         %{
+           status: 500,
+           code: "rate_limit_exceeded",
+           message: provider_message,
+           param: "provider_stack"
+         }},
+        fn decoded -> decoded end
+      )
+
+    assert %{"error" => error} = json_response(conn, 500)
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
+    assert error["code"] == "rate_limit_exceeded"
+    refute Map.has_key?(error, "param")
+    refute conn.resp_body =~ "provider failed"
+    refute conn.resp_body =~ "upstream.internal.example"
+    refute conn.resp_body =~ "/internal/gateway"
+    refute conn.resp_body =~ "provider_stack"
+  end
+
+  @tag :server_error_redaction
+  test "POST /v1/responses streaming redacts terminal server-class upstream errors", %{
+    conn: conn
+  } do
+    provider_message =
+      "provider failed at https://upstream.internal.example/internal/stream?token=secret"
+
+    upstream_error = %{
+      "type" => "internal_error",
+      "code" => "internal_error",
+      "message" => provider_message,
+      "param" => "provider_stack"
+    }
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.failed",
+           %{
+             "type" => "response.failed",
+             "error" => upstream_error,
+             "response" => %{
+               "id" => "resp_v1_stream_server_failed",
+               "status" => "failed",
+               "error" => upstream_error
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic stream failure request",
+        "stream" => true
+      })
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+    assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
+    assert get_in(data, ["error", "message"]) == "upstream request failed"
+    assert get_in(data, ["error", "type"]) == "server_error"
+    assert get_in(data, ["error", "code"]) == "internal_error"
+    refute Map.has_key?(data["error"], "param")
+    refute conn.resp_body =~ "provider failed"
+    refute conn.resp_body =~ "upstream.internal.example"
+    refute conn.resp_body =~ "/internal/stream"
+    refute conn.resp_body =~ "provider_stack"
+    refute conn.resp_body =~ "event: response.created\n"
+    refute conn.resp_body =~ "event: response.output_text.delta\n"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
-    assert request.endpoint == "/backend-api/codex/responses"
-    assert [_attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert request.transport == "http_sse"
+    assert request.status == "failed"
+    assert request.last_error_code == "internal_error"
+  end
+
+  @tag :server_error_redaction
+  test "POST /v1/responses streaming redacts safe-looking terminal 502 errors", %{
+    conn: conn
+  } do
+    provider_message =
+      "provider failed at https://upstream.internal.example/internal/stream?token=secret"
+
+    upstream_error = safe_looking_upstream_error(provider_message)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.failed",
+           %{
+             "type" => "response.failed",
+             "error" => upstream_error,
+             "response" => %{
+               "id" => "resp_v1_stream_safe_looking_server_failed",
+               "status" => "failed",
+               "error" => upstream_error
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic safe-looking stream failure request",
+        "stream" => true
+      })
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+    assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(conn.resp_body)
+
+    for error <- [data["error"], get_in(data, ["response", "error"])] do
+      assert error["message"] == "upstream request failed"
+      assert error["type"] == "server_error"
+      assert error["code"] == "rate_limit_exceeded"
+      refute Map.has_key?(error, "param")
+    end
+
+    refute conn.resp_body =~ "provider failed"
+    refute conn.resp_body =~ "upstream.internal.example"
+    refute conn.resp_body =~ "/internal/stream"
+    refute conn.resp_body =~ "provider_stack"
+    refute conn.resp_body =~ "event: response.created\n"
+    refute conn.resp_body =~ "event: response.output_text.delta\n"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "http_sse"
+    assert request.status == "failed"
+    assert request.last_error_code == "rate_limit_exceeded"
   end
 
   @tag :streaming_sequence
@@ -3269,9 +3703,11 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       })
 
     assert %{"error" => error} = json_response(conn, 400)
-    assert error["type"] == "invalid_request_error"
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
     assert error["code"] == "upstream_status"
-    assert error["message"] == "upstream returned 400"
+    refute Map.has_key?(error, "param")
+    refute conn.resp_body =~ "synthetic startup rejection"
     assert FakeUpstream.count(upstream) == 1
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -3697,6 +4133,63 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         }
       ]
     }
+  end
+
+  defp structured_tool_result_output do
+    %{
+      "command" => "TASK7_RAW_TOOL_COMMAND_SENTINEL run private command",
+      "exit_code" => 0,
+      "files" => [
+        %{
+          "path" => "sample-output.txt",
+          "content" => "TASK7_RAW_TOOL_OUTPUT_SENTINEL\n" <> String.duplicate("line\n", 200)
+        }
+      ],
+      "nested" => %{
+        "list" => [
+          %{"stdout_preview" => String.duplicate("TASK7_LONG_NESTED_VALUE_", 40)},
+          %{"secret_like" => "TASK7_SECRET_LIKE_TOOL_SENTINEL"}
+        ],
+        "ok" => true
+      }
+    }
+  end
+
+  defp structured_tool_result_sentinels do
+    [
+      "TASK7_RAW_TOOL_COMMAND_SENTINEL",
+      "TASK7_RAW_TOOL_OUTPUT_SENTINEL",
+      "TASK7_LONG_NESTED_VALUE_",
+      "TASK7_SECRET_LIKE_TOOL_SENTINEL"
+    ]
+  end
+
+  defp safe_looking_upstream_error(provider_message) do
+    %{
+      "type" => "api_error",
+      "code" => "rate_limit_exceeded",
+      "message" => provider_message,
+      "param" => "provider_stack"
+    }
+  end
+
+  defp provider_invalid_request_error(code, provider_message, param) do
+    %{
+      "type" => "invalid_request_error",
+      "code" => code,
+      "message" => provider_message,
+      "param" => param
+    }
+  end
+
+  defp assert_payload_equal_no_echo!(actual, expected, message) do
+    unless actual == expected, do: flunk(message)
+  end
+
+  defp assert_no_sentinel_echo!(text, sentinels) when is_binary(text) do
+    Enum.each(sentinels, fn sentinel ->
+      if text =~ sentinel, do: flunk("projection leaked structured tool-result sentinel")
+    end)
   end
 
   defp public_sse_events(body) do

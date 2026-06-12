@@ -1,6 +1,7 @@
 defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   @moduledoc false
 
+  alias CodexPooler.Gateway.OpenAICompatibility.PublicResponse
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
@@ -402,11 +403,23 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
     cond do
       status in [nil, "completed", "in_progress"] -> "stop"
-      status == "incomplete" -> "length"
+      status == "incomplete" -> incomplete_finish_reason(decoded)
       status == "failed" -> "stop"
       true -> "stop"
     end
   end
+
+  defp incomplete_finish_reason(decoded) do
+    case incomplete_reason(decoded) do
+      reason when reason in ["content_filter", "content-filter"] -> "content_filter"
+      _reason -> "length"
+    end
+  end
+
+  defp incomplete_reason(%{"incomplete_details" => %{} = details}),
+    do: decoded_string(details, "reason")
+
+  defp incomplete_reason(_decoded), do: nil
 
   defp moderation_metadata(%{"moderation" => %{} = moderation}), do: moderation
   defp moderation_metadata(_decoded), do: nil
@@ -416,19 +429,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
   defp public_error(decoded) do
     error = response_map(decoded)["error"] || Map.get(decoded, "error") || %{}
+    status = PublicResponse.terminal_error_status(error)
 
-    %{
-      "message" => safe_error_message(error),
-      "type" => Map.get(error, "type") || "invalid_request_error",
-      "code" => Map.get(error, "code") || "upstream_error",
-      "param" => Map.get(error, "param")
-    }
-    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-    |> Map.new()
+    PublicResponse.normalize_error(error, status: status)
   end
-
-  defp safe_error_message(%{"message" => message}) when is_binary(message), do: message
-  defp safe_error_message(_error), do: "upstream request failed"
 
   defp tool_call_id(item, context, index) do
     decoded_string(item, "call_id") || decoded_string(item, "id") ||

@@ -386,9 +386,11 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert content_type =~ "text/event-stream"
     assert conn.status == 200
     assert [%{"error" => error}] = chat_chunks(conn.resp_body)
-    assert error["type"] == "invalid_request_error"
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
     assert error["code"] == "invalid_request_error"
-    assert error["message"] == "synthetic chat streaming validation"
+    refute Map.has_key?(error, "param")
+    refute conn.resp_body =~ "synthetic chat streaming validation"
     refute conn.resp_body =~ "\"role\":\"assistant\""
     refute conn.resp_body =~ "\"choices\""
     refute conn.resp_body =~ "data: [DONE]\n\n"
@@ -402,7 +404,6 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert attempt.status == "failed"
   end
 
-  @tag :streaming_chat
   test "POST /v1/chat/completions streaming emits early incomplete as length finish", %{
     conn: conn
   } do
@@ -455,6 +456,96 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
 
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.status == "failed"
+  end
+
+  @tag :chat_content_filter_finish
+  test "POST /v1/chat/completions non-streaming maps content filter incomplete reasons to finish_reason" do
+    for reason <- ["content_filter", "content-filter"] do
+      upstream =
+        start_upstream(
+          FakeUpstream.sse_stream([
+            {"response.incomplete",
+             %{
+               "type" => "response.incomplete",
+               "response" => %{
+                 "id" => "resp_chat_content_filter_#{reason}",
+                 "status" => "incomplete",
+                 "incomplete_details" => %{"reason" => reason},
+                 "output" => [
+                   %{
+                     "type" => "message",
+                     "content" => [
+                       %{"type" => "output_text", "text" => "synthetic filtered output"}
+                     ]
+                   }
+                 ],
+                 "usage" => %{"input_tokens" => 4, "output_tokens" => 1, "total_tokens" => 5}
+               }
+             }}
+          ])
+        )
+
+      setup = gateway_setup(upstream)
+
+      conn =
+        build_conn()
+        |> auth(setup)
+        |> post("/v1/chat/completions", chat_payload(setup))
+
+      assert %{"choices" => [%{"finish_reason" => "content_filter"}]} =
+               json_response(conn, 200)
+
+      refute conn.resp_body =~ "\"error\""
+      assert FakeUpstream.count(upstream) == 1
+    end
+  end
+
+  @tag :chat_content_filter_finish
+  test "POST /v1/chat/completions streaming maps content filter incomplete reasons to finish_reason" do
+    for reason <- ["content_filter", "content-filter"] do
+      upstream =
+        start_upstream(
+          FakeUpstream.sse_stream([
+            {"response.incomplete",
+             %{
+               "type" => "response.incomplete",
+               "response" => %{
+                 "id" => "resp_chat_stream_content_filter_#{reason}",
+                 "status" => "incomplete",
+                 "incomplete_details" => %{"reason" => reason},
+                 "usage" => %{"input_tokens" => 4, "output_tokens" => 0, "total_tokens" => 4}
+               }
+             }}
+          ])
+        )
+
+      setup = gateway_setup(upstream)
+
+      conn =
+        build_conn()
+        |> auth(setup)
+        |> post(
+          "/v1/chat/completions",
+          chat_payload(setup)
+          |> Map.put("stream", true)
+          |> Map.put("stream_options", %{"include_usage" => true})
+        )
+
+      finish_reasons =
+        conn.resp_body
+        |> chat_chunks()
+        |> Enum.flat_map(&Map.get(&1, "choices", []))
+        |> Enum.map(& &1["finish_reason"])
+        |> Enum.reject(&is_nil/1)
+
+      assert [content_type] = get_resp_header(conn, "content-type")
+      assert content_type =~ "text/event-stream"
+      assert conn.status == 200
+      assert List.last(finish_reasons) == "content_filter"
+      assert conn.resp_body =~ "data: [DONE]\n\n"
+      refute conn.resp_body =~ "\"error\""
+      assert FakeUpstream.count(upstream) == 1
+    end
   end
 
   @tag :streaming_chat
@@ -692,19 +783,53 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
-  test "POST /v1/chat/completions normalizes upstream JSON errors", %{conn: conn} do
+  @tag :invalid_request_error
+  test "POST /v1/chat/completions preserves local validation errors before dispatch", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post(
+        "/v1/chat/completions",
+        chat_payload(setup) |> Map.put("function_call", "auto")
+      )
+
+    assert %{"error" => error} = json_response(conn, 400)
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "invalid_request"
+    assert error["message"] == "legacy function_call is not translatable"
+    assert error["param"] == "function_call"
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  @tag :provider_invalid_request_redaction
+  test "POST /v1/chat/completions non-streaming redacts provider invalid_request_error", %{
+    conn: conn
+  } do
+    provider_message =
+      "provider 400 leaked https://provider.internal.example/chat?key=sk-secret and account acct_123"
+
+    upstream_error =
+      provider_invalid_request_error("context_length_exceeded", provider_message, "messages")
+
     upstream =
       start_upstream(
         FakeUpstream.sse_stream([
           {"response.failed",
            %{
              "type" => "response.failed",
-             "error" => %{
-               "type" => "invalid_request_error",
-               "code" => "invalid_request_error",
-               "message" => "synthetic chat upstream validation"
-             },
-             "response" => %{"id" => "resp_chat_failed", "status" => "failed"}
+             "error" => upstream_error,
+             "response" => %{
+               "id" => "resp_chat_provider_invalid_request",
+               "status" => "failed",
+               "error" => upstream_error
+             }
            }}
         ])
       )
@@ -713,15 +838,182 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
 
     conn = conn |> auth(setup) |> post("/v1/chat/completions", chat_payload(setup))
 
-    assert %{"error" => error} = json_response(conn, 400)
-    assert error["type"] == "invalid_request_error"
-    assert error["code"] == "invalid_request_error"
-    assert error["message"] == "synthetic chat upstream validation"
+    assert %{"error" => error} = json_response(conn, 502)
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
+    assert error["code"] == "context_length_exceeded"
+    refute Map.has_key?(error, "param")
+    refute conn.resp_body =~ provider_message
+    refute conn.resp_body =~ "provider.internal.example"
+    refute conn.resp_body =~ "sk-secret"
+    refute conn.resp_body =~ "acct_123"
+    refute conn.resp_body =~ "messages"
     assert FakeUpstream.count(upstream) == 1
+  end
 
-    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
-    assert request.endpoint == "/backend-api/codex/responses"
-    assert [_attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+  @tag :provider_invalid_request_redaction
+  test "POST /v1/chat/completions streaming redacts provider invalid_request_error", %{
+    conn: conn
+  } do
+    provider_message =
+      "provider 400 leaked https://provider.internal.example/chat-stream?key=sk-secret and prompt SENTINEL_CHAT_STREAM"
+
+    upstream_error =
+      provider_invalid_request_error("context_length_exceeded", provider_message, "messages")
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.failed",
+           %{
+             "type" => "response.failed",
+             "error" => upstream_error,
+             "response" => %{
+               "id" => "resp_chat_stream_provider_invalid_request",
+               "status" => "failed",
+               "error" => upstream_error
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post(
+        "/v1/chat/completions",
+        chat_payload(setup) |> Map.put("stream", true)
+      )
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+    assert [%{"error" => error}] = chat_chunks(conn.resp_body)
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
+    assert error["code"] == "context_length_exceeded"
+    refute Map.has_key?(error, "param")
+    refute conn.resp_body =~ provider_message
+    refute conn.resp_body =~ "provider.internal.example"
+    refute conn.resp_body =~ "sk-secret"
+    refute conn.resp_body =~ "SENTINEL_CHAT_STREAM"
+    refute conn.resp_body =~ "\"param\""
+    refute conn.resp_body =~ "data: [DONE]\n\n"
+    assert FakeUpstream.count(upstream) == 1
+  end
+
+  @tag :server_error_redaction
+  test "POST /v1/chat/completions streaming redacts safe-looking terminal 502 errors", %{
+    conn: conn
+  } do
+    provider_message =
+      "provider failed at https://upstream.internal.example/internal/rate?token=secret"
+
+    upstream_error = %{
+      "type" => "api_error",
+      "code" => "rate_limit_exceeded",
+      "message" => provider_message,
+      "param" => "provider_stack"
+    }
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.failed",
+           %{
+             "type" => "response.failed",
+             "error" => upstream_error,
+             "response" => %{
+               "id" => "resp_chat_stream_safe_looking_server_failed",
+               "status" => "failed",
+               "error" => upstream_error
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post(
+        "/v1/chat/completions",
+        chat_payload(setup) |> Map.put("stream", true)
+      )
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+    assert [%{"error" => error}] = chat_chunks(conn.resp_body)
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
+    assert error["code"] == "rate_limit_exceeded"
+    refute Map.has_key?(error, "param")
+    refute conn.resp_body =~ "provider failed"
+    refute conn.resp_body =~ "upstream.internal.example"
+    refute conn.resp_body =~ "/internal/rate"
+    refute conn.resp_body =~ "provider_stack"
+    refute conn.resp_body =~ "data: [DONE]\n\n"
+    assert FakeUpstream.count(upstream) == 1
+  end
+
+  @tag :server_error_redaction
+  test "POST /v1/chat/completions streaming redacts server-class upstream errors", %{
+    conn: conn
+  } do
+    provider_message =
+      "provider failed at https://upstream.internal.example/internal/path?token=secret"
+
+    upstream_error = %{
+      "type" => "internal_error",
+      "code" => "internal_error",
+      "message" => provider_message,
+      "param" => "provider_stack"
+    }
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.failed",
+           %{
+             "type" => "response.failed",
+             "error" => upstream_error,
+             "response" => %{
+               "id" => "resp_chat_stream_server_failed",
+               "status" => "failed",
+               "error" => upstream_error
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post(
+        "/v1/chat/completions",
+        chat_payload(setup) |> Map.put("stream", true)
+      )
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+    assert [%{"error" => error}] = chat_chunks(conn.resp_body)
+    assert error["message"] == "upstream request failed"
+    assert error["type"] == "server_error"
+    assert error["code"] == "internal_error"
+    refute Map.has_key?(error, "param")
+    refute conn.resp_body =~ "provider failed"
+    refute conn.resp_body =~ "upstream.internal.example"
+    refute conn.resp_body =~ "/internal/path"
+    refute conn.resp_body =~ "provider_stack"
+    refute conn.resp_body =~ "data: [DONE]\n\n"
+    assert FakeUpstream.count(upstream) == 1
   end
 
   test "POST /v1/chat/completions falls back to Responses input and preserves additional tools",
@@ -1187,6 +1479,15 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
           "required" => []
         }
       }
+    }
+  end
+
+  defp provider_invalid_request_error(code, provider_message, param) do
+    %{
+      "type" => "invalid_request_error",
+      "code" => code,
+      "message" => provider_message,
+      "param" => param
     }
   end
 

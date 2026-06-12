@@ -762,6 +762,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
        %{conn: conn} do
     unique = System.unique_integer([:positive])
     file_id = "file_v1_affinity_#{unique}"
+    file_contents = "synthetic affinity bytes"
+    upload_url = stub_upload_put(file_id)
 
     file_upstream = start_upstream(FakeUpstream.file_protocol_success(file_id: file_id))
 
@@ -769,7 +771,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       file_upstream,
       FakeUpstream.file_protocol_success(
         file_id: file_id,
-        upload_url: FakeUpstream.url(file_upstream) <> "/upload/#{file_id}"
+        upload_url: upload_url
       )
     )
 
@@ -780,10 +782,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       |> auth(setup)
       |> post("/v1/files", %{
         "purpose" => "user_data",
-        "file" => upload_fixture("affinity.txt", "text/plain", "synthetic affinity bytes")
+        "file" => upload_fixture("affinity.txt", "text/plain", file_contents)
       })
 
     assert %{"id" => ^file_id, "status" => "uploaded"} = json_response(create_conn, 200)
+    assert_upload_put(file_id, "/upload/#{file_id}", file_contents, "text/plain")
 
     owner_response_upstream =
       start_upstream(
@@ -890,13 +893,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     conn: conn
   } do
     file_id = "file_v1_sediment_#{System.unique_integer([:positive])}"
+    file_contents = "synthetic sediment bytes"
+    upload_url = stub_upload_put(file_id)
     upstream = start_upstream(FakeUpstream.file_protocol_success(file_id: file_id))
 
     FakeUpstream.set_mode(
       upstream,
       FakeUpstream.file_protocol_success(
         file_id: file_id,
-        upload_url: FakeUpstream.url(upstream) <> "/upload/#{file_id}"
+        upload_url: upload_url
       )
     )
 
@@ -907,10 +912,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       |> auth(setup)
       |> post("/v1/files", %{
         "purpose" => "user_data",
-        "file" => upload_fixture("image-ref.txt", "text/plain", "synthetic sediment bytes")
+        "file" => upload_fixture("image-ref.txt", "text/plain", file_contents)
       })
 
     assert json_response(create_conn, 200)["id"] == file_id
+    assert_upload_put(file_id, "/upload/#{file_id}", file_contents, "text/plain")
     create_dispatch_count = FakeUpstream.count(upstream)
 
     rejected_conn =
@@ -947,6 +953,55 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     File.write!(path, contents)
     on_exit(fn -> File.rm(path) end)
     %Plug.Upload{path: path, filename: filename, content_type: content_type}
+  end
+
+  defp stub_upload_put(file_id) do
+    stub_name = {__MODULE__, :upload_put, file_id}
+    test_pid = self()
+
+    Req.Test.stub(stub_name, fn conn ->
+      send(test_pid, {
+        :upload_put,
+        file_id,
+        conn.method,
+        conn.request_path,
+        Req.Test.raw_body(conn),
+        conn.req_headers
+      })
+
+      conn
+      |> Plug.Conn.put_status(201)
+      |> Req.Test.text("")
+    end)
+
+    current_bridge_config = Application.get_env(:codex_pooler, FileBridge, [])
+
+    Application.put_env(
+      :codex_pooler,
+      FileBridge,
+      Keyword.merge(current_bridge_config, upload_req_options: [plug: {Req.Test, stub_name}])
+    )
+
+    "https://fake-upload.invalid/upload/#{file_id}?sig=fake-upload"
+  end
+
+  defp assert_upload_put(file_id, path, body, content_type) do
+    assert_receive {:upload_put, ^file_id, "PUT", ^path, ^body, headers}, 1_000
+    assert header!(headers, "content-type") == content_type
+    assert header!(headers, "x-ms-blob-type") == "BlockBlob"
+    refute Enum.any?(headers, fn {name, _value} -> name in ["authorization", "cookie"] end)
+  end
+
+  defp header!(headers, name) do
+    headers
+    |> Enum.find_value(fn
+      {^name, value} -> value
+      _other -> nil
+    end)
+    |> case do
+      nil -> flunk("missing header #{name}")
+      value -> value
+    end
   end
 
   defp persisted_gateway_metadata(pool_id) do

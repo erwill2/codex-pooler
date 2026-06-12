@@ -2,6 +2,7 @@ defmodule CodexPooler.Gateway.Payloads.InputShape do
   @moduledoc false
 
   alias CodexPooler.Gateway.OpenAICompatibility.Error
+  alias CodexPooler.Gateway.Payloads.ToolResultShape
 
   @supported_input_image_data_mimes ~w(image/gif image/jpeg image/png image/webp)
   @supported_input_file_data_mimes ~w(application/pdf text/plain)
@@ -20,18 +21,23 @@ defmodule CodexPooler.Gateway.Payloads.InputShape do
   defp find_unsupported_media(%{} = value) do
     value = Map.new(value, fn {key, item_value} -> {to_string(key), item_value} end)
 
+    searchable_value =
+      if ToolResultShape.tool_result?(value),
+        do: Map.drop(value, ["output", "result"]),
+        else: value
+
     cond do
-      unsupported_input_image_file_id?(value) ->
+      unsupported_input_image_file_id?(searchable_value) ->
         unsupported_input_image_error()
 
-      unsupported_input_image_url_reason(value) != nil ->
+      unsupported_input_image_url_reason(searchable_value) != nil ->
         unsupported_input_image_error()
 
-      unsupported_input_file_data_reason(value) != nil ->
+      unsupported_input_file_data_reason(searchable_value) != nil ->
         unsupported_input_file_error()
 
       true ->
-        Enum.find_value(Map.values(value), &find_unsupported_media/1)
+        searchable_value |> Map.values() |> Enum.find_value(&find_unsupported_media/1)
     end
   end
 
