@@ -16,7 +16,7 @@
     "npm"
   ],
   "constraints": {
-    "elixir": "1.20.0",
+    "elixir": "1.19.5",
     "erlang": "28.5.0.2"
   },
   "labels": [
@@ -73,6 +73,16 @@
       ],
       "groupName": "Elixir/Erlang toolchain",
       "groupSlug": "elixir-erlang-toolchain"
+    },
+    {
+      "description": "Keep Renovate Mix artifacts on Elixir releases installable by containerbase",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "matchPackageNames": [
+        "elixir-lang/elixir"
+      ],
+      "allowedVersions": "<1.20.0"
     },
     {
       "description": "Keep Node runtime image updates together",
