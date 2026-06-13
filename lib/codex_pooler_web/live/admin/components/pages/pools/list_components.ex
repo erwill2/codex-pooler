@@ -427,7 +427,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
             label="API keys"
             value={@pool_row.api_key_count}
             value_id={"pool-row-#{@pool_row.pool.id}-api-key-count"}
-            wrapper_class="min-w-0 px-3"
+            wrapper_class="min-w-0 pl-3 sm:px-3"
           />
           <.pool_metric_link
             data_role="pool-request-count-cell"
@@ -440,7 +440,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
               )
             }
             value_id={"pool-row-#{@pool_row.pool.id}-request-throughput"}
-            wrapper_class="min-w-0 px-3"
+            wrapper_class="min-w-0 pr-3 sm:px-3"
           >
             <span id={"pool-row-#{@pool_row.pool.id}-request-count"}>
               {PoolsReadModel.format_metric_integer(@pool_row.request_count)}
@@ -516,13 +516,28 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       >
         <div class="pool-token-histogram-header">
           <div class="grid gap-1">
-            <h3>{@traffic_histogram_card.title}</h3>
+            <h3>
+              <span class="pool-token-histogram-label">Traffic</span>
+              <span class="pool-token-histogram-value">
+                {@traffic_histogram_card.window_label}
+              </span>
+            </h3>
           </div>
           <span
             id={"pool-row-#{@pool_row.pool.id}-traffic-histogram-total"}
             class="pool-token-histogram-total"
           >
-            {@traffic_histogram_card.total_label}
+            <span class="pool-token-histogram-value">
+              {@traffic_histogram_card.token_total_label}
+            </span>
+            <span class="pool-token-histogram-label"> tokens</span>
+            <span aria-hidden="true"> / </span>
+            <span class="pool-token-histogram-value">
+              {@traffic_histogram_card.request_total_label}
+            </span>
+            <span class="pool-token-histogram-label">
+              {" " <> @traffic_histogram_card.request_total_unit}
+            </span>
           </span>
         </div>
         <div
@@ -548,7 +563,11 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           class="pool-activity-empty-state"
           data-role="pool-traffic-empty-state"
         >
-          <span class="pool-activity-empty-state-icon" aria-hidden="true">
+          <span
+            class="pool-activity-empty-state-icon"
+            data-role="pool-traffic-empty-icon"
+            aria-hidden="true"
+          >
             <.icon name="hero-chart-bar" class="size-4" />
           </span>
           <p class="pool-activity-empty-copy">
@@ -659,6 +678,9 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     %{
       title: "Traffic #{window_label}",
       window_label: window_label,
+      token_total_label: Format.token_count(token_total),
+      request_total_label: format_integer(request_total),
+      request_total_unit: request_total_unit(request_total),
       total_label:
         "#{Format.token_count(token_total)} tokens / #{format_request_count(request_total)}",
       categories: Jason.encode!(Enum.map(points, & &1.label)),
@@ -685,6 +707,9 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     do: hour <> ":00"
 
   defp format_chart_bucket(bucket), do: to_string(bucket)
+
+  defp request_total_unit(1), do: "request"
+  defp request_total_unit(_value), do: "requests"
 
   defp format_request_count(1), do: "1 request"
   defp format_request_count(value) when is_integer(value), do: "#{format_integer(value)} requests"

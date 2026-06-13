@@ -243,6 +243,11 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              "No traffic in the last 24h"
            )
 
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-traffic-histogram [data-role='pool-traffic-empty-icon']"
+           )
+
     assert has_element?(view, "#pool-row-#{pool.id} > footer.pool-card-metrics.border-t")
 
     metric_links = [
@@ -271,6 +276,16 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
                "#pool-row-#{pool.id} > footer [data-role='#{role}']"
              )
     end
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id} > footer [data-role='pool-api-key-count-cell'].pl-3.sm\\:px-3"
+           )
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id} > footer [data-role='pool-request-count-cell'].pr-3.sm\\:px-3"
+           )
 
     assert has_element?(view, "#pool-row-#{pool.id} > footer [data-role='pool-cost-cell']")
 
@@ -415,6 +430,30 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(
              view,
              "#pool-row-#{pool.id}-traffic-histogram-total.pool-token-histogram-total"
+           )
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-traffic-histogram h3 .pool-token-histogram-label",
+             "Traffic"
+           )
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-traffic-histogram-total .pool-token-histogram-label",
+             "tokens"
+           )
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-traffic-histogram-total .pool-token-histogram-label",
+             "request"
+           )
+
+    assert has_element?(
+             view,
+             "#pool-row-#{pool.id}-traffic-histogram-total .pool-token-histogram-value",
+             "100"
            )
 
     assert has_element?(view, "#pool-row-#{pool.id}-traffic-histogram", "100 tokens")
