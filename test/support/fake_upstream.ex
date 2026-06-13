@@ -10,6 +10,8 @@ defmodule CodexPooler.FakeUpstream do
 
   defstruct [:pid, :server, :url]
 
+  @type t :: %__MODULE__{pid: pid(), server: pid(), url: String.t()}
+
   @type mode ::
           {:json, non_neg_integer(), map()}
           | {:json_headers, non_neg_integer(), map(), [{String.t(), String.t()}]}

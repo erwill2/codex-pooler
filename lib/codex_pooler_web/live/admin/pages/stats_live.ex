@@ -84,67 +84,74 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
       active_nav={:stats}
       alert_notification_center={@alert_notification_center}
     >
-      <section id="admin-stats" class="grid min-w-0 gap-6">
-        <AdminComponents.page_header
-          id="stats-page-header"
-          title="Usage"
-          description="Usage, cost, latency, sessions, and quota for the current scope."
-        />
-
-        <AdminComponents.filter_form id="stats-filter-form" for={@filter_form} phx-submit="filter">
-          <PoolFilterComponents.pool_filter_dropdown
-            id="stats-pool-filter-control"
-            label="Scope"
-            hidden_id="stats-pool-filter"
-            selected_value={@filter_form.params["pool_id"] || ""}
-            selected={stats_pool_filter_selected(@pool_filter_options)}
-            options={@pool_filter_options}
+      <section id="admin-stats" class="mx-auto grid w-full max-w-[100rem] min-w-0 gap-4 lg:gap-5">
+        <div class="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(24rem,34rem)] xl:items-end">
+          <AdminComponents.page_header
+            id="stats-page-header"
+            title="Usage"
+            description="Usage, cost, latency, sessions, and quota for the current scope."
           />
-          <div class="grid gap-2">
-            <input
-              type="hidden"
-              id="stats-time-filter"
-              name="filters[window]"
-              value={@filter_form.params["window"] || "24h"}
+
+          <AdminComponents.filter_form
+            id="stats-filter-form"
+            for={@filter_form}
+            phx-submit="filter"
+            compact
+          >
+            <PoolFilterComponents.pool_filter_dropdown
+              id="stats-pool-filter-control"
+              label="Scope"
+              hidden_id="stats-pool-filter"
+              selected_value={@filter_form.params["pool_id"] || ""}
+              selected={stats_pool_filter_selected(@pool_filter_options)}
+              options={@pool_filter_options}
             />
-            <details
-              id="stats-time-filter-control"
-              class="dropdown w-full"
-              phx-click-away={JS.remove_attribute("open", to: "#stats-time-filter-control")}
-            >
-              <summary
-                data-role="window-filter-trigger"
-                aria-label="Range"
-                class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+            <div class="grid gap-2">
+              <input
+                type="hidden"
+                id="stats-time-filter"
+                name="filters[window]"
+                value={@filter_form.params["window"] || "24h"}
+              />
+              <details
+                id="stats-time-filter-control"
+                class="dropdown w-full"
+                phx-click-away={JS.remove_attribute("open", to: "#stats-time-filter-control")}
               >
-                <.icon name="hero-clock" class="size-4 shrink-0 text-base-content/60" />
-                <span class="truncate">{selected_window_filter_label(@filter_form)}</span>
-              </summary>
-              <ul
-                data-role="window-filter-menu"
-                class="menu dropdown-content z-[60] mt-1 max-h-80 w-full flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-1 !transition-none ![scale:100%] shadow-xl"
-              >
-                <li :for={{label, window} <- window_options()}>
-                  <button
-                    type="button"
-                    phx-click="select_window_filter"
-                    phx-value-window={window}
-                    data-role="window-filter-option"
-                    data-window={window}
-                    class={[
-                      "flex items-center gap-2 text-sm",
-                      window == (@filter_form.params["window"] || "24h") && "active"
-                    ]}
-                    aria-current={window == (@filter_form.params["window"] || "24h") && "true"}
-                  >
-                    <.icon name="hero-clock" class="size-4 shrink-0" />
-                    <span>{label}</span>
-                  </button>
-                </li>
-              </ul>
-            </details>
-          </div>
-        </AdminComponents.filter_form>
+                <summary
+                  data-role="window-filter-trigger"
+                  aria-label="Range"
+                  class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+                >
+                  <.icon name="hero-clock" class="size-4 shrink-0 text-base-content/60" />
+                  <span class="truncate">{selected_window_filter_label(@filter_form)}</span>
+                </summary>
+                <ul
+                  data-role="window-filter-menu"
+                  class="menu dropdown-content z-[60] mt-1 max-h-80 w-full flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-1 !transition-none ![scale:100%] shadow-xl"
+                >
+                  <li :for={{label, window} <- window_options()}>
+                    <button
+                      type="button"
+                      phx-click="select_window_filter"
+                      phx-value-window={window}
+                      data-role="window-filter-option"
+                      data-window={window}
+                      class={[
+                        "flex items-center gap-2 text-sm",
+                        window == (@filter_form.params["window"] || "24h") && "active"
+                      ]}
+                      aria-current={window == (@filter_form.params["window"] || "24h") && "true"}
+                    >
+                      <.icon name="hero-clock" class="size-4 shrink-0" />
+                      <span>{label}</span>
+                    </button>
+                  </li>
+                </ul>
+              </details>
+            </div>
+          </AdminComponents.filter_form>
+        </div>
 
         <div :if={@filter_error} id="stats-filter-error" class="alert alert-warning items-start">
           <.icon name="hero-exclamation-triangle" class="size-5" />
@@ -161,6 +168,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
             requests={@dashboard.charts.requests}
             tokens={@dashboard.charts.tokens}
             costs={@dashboard.charts.estimated_cost}
+            model_usage={@dashboard.charts.model_usage}
           />
 
           <section class="grid min-w-0 gap-4 2xl:grid-cols-2">
@@ -326,7 +334,22 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
       "pool_id" => params |> Map.get("pool_id") |> blank_to_nil(),
       "window" => normalize_window(Map.get(params, "window"))
     }
+    |> maybe_put_as_of(parse_as_of(Map.get(params, "as_of")))
   end
+
+  defp maybe_put_as_of(filters, %DateTime{} = as_of), do: Map.put(filters, "as_of", as_of)
+  defp maybe_put_as_of(filters, _as_of), do: filters
+
+  defp parse_as_of(%DateTime{} = as_of), do: DateTime.truncate(as_of, :microsecond)
+
+  defp parse_as_of(as_of) when is_binary(as_of) do
+    case DateTime.from_iso8601(as_of) do
+      {:ok, parsed, _offset} -> DateTime.truncate(parsed, :microsecond)
+      {:error, _reason} -> nil
+    end
+  end
+
+  defp parse_as_of(_as_of), do: nil
 
   defp stats_filter_form(filters) do
     filters
