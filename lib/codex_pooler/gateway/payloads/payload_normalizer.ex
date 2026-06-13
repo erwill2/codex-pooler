@@ -7,6 +7,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.ToolResultShape
 
+  @backend_turn_state_client_metadata_key "x-codex-turn-state"
   @websocket_responses_lite_client_metadata_key "ws_request_header_x_openai_internal_codex_responses_lite"
 
   @unsupported_upstream_fields ~w(
@@ -42,6 +43,15 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
       json_payload(payload, model, endpoint, request_options)
     end
   end
+
+  @spec backend_client_metadata_turn_state(map()) :: String.t() | nil
+  def backend_client_metadata_turn_state(%{"client_metadata" => %{} = metadata}) do
+    metadata
+    |> Map.get(@backend_turn_state_client_metadata_key)
+    |> clean_string()
+  end
+
+  def backend_client_metadata_turn_state(%{}), do: nil
 
   defp json_payload(payload, model, endpoint, %RequestOptions{} = request_options) do
     payload =

@@ -143,6 +143,56 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
              ]
     end
 
+    test "preserves backend Codex plaintext input_text agent messages while stripping encrypted-only siblings" do
+      payload = %{
+        "model" => "gpt-5.5",
+        "input" => [
+          %{"type" => "message", "role" => "user", "content" => "hello"},
+          %{
+            "type" => "agent_message",
+            "author" => "root",
+            "recipient" => "worker",
+            "content" => [
+              %{"type" => "encrypted_content", "encrypted_content" => "opaque-agent-message"}
+            ]
+          },
+          %{
+            "type" => "agent_message",
+            "author" => "root",
+            "recipient" => "worker",
+            "content" => [%{"type" => "input_text", "text" => "synthetic agent note"}]
+          }
+        ]
+      }
+
+      request_options =
+        %{}
+        |> RequestOptions.build("/backend-api/codex/responses", payload)
+        |> RequestOptions.for_websocket(payload)
+
+      model = %Model{upstream_model_id: "provider-model"}
+
+      assert {:ok, encoded} =
+               PayloadNormalizer.upstream_payload(
+                 payload,
+                 model,
+                 "/backend-api/codex/responses",
+                 request_options
+               )
+
+      upstream = Jason.decode!(encoded)
+
+      assert upstream["input"] == [
+               %{"type" => "message", "role" => "user", "content" => "hello"},
+               %{
+                 "type" => "agent_message",
+                 "author" => "root",
+                 "recipient" => "worker",
+                 "content" => [%{"type" => "input_text", "text" => "synthetic agent note"}]
+               }
+             ]
+    end
+
     test "omits absent, auto, and default service tiers while preserving concrete tiers upstream" do
       model = %Model{upstream_model_id: "provider-model"}
 
