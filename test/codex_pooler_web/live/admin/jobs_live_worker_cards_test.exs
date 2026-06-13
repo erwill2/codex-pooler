@@ -313,6 +313,12 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     card = worker_card_selector(:runtime_cleanup)
 
     assert has_element?(view, "#{card}", "Runtime cleanup")
+
+    assert has_element?(
+             view,
+             "#{card} [data-role='worker-card-header'].flex.flex-row.items-center.justify-between"
+           )
+
     assert has_element?(view, "#{card} [data-role='worker-card-title-row'].items-center")
     assert has_element?(view, "#{card} [data-role='worker-card-title-row'] > .hero-sparkles")
     refute has_element?(view, "#{card} [data-role='worker-card-title-row'] > .rounded-box")
@@ -504,6 +510,11 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
            )
 
     assert has_element?(view, "#{catalog_card} #enqueue-job-worker-catalog-sync", "Enqueue Now")
+
+    assert has_element?(
+             view,
+             "#{catalog_card} [data-role='worker-card-header-actions'] > [data-role='job-worker-card-actions']"
+           )
 
     refute has_element?(view, "#{token_card} [data-role='job-worker-card-actions']")
     refute has_element?(view, "#{token_card}", "Enqueue Now")

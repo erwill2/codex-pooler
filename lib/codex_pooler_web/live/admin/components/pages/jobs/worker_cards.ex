@@ -36,17 +36,23 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
 
   defp job_worker_card_header(assigns) do
     ~H"""
-    <header class="grid min-w-0 gap-3 px-4 pb-3 pt-4 sm:grid-cols-[minmax(0,1fr)_auto]">
-      <div data-role="worker-card-title-row" class="flex min-w-0 items-center gap-2.5">
-        <.icon name={@card.icon} class="size-5 shrink-0 text-base-content/45" />
-        <div class="grid min-w-0">
-          <h2 class="truncate text-base font-semibold text-base-content">{@card.title}</h2>
+    <header
+      data-role="worker-card-header"
+      class="flex flex-row items-center justify-between gap-3 border-b border-base-300 bg-base-200/35 px-4 py-3"
+    >
+      <div class="min-w-0 flex-1">
+        <div data-role="worker-card-title-row" class="flex min-w-0 items-center gap-2.5">
+          <.icon name={@card.icon} class="size-5 shrink-0 text-base-content/45" />
+          <h2 class="min-w-0 truncate text-base font-semibold leading-5 text-base-content">
+            {@card.title}
+          </h2>
         </div>
       </div>
 
       <div
         :if={worker_state_badge_visible?(@card.state) or @card.manual_enqueue}
-        class="flex flex-wrap items-center gap-2 sm:justify-end"
+        data-role="worker-card-header-actions"
+        class="flex shrink-0 items-center gap-2 self-center"
       >
         <span
           :if={worker_state_badge_visible?(@card.state)}
