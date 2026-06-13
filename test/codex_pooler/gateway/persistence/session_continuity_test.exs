@@ -96,10 +96,10 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
 
     assert first_session.id == second_session.id
 
-    assert 1 ==
-             Sandbox.unboxed_run(Repo, fn ->
-               active_session_count(auth.pool.id, session_key)
-             end)
+    Sandbox.unboxed_run(Repo, fn ->
+      assert active_session_count(auth.pool.id, turn_state_session_key(session_key)) == 1
+      refute_raw_turn_state_session_key!(auth.pool.id, session_key)
+    end)
   end
 
   @tag :session_start_race
@@ -122,7 +122,8 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
              )
 
     assert recovered_session.id == first_session.id
-    assert unboxed_active_session_count(auth.pool.id, session_key) == 1
+    assert unboxed_active_session_count(auth.pool.id, turn_state_session_key(session_key)) == 1
+    unboxed_refute_raw_turn_state_session_key!(auth.pool.id, session_key)
 
     recovered_session = unboxed_get_session!(first_session.id)
     active_lease = unboxed_active_lease!(first_session.id)
@@ -198,7 +199,11 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
              )
 
     assert alternate_session.id == primary_session.id
-    assert unboxed_active_session_count(primary_auth.pool.id, normal_key) == 1
+
+    assert unboxed_active_session_count(primary_auth.pool.id, turn_state_session_key(normal_key)) ==
+             1
+
+    unboxed_refute_raw_turn_state_session_key!(primary_auth.pool.id, normal_key)
 
     owner_attach_key = "session-conflict-owner-attach-#{System.unique_integer([:positive])}"
 
@@ -217,7 +222,14 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
              )
 
     assert unboxed_get_session!(owner_session.id).api_key_id == primary_auth.api_key.id
-    assert unboxed_active_session_count(primary_auth.pool.id, owner_attach_key) == 1
+
+    assert unboxed_active_session_count(
+             primary_auth.pool.id,
+             turn_state_session_key(owner_attach_key)
+           ) ==
+             1
+
+    unboxed_refute_raw_turn_state_session_key!(primary_auth.pool.id, owner_attach_key)
 
     assert {:error, :owner_unavailable} =
              Sandbox.unboxed_run(Repo, fn ->
@@ -258,7 +270,8 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
 
     assert %CodexSession{status: "closed"} = unboxed_get_session!(expired_session.id)
     assert %CodexSession{status: "active"} = unboxed_get_session!(replacement.id)
-    assert unboxed_active_session_count(auth.pool.id, session_key) == 1
+    assert unboxed_active_session_count(auth.pool.id, turn_state_session_key(session_key)) == 1
+    unboxed_refute_raw_turn_state_session_key!(auth.pool.id, session_key)
   end
 
   @tag :session_start_race
@@ -714,6 +727,10 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
     Sandbox.unboxed_run(Repo, fn -> active_session_count(pool_id, session_key) end)
   end
 
+  defp unboxed_refute_raw_turn_state_session_key!(pool_id, turn_state) do
+    Sandbox.unboxed_run(Repo, fn -> refute_raw_turn_state_session_key!(pool_id, turn_state) end)
+  end
+
   defp auth_fixture do
     %{user: owner} = bootstrap_owner_fixture()
     pool = pool_fixture(%{created_by_user_id: owner.id})
@@ -759,6 +776,20 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
             session.status in ["active", "interrupted"],
         select: count(session.id)
     )
+  end
+
+  defp refute_raw_turn_state_session_key!(pool_id, turn_state) do
+    refute Repo.exists?(
+             from session in CodexSession,
+               where:
+                 session.pool_id == ^pool_id and
+                   fragment("lower(?)", session.session_key) == ^String.downcase(turn_state)
+           )
+  end
+
+  defp turn_state_session_key(turn_state) do
+    "x-codex-turn-state:" <>
+      (:crypto.hash(:sha256, String.trim(turn_state)) |> Base.encode16(case: :lower))
   end
 
   defp expire_owner_lease!(session_id) do

@@ -68,6 +68,18 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity do
     end
   end
 
+  @spec start_codex_session_from_turn_state(auth(), opts()) ::
+          session_result() | {:error, :session_not_found}
+  def start_codex_session_from_turn_state(auth, %RequestOptions{} = opts) do
+    case blank_to_nil(opts.continuity.accepted_turn_state) do
+      nil ->
+        {:error, :session_not_found}
+
+      turn_state ->
+        start_codex_session_from_turn_state(auth, opts, turn_state)
+    end
+  end
+
   defp start_codex_session_from_previous_response_id(auth, opts, previous_response_id) do
     now = now()
     owner = owner_instance_id(opts)
@@ -75,6 +87,18 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity do
     Repo.transaction(fn ->
       auth
       |> previous_response_session_for_update(previous_response_id, now)
+      |> start_previous_response_session!(auth, opts, owner, now)
+    end)
+    |> unwrap_transaction()
+  end
+
+  defp start_codex_session_from_turn_state(auth, opts, turn_state) do
+    now = now()
+    owner = owner_instance_id(opts)
+
+    Repo.transaction(fn ->
+      auth.pool.id
+      |> Aliases.active_session_for_update(auth.api_key.id, "turn_state", turn_state, now)
       |> start_previous_response_session!(auth, opts, owner, now)
     end)
     |> unwrap_transaction()
@@ -422,11 +446,19 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity do
   end
 
   defp session_key(%RequestOptions{} = request_options) do
-    request_options.continuity.accepted_turn_state
-    |> blank_to_nil()
+    request_options
+    |> turn_state_session_key()
     |> Kernel.||(session_header_session_key(request_options))
     |> Kernel.||(request_options.continuity.session_key |> blank_to_nil())
     |> Kernel.||(Ecto.UUID.generate())
+  end
+
+  @spec turn_state_session_key(RequestOptions.t()) :: String.t() | nil
+  defp turn_state_session_key(%RequestOptions{continuity: %{accepted_turn_state: turn_state}}) do
+    case blank_to_nil(turn_state) do
+      nil -> nil
+      value -> "x-codex-turn-state:" <> safe_hash(value)
+    end
   end
 
   defp session_header_session_key(%RequestOptions{
