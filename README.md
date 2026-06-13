@@ -554,6 +554,86 @@ operator MCP token.
 </details>
 
 <details>
+<summary><img src=".github/assets/omp-favicon.png" alt="OMP logo" width="16" height="16"> OMP <code>~/.omp/agent/models.yml</code> and <code>config.yml</code></summary>
+
+Oh My Pi (OMP) is a Pi fork, but it should be treated as a separate Codex
+Pooler harness: it has its own package, `omp` binary, YAML config, and model
+role defaults. Install the current CLI through Bun:
+
+```bash
+bun install -g @oh-my-pi/pi-coding-agent
+```
+
+Then add a provider to `~/.omp/agent/models.yml`:
+
+```yaml
+providers:
+  codex-pooler:
+    baseUrl: http://localhost:4000/v1
+    api: openai-responses
+    apiKey: CODEX_POOLER_API_KEY
+    authHeader: true
+    models:
+      - id: gpt-5.5
+        name: GPT-5.5 via Codex Pooler
+        reasoning: true
+        thinking:
+          mode: effort
+          efforts:
+            - xhigh
+          defaultLevel: xhigh
+          effortMap:
+            xhigh: xhigh
+        input:
+          - text
+          - image
+        contextWindow: 400000
+        maxTokens: 128000
+```
+
+`apiKey: CODEX_POOLER_API_KEY` makes OMP resolve that environment variable at
+runtime. `authHeader: true` makes OMP send the Pool API key as
+`Authorization: Bearer ...`. Define only model ids your assigned Pool can
+serve. For deployed instances, change `baseUrl` to
+`https://codex-pooler.example.com/v1`.
+
+Optionally set Codex Pooler as the default OMP model roles in
+`~/.omp/agent/config.yml`:
+
+```yaml
+startup:
+  setupWizard: false
+defaultThinkingLevel: xhigh
+enabledModels:
+  - codex-pooler/gpt-5.5
+modelProviderOrder:
+  - codex-pooler
+modelRoles:
+  default: codex-pooler/gpt-5.5:xhigh
+  smol: codex-pooler/gpt-5.5:xhigh
+  slow: codex-pooler/gpt-5.5:xhigh
+  plan: codex-pooler/gpt-5.5:xhigh
+  task: codex-pooler/gpt-5.5:xhigh
+  vision: codex-pooler/gpt-5.5:xhigh
+```
+
+Check the non-interactive path from a repository:
+
+```bash
+export CODEX_POOLER_API_KEY=<pool-api-key>
+omp --model codex-pooler/gpt-5.5:xhigh \
+  --no-session \
+  --tools bash \
+  -p 'Reply with exactly: omp ok'
+```
+
+OMP ships MCP-capable tooling, but Codex Pooler model use does not require MCP.
+If you use Codex Pooler's optional operator MCP endpoint, keep the `/mcp`
+operator token separate from the Pool API key used for `/v1`.
+
+</details>
+
+<details>
 <summary><img src=".github/assets/kilo-favicon.png" alt="Kilo logo" width="16" height="16"> Kilo <code>~/.config/kilo/kilo.jsonc</code></summary>
 
 Kilo Code uses the OpenAI-compatible provider path for Codex Pooler's `/v1`
