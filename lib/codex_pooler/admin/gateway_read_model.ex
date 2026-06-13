@@ -9,6 +9,8 @@ defmodule CodexPooler.Admin.GatewayReadModel do
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
   alias CodexPooler.Repo
 
+  @type bucket_granularity :: :hour | :day
+
   @spec requests_for_pool_ids([Ecto.UUID.t()], DateTime.t(), DateTime.t()) :: [map()]
   def requests_for_pool_ids([], _started_at, _ended_at), do: []
 
@@ -60,6 +62,24 @@ defmodule CodexPooler.Admin.GatewayReadModel do
   def hourly_request_counts_by_pool_ids([], _started_at, _ended_at), do: []
 
   def hourly_request_counts_by_pool_ids(pool_ids, started_at, ended_at) do
+    bucketed_request_counts_by_pool_ids(pool_ids, started_at, ended_at, :hour)
+  end
+
+  @spec bucketed_request_counts_by_pool_ids(
+          [Ecto.UUID.t()],
+          DateTime.t(),
+          DateTime.t(),
+          bucket_granularity()
+        ) :: [
+          %{
+            required(:pool_id) => Ecto.UUID.t(),
+            required(:bucket) => DateTime.t(),
+            required(:requests) => non_neg_integer()
+          }
+        ]
+  def bucketed_request_counts_by_pool_ids([], _started_at, _ended_at, _granularity), do: []
+
+  def bucketed_request_counts_by_pool_ids(pool_ids, started_at, ended_at, :hour) do
     Repo.all(
       from request in Request,
         where:
@@ -71,6 +91,22 @@ defmodule CodexPooler.Admin.GatewayReadModel do
           pool_id: request.pool_id,
           bucket:
             type(fragment("date_trunc('hour', ?)", request.admitted_at), :utc_datetime_usec),
+          requests: count(request.id)
+        }
+    )
+  end
+
+  def bucketed_request_counts_by_pool_ids(pool_ids, started_at, ended_at, :day) do
+    Repo.all(
+      from request in Request,
+        where:
+          request.pool_id in ^pool_ids and request.admitted_at >= ^started_at and
+            request.admitted_at <= ^ended_at,
+        group_by: [request.pool_id, fragment("date_trunc('day', ?)", request.admitted_at)],
+        order_by: [asc: fragment("date_trunc('day', ?)", request.admitted_at)],
+        select: %{
+          pool_id: request.pool_id,
+          bucket: type(fragment("date_trunc('day', ?)", request.admitted_at), :utc_datetime_usec),
           requests: count(request.id)
         }
     )

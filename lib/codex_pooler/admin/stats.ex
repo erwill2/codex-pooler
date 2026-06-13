@@ -17,10 +17,37 @@ defmodule CodexPooler.Admin.Stats do
 
   @succeeded "succeeded"
   @failed_statuses ~w(failed rejected interrupted cancelled)
-  @pool_usage_window_seconds 5 * 60 * 60
-  @pool_histogram_window_seconds 24 * 60 * 60
+  @pool_default_window :twenty_four_hours
+  @pool_windows %{
+    "1h" => :one_hour,
+    "5h" => :five_hours,
+    "24h" => :twenty_four_hours,
+    "7d" => :seven_days,
+    one_hour: :one_hour,
+    five_hours: :five_hours,
+    twenty_four_hours: :twenty_four_hours,
+    seven_days: :seven_days
+  }
 
   @type access_error :: %{required(:code) => atom(), required(:message) => String.t()}
+  @type pool_usage_opt ::
+          {:as_of, DateTime.t()}
+          | {:started_at, DateTime.t()}
+          | {:weekly_started_at, DateTime.t()}
+          | {:histogram_started_at, DateTime.t()}
+          | {:traffic_window, String.t() | atom()}
+          | {:histogram_window, String.t() | atom()}
+  @type pool_usage_metrics :: %{
+          required(:request_count) => non_neg_integer(),
+          required(:tokens_per_second) => number() | nil,
+          required(:total_tokens) => non_neg_integer(),
+          required(:latency_ms) => non_neg_integer(),
+          required(:token_usage) => map(),
+          required(:token_usage_weekly) => map(),
+          required(:token_histogram) => [map()],
+          required(:request_histogram) => [map()],
+          required(:estimated_cost_micros) => non_neg_integer()
+        }
 
   @spec build_dashboard(Scope.t(), map() | keyword()) ::
           {:ok, map()} | {:error, access_error()}
@@ -35,24 +62,29 @@ defmodule CodexPooler.Admin.Stats do
       {:error,
        Filters.access_error(:unauthorized, "admin statistics require an authenticated operator")}
 
-  @spec pool_usage_metrics_by_pool_ids([Ecto.UUID.t()], keyword()) :: %{
-          optional(Ecto.UUID.t()) => map()
+  @spec pool_usage_metrics_by_pool_ids([Ecto.UUID.t()], [pool_usage_opt()]) :: %{
+          optional(Ecto.UUID.t()) => pool_usage_metrics()
         }
   def pool_usage_metrics_by_pool_ids(pool_ids, opts \\ [])
 
   def pool_usage_metrics_by_pool_ids(pool_ids, opts) when is_list(pool_ids) and is_list(opts) do
     pool_ids = pool_ids |> Enum.filter(&is_binary/1) |> Enum.uniq()
     ended_at = Keyword.get_lazy(opts, :as_of, &now/0)
+    window = pool_window(opts)
 
     started_at =
-      Keyword.get(opts, :started_at, DateTime.add(ended_at, -@pool_usage_window_seconds, :second))
+      Keyword.get(
+        opts,
+        :started_at,
+        pool_default_started_at(ended_at, window)
+      )
 
     weekly_started_at = Keyword.get(opts, :weekly_started_at, DateTime.add(ended_at, -7, :day))
 
     request_counts = GatewayReadModel.request_counts_by_pool_ids(pool_ids, started_at, ended_at)
     token_totals = AccountingReporting.token_totals_by_pool_ids(pool_ids, started_at, ended_at)
     latency_totals = GatewayReadModel.latency_totals_by_pool_ids(pool_ids, started_at, ended_at)
-    token_usage_5h = AccountingReporting.token_usage_by_pool_ids(pool_ids, started_at, ended_at)
+    token_usage = AccountingReporting.token_usage_by_pool_ids(pool_ids, started_at, ended_at)
 
     token_usage_weekly =
       AccountingReporting.token_usage_by_pool_ids(pool_ids, weekly_started_at, ended_at)
@@ -61,42 +93,49 @@ defmodule CodexPooler.Admin.Stats do
       Keyword.get(
         opts,
         :histogram_started_at,
-        DateTime.add(ended_at, -@pool_histogram_window_seconds, :second)
+        started_at
       )
 
     histogram_settlements =
       AccountingReporting.settlements_for_pool_ids(pool_ids, histogram_started_at, ended_at)
 
-    token_histograms = pool_token_histograms(pool_ids, histogram_settlements, ended_at)
-    cost_micros_24h = pool_estimated_cost_micros(pool_ids, histogram_settlements)
+    token_histograms = pool_token_histograms(pool_ids, histogram_settlements, ended_at, window)
+    cost_micros = pool_estimated_cost_micros(pool_ids, histogram_settlements)
 
     request_histograms =
       pool_request_histograms(
         pool_ids,
-        GatewayReadModel.hourly_request_counts_by_pool_ids(
+        GatewayReadModel.bucketed_request_counts_by_pool_ids(
           pool_ids,
           histogram_started_at,
-          ended_at
+          ended_at,
+          pool_bucket_granularity(window)
         ),
-        ended_at
+        ended_at,
+        window
       )
 
     Enum.into(pool_ids, %{}, fn pool_id ->
+      total_tokens = Map.get(token_totals, pool_id, 0)
+      latency_ms = Map.get(latency_totals, pool_id, 0)
+
       tokens_per_second =
         pool_tokens_per_second(
-          Map.get(token_totals, pool_id, 0),
-          Map.get(latency_totals, pool_id, 0)
+          total_tokens,
+          latency_ms
         )
 
       {pool_id,
        %{
-         request_count_5h: Map.get(request_counts, pool_id, 0),
+         request_count: Map.get(request_counts, pool_id, 0),
          tokens_per_second: tokens_per_second,
-         token_usage_5h: Map.get(token_usage_5h, pool_id, empty_token_usage()),
+         total_tokens: total_tokens,
+         latency_ms: latency_ms,
+         token_usage: Map.get(token_usage, pool_id, empty_token_usage()),
          token_usage_weekly: Map.get(token_usage_weekly, pool_id, empty_token_usage()),
-         token_histogram_24h: Map.fetch!(token_histograms, pool_id),
-         request_histogram_24h: Map.fetch!(request_histograms, pool_id),
-         estimated_cost_micros_24h: Map.fetch!(cost_micros_24h, pool_id)
+         token_histogram: Map.fetch!(token_histograms, pool_id),
+         request_histogram: Map.fetch!(request_histograms, pool_id),
+         estimated_cost_micros: Map.fetch!(cost_micros, pool_id)
        }}
     end)
   end
@@ -265,12 +304,36 @@ defmodule CodexPooler.Admin.Stats do
 
   defp pool_tokens_per_second(_total_tokens, _latency_ms), do: nil
 
-  defp pool_token_histograms(pool_ids, settlements, ended_at) do
-    labels = bucket_labels(%{window: :twenty_four_hours, ended_at: ended_at})
+  defp pool_window(opts) do
+    opts
+    |> Keyword.get(:traffic_window, Keyword.get(opts, :histogram_window, @pool_default_window))
+    |> then(&Map.get(@pool_windows, &1, @pool_default_window))
+  end
+
+  defp pool_window_seconds(:one_hour), do: 60 * 60
+  defp pool_window_seconds(:five_hours), do: 5 * 60 * 60
+  defp pool_window_seconds(:twenty_four_hours), do: 24 * 60 * 60
+
+  defp pool_default_started_at(ended_at, :seven_days) do
+    ended_at
+    |> DateTime.to_date()
+    |> Date.add(-6)
+    |> DateTime.new!(~T[00:00:00], "Etc/UTC")
+  end
+
+  defp pool_default_started_at(ended_at, window) do
+    DateTime.add(ended_at, -pool_window_seconds(window), :second)
+  end
+
+  defp pool_bucket_granularity(:seven_days), do: :day
+  defp pool_bucket_granularity(_window), do: :hour
+
+  defp pool_token_histograms(pool_ids, settlements, ended_at, window) do
+    labels = bucket_labels(%{window: window, ended_at: ended_at})
 
     entries_by_pool_bucket =
       Enum.group_by(settlements, fn settlement ->
-        {settlement.pool_id, bucket_label(settlement.occurred_at, :twenty_four_hours)}
+        {settlement.pool_id, bucket_label(settlement.occurred_at, window)}
       end)
 
     Map.new(pool_ids, fn pool_id ->
@@ -288,12 +351,12 @@ defmodule CodexPooler.Admin.Stats do
     end)
   end
 
-  defp pool_request_histograms(pool_ids, request_counts, ended_at) do
-    labels = bucket_labels(%{window: :twenty_four_hours, ended_at: ended_at})
+  defp pool_request_histograms(pool_ids, request_counts, ended_at, window) do
+    labels = bucket_labels(%{window: window, ended_at: ended_at})
 
     requests_by_pool_bucket =
       Map.new(request_counts, fn row ->
-        {{row.pool_id, bucket_label(row.bucket, :twenty_four_hours)}, row.requests}
+        {{row.pool_id, bucket_label(row.bucket, window)}, row.requests}
       end)
 
     Map.new(pool_ids, fn pool_id ->

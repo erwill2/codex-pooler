@@ -11,24 +11,60 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
   alias CodexPoolerWeb.Admin.OptionLoaderFallback
 
   @pool_statuses ["active", "disabled", "archived"]
+  @traffic_windows ["1h", "5h", "24h", "7d"]
+  @traffic_window_options [
+    {"Traffic: Last 1 hour", "1h"},
+    {"Traffic: Last 5 hours", "5h"},
+    {"Traffic: Last 24 hours", "24h"},
+    {"Traffic: Last 7 days", "7d"}
+  ]
+  @traffic_window_short_labels %{
+    "1h" => "1h",
+    "5h" => "5h",
+    "24h" => "24h",
+    "7d" => "7d"
+  }
 
+  @type filter_values :: %{
+          required(String.t()) => String.t()
+        }
+  @type option :: {String.t(), String.t()}
+
+  @spec filter(map() | keyword()) :: filter_values()
   def filter(attrs \\ %{}) do
     attrs = Map.new(attrs)
-    status = attrs |> Map.get("status", "all") |> to_string()
+    status = attrs |> value_for("status", "all") |> to_string()
+    traffic_window = attrs |> value_for("traffic_window", "24h") |> normalize_traffic_window()
 
     %{
-      "query" => attrs |> Map.get("query", "") |> to_string() |> String.trim(),
-      "status" => if(status in ["all" | @pool_statuses], do: status, else: "all")
+      "query" => attrs |> value_for("query", "") |> to_string() |> String.trim(),
+      "status" => if(status in ["all" | @pool_statuses], do: status, else: "all"),
+      "traffic_window" => traffic_window
     }
   end
 
+  @spec filter_form(map() | keyword()) :: Phoenix.HTML.Form.t()
   def filter_form(attrs \\ filter()) do
     attrs
     |> filter()
     |> to_form(as: :pool_filters)
   end
 
+  @spec filter_status_options() :: [option()]
   def filter_status_options, do: [{"Status: All", "all"} | status_options()]
+
+  @spec traffic_window_options() :: [option()]
+  def traffic_window_options, do: @traffic_window_options
+
+  @spec traffic_window_short_label(String.t()) :: String.t()
+  def traffic_window_short_label(window),
+    do: Map.get(@traffic_window_short_labels, normalize_traffic_window(window), "24h")
+
+  @spec normalize_traffic_window(term()) :: String.t()
+  def normalize_traffic_window(window) do
+    window = to_string(window || "")
+    if window in @traffic_windows, do: window, else: "24h"
+  end
 
   def create_form(attrs \\ %{}, errors \\ []) do
     attrs
@@ -177,6 +213,15 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
       |> Enum.reject(&(&1 in [nil, ""]))
     end)
   end
+
+  defp value_for(attrs, "query", default),
+    do: Map.get(attrs, "query") || Map.get(attrs, :query) || default
+
+  defp value_for(attrs, "status", default),
+    do: Map.get(attrs, "status") || Map.get(attrs, :status) || default
+
+  defp value_for(attrs, "traffic_window", default),
+    do: Map.get(attrs, "traffic_window") || Map.get(attrs, :traffic_window) || default
 
   defp list_input_values(nil), do: []
 

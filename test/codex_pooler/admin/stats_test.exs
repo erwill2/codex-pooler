@@ -265,28 +265,50 @@ defmodule CodexPooler.Admin.StatsTest do
       50
     )
 
+    insert_timed_usage!(
+      pool,
+      api_key,
+      assignment,
+      identity,
+      DateTime.add(as_of, -6, :day),
+      25
+    )
+
     metrics = Stats.pool_usage_metrics_by_pool_ids([pool.id, other_pool.id], as_of: as_of)
 
-    assert metrics[pool.id].request_count_5h == 1
+    assert metrics[pool.id].request_count == 1
     assert metrics[pool.id].tokens_per_second == 50.0
-    assert metrics[pool.id].token_usage_5h.total_tokens == 100
-    assert metrics[pool.id].token_usage_5h.cached_input_tokens == 20
-    assert metrics[pool.id].token_usage_weekly.total_tokens == 100
-    assert metrics[pool.id].estimated_cost_micros_24h == 1_500_000
-    assert length(metrics[pool.id].token_histogram_24h) == 24
-    assert Enum.any?(metrics[pool.id].token_histogram_24h, &(&1.total_tokens == 100))
-    assert Enum.sum(Enum.map(metrics[pool.id].token_histogram_24h, & &1.total_tokens)) == 100
-    assert length(metrics[pool.id].request_histogram_24h) == 24
-    assert Enum.any?(metrics[pool.id].request_histogram_24h, &(&1.requests == 1))
-    assert Enum.sum(Enum.map(metrics[pool.id].request_histogram_24h, & &1.requests)) == 1
+    assert metrics[pool.id].token_usage.total_tokens == 100
+    assert metrics[pool.id].token_usage.cached_input_tokens == 20
+    assert metrics[pool.id].token_usage_weekly.total_tokens == 125
+    assert metrics[pool.id].estimated_cost_micros == 1_500_000
+    assert length(metrics[pool.id].token_histogram) == 24
+    assert Enum.any?(metrics[pool.id].token_histogram, &(&1.total_tokens == 100))
+    assert Enum.sum(Enum.map(metrics[pool.id].token_histogram, & &1.total_tokens)) == 100
+    assert length(metrics[pool.id].request_histogram) == 24
+    assert Enum.any?(metrics[pool.id].request_histogram, &(&1.requests == 1))
+    assert Enum.sum(Enum.map(metrics[pool.id].request_histogram, & &1.requests)) == 1
 
-    assert metrics[other_pool.id].request_count_5h == 0
-    assert metrics[other_pool.id].tokens_per_second == nil
-    assert metrics[other_pool.id].token_usage_5h.total_tokens == 0
+    assert metrics[other_pool.id].request_count == 1
+    assert metrics[other_pool.id].tokens_per_second == 500.0
+    assert metrics[other_pool.id].token_usage.total_tokens == 50
     assert metrics[other_pool.id].token_usage_weekly.total_tokens == 50
-    assert metrics[other_pool.id].estimated_cost_micros_24h == 50
-    assert Enum.sum(Enum.map(metrics[other_pool.id].token_histogram_24h, & &1.total_tokens)) == 50
-    assert Enum.sum(Enum.map(metrics[other_pool.id].request_histogram_24h, & &1.requests)) == 1
+    assert metrics[other_pool.id].estimated_cost_micros == 50
+    assert Enum.sum(Enum.map(metrics[other_pool.id].token_histogram, & &1.total_tokens)) == 50
+    assert Enum.sum(Enum.map(metrics[other_pool.id].request_histogram, & &1.requests)) == 1
+
+    seven_day_metrics =
+      Stats.pool_usage_metrics_by_pool_ids([pool.id], as_of: as_of, traffic_window: "7d")
+
+    assert seven_day_metrics[pool.id].request_count == 2
+    assert seven_day_metrics[pool.id].token_usage.total_tokens == 125
+    assert seven_day_metrics[pool.id].estimated_cost_micros == 1_500_025
+    assert length(seven_day_metrics[pool.id].token_histogram) == 7
+
+    assert Enum.sum(Enum.map(seven_day_metrics[pool.id].token_histogram, & &1.total_tokens)) ==
+             125
+
+    assert Enum.sum(Enum.map(seven_day_metrics[pool.id].request_histogram, & &1.requests)) == 2
   end
 
   test "UTC window boundaries include exact start and end and exclude adjacent rows" do

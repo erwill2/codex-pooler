@@ -14,8 +14,9 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
           required(:total_count) => non_neg_integer(),
           required(:upstream_count) => non_neg_integer(),
           required(:api_key_count) => non_neg_integer(),
-          required(:request_count_5h) => non_neg_integer(),
-          required(:tokens_per_second) => number() | nil
+          required(:request_count) => non_neg_integer(),
+          required(:tokens_per_second) => number() | nil,
+          required(:traffic_window_label) => String.t()
         }
   @type token_usage :: %{
           required(:cached_input_tokens) => non_neg_integer(),
@@ -28,13 +29,17 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
           required(:pool) => Pool.t(),
           required(:api_key_count) => non_neg_integer(),
           required(:upstream_count) => non_neg_integer(),
-          required(:request_count_5h) => non_neg_integer(),
+          required(:request_count) => non_neg_integer(),
           required(:tokens_per_second) => number() | nil,
-          required(:token_usage_5h) => token_usage(),
+          required(:total_tokens) => non_neg_integer(),
+          required(:latency_ms) => non_neg_integer(),
+          required(:token_usage) => token_usage(),
           required(:token_usage_weekly) => token_usage(),
-          required(:token_histogram_24h) => [map()],
-          required(:request_histogram_24h) => [map()],
-          required(:estimated_cost_micros_24h) => non_neg_integer(),
+          required(:token_histogram) => [map()],
+          required(:request_histogram) => [map()],
+          required(:estimated_cost_micros) => non_neg_integer(),
+          required(:traffic_window) => String.t(),
+          required(:traffic_window_label) => String.t(),
           required(:routing_strategy) => String.t()
         }
   @type page_state :: %{
@@ -51,7 +56,8 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
 
   @spec load(term(), map()) :: page_state()
   def load(scope, filters) do
-    pool_rows = pool_rows(scope)
+    traffic_window = PoolForm.normalize_traffic_window(Map.get(filters, "traffic_window", "24h"))
+    pool_rows = pool_rows(scope, traffic_window)
     visible_pool_rows = filter_pool_rows(pool_rows, filters)
     can_manage_pools? = Pools.can_manage_pools?(scope)
 
@@ -62,7 +68,7 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
 
     %{
       pools: visible_pool_rows,
-      pool_metrics: pool_metrics(pool_rows, scope),
+      pool_metrics: pool_metrics(pool_rows, traffic_window),
       can_manage_pools?: can_manage_pools?,
       upstream_identity_options: upstream_identity_options,
       api_key_options: api_key_options,
@@ -98,7 +104,7 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
     |> then(&"$#{&1}")
   end
 
-  defp pool_rows(scope) do
+  defp pool_rows(scope, traffic_window) do
     pools =
       case Pools.list_pools_for_management(scope) do
         {:ok, pools} -> pools
@@ -109,7 +115,8 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
     api_key_counts = Access.count_api_keys_by_pool_ids(pool_ids)
     upstream_counts = CodexPooler.Upstreams.count_pool_assignments_by_pool_ids(pool_ids)
     routing_settings = Pools.routing_settings_by_pool_ids(pool_ids)
-    usage_metrics = Stats.pool_usage_metrics_by_pool_ids(pool_ids)
+    usage_metrics = Stats.pool_usage_metrics_by_pool_ids(pool_ids, traffic_window: traffic_window)
+    traffic_window_label = PoolForm.traffic_window_short_label(traffic_window)
 
     Enum.map(pools, fn pool ->
       usage = Map.fetch!(usage_metrics, pool.id)
@@ -118,13 +125,17 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
         pool: pool,
         api_key_count: Map.get(api_key_counts, pool.id, 0),
         upstream_count: Map.get(upstream_counts, pool.id, 0),
-        request_count_5h: usage.request_count_5h,
+        request_count: usage.request_count,
         tokens_per_second: usage.tokens_per_second,
-        token_usage_5h: usage.token_usage_5h,
+        total_tokens: usage.total_tokens,
+        latency_ms: usage.latency_ms,
+        token_usage: usage.token_usage,
         token_usage_weekly: usage.token_usage_weekly,
-        token_histogram_24h: usage.token_histogram_24h,
-        request_histogram_24h: usage.request_histogram_24h,
-        estimated_cost_micros_24h: usage.estimated_cost_micros_24h,
+        token_histogram: usage.token_histogram,
+        request_histogram: usage.request_histogram,
+        estimated_cost_micros: usage.estimated_cost_micros,
+        traffic_window: traffic_window,
+        traffic_window_label: traffic_window_label,
         routing_strategy: Map.get(routing_settings, pool.id).routing_strategy
       }
     end)
@@ -162,33 +173,31 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
   defp pool_matches_status?(pool_row, status), do: pool_row.pool.status == status
 
   defp pool_metrics(pool_rows) do
+    total_tokens = Enum.sum(Enum.map(pool_rows, & &1.total_tokens))
+    latency_ms = Enum.sum(Enum.map(pool_rows, & &1.latency_ms))
+
     %{
       total_count: length(pool_rows),
       upstream_count: Enum.sum(Enum.map(pool_rows, & &1.upstream_count)),
       api_key_count: Enum.sum(Enum.map(pool_rows, & &1.api_key_count)),
-      request_count_5h: 0,
-      tokens_per_second: nil
+      request_count: Enum.sum(Enum.map(pool_rows, & &1.request_count)),
+      tokens_per_second: pool_tokens_per_second(total_tokens, latency_ms),
+      traffic_window_label: "24h"
     }
   end
 
-  defp pool_metrics(pool_rows, scope) do
-    pool_rows
-    |> pool_metrics()
-    |> Map.merge(pool_usage_metrics(scope))
+  defp pool_metrics(pool_rows, traffic_window) do
+    Map.put(
+      pool_metrics(pool_rows),
+      :traffic_window_label,
+      PoolForm.traffic_window_short_label(traffic_window)
+    )
   end
 
-  defp pool_usage_metrics(scope) do
-    case Stats.build_dashboard(scope, %{"window" => "5h"}) do
-      {:ok, %{kpis: %{requests: requests, tokens_per_second: tokens_per_second}}} ->
-        %{
-          request_count_5h: Map.get(requests, :value, 0),
-          tokens_per_second: Map.get(tokens_per_second, :value)
-        }
+  defp pool_tokens_per_second(total_tokens, latency_ms) when total_tokens > 0 and latency_ms > 0,
+    do: Float.round(total_tokens / (latency_ms / 1000), 2)
 
-      {:error, _reason} ->
-        %{request_count_5h: 0, tokens_per_second: nil}
-    end
-  end
+  defp pool_tokens_per_second(_total_tokens, _latency_ms), do: nil
 
   defp fixed_decimal_places(value, places) do
     case String.split(value, ".", parts: 2) do

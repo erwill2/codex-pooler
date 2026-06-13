@@ -225,6 +225,16 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
      |> load_pools()}
   end
 
+  def handle_event("select_pool_traffic_window_filter", %{"window" => window}, socket) do
+    filters = PoolForm.filter(Map.put(socket.assigns.pool_filters, "traffic_window", window))
+
+    {:noreply,
+     socket
+     |> assign(:pool_filters, filters)
+     |> assign(:pool_filter_form, PoolForm.filter_form(filters))
+     |> load_pools()}
+  end
+
   @impl true
   def handle_info({Events, %{pool_id: pool_id, topics: topics}}, socket) do
     if pool_event_refresh?(topics, pool_id) do
@@ -306,14 +316,14 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
           <AdminComponents.metric_card
             id="pool-metric-requests"
             icon="hero-arrow-path"
-            label="Requests 5h"
-            value={PoolsReadModel.format_metric_integer(@pool_metrics.request_count_5h)}
+            label={"Requests #{@pool_metrics.traffic_window_label}"}
+            value={PoolsReadModel.format_metric_integer(@pool_metrics.request_count)}
             compact_mobile
           />
           <AdminComponents.metric_card
             id="pool-metric-tokens-per-sec"
             icon="hero-bolt"
-            label="TPS 5h"
+            label={"TPS #{@pool_metrics.traffic_window_label}"}
             value={PoolsReadModel.format_metric_rate(@pool_metrics.tokens_per_second)}
             tone={:primary}
             compact_mobile

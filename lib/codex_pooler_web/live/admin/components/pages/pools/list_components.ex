@@ -152,6 +152,10 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
         selected_value={@form[:status].value}
         selected={selected_pool_status_filter_option(@form[:status].value)}
       />
+      <.pool_traffic_window_filter_dropdown
+        selected_value={@form[:traffic_window].value}
+        selected={selected_pool_traffic_window_filter_option(@form[:traffic_window].value)}
+      />
     </AdminComponents.filter_form>
     """
   end
@@ -279,6 +283,73 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     }
   end
 
+  attr :selected_value, :string, required: true
+  attr :selected, :map, required: true
+
+  defp pool_traffic_window_filter_dropdown(assigns) do
+    ~H"""
+    <div class="grid gap-2">
+      <label for="pool-traffic-window-filter" class="sr-only">Traffic window</label>
+      <input
+        type="hidden"
+        id="pool_filters_traffic_window"
+        name="pool_filters[traffic_window]"
+        value={@selected_value}
+      />
+      <details
+        id="pool-traffic-window-filter"
+        class="dropdown w-full"
+        phx-click-away={JS.remove_attribute("open", to: "#pool-traffic-window-filter")}
+      >
+        <summary
+          data-role="traffic-window-filter-trigger"
+          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+        >
+          <.icon name="hero-clock" class="size-4 shrink-0 text-base-content/60" />
+          <span class="truncate">{@selected.label}</span>
+        </summary>
+        <ul
+          data-role="traffic-window-filter-menu"
+          class="menu dropdown-content z-[60] mt-1 max-h-80 w-full flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-1 !transition-none ![scale:100%] shadow-xl"
+        >
+          <li :for={option <- pool_traffic_window_filter_options()}>
+            <button
+              type="button"
+              phx-click="select_pool_traffic_window_filter"
+              phx-value-window={option.value}
+              data-role="traffic-window-filter-option"
+              data-window={option.value}
+              class={[
+                "flex items-center gap-2 text-sm",
+                option.value == @selected_value && "active"
+              ]}
+              aria-current={option.value == @selected_value && "true"}
+            >
+              <.icon name="hero-clock" class="size-4 shrink-0 text-base-content/50" />
+              <span class="truncate">{option.label}</span>
+            </button>
+          </li>
+        </ul>
+      </details>
+    </div>
+    """
+  end
+
+  defp selected_pool_traffic_window_filter_option(window) do
+    Enum.find(pool_traffic_window_filter_options(), &(&1.value == window)) ||
+      default_pool_traffic_window_filter_option()
+  end
+
+  defp pool_traffic_window_filter_options do
+    Enum.map(PoolForm.traffic_window_options(), fn {label, value} ->
+      %{label: label, value: value}
+    end)
+  end
+
+  defp default_pool_traffic_window_filter_option do
+    %{label: "Traffic: Last 24 hours", value: "24h"}
+  end
+
   defp pool_query_filter_value(%{value: value}) when is_binary(value), do: value
   defp pool_query_filter_value(_field), do: ""
 
@@ -360,33 +431,33 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           <.pool_metric_link
             data_role="pool-request-count-cell"
             href={~p"/admin/request-logs?pool_id=#{@pool_row.pool.id}"}
-            label="Req/TPS 5h"
+            label={"Req/TPS #{@pool_row.traffic_window_label}"}
             value={
               PoolsReadModel.format_request_throughput(
-                @pool_row.request_count_5h,
+                @pool_row.request_count,
                 @pool_row.tokens_per_second
               )
             }
-            value_id={"pool-row-#{@pool_row.pool.id}-request-throughput-5h"}
+            value_id={"pool-row-#{@pool_row.pool.id}-request-throughput"}
             wrapper_class="min-w-0 px-3"
           >
-            <span id={"pool-row-#{@pool_row.pool.id}-request-count-5h"}>
-              {PoolsReadModel.format_metric_integer(@pool_row.request_count_5h)}
+            <span id={"pool-row-#{@pool_row.pool.id}-request-count"}>
+              {PoolsReadModel.format_metric_integer(@pool_row.request_count)}
             </span>
             <span aria-hidden="true"> / </span>
             <span id={"pool-row-#{@pool_row.pool.id}-tokens-per-sec"}>
               {PoolsReadModel.format_metric_rate(@pool_row.tokens_per_second)}
             </span>
           </.pool_metric_link>
-          <div class="min-w-0 pl-3" data-role="pool-cost-24h-cell">
+          <div class="min-w-0 pl-3" data-role="pool-cost-cell">
             <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
-              Cost 24h
+              Cost {@pool_row.traffic_window_label}
             </dt>
             <dd
-              id={"pool-row-#{@pool_row.pool.id}-estimated-cost-24h"}
+              id={"pool-row-#{@pool_row.pool.id}-estimated-cost"}
               class="truncate text-base-content/60"
             >
-              {PoolsReadModel.format_estimated_cost_micros(@pool_row.estimated_cost_micros_24h)}
+              {PoolsReadModel.format_estimated_cost_micros(@pool_row.estimated_cost_micros)}
             </dd>
           </div>
         </dl>
@@ -478,7 +549,9 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           <span class="pool-activity-empty-state-icon" aria-hidden="true">
             <.icon name="hero-chart-bar" class="size-4" />
           </span>
-          <p class="pool-activity-empty-copy">No traffic in the last 24h</p>
+          <p class="pool-activity-empty-copy">
+            No traffic in the last {@traffic_histogram_card.window_label}
+          </p>
         </div>
         <ul class="sr-only">
           <li :for={point <- @traffic_histogram_card.points}>
@@ -555,12 +628,14 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
   end
 
   defp pool_traffic_histogram_card(pool_row) do
+    window_label = Map.get(pool_row, :traffic_window_label, "24h")
+
     token_points =
-      Map.get(pool_row, :token_histogram_24h, [])
+      Map.get(pool_row, :token_histogram, [])
 
     request_points =
       pool_row
-      |> Map.get(:request_histogram_24h, [])
+      |> Map.get(:request_histogram, [])
       |> Map.new(fn point -> {Map.get(point, :bucket), max(Map.get(point, :requests, 0), 0)} end)
 
     points =
@@ -580,7 +655,8 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     request_total = Enum.sum(request_values)
 
     %{
-      title: "Traffic 24h",
+      title: "Traffic #{window_label}",
+      window_label: window_label,
       total_label:
         "#{format_token_count(token_total)} tokens / #{format_request_count(request_total)}",
       categories: Jason.encode!(Enum.map(points, & &1.label)),
@@ -599,7 +675,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       points: points,
       empty?: token_total == 0 and request_total == 0,
       aria_label:
-        "Traffic in the last 24 hours: #{format_token_count(token_total)} tokens and #{format_request_count(request_total)}"
+        "Traffic in the last #{window_label}: #{format_token_count(token_total)} tokens and #{format_request_count(request_total)}"
     }
   end
 
