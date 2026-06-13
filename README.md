@@ -468,6 +468,66 @@ change the MCP `url` to `https://codex-pooler.example.com/mcp`.
 </details>
 
 <details>
+<summary><img src=".github/assets/pi-favicon.png" alt="Pi logo" width="16" height="16"> Pi <code>~/.pi/agent/models.json</code></summary>
+
+Pi works best through a custom provider that uses Codex Pooler's narrow
+OpenAI-compatible `/v1` Responses surface. Install Pi from npm so you get the
+latest published CLI:
+
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+Then add a provider to `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "codex-pooler": {
+      "name": "Codex Pooler",
+      "baseUrl": "http://localhost:4000/v1",
+      "api": "openai-responses",
+      "apiKey": "$CODEX_POOLER_API_KEY",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "gpt-5.5",
+          "name": "GPT-5.5 via Codex Pooler",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 400000,
+          "maxTokens": 128000
+        }
+      ]
+    }
+  }
+}
+```
+
+`authHeader: true` makes Pi send the Pool API key as
+`Authorization: Bearer ...`. Define only model ids your assigned Pool can serve.
+For deployed instances, change `baseUrl` to
+`https://codex-pooler.example.com/v1`.
+
+Check the non-interactive path from a repository:
+
+```bash
+export CODEX_POOLER_API_KEY=<pool-api-key>
+pi --provider codex-pooler \
+  --model gpt-5.5 \
+  --no-session \
+  --no-context-files \
+  --tools bash \
+  -p 'Reply with exactly: pi ok'
+```
+
+Pi does not ship built-in MCP support. Codex Pooler model use does not require
+MCP; if you need operator metadata, use a separate MCP-capable host with an
+operator MCP token.
+
+</details>
+
+<details>
 <summary><img src=".github/assets/aider-favicon.png" alt="Aider logo" width="16" height="16"> Aider <code>~/.aider.conf.yml</code></summary>
 
 Aider uses the OpenAI-compatible route with the `openai/` model prefix. Keep the

@@ -1,0 +1,70 @@
+---
+title: Pi
+description: Configure Pi coding agent with Codex Pooler's narrow OpenAI-compatible /v1 Responses surface and a Pool API key.
+---
+
+Pi should use Codex Pooler through a custom provider in `~/.pi/agent/models.json`. Point that provider at the narrow OpenAI-compatible `/v1` surface, keep the Pool API key in the environment, and choose `openai-responses` so Pi sends agent turns through the Responses route.
+
+## Install
+
+Use the current npm package:
+
+```bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+```
+
+`--ignore-scripts` matches Pi's published install guidance and keeps dependency lifecycle scripts disabled during install.
+
+## Provider shape
+
+For a deployed instance, add:
+
+```json
+{
+  "providers": {
+    "codex-pooler": {
+      "name": "Codex Pooler",
+      "baseUrl": "https://codex-pooler.example.com/v1",
+      "api": "openai-responses",
+      "apiKey": "$CODEX_POOLER_API_KEY",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "gpt-5.5",
+          "name": "GPT-5.5 via Codex Pooler",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 400000,
+          "maxTokens": 128000
+        }
+      ]
+    }
+  }
+}
+```
+
+For local setup, change `baseUrl` to `http://localhost:4000/v1`.
+
+`authHeader: true` makes Pi send the Pool API key as `Authorization: Bearer ...`. Define only model ids your assigned Pool can serve.
+
+## Smoke check
+
+Run a one-shot prompt from the repository you want Pi to inspect:
+
+```bash
+export CODEX_POOLER_API_KEY=<pool-api-key>
+pi --provider codex-pooler \
+  --model gpt-5.5 \
+  --no-session \
+  --no-context-files \
+  --tools bash \
+  -p 'Reply with exactly: pi ok'
+```
+
+`--no-session` keeps the check ephemeral. `--no-context-files` keeps the smoke independent from local project instructions. For normal interactive use, omit those flags if you want Pi to load `AGENTS.md`, skills, sessions, and project settings.
+
+## MCP boundary
+
+Pi model requests use Codex Pooler's narrow OpenAI-compatible `/v1` support for selected SDK routes. Codex Pooler doesn't provide full OpenAI API parity.
+
+Pi does not ship built-in MCP support. Codex Pooler model use does not require MCP. If you need operator metadata from `/mcp`, use a separate MCP-capable host and authenticate it with an operator-owned MCP token, not the Pool API key.
