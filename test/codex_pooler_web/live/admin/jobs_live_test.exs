@@ -544,6 +544,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/jobs")
 
     assert has_element?(view, "#job-filter-form")
+    assert has_element?(view, "#job-filter-form[phx-hook='AdminFilterDropdowns']")
 
     assert has_element?(
              view,

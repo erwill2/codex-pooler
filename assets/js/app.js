@@ -212,6 +212,47 @@ const CallyDatePicker = {
     }).format(new Date(year, month - 1, day))
   },
 }
+const closeFilterDropdowns = (root, except = null) => {
+  root.querySelectorAll("details.dropdown[open]").forEach(details => {
+    if (details !== except) details.removeAttribute("open")
+  })
+}
+const AdminFilterDropdowns = {
+  mounted() {
+    this.handleToggle = event => {
+      const details = event.target
+
+      if (!(details instanceof HTMLDetailsElement)) return
+      if (!details.matches("details.dropdown") || !details.open) return
+
+      closeFilterDropdowns(this.el, details)
+    }
+
+    this.handleKeydown = event => {
+      if (event.key !== "Escape") return
+
+      const openDropdowns = Array.from(this.el.querySelectorAll("details.dropdown[open]"))
+      if (openDropdowns.length === 0) return
+
+      event.preventDefault()
+      event.stopPropagation()
+      closeFilterDropdowns(this.el)
+
+      const activeDropdown = document.activeElement?.closest?.("details.dropdown")
+      const focusTarget = activeDropdown && this.el.contains(activeDropdown)
+        ? activeDropdown
+        : openDropdowns.at(-1)
+      focusTarget?.querySelector("summary")?.focus()
+    }
+
+    this.el.addEventListener("toggle", this.handleToggle, true)
+    this.el.addEventListener("keydown", this.handleKeydown)
+  },
+  destroyed() {
+    this.el.removeEventListener("toggle", this.handleToggle, true)
+    this.el.removeEventListener("keydown", this.handleKeydown)
+  },
+}
 const QuotaPressureChart = {
   mounted() {
     this.renderChart()
@@ -683,14 +724,44 @@ const forgetMemorizedLongPollFallback = () => {
     return
   }
 }
+const dismissAdminDialogFromKeyboard = event => {
+  const dialog = event.target
+
+  if (!(dialog instanceof HTMLDialogElement) || !dialog.classList.contains("modal")) return
+
+  if (dismissAdminDialog(dialog)) event.preventDefault()
+}
+const dismissAdminDialog = dialog => {
+  const dismissButton = dialog.querySelector("[data-role='dialog-dismiss'], .modal-backdrop button")
+  if (!dismissButton) return
+
+  dismissButton.click()
+
+  return true
+}
+const dismissTopAdminDialogFromEscape = event => {
+  if (event.key !== "Escape") return
+
+  const openDialogs = Array.from(document.querySelectorAll("dialog.modal[open]"))
+  const dialog = openDialogs.at(-1)
+  if (!dialog) return
+
+  if (!dismissAdminDialog(dialog)) return
+
+  event.preventDefault()
+  event.stopPropagation()
+}
 
 forgetMemorizedLongPollFallback()
+document.addEventListener("cancel", dismissAdminDialogFromKeyboard, true)
+document.addEventListener("keydown", dismissTopAdminDialogFromEscape, true)
 
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 8000,
   params: {_csrf_token: csrfToken},
   hooks: {
     ...colocatedHooks,
+    AdminFilterDropdowns,
     ApexBarChart,
     ApexTimeSeriesChart,
     CallyDatePicker,

@@ -311,6 +311,7 @@ defmodule CodexPoolerWeb.Admin.Components do
     <.form
       for={@for}
       id={@id}
+      phx-hook="AdminFilterDropdowns"
       class="bg-transparent p-0"
       {@rest}
     >
