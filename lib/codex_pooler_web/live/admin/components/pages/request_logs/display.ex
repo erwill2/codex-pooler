@@ -2,6 +2,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
   @moduledoc false
 
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
+  alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.Admin.RequestLogsDisplay.{Errors, Status, UserAgents}
   alias CodexPoolerWeb.DateTimeDisplay
 
@@ -116,7 +117,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   def format_token_counts(counts) do
     case total_token_count(counts) do
-      total when is_integer(total) -> "#{format_compact_integer(total)} tokens"
+      total when is_integer(total) -> "#{Format.token_count(total)} tokens"
       _total -> "-"
     end
   end
@@ -213,7 +214,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
     cached = log.token_counts.cached_input_tokens
 
     if cached && cached != 0 do
-      "(#{format_compact_integer(cached)} cached)"
+      "(#{Format.token_count(cached)} cached)"
     else
       nil
     end
@@ -323,11 +324,14 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   defp token_part(_label, nil), do: nil
   defp token_part(_label, 0), do: nil
-  defp token_part(label, value) when is_integer(value), do: "#{format_integer(value)} #{label}"
+
+  defp token_part(label, value) when is_integer(value),
+    do: "#{Format.token_count(value)} #{label}"
+
   defp token_part(_label, _value), do: nil
 
   defp format_cost(%{status: "priced", usd: %Decimal{} = usd}) do
-    "$#{format_usd(usd)}"
+    Format.money(usd)
   end
 
   defp format_cost(%{status: "unpriced"}), do: "-"
@@ -386,7 +390,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
     cached = log.token_counts.cached_input_tokens
 
     if cached && cached != 0 do
-      [verbose_non_cached_tokens(total, cached), "#{format_integer(cached)} cached input"]
+      [verbose_non_cached_tokens(total, cached), "#{Format.token_count(cached)} cached input"]
       |> Enum.reject(&is_nil/1)
       |> Enum.join("; ")
     else
@@ -395,61 +399,22 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
   end
 
   defp verbose_non_cached_tokens(total, cached) when is_integer(total) and is_integer(cached),
-    do: "#{format_integer(max(total - cached, 0))} non-cached"
+    do: "#{Format.token_count(max(total - cached, 0))} non-cached"
 
   defp verbose_non_cached_tokens(_total, _cached), do: nil
 
   defp format_seconds(value) when rem(value, 1_000) == 0, do: "#{div(value, 1_000)}s"
   defp format_seconds(value), do: "#{Float.round(value / 1_000, 1)}s"
 
-  defp format_compact_integer(value) when is_integer(value) do
-    cond do
-      abs(value) >= 1_000_000 ->
-        "#{format_compact_scaled(value, 1_000_000)}m"
-
-      abs(value) >= 1_000 ->
-        "#{format_compact_scaled(value, 1_000)}k"
-
-      true ->
-        format_integer(value)
-    end
-  end
-
   defp format_cached_input_cost(%Decimal{} = usd),
-    do: "Cached input cost $#{format_usd(usd)} is included in the total cost"
+    do: "Cached input cost #{Format.money(usd)} is included in the total cost"
 
   defp format_cached_input_cost(_usd), do: nil
 
   defp compact_cached_input_cost(%Decimal{} = usd),
-    do: "($#{format_usd(usd)} cached)"
+    do: "(#{Format.money(usd)} cached)"
 
   defp compact_cached_input_cost(_usd), do: nil
-
-  defp format_compact_scaled(value, scale) do
-    scaled = value / scale
-
-    scaled
-    |> :erlang.float_to_binary(decimals: 1)
-    |> String.trim_trailing("0")
-    |> String.trim_trailing(".")
-  end
-
-  defp format_usd(%Decimal{} = usd) do
-    usd
-    |> Decimal.round(2)
-    |> Decimal.to_string(:normal)
-    |> fixed_decimal_places(2)
-  end
-
-  defp fixed_decimal_places(value, places) do
-    case String.split(value, ".", parts: 2) do
-      [whole] ->
-        whole <> "." <> String.duplicate("0", places)
-
-      [whole, fraction] ->
-        whole <> "." <> (fraction |> String.pad_trailing(places, "0") |> String.slice(0, places))
-    end
-  end
 
   defp blank?(nil), do: true
   defp blank?(value), do: String.trim(to_string(value)) == ""

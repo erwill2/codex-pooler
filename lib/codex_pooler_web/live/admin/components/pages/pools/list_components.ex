@@ -7,6 +7,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
 
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.Admin.PoolForm
   alias CodexPoolerWeb.Admin.PoolsReadModel
 
@@ -658,7 +659,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       title: "Traffic #{window_label}",
       window_label: window_label,
       total_label:
-        "#{format_token_count(token_total)} tokens / #{format_request_count(request_total)}",
+        "#{Format.token_count(token_total)} tokens / #{format_request_count(request_total)}",
       categories: Jason.encode!(Enum.map(points, & &1.label)),
       series:
         Jason.encode!([
@@ -675,7 +676,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       points: points,
       empty?: token_total == 0 and request_total == 0,
       aria_label:
-        "Traffic in the last #{window_label}: #{format_token_count(token_total)} tokens and #{format_request_count(request_total)}"
+        "Traffic in the last #{window_label}: #{Format.token_count(token_total)} tokens and #{format_request_count(request_total)}"
     }
   end
 
@@ -683,9 +684,6 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     do: hour <> ":00"
 
   defp format_chart_bucket(bucket), do: to_string(bucket)
-
-  defp format_token_count(value) when is_integer(value), do: format_integer(value)
-  defp format_token_count(value) when is_float(value), do: value |> round() |> format_integer()
 
   defp format_request_count(1), do: "1 request"
   defp format_request_count(value) when is_integer(value), do: "#{format_integer(value)} requests"

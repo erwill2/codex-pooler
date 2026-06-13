@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
 
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.Admin.PoolInviteForm
 
   @reactivatable_statuses ~w(paused refresh_due refresh_failed)
@@ -558,20 +559,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
 
   defp recent_token_count_label(%{token_burn: %{recent_tokens: tokens}})
        when is_integer(tokens) and tokens >= 0 do
-    "#{format_token_count(tokens)} tokens"
+    "#{Format.token_count(tokens)} tokens"
   end
 
   defp recent_token_count_label(_account), do: "0 tokens"
-
-  defp format_token_count(tokens) when tokens >= 1_000_000 do
-    "#{Float.round(tokens / 1_000_000, 1)}m"
-  end
-
-  defp format_token_count(tokens) when tokens >= 1_000 do
-    "#{Float.round(tokens / 1_000, 1)}k"
-  end
-
-  defp format_token_count(tokens), do: Integer.to_string(tokens)
 
   @spec recovery_eligible?(map()) :: boolean()
   defp recovery_eligible?(%{identity: %{status: status}} = account) do

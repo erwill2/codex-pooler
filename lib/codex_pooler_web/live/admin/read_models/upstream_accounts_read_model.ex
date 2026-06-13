@@ -9,6 +9,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.Admin.UpstreamQuotaReadiness
   alias CodexPoolerWeb.DateTimeDisplay
 
@@ -387,7 +388,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       level: level,
       label: "x#{level}",
       title:
-        "last 5m: #{format_integer(recent_tokens)} tokens; previous 1h: #{format_integer(baseline_tokens)} tokens",
+        "last 5m: #{Format.token_count(recent_tokens)} tokens; previous 1h: #{Format.token_count(baseline_tokens)} tokens",
       recent_tokens: recent_tokens,
       baseline_tokens: baseline_tokens
     }

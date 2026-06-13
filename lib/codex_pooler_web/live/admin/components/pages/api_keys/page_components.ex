@@ -474,13 +474,13 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         {ApiKeysReadModel.format_integer(@usage.request_count)} requests
       </span>
       <span class="text-xs text-base-content/70">
-        {ApiKeysReadModel.format_integer(@usage.total_tokens)} tokens
+        {ApiKeysReadModel.format_token_count(@usage.total_tokens)} tokens
       </span>
       <span
         :if={ApiKeysReadModel.usage_present?(%{cached_input_tokens: @usage.cached_input_tokens})}
         class="text-xs text-base-content/60"
       >
-        {ApiKeysReadModel.format_integer(@usage.cached_input_tokens)} cached input
+        {ApiKeysReadModel.format_token_count(@usage.cached_input_tokens)} cached input
       </span>
       <span :if={ApiKeysReadModel.row_usage_cost(@usage)} class="text-xs text-base-content/60">
         {ApiKeysReadModel.row_usage_cost(@usage)}

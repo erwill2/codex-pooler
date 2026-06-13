@@ -8,6 +8,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysReadModel do
   alias CodexPooler.Pools
   alias CodexPooler.Pools.Pool
   alias CodexPoolerWeb.Admin.ApiKeyPolicyForm
+  alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.Admin.OptionLoaderFallback
 
   @type data_load_warning :: map()
@@ -227,10 +228,17 @@ defmodule CodexPoolerWeb.Admin.ApiKeysReadModel do
 
   @spec row_usage_cost(usage_summary() | nil) :: String.t() | nil
   def row_usage_cost(%{total_cost_status: "priced", total_cost_usd: %Decimal{} = usd}) do
-    "Cost $#{format_usd(usd)}"
+    "Cost #{Format.money(usd)}"
   end
 
   def row_usage_cost(_usage), do: nil
+
+  @spec format_token_count(integer() | Decimal.t() | nil | term()) :: String.t()
+  def format_token_count(value) when is_integer(value) or is_float(value) or is_nil(value),
+    do: Format.token_count(value)
+
+  def format_token_count(%Decimal{} = value), do: Format.token_count(value)
+  def format_token_count(value), do: value |> to_string() |> blank_to_nil() || "unknown"
 
   @spec format_integer(integer() | Decimal.t() | nil | term()) :: String.t()
   def format_integer(value) when is_integer(value) do
@@ -452,20 +460,6 @@ defmodule CodexPoolerWeb.Admin.ApiKeysReadModel do
   end
 
   defp positive_integer?(value), do: is_integer(value) and value > 0
-
-  defp format_usd(%Decimal{} = usd) do
-    usd
-    |> Decimal.round(2)
-    |> Decimal.to_string(:normal)
-    |> fixed_decimal_places(2)
-  end
-
-  defp fixed_decimal_places(value, places) do
-    case String.split(value, ".", parts: 2) do
-      [whole] -> whole <> "." <> String.duplicate("0", places)
-      [whole, fraction] -> whole <> "." <> String.pad_trailing(fraction, places, "0")
-    end
-  end
 
   defp dom_token(value) do
     value

@@ -4,6 +4,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents.Review do
   use CodexPoolerWeb, :html
 
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
+  alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.DateTimeDisplay
 
   attr :review_sections, :list, required: true
@@ -100,7 +101,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents.Review do
             No usage recorded yet
           </p>
           <p :if={@has_usage?} id={"#{@id}-totals"} class="text-sm text-base-content/70">
-            {format_integer(@usage.request_count)} requests · {format_integer(@usage.total_tokens)} tokens
+            {format_integer(@usage.request_count)} requests · {Format.token_count(@usage.total_tokens)} tokens
           </p>
           <p :if={@has_usage?} id={"#{@id}-cost"} class="text-sm text-base-content/70">
             {api_key_usage_cost_summary(@usage)}
@@ -148,7 +149,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents.Review do
   defp api_key_usage_limits(_usage), do: []
 
   defp api_key_usage_cost_summary(%{total_cost_usd: %Decimal{} = total_cost_usd}) do
-    "Cost $#{Decimal.to_string(total_cost_usd, :normal)}"
+    "Cost #{Format.money(total_cost_usd)}"
   end
 
   defp api_key_usage_cost_summary(%{total_cost_status: status}) when is_binary(status) do

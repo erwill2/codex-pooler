@@ -302,8 +302,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/api-keys")
 
     assert has_element?(view, "#api-key-row-#{used_key.id}-usage", "2 requests")
-    assert has_element?(view, "#api-key-row-#{used_key.id}-usage", "50,000 tokens")
-    assert has_element?(view, "#api-key-row-#{used_key.id}-usage", "10,500 cached input")
+    assert has_element?(view, "#api-key-row-#{used_key.id}-usage", "50k tokens")
+    assert has_element?(view, "#api-key-row-#{used_key.id}-usage", "10.5k cached input")
     assert has_element?(view, "#api-key-row-#{unused_key.id}-usage", "No usage recorded")
 
     html = render(view)
