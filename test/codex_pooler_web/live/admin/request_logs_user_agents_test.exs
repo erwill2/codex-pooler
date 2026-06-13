@@ -19,6 +19,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogsUserAgentsTest do
       assert %{kind: "openai_python", label: "OpenAI Python SDK"} =
                UserAgents.classify("OpenAI/Python 2.38.0")
 
+      assert %{kind: "openai_python", label: "OpenAI Python SDK"} =
+               UserAgents.classify("AsyncOpenAI/Python 2.36.0")
+
       assert %{kind: "openai_node", label: "OpenAI Node SDK"} =
                UserAgents.classify("OpenAI/JS 6.39.0")
 
@@ -37,6 +40,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsUserAgentsTest do
       assert %{kind: "opencode", label: "opencode"} = UserAgents.classify("opencode/0.15.0")
       assert %{kind: "openclaw", label: "OpenClaw"} = UserAgents.classify("OpenClaw/1.0")
       assert %{kind: "hermes", label: "Hermes Agent"} = UserAgents.classify("Hermes-Agent/0.9")
+      assert %{kind: "windmill", label: "Windmill"} = UserAgents.classify("windmill/beta")
       assert %{kind: "aider", label: "Aider"} = UserAgents.classify("aider/0.86.2")
       assert %{kind: "continue", label: "Continue"} = UserAgents.classify("Continue/1.5.45")
       assert %{kind: "cline", label: "Cline"} = UserAgents.classify("Cline/3.16.0")
