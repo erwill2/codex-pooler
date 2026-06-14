@@ -27,19 +27,17 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
 
   @spec from_websocket_body(binary()) :: usage()
   def from_websocket_body(body) when is_binary(body) do
-    case usage_from_sse_lines(body) do
-      %{status: "usage_known"} = usage ->
-        usage
+    line_or_message_usage =
+      best_usage(usage_from_sse_lines(body), from_delimited_json_messages(body))
 
-      _missing ->
-        from_delimited_json_messages(body) ||
-          usage_from_retained_usage_fragment(body) ||
-          %{status: "usage_unknown", source: "websocket_usage_missing"}
+    case best_usage(line_or_message_usage, usage_from_retained_usage_fragment(body)) do
+      %{status: "usage_known"} = usage -> usage
+      _missing -> %{status: "usage_unknown", source: "websocket_usage_missing"}
     end
   end
 
   defp from_sse_body(body, missing_source) do
-    usage_from_sse_lines(body) || usage_from_retained_usage_fragment(body) ||
+    best_usage(usage_from_sse_lines(body), usage_from_retained_usage_fragment(body)) ||
       %{status: "usage_unknown", source: missing_source}
   end
 
@@ -54,14 +52,33 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
   end
 
   defp usage_from_retained_usage_fragment(body) do
-    with {:ok, input_tokens} <- retained_int(body, ~r/"input_tokens"\s*:\s*(\d+)/),
-         {:ok, output_tokens} <- retained_int(body, ~r/"output_tokens"\s*:\s*(\d+)/),
-         {:ok, total_tokens} <- retained_int(body, ~r/"total_tokens"\s*:\s*(\d+)/) do
+    body
+    |> retained_usage_candidates()
+    |> Enum.reduce(nil, fn candidate, acc ->
+      case usage_from_retained_usage_candidate(candidate) do
+        %{status: "usage_known"} = usage -> usage
+        _missing -> acc
+      end
+    end)
+  end
+
+  defp retained_usage_candidates(body) do
+    ~r/"usage"\s*:/
+    |> Regex.scan(body, return: :index)
+    |> Enum.map(fn [{offset, _length} | _captures] ->
+      binary_part(body, offset, byte_size(body) - offset)
+    end)
+  end
+
+  defp usage_from_retained_usage_candidate(candidate) do
+    with {:ok, input_tokens} <- retained_int(candidate, ~r/"input_tokens"\s*:\s*(\d+)/),
+         {:ok, output_tokens} <- retained_int(candidate, ~r/"output_tokens"\s*:\s*(\d+)/),
+         {:ok, total_tokens} <- retained_int(candidate, ~r/"total_tokens"\s*:\s*(\d+)/) do
       %{
         "input_tokens" => input_tokens,
-        "cached_input_tokens" => retained_cached_input_tokens(body),
+        "cached_input_tokens" => retained_cached_input_tokens(candidate),
         "output_tokens" => output_tokens,
-        "reasoning_tokens" => retained_int_or_zero(body, ~r/"reasoning_tokens"\s*:\s*(\d+)/),
+        "reasoning_tokens" => retained_int_or_zero(candidate, ~r/"reasoning_tokens"\s*:\s*(\d+)/),
         "total_tokens" => total_tokens
       }
       |> normalize_usage(%{})
@@ -99,10 +116,10 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
   end
 
   defp usage_from_json_lines(lines) do
-    Enum.find_value(lines, fn line ->
+    Enum.reduce(lines, nil, fn line, acc ->
       case Jason.decode(line) do
-        {:ok, decoded} -> usage_from_decoded(decoded, false)
-        {:error, _reason} -> nil
+        {:ok, decoded} -> latest_usage_candidate(decoded, acc)
+        {:error, _reason} -> acc
       end
     end)
   end
@@ -117,17 +134,62 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
        do: normalize_usage(usage, response)
 
   defp usage_from_decoded(%{"output" => output}, default) when is_list(output) do
-    Enum.find_value(output, &usage_from_decoded(&1, false)) || maybe_default_usage(default)
+    latest_usage(output) || maybe_default_usage(default)
   end
 
   defp usage_from_decoded(_decoded, default), do: maybe_default_usage(default)
 
+  defp latest_usage(items) do
+    Enum.reduce(items, nil, fn item, acc ->
+      case usage_from_decoded(item, false) do
+        %{status: "usage_known"} = usage -> usage
+        %{status: "usage_unknown"} = usage -> acc || usage
+        nil -> acc
+      end
+    end)
+  end
+
+  defp latest_usage_candidate(decoded, acc) do
+    case usage_from_decoded(decoded, false) do
+      %{status: "usage_known"} = usage -> usage
+      %{status: "usage_unknown"} = usage -> acc || usage
+      nil -> acc
+    end
+  end
+
+  defp best_usage(nil, nil), do: nil
+
+  defp best_usage(%{status: "usage_known"} = usage, nil), do: usage
+  defp best_usage(nil, %{status: "usage_known"} = usage), do: usage
+
+  defp best_usage(
+         %{status: "usage_known"} = line_usage,
+         %{status: "usage_known"} = fragment_usage
+       ) do
+    if total_tokens(fragment_usage) > total_tokens(line_usage),
+      do: fragment_usage,
+      else: line_usage
+  end
+
+  defp best_usage(%{status: "usage_unknown"}, %{status: "usage_known"} = usage), do: usage
+  defp best_usage(%{status: "usage_known"} = usage, %{status: "usage_unknown"}), do: usage
+  defp best_usage(%{status: "usage_unknown"} = usage, nil), do: usage
+  defp best_usage(nil, %{status: "usage_unknown"} = usage), do: usage
+  defp best_usage(%{status: "usage_unknown"} = usage, _fragment_usage), do: usage
+  defp best_usage(_line_usage, %{status: "usage_unknown"} = usage), do: usage
+
+  defp total_tokens(%{total_tokens: total_tokens}) when is_integer(total_tokens), do: total_tokens
+  defp total_tokens(_usage), do: 0
+
   defp normalize_usage(usage, envelope) do
-    with {:ok, input_tokens} <- int_value(usage["input_tokens"] || usage["prompt_tokens"]),
-         {:ok, cached_input_tokens} <- int_value(cached_input_tokens(usage)),
-         {:ok, output_tokens} <- int_value(usage["output_tokens"] || usage["completion_tokens"]),
-         {:ok, reasoning_tokens} <- int_value(usage["reasoning_tokens"]),
-         {:ok, total_tokens} <- int_value(usage["total_tokens"]) do
+    with {:ok, input_tokens} <-
+           required_int_value(usage["input_tokens"] || usage["prompt_tokens"]),
+         {:ok, cached_input_tokens} <- optional_int_value(cached_input_tokens(usage)),
+         {:ok, output_tokens} <-
+           required_int_value(usage["output_tokens"] || usage["completion_tokens"]),
+         {:ok, reasoning_tokens} <- optional_int_value(usage["reasoning_tokens"]),
+         {:ok, total_tokens} <-
+           total_tokens_value(usage["total_tokens"], input_tokens, output_tokens) do
       %{
         status: "usage_known",
         source: "upstream_usage",
@@ -160,7 +222,18 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
   defp maybe_default_usage(true), do: %{status: "usage_unknown", source: "usage_missing"}
   defp maybe_default_usage(false), do: nil
 
-  defp int_value(nil), do: {:ok, 0}
+  defp total_tokens_value(nil, input_tokens, output_tokens),
+    do: {:ok, input_tokens + output_tokens}
+
+  defp total_tokens_value(value, _input_tokens, _output_tokens), do: required_int_value(value)
+
+  defp required_int_value(nil), do: :error
+  defp required_int_value(value), do: int_value(value)
+
+  defp optional_int_value(nil), do: {:ok, 0}
+  defp optional_int_value(value), do: int_value(value)
+
+  defp int_value(nil), do: :error
   defp int_value(value) when is_integer(value), do: {:ok, value}
   defp int_value(value) when is_float(value), do: :error
 

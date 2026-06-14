@@ -38,6 +38,17 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
               "response" => %{
                 "service_tier" => "default",
                 "usage" => %{
+                  "prompt_tokens" => 0,
+                  "prompt_tokens_details" => %{"cached_tokens" => 0},
+                  "completion_tokens" => 0,
+                  "total_tokens" => 0
+                }
+              }
+            },
+            %{
+              "response" => %{
+                "service_tier" => "default",
+                "usage" => %{
                   "prompt_tokens" => 2,
                   "prompt_tokens_details" => %{"cached_tokens" => 1},
                   "completion_tokens" => 3,
@@ -75,10 +86,13 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
   end
 
   describe "from_sse/1" do
-    test "extracts first valid usage payload from SSE data frames" do
+    test "extracts latest valid usage payload from SSE data frames" do
       body = """
       event: ping
       data: nope
+
+      event: response.in_progress
+      data: {"response":{"service_tier":"default","usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"total_tokens":0}}}
 
       event: response.completed
       data: {"response":{"service_tier":"flex","usage":{"input_tokens":3,"cached_input_tokens":2,"output_tokens":4,"total_tokens":7}}}
@@ -146,6 +160,35 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
              }
     end
 
+    test "prefers retained terminal usage over earlier zero-token SSE usage" do
+      body =
+        sse_event("response.in_progress", %{
+          "response" => %{
+            "usage" => %{
+              "input_tokens" => 0,
+              "cached_input_tokens" => 0,
+              "output_tokens" => 0,
+              "reasoning_tokens" => 0,
+              "total_tokens" => 0
+            }
+          }
+        }) <>
+          ~s(output_text":"truncated prefix) <>
+          ~s(","usage":{"input_tokens":16086,"input_tokens_details":{"cached_tokens":0},"output_tokens":117,"reasoning_tokens":0,"total_tokens":16203},"status":"completed"}}\n\n) <>
+          "data: [DONE]\n\n"
+
+      assert ResponseUsage.from_sse(body) == %{
+               status: "usage_known",
+               source: "upstream_usage",
+               input_tokens: 16_086,
+               cached_input_tokens: 0,
+               output_tokens: 117,
+               reasoning_tokens: 0,
+               total_tokens: 16_203,
+               service_tier: nil
+             }
+    end
+
     test "marks SSE without usage as unknown" do
       body = ~S"""
       data: {"type":"response.created"}
@@ -156,6 +199,44 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
 
       assert ResponseUsage.from_sse(body) ==
                %{status: "usage_unknown", source: "sse_usage_missing"}
+    end
+
+    test "marks empty terminal usage maps as unknown" do
+      body =
+        sse_event("response.completed", %{
+          "type" => "response.completed",
+          "response" => %{"usage" => %{}}
+        })
+
+      assert ResponseUsage.from_sse(body) ==
+               %{status: "usage_unknown", source: "invalid_usage_tokens"}
+    end
+
+    test "keeps explicit zero token usage as known" do
+      body =
+        sse_event("response.completed", %{
+          "type" => "response.completed",
+          "response" => %{
+            "usage" => %{
+              "input_tokens" => 0,
+              "cached_input_tokens" => 0,
+              "output_tokens" => 0,
+              "reasoning_tokens" => 0,
+              "total_tokens" => 0
+            }
+          }
+        })
+
+      assert ResponseUsage.from_sse(body) == %{
+               status: "usage_known",
+               source: "upstream_usage",
+               input_tokens: 0,
+               cached_input_tokens: 0,
+               output_tokens: 0,
+               reasoning_tokens: 0,
+               total_tokens: 0,
+               service_tier: nil
+             }
     end
   end
 
