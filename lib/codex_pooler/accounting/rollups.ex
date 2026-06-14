@@ -1,14 +1,18 @@
 defmodule CodexPooler.Accounting.Rollups do
   @moduledoc """
-  Daily rollup mutation, rebuild, and read helpers for accounting usage data.
+  Daily and hourly rollup mutation, rebuild, and read helpers for accounting usage data.
   """
 
   import Ecto.Query
 
-  alias CodexPooler.Accounting.{DailyRollup, LedgerEntry, Request}
+  alias CodexPooler.Accounting.{DailyRollup, HourlyModelUsageRollup, LedgerEntry, Request}
+  alias CodexPooler.Catalog.Model
   alias CodexPooler.Repo
 
+  @entry_settlement "settlement"
+  @amount_recorded "recorded"
   @usage_known "usage_known"
+  @unknown_model_code "Unknown model"
 
   @daily_rollup_rebuild_sql """
   WITH source AS MATERIALIZED (
@@ -225,8 +229,150 @@ defmodule CodexPooler.Accounting.Rollups do
     (SELECT count(*) FROM inserted)::bigint AS rollup_count
   """
 
+  @hourly_model_usage_rebuild_sql """
+  WITH source AS MATERIALIZED (
+    SELECT
+      date_trunc('hour', entry.occurred_at) AS bucket_started_at,
+      entry.id AS ledger_entry_id,
+      entry.occurred_at,
+      entry.created_at,
+      request.pool_id,
+      CASE
+        WHEN model.id IS NULL THEN NULL::uuid
+        ELSE request.model_id
+      END AS model_id,
+      CASE
+        WHEN model.id IS NULL THEN $4::text
+        ELSE model.exposed_model_id
+      END AS model_code,
+      request.status AS request_status,
+      COALESCE(request.retry_count, 0) AS retry_count,
+      COALESCE(entry.input_tokens, 0) AS input_tokens,
+      COALESCE(entry.cached_input_tokens, 0) AS cached_input_tokens,
+      COALESCE(entry.output_tokens, 0) AS output_tokens,
+      COALESCE(entry.reasoning_tokens, 0) AS reasoning_tokens,
+      COALESCE(entry.total_tokens, 0) AS total_tokens,
+      COALESCE(entry.estimated_cost_micros, 0::numeric) AS estimated_cost_micros,
+      CASE
+        WHEN entry.usage_status = 'usage_known' THEN COALESCE(entry.settled_cost_micros, 0::numeric)
+        ELSE 0::numeric
+      END AS settled_cost_micros
+    FROM public.ledger_entries AS entry
+    INNER JOIN public.requests AS request ON request.id = entry.request_id
+    LEFT JOIN public.models AS model
+      ON model.id = request.model_id
+      AND model.pool_id = request.pool_id
+    WHERE entry.entry_kind = 'settlement'
+      AND entry.amount_status = 'recorded'
+      AND request.model_id IS NOT NULL
+      AND entry.occurred_at >= $1
+      AND entry.occurred_at < $2
+  ),
+  aggregated AS (
+    SELECT
+      bucket_started_at,
+      pool_id,
+      model_id,
+      model_code,
+      count(*)::bigint AS request_count,
+      sum(CASE WHEN request_status = 'succeeded' THEN 1 ELSE 0 END)::bigint AS success_count,
+      sum(CASE WHEN request_status = 'succeeded' THEN 0 ELSE 1 END)::bigint AS failure_count,
+      sum(retry_count)::bigint AS retry_count,
+      sum(input_tokens)::bigint AS input_tokens,
+      sum(cached_input_tokens)::bigint AS cached_input_tokens,
+      sum(output_tokens)::bigint AS output_tokens,
+      sum(reasoning_tokens)::bigint AS reasoning_tokens,
+      sum(total_tokens)::bigint AS total_tokens,
+      sum(estimated_cost_micros) AS estimated_cost_micros,
+      sum(settled_cost_micros) AS settled_cost_micros
+    FROM source
+    GROUP BY
+      bucket_started_at,
+      pool_id,
+      model_id,
+      model_code
+  ),
+  deleted AS (
+    DELETE FROM public.hourly_model_usage_rollups AS rollup
+    WHERE rollup.bucket_started_at >= $1
+      AND rollup.bucket_started_at < $2
+      AND rollup.updated_at <= $3
+      AND NOT EXISTS (
+        SELECT 1
+        FROM aggregated AS aggregated_row
+        WHERE aggregated_row.bucket_started_at = rollup.bucket_started_at
+          AND aggregated_row.pool_id = rollup.pool_id
+          AND aggregated_row.model_code = rollup.model_code
+      )
+    RETURNING 1
+  ),
+  upserted AS (
+    INSERT INTO public.hourly_model_usage_rollups (
+      bucket_started_at,
+      pool_id,
+      model_id,
+      model_code,
+      request_count,
+      success_count,
+      failure_count,
+      retry_count,
+      input_tokens,
+      cached_input_tokens,
+      output_tokens,
+      reasoning_tokens,
+      total_tokens,
+      estimated_cost_micros,
+      settled_cost_micros,
+      created_at,
+      updated_at
+    )
+    SELECT
+      bucket_started_at,
+      pool_id,
+      model_id,
+      model_code,
+      request_count,
+      success_count,
+      failure_count,
+      retry_count,
+      input_tokens,
+      cached_input_tokens,
+      output_tokens,
+      reasoning_tokens,
+      total_tokens,
+      estimated_cost_micros,
+      settled_cost_micros,
+      $3,
+      $3
+    FROM aggregated
+    ON CONFLICT (bucket_started_at, pool_id, model_code) DO UPDATE SET
+      model_id = EXCLUDED.model_id,
+      request_count = EXCLUDED.request_count,
+      success_count = EXCLUDED.success_count,
+      failure_count = EXCLUDED.failure_count,
+      retry_count = EXCLUDED.retry_count,
+      input_tokens = EXCLUDED.input_tokens,
+      cached_input_tokens = EXCLUDED.cached_input_tokens,
+      output_tokens = EXCLUDED.output_tokens,
+      reasoning_tokens = EXCLUDED.reasoning_tokens,
+      total_tokens = EXCLUDED.total_tokens,
+      estimated_cost_micros = EXCLUDED.estimated_cost_micros,
+      settled_cost_micros = EXCLUDED.settled_cost_micros,
+      updated_at = EXCLUDED.updated_at
+    WHERE public.hourly_model_usage_rollups.updated_at <= $3
+    RETURNING 1
+  )
+  SELECT
+    (SELECT count(*) FROM source)::bigint AS settlement_count,
+    (SELECT count(*) FROM upserted)::bigint AS upserted_count,
+    (SELECT count(*) FROM deleted)::bigint AS deleted_count
+  """
+
   @spec accumulate!(Request.t(), LedgerEntry.t()) :: :ok
-  def accumulate!(%Request{} = request, %LedgerEntry{} = settlement) do
+  def accumulate!(
+        %Request{} = request,
+        %LedgerEntry{entry_kind: @entry_settlement, amount_status: @amount_recorded} = settlement
+      ) do
     delta = rollup_delta(request, settlement)
     date = DateTime.to_date(settlement.occurred_at || now())
 
@@ -270,8 +416,12 @@ defmodule CodexPooler.Accounting.Rollups do
       )
     end
 
+    upsert_hourly_model_usage_rollup!(request, settlement, delta)
+
     :ok
   end
+
+  def accumulate!(%Request{}, %LedgerEntry{}), do: :ok
 
   @spec list(term(), keyword()) :: [term()]
   def list(pool_or_id, opts \\ []) do
@@ -310,6 +460,119 @@ defmodule CodexPooler.Accounting.Rollups do
   end
 
   def rebuild_for_date(_date), do: {:error, :invalid_rollup_date}
+
+  @spec rebuild_hourly_model_usage_rollups_for_hour(DateTime.t()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def rebuild_hourly_model_usage_rollups_for_hour(%DateTime{} = bucket_started_at) do
+    started_at = hour_bucket(bucket_started_at)
+
+    rebuild_hourly_model_usage_rollups_for_range(
+      started_at,
+      DateTime.add(started_at, 3_600, :second)
+    )
+  end
+
+  def rebuild_hourly_model_usage_rollups_for_hour(_bucket_started_at),
+    do: {:error, :invalid_hourly_model_usage_rollup_hour}
+
+  @spec rebuild_hourly_model_usage_rollups_for_range(DateTime.t(), DateTime.t()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def rebuild_hourly_model_usage_rollups_for_range(
+        %DateTime{} = started_at,
+        %DateTime{} = ended_at
+      ) do
+    with {:ok, started_at} <- normalize_hour_boundary(started_at),
+         {:ok, ended_at} <- normalize_hour_boundary(ended_at),
+         true <- DateTime.compare(started_at, ended_at) == :lt do
+      rebuild_started_at = now()
+
+      Repo.transaction(fn ->
+        %{rows: [[settlement_count, _upserted_count, _deleted_count]]} =
+          Repo.query!(@hourly_model_usage_rebuild_sql, [
+            started_at,
+            ended_at,
+            rebuild_started_at,
+            @unknown_model_code
+          ])
+
+        settlement_count
+      end)
+      |> unwrap_transaction()
+    else
+      _error -> {:error, :invalid_hourly_model_usage_rollup_range}
+    end
+  end
+
+  def rebuild_hourly_model_usage_rollups_for_range(_started_at, _ended_at),
+    do: {:error, :invalid_hourly_model_usage_rollup_range}
+
+  defp upsert_hourly_model_usage_rollup!(request, settlement, delta) do
+    case hourly_model_identity(request) do
+      nil ->
+        :ok
+
+      identity ->
+        now = now()
+        bucket_started_at = hour_bucket(settlement.occurred_at || now)
+
+        attrs =
+          identity
+          |> Map.merge(delta)
+          |> Map.merge(%{
+            bucket_started_at: bucket_started_at,
+            pool_id: request.pool_id,
+            created_at: now,
+            updated_at: now
+          })
+
+        Repo.insert_all(HourlyModelUsageRollup, [attrs],
+          on_conflict: hourly_model_usage_increment_conflict(delta, identity.model_id, now),
+          conflict_target: [:bucket_started_at, :pool_id, :model_code]
+        )
+
+        :ok
+    end
+  end
+
+  defp hourly_model_usage_increment_conflict(delta, model_id, now) do
+    from rollup in HourlyModelUsageRollup,
+      update: [
+        set: [
+          model_id: ^model_id,
+          estimated_cost_micros:
+            fragment("? + EXCLUDED.estimated_cost_micros", rollup.estimated_cost_micros),
+          settled_cost_micros:
+            fragment("? + EXCLUDED.settled_cost_micros", rollup.settled_cost_micros),
+          updated_at: ^now
+        ],
+        inc: [
+          request_count: ^delta.request_count,
+          success_count: ^delta.success_count,
+          failure_count: ^delta.failure_count,
+          retry_count: ^delta.retry_count,
+          input_tokens: ^delta.input_tokens,
+          cached_input_tokens: ^delta.cached_input_tokens,
+          output_tokens: ^delta.output_tokens,
+          reasoning_tokens: ^delta.reasoning_tokens,
+          total_tokens: ^delta.total_tokens
+        ]
+      ]
+  end
+
+  defp hourly_model_identity(%Request{model_id: nil}), do: nil
+
+  defp hourly_model_identity(%Request{pool_id: pool_id, model_id: model_id}) do
+    case Repo.get_by(Model, id: model_id, pool_id: pool_id) do
+      %Model{exposed_model_id: model_code} when is_binary(model_code) ->
+        case String.trim(model_code) do
+          "" -> %{model_id: nil, model_code: @unknown_model_code}
+          code -> %{model_id: model_id, model_code: code}
+        end
+
+      nil ->
+        %{model_id: nil, model_code: @unknown_model_code}
+    end
+  end
 
   defp upsert_rollup!(identity, date, delta) do
     now = now()
@@ -393,6 +656,22 @@ defmodule CodexPooler.Accounting.Rollups do
   defp id_for(%{id: id}), do: id
   defp id_for(id) when is_binary(id), do: id
   defp id_for(_), do: nil
+
+  defp normalize_hour_boundary(%DateTime{} = datetime) do
+    datetime = datetime |> DateTime.shift_zone!("Etc/UTC") |> DateTime.truncate(:microsecond)
+
+    if hour_boundary?(datetime),
+      do: {:ok, datetime},
+      else: {:error, :not_hour_boundary}
+  end
+
+  defp hour_boundary?(%DateTime{minute: 0, second: 0, microsecond: {0, _precision}}), do: true
+  defp hour_boundary?(%DateTime{}), do: false
+
+  defp hour_bucket(%DateTime{} = datetime) do
+    datetime = datetime |> DateTime.shift_zone!("Etc/UTC") |> DateTime.truncate(:microsecond)
+    %{datetime | minute: 0, second: 0, microsecond: {0, 6}}
+  end
 
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
   defp unwrap_transaction({:ok, value}), do: {:ok, value}

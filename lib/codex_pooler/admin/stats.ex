@@ -191,6 +191,16 @@ defmodule CodexPooler.Admin.Stats do
         normalized.ended_at
       )
 
+    model_usage_report =
+      AccountingReporting.model_usage_buckets_for_pool_ids(
+        pool_ids,
+        normalized.window,
+        normalized.started_at,
+        normalized.ended_at
+      )
+
+    model_usage = model_usage_series(model_usage_report.rows, normalized)
+
     active_session_count = GatewayReadModel.active_session_count_for_pool_ids(pool_ids)
 
     turns =
@@ -235,7 +245,8 @@ defmodule CodexPooler.Admin.Stats do
       charts: %{
         requests: request_series(requests, normalized),
         tokens: token_series(settlements, normalized),
-        estimated_cost: cost_series(settlements, normalized)
+        estimated_cost: cost_series(settlements, normalized),
+        model_usage: model_usage
       },
       quota: %{
         summary: quota_summary,
@@ -248,7 +259,9 @@ defmodule CodexPooler.Admin.Stats do
           settlements,
           daily_rollups,
           turns,
-          activity_counts
+          activity_counts,
+          model_usage_report.source,
+          length(model_usage)
         ),
       empty_states: empty_states(requests, settlements, quota_accounts)
     }
@@ -283,13 +296,14 @@ defmodule CodexPooler.Admin.Stats do
       charts: %{
         requests: [],
         tokens: [],
-        estimated_cost: []
+        estimated_cost: [],
+        model_usage: []
       },
       quota: %{
         summary: quota_summary,
         accounts: []
       },
-      sources: source_summary([], [], [], [], [], %{audit_events: 0, jobs: 0}),
+      sources: source_summary([], [], [], [], [], %{audit_events: 0, jobs: 0}, nil, 0),
       empty_states: [
         %{
           code: :no_reporting_pools,
@@ -550,7 +564,16 @@ defmodule CodexPooler.Admin.Stats do
     end)
   end
 
-  defp source_summary(requests, attempts, settlements, daily_rollups, turns, activity_counts) do
+  defp source_summary(
+         requests,
+         attempts,
+         settlements,
+         daily_rollups,
+         turns,
+         activity_counts,
+         model_usage_source,
+         model_usage_rows
+       ) do
     %{
       requests: length(requests),
       attempts: length(attempts),
@@ -559,6 +582,8 @@ defmodule CodexPooler.Admin.Stats do
       codex_turns: length(turns),
       audit_events: activity_counts.audit_events,
       jobs: activity_counts.jobs,
+      model_usage_source: model_usage_source,
+      model_usage_rows: model_usage_rows,
       usage_source:
         if(daily_rollups == [], do: :raw_ledger_fallback, else: :raw_ledger_with_rollup_context)
     }
@@ -615,6 +640,130 @@ defmodule CodexPooler.Admin.Stats do
       }
     end)
   end
+
+  defp model_usage_series(rows, normalized) do
+    buckets = bucket_labels(normalized)
+    bucket_set = MapSet.new(buckets)
+
+    bucketed_rows =
+      rows
+      |> Enum.map(&normalize_model_usage_bucket(&1, normalized.window))
+      |> Enum.filter(&(&1.bucket in bucket_set and &1.model_code != ""))
+      |> aggregate_model_usage_rows()
+
+    ranked_models =
+      bucketed_rows
+      |> model_usage_totals()
+      |> Enum.filter(&(&1.total_tokens > 0))
+      |> Enum.sort_by(fn row -> {-row.total_tokens, -row.request_count, row.model_code} end)
+
+    top_model_codes =
+      ranked_models
+      |> Enum.take(5)
+      |> Enum.map(& &1.model_code)
+
+    other_model_codes =
+      ranked_models
+      |> Enum.drop(5)
+      |> Enum.map(& &1.model_code)
+
+    top_rows =
+      Enum.flat_map(top_model_codes, fn model_code ->
+        model_usage_rows_for_model(bucketed_rows, buckets, model_code)
+      end)
+
+    case other_model_codes do
+      [] ->
+        top_rows
+
+      _other_model_codes ->
+        top_rows ++ model_usage_rows_for_other(bucketed_rows, buckets, other_model_codes)
+    end
+  end
+
+  defp normalize_model_usage_bucket(row, window) do
+    %{
+      bucket: model_usage_bucket_label(row.bucket, window),
+      model_code: row.model_code || "",
+      request_count: model_usage_integer(row, :request_count),
+      input_tokens: model_usage_integer(row, :input_tokens),
+      cached_input_tokens: model_usage_integer(row, :cached_input_tokens),
+      output_tokens: model_usage_integer(row, :output_tokens),
+      reasoning_tokens: model_usage_integer(row, :reasoning_tokens),
+      total_tokens: model_usage_integer(row, :total_tokens),
+      estimated_cost_micros: model_usage_integer(row, :estimated_cost_micros),
+      settled_cost_micros: model_usage_integer(row, :settled_cost_micros)
+    }
+  end
+
+  defp model_usage_integer(row, field), do: Map.get(row, field) || 0
+
+  defp aggregate_model_usage_rows(rows) do
+    rows
+    |> Enum.group_by(&{&1.model_code, &1.bucket})
+    |> Map.new(fn {{model_code, bucket}, bucket_rows} ->
+      {{model_code, bucket}, aggregate_model_usage_row(model_code, bucket, bucket_rows)}
+    end)
+  end
+
+  defp model_usage_totals(bucketed_rows) do
+    bucketed_rows
+    |> Map.values()
+    |> Enum.group_by(& &1.model_code)
+    |> Enum.map(fn {model_code, rows} ->
+      %{
+        model_code: model_code,
+        request_count: sum_integer(rows, :request_count),
+        total_tokens: sum_integer(rows, :total_tokens)
+      }
+    end)
+  end
+
+  defp model_usage_rows_for_model(bucketed_rows, buckets, model_code) do
+    Enum.map(buckets, fn bucket ->
+      Map.get(bucketed_rows, {model_code, bucket}, empty_model_usage_row(model_code, bucket))
+    end)
+  end
+
+  defp model_usage_rows_for_other(bucketed_rows, buckets, other_model_codes) do
+    other_model_codes = MapSet.new(other_model_codes)
+
+    Enum.map(buckets, fn bucket ->
+      rows =
+        bucketed_rows
+        |> Map.values()
+        |> Enum.filter(&(&1.bucket == bucket and &1.model_code in other_model_codes))
+
+      aggregate_model_usage_row("Other", bucket, rows)
+    end)
+  end
+
+  defp aggregate_model_usage_row(model_code, bucket, rows) do
+    %{
+      bucket: bucket,
+      model_code: model_code,
+      request_count: sum_integer(rows, :request_count),
+      input_tokens: sum_integer(rows, :input_tokens),
+      cached_input_tokens: sum_integer(rows, :cached_input_tokens),
+      output_tokens: sum_integer(rows, :output_tokens),
+      reasoning_tokens: sum_integer(rows, :reasoning_tokens),
+      total_tokens: sum_integer(rows, :total_tokens),
+      estimated_cost_micros: sum_integer(rows, :estimated_cost_micros),
+      settled_cost_micros: sum_integer(rows, :settled_cost_micros)
+    }
+  end
+
+  defp empty_model_usage_row(model_code, bucket) do
+    aggregate_model_usage_row(model_code, bucket, [])
+  end
+
+  defp model_usage_bucket_label(%Date{} = date, _window), do: Date.to_iso8601(date)
+
+  defp model_usage_bucket_label(%DateTime{} = datetime, window),
+    do: bucket_label(datetime, window)
+
+  defp model_usage_bucket_label(bucket, _window) when is_binary(bucket), do: bucket
+  defp model_usage_bucket_label(_bucket, _window), do: nil
 
   defp bucket_labels(%{window: :seven_days, ended_at: ended_at}) do
     today = DateTime.to_date(ended_at)

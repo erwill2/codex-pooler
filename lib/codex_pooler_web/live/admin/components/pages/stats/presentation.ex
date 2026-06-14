@@ -25,7 +25,11 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
 
   def kpi_strip(assigns) do
     ~H"""
-    <AdminComponents.metric_strip id={@id}>
+    <section
+      id={@id}
+      class="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 min-[1900px]:grid-cols-8"
+      aria-label="Page metrics"
+    >
       <AdminComponents.metric_card
         id="stats-kpi-requests"
         icon="hero-arrow-path-rounded-square"
@@ -94,7 +98,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
         tone={quota_tone(@dashboard.kpis.quota_health.state)}
         compact_mobile
       />
-    </AdminComponents.metric_strip>
+    </section>
     """
   end
 
@@ -106,7 +110,49 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
       id="stats-api-key-surface"
       title="Top API keys"
     >
-      <div class="overflow-x-auto">
+      <div class="divide-y divide-base-300 md:hidden">
+        <p
+          :if={@rows == []}
+          id="stats-api-key-empty-card"
+          class="px-3 py-4 text-center text-sm text-base-content/60"
+        >
+          No settled API-key usage for this period.
+        </p>
+        <article
+          :for={{row, index} <- Enum.with_index(@rows)}
+          id={"stats-api-key-card-#{index}"}
+          class="grid gap-2 px-3 py-3"
+        >
+          <div class="flex min-w-0 items-start justify-between gap-3">
+            <div class="grid min-w-0 gap-1">
+              <h3 class="truncate text-sm font-semibold text-base-content">
+                {row.display_name || "API key not recorded"}
+              </h3>
+              <p class="truncate text-xs text-base-content/60">
+                {row.pool_name || "Pool not available"}
+              </p>
+            </div>
+            <span class="shrink-0 font-mono text-sm font-semibold tabular-nums">
+              {format_micros(row.estimated_cost_micros)}
+            </span>
+          </div>
+          <dl class="grid grid-cols-2 gap-2 text-xs">
+            <div>
+              <dt class="text-base-content/50">Requests</dt>
+              <dd class="font-mono font-semibold tabular-nums">
+                {format_integer(row.requests)}
+              </dd>
+            </div>
+            <div>
+              <dt class="text-base-content/50">Tokens</dt>
+              <dd class="font-mono font-semibold tabular-nums">
+                {Format.token_count(row.total_tokens)}
+              </dd>
+            </div>
+          </dl>
+        </article>
+      </div>
+      <div class="hidden overflow-x-auto md:block">
         <table id="stats-api-key-table" class="table table-zebra table-sm">
           <thead>
             <tr>
@@ -155,7 +201,44 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
       id="stats-upstream-surface"
       title="Upstream usage"
     >
-      <div class="overflow-x-auto">
+      <div class="divide-y divide-base-300 md:hidden">
+        <p
+          :if={@rows == []}
+          id="stats-upstream-empty-card"
+          class="px-3 py-4 text-center text-sm text-base-content/60"
+        >
+          No upstream assignments in this scope.
+        </p>
+        <article
+          :for={{row, index} <- Enum.with_index(@rows)}
+          id={"stats-upstream-card-#{index}"}
+          class="grid gap-2 px-3 py-3"
+        >
+          <div class="flex min-w-0 items-start justify-between gap-3">
+            <h3 class="min-w-0 truncate text-sm font-semibold text-base-content">
+              {row.assignment_label || row.upstream_label || "upstream account"}
+            </h3>
+            <span class={AdminBadges.status_chip_class(row.status)}>
+              {row.status || "unknown"}
+            </span>
+          </div>
+          <dl class="grid grid-cols-2 gap-2 text-xs">
+            <div>
+              <dt class="text-base-content/50">Requests</dt>
+              <dd class="font-mono font-semibold tabular-nums">
+                {format_integer(row.requests)}
+              </dd>
+            </div>
+            <div>
+              <dt class="text-base-content/50">Tokens</dt>
+              <dd class="font-mono font-semibold tabular-nums">
+                {Format.token_count(row.total_tokens)}
+              </dd>
+            </div>
+          </dl>
+        </article>
+      </div>
+      <div class="hidden overflow-x-auto md:block">
         <table id="stats-upstream-table" class="table table-zebra table-sm">
           <thead>
             <tr>

@@ -88,6 +88,66 @@ const formatChartValue = (value, kind) => {
       return formatChartNumber(value)
   }
 }
+const escapeChartHTML = value => String(value ?? "")
+  .replace(/&/g, "&amp;")
+  .replace(/</g, "&lt;")
+  .replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;")
+  .replace(/'/g, "&#39;")
+const buildChartTooltip = ({categories, series, unit, units, valueKinds, safeTooltip}) => {
+  const tooltip = {
+    shared: true,
+    intersect: false,
+    x: {show: true},
+    y: {
+      formatter: (value, {seriesIndex}) => {
+        const valueKind = valueKinds[seriesIndex] || units[seriesIndex] || unit
+        const formattedValue = formatChartValue(value, valueKind)
+
+        if (["money", "usd"].includes(valueKind)) return formattedValue
+
+        return `${formattedValue} ${units[seriesIndex] || unit}`
+      },
+      title: {formatter: seriesName => `${seriesName}: `},
+    },
+  }
+
+  if (!safeTooltip) return tooltip
+
+  return {
+    ...tooltip,
+    custom: ({series: values, dataPointIndex, w}) => {
+      const configSeries = w?.config?.series || series
+      const rows = configSeries.map((item, index) => {
+        const value = Number(values?.[index]?.[dataPointIndex] || 0)
+        const valueKind = valueKinds[index] || units[index] || unit
+        const formattedValue = formatChartValue(value, valueKind)
+        const suffix = ["money", "usd"].includes(valueKind) ? "" : ` ${units[index] || unit}`
+
+        return {
+          name: item.name || `Series ${index + 1}`,
+          value,
+          label: `${formattedValue}${suffix}`,
+        }
+      })
+      const visibleRows = rows.filter(row => row.value !== 0)
+      const renderedRows = visibleRows.length ? visibleRows : rows
+      const title = categories[dataPointIndex] || ""
+
+      return `
+        <div class="px-3 py-2 text-xs">
+          <div class="mb-1 font-semibold">${escapeChartHTML(title)}</div>
+          ${renderedRows.map(row => `
+            <div class="flex items-center justify-between gap-4">
+              <span>${escapeChartHTML(row.name)}</span>
+              <span class="font-semibold">${escapeChartHTML(row.label)}</span>
+            </div>
+          `).join("")}
+        </div>
+      `
+    },
+  }
+}
 const ClipboardCopy = {
   mounted() {
     this.el.addEventListener("click", async () => {
@@ -368,6 +428,7 @@ const ApexTimeSeriesChart = {
     const yaxisConfig = parseChartJSON(this.el.dataset.chartYaxis, null)
     const compact = this.el.dataset.chartCompact === "true"
     const stacked = this.el.dataset.chartStacked === "true"
+    const safeTooltip = this.el.dataset.chartSafeTooltip === "true"
     const showLegend = this.el.dataset.chartLegend
       ? this.el.dataset.chartLegend !== "false"
       : !compact
@@ -384,6 +445,14 @@ const ApexTimeSeriesChart = {
     const gridColor = resolveCssColor(this.el, "color-mix(in oklab, var(--color-base-content) 12%, transparent)")
     const seriesTypes = series.map(item => item.type || "column")
     const yaxis = buildChartYaxis({compact, axisColor, units, valueKinds, yaxisConfig})
+
+    if (!categories.length || !series.length) {
+      this.chart?.destroy()
+      this.chart = null
+      this.el.replaceChildren()
+      return
+    }
+
     const options = {
       chart: {
         type: "line",
@@ -431,22 +500,7 @@ const ApexTimeSeriesChart = {
         lineCap: "round",
         width: seriesTypes.map(type => type === "line" ? (compact ? 1.4 : 2) : 0),
       },
-      tooltip: {
-        shared: true,
-        intersect: false,
-        x: {show: true},
-        y: {
-          formatter: (value, {seriesIndex}) => {
-            const valueKind = valueKinds[seriesIndex] || units[seriesIndex] || unit
-            const formattedValue = formatChartValue(value, valueKind)
-
-            if (["money", "usd"].includes(valueKind)) return formattedValue
-
-            return `${formattedValue} ${units[seriesIndex] || unit}`
-          },
-          title: {formatter: seriesName => `${seriesName}: `},
-        },
-      },
+      tooltip: buildChartTooltip({categories, series, unit, units, valueKinds, safeTooltip}),
       xaxis: {
         categories,
         tickAmount: compact ? undefined : Math.min(Math.max(categories.length - 1, 1), 8),

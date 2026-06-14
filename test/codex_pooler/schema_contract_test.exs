@@ -17,7 +17,7 @@ defmodule CodexPooler.SchemaContractTest do
     AlertRuleChannel
   }
 
-  alias CodexPooler.Accounting.{DailyRollup, LedgerEntry, RequestLogFact}
+  alias CodexPooler.Accounting.{DailyRollup, HourlyModelUsageRollup, LedgerEntry, RequestLogFact}
   alias CodexPooler.Catalog.{Model, PricingSnapshot}
   alias CodexPooler.Files.FileRecord
   alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, RoutingCircuitState}
@@ -30,7 +30,7 @@ defmodule CodexPooler.SchemaContractTest do
   @expected_tables ~w(
     account_quota_windows alert_channels alert_delivery_attempts alert_incident_receipts alert_incident_targets alert_incidents
     alert_rule_channels alert_rules api_key_policy_bindings api_keys attempts audit_events bridge_owner_leases
-    bridge_session_aliases codex_files codex_sessions codex_turns daily_rollups
+    bridge_session_aliases codex_files codex_sessions codex_turns daily_rollups hourly_model_usage_rollups
     encrypted_secrets gateway_idempotency_keys instance_settings invite_acceptances invites ledger_entries memberships
     models operator_pool_assignments platform_bootstrap_state pricing_snapshots recovery_codes request_log_facts requests routing_circuit_states
     sessions sync_runs pools pool_routing_settings pool_upstream_assignments totp_settings
@@ -55,6 +55,7 @@ defmodule CodexPooler.SchemaContractTest do
     AlertRule,
     AlertRuleChannel,
     DailyRollup,
+    HourlyModelUsageRollup,
     LedgerEntry,
     RequestLogFact,
     CodexPooler.Audit.AuditEvent,
@@ -127,6 +128,9 @@ defmodule CodexPooler.SchemaContractTest do
           "ledger_entries_api_key_recorded_occurred_idx",
           "request_log_facts_latest_upstream_identity_request_idx",
           "daily_rollups_pool_uq",
+          "hourly_model_usage_rollups_bucket_pool_model_code_uq",
+          "hourly_model_usage_rollups_pool_bucket_model_idx",
+          "hourly_model_usage_rollups_model_bucket_pool_idx",
           "codex_sessions_pool_session_key_uq",
           "codex_turns_session_sequence_uq",
           "invite_acceptances_invite_id_uq",
@@ -169,6 +173,15 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert indexes["request_log_facts_latest_upstream_identity_request_idx"] =~
              "WHERE (latest_upstream_identity_id IS NOT NULL)"
+
+    assert indexes["hourly_model_usage_rollups_bucket_pool_model_code_uq"] =~
+             "(bucket_started_at, pool_id, model_code)"
+
+    assert indexes["hourly_model_usage_rollups_pool_bucket_model_idx"] =~
+             "(pool_id, bucket_started_at, model_code)"
+
+    assert indexes["hourly_model_usage_rollups_model_bucket_pool_idx"] =~
+             "(model_code, bucket_started_at, pool_id)"
 
     assert indexes["account_quota_windows_evidence_identity_uq"] =~ "quota_scope"
     assert indexes["requests_api_key_admitted_idx"] =~ "api_key_id"
@@ -293,6 +306,30 @@ defmodule CodexPooler.SchemaContractTest do
     assert constraints["upstream_oauth_flows_metadata_shape_check"] =~ "jsonb_typeof(metadata)"
     assert constraints["upstream_oauth_flows_interval_seconds_check"] =~ "interval_seconds > 0"
     assert constraints["upstream_oauth_flows_state_hash_shape_check"] =~ "octet_length"
+
+    assert constraints["hourly_model_usage_rollups_bucket_started_at_hour_check"] =~
+             "date_trunc('hour'"
+
+    assert constraints["hourly_model_usage_rollups_model_code_check"] =~ "btrim(model_code)"
+
+    for column <- [
+          "request_count",
+          "success_count",
+          "failure_count",
+          "retry_count",
+          "input_tokens",
+          "cached_input_tokens",
+          "output_tokens",
+          "reasoning_tokens",
+          "total_tokens",
+          "estimated_cost_micros",
+          "settled_cost_micros"
+        ] do
+      check = constraints["hourly_model_usage_rollups_#{column}_check"]
+
+      assert check =~ column
+      assert check =~ ">="
+    end
   end
 
   test "preserves JSONB, decimal-compatible money/rate fields, and integer token counters" do
@@ -338,10 +375,14 @@ defmodule CodexPooler.SchemaContractTest do
     assert column_type("pricing_snapshots", "request_base_micros") == "numeric(30,9)"
     assert column_type("ledger_entries", "estimated_cost_micros") == "numeric(30,9)"
     assert column_type("daily_rollups", "settled_cost_micros") == "numeric(30,9)"
+    assert column_type("hourly_model_usage_rollups", "estimated_cost_micros") == "numeric(30,9)"
+    assert column_type("hourly_model_usage_rollups", "settled_cost_micros") == "numeric(30,9)"
     assert column_type("account_quota_windows", "used_percent") == "numeric(6,3)"
 
     assert column_type("ledger_entries", "input_tokens") == "bigint"
     assert column_type("ledger_entries", "total_tokens") == "bigint"
+    assert column_type("hourly_model_usage_rollups", "request_count") == "bigint"
+    assert column_type("hourly_model_usage_rollups", "total_tokens") == "bigint"
     assert column_type("request_log_facts", "latest_input_tokens") == "bigint"
     assert column_type("request_log_facts", "latest_settled_cost_micros") == "bigint"
     assert column_type("request_log_facts", "latest_cached_input_cost_micros") == "bigint"
@@ -350,6 +391,13 @@ defmodule CodexPooler.SchemaContractTest do
              "timestamp without time zone"
 
     assert column_type("daily_rollups", "output_tokens") == "bigint"
+
+    assert column_type("hourly_model_usage_rollups", "bucket_started_at") ==
+             "timestamp without time zone"
+
+    assert column_type("hourly_model_usage_rollups", "pool_id") == "uuid"
+    assert column_type("hourly_model_usage_rollups", "model_id") == "uuid"
+    assert column_type("hourly_model_usage_rollups", "model_code") == "text"
     assert column_type("api_key_policy_bindings", "max_tokens_per_day") == "bigint"
     assert column_type("api_key_policy_bindings", "max_tokens_per_week") == "bigint"
     assert column_type("codex_files", "byte_size") == "bigint"
@@ -388,6 +436,7 @@ defmodule CodexPooler.SchemaContractTest do
     assert fk_action("request_log_facts_latest_pool_upstream_assignment_id_fkey") == {"n", "a"}
     assert fk_action("request_log_facts_latest_upstream_identity_id_fkey") == {"n", "a"}
     assert fk_action("request_log_facts_latest_settlement_entry_id_fkey") == {"n", "a"}
+    assert fk_action("hourly_model_usage_rollups_pool_id_fkey") == {"c", "a"}
     assert fk_action("codex_turns_final_attempt_id_request_id_fkey") == {"a", "a"}
     assert fk_action("codex_files_request_id_fkey") == {"n", "a"}
     assert fk_action("codex_files_pool_upstream_assignment_id_fkey") == {"n", "a"}
@@ -711,6 +760,47 @@ defmodule CodexPooler.SchemaContractTest do
     end
   end
 
+  test "hourly model usage rollups preserve the metadata-only storage contract" do
+    columns = table_columns("hourly_model_usage_rollups")
+
+    assert columns == %{
+             "id" => {"uuid", "NO"},
+             "bucket_started_at" => {"timestamp without time zone", "NO"},
+             "pool_id" => {"uuid", "NO"},
+             "model_id" => {"uuid", "YES"},
+             "model_code" => {"text", "NO"},
+             "request_count" => {"bigint", "NO"},
+             "success_count" => {"bigint", "NO"},
+             "failure_count" => {"bigint", "NO"},
+             "retry_count" => {"bigint", "NO"},
+             "input_tokens" => {"bigint", "NO"},
+             "cached_input_tokens" => {"bigint", "NO"},
+             "output_tokens" => {"bigint", "NO"},
+             "reasoning_tokens" => {"bigint", "NO"},
+             "total_tokens" => {"bigint", "NO"},
+             "estimated_cost_micros" => {"numeric", "NO"},
+             "settled_cost_micros" => {"numeric", "NO"},
+             "created_at" => {"timestamp without time zone", "NO"},
+             "updated_at" => {"timestamp without time zone", "NO"}
+           }
+
+    assert HourlyModelUsageRollup.__schema__(:source) == "hourly_model_usage_rollups"
+    assert HourlyModelUsageRollup.__schema__(:type, :bucket_started_at) == :utc_datetime_usec
+    assert HourlyModelUsageRollup.__schema__(:type, :pool_id) == :binary_id
+    assert HourlyModelUsageRollup.__schema__(:type, :model_id) == :binary_id
+    assert HourlyModelUsageRollup.__schema__(:type, :model_code) == :string
+    assert HourlyModelUsageRollup.__schema__(:type, :request_count) == :integer
+    assert HourlyModelUsageRollup.__schema__(:type, :total_tokens) == :integer
+    assert HourlyModelUsageRollup.__schema__(:type, :settled_cost_micros) == :decimal
+
+    for forbidden <- ~w(
+          prompt request_body response_body authorization cookie websocket_frame idempotency_key
+          request_metadata response_metadata details
+        ) do
+      refute Map.has_key?(columns, forbidden)
+    end
+  end
+
   test "operator pool assignments preserve the scoped admin grant storage contract" do
     columns = table_columns("operator_pool_assignments")
 
@@ -865,6 +955,7 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert LedgerEntry.__schema__(:type, :input_tokens) == :integer
     assert DailyRollup.__schema__(:type, :total_tokens) == :integer
+    assert HourlyModelUsageRollup.__schema__(:type, :total_tokens) == :integer
 
     assert APIKeyPolicyBinding.__schema__(:type, :max_tokens_per_day) ==
              :integer

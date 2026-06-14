@@ -247,6 +247,105 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       refute html =~ "raw prompt #{sensitive_marker}"
     end
 
+    test "renders model usage chart selectors and sanitized hook payload", %{
+      conn: conn,
+      scope: scope
+    } do
+      {:ok, pool} =
+        Pools.create_pool(scope, %{slug: "stats-model-usage-live", name: "Stats Model Usage"})
+
+      sensitive_marker = "model-usage-secret-do-not-render"
+
+      safe_model =
+        model_fixture(pool, %{
+          exposed_model_id: "gpt-5.5",
+          display_name: "Model Usage Display Name #{sensitive_marker}"
+        })
+
+      unsafe_model_code = "gpt-<img src=x onerror=alert(1)>"
+      escaped_unsafe_model_code = "gpt-&lt;img src=x onerror=alert(1)&gt;"
+
+      unsafe_model =
+        model_fixture(pool, %{
+          exposed_model_id: unsafe_model_code,
+          display_name: "Unsafe Model Usage Display Name #{sensitive_marker}"
+        })
+
+      as_of = ~U[2026-01-10 12:00:00.000000Z]
+      as_of_iso = DateTime.to_iso8601(as_of)
+
+      setup =
+        stats_model_usage_fixture(pool, safe_model, %{
+          sensitive_marker: sensitive_marker,
+          as_of: as_of,
+          total_tokens: 123,
+          input_tokens: 80,
+          cached_input_tokens: 10,
+          output_tokens: 30,
+          reasoning_tokens: 13
+        })
+
+      stats_model_usage_fixture(pool, unsafe_model, %{
+        sensitive_marker: sensitive_marker,
+        as_of: as_of,
+        correlation_id: "stats-model-usage-live-unsafe",
+        total_tokens: 7,
+        input_tokens: 4,
+        cached_input_tokens: 1,
+        output_tokens: 2,
+        reasoning_tokens: 1
+      })
+
+      {:ok, view, _html} =
+        live(conn, ~p"/admin/stats?pool_id=#{pool.id}&window=1h&as_of=#{as_of_iso}")
+
+      assert has_element?(view, "#stats-model-usage-chart")
+      assert has_element?(view, "#stats-model-usage-chart", "Model usage")
+      assert has_element?(view, "#stats-model-usage-chart", "130 tokens")
+
+      assert has_element?(
+               view,
+               "#stats-model-usage-chart-scroll[data-role='chart-scroll-region']"
+             )
+
+      assert has_element?(view, "#stats-model-usage-chart-scroll.overflow-x-auto")
+      assert has_element?(view, "#stats-model-usage-chart-plot.admin-chart-mobile-wide")
+      assert has_element?(view, "#stats-model-usage-chart-plot[phx-hook='ApexTimeSeriesChart']")
+      assert has_element?(view, "#stats-model-usage-chart-plot[phx-update='ignore']")
+      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-legend='false']")
+      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-safe-tooltip='true']")
+      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-stacked='true']")
+      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-categories]")
+      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-series]")
+      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-yaxis]")
+
+      chart_html = view |> element("#stats-model-usage-chart-plot") |> render()
+      series = chart_json_attribute(chart_html, "data-chart-series")
+      yaxis = chart_json_attribute(chart_html, "data-chart-yaxis")
+      series_names = Enum.map(series, & &1["name"])
+
+      assert "gpt-5.5" in series_names
+      assert escaped_unsafe_model_code in series_names
+      refute unsafe_model_code in series_names
+      assert [%{"seriesName" => yaxis_series_names}] = yaxis
+      assert "gpt-5.5" in yaxis_series_names
+      assert escaped_unsafe_model_code in yaxis_series_names
+      refute unsafe_model_code in yaxis_series_names
+      assert chart_html =~ "gpt-5.5"
+      assert chart_html =~ "&amp;lt;img src=x onerror=alert(1)&amp;gt;"
+      refute chart_html =~ "<img src=x onerror=alert(1)>"
+      refute chart_html =~ "Model Usage Display Name"
+      refute chart_html =~ "Unsafe Model Usage Display Name"
+      refute chart_html =~ sensitive_marker
+
+      html = render(view)
+      refute html =~ unsafe_model_code
+      refute html =~ "<img src=x onerror=alert(1)>"
+      refute html =~ setup.raw_key
+      refute html =~ "Bearer #{sensitive_marker}"
+      refute html =~ "raw prompt #{sensitive_marker}"
+    end
+
     test "filter form patches deterministic params and re-renders selected Pool values", %{
       conn: conn,
       scope: scope
@@ -735,6 +834,17 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-traffic-chart", "0 requests")
       assert has_element?(view, "#stats-traffic-chart", "0 tokens")
       assert has_element?(view, "#stats-token-cost-chart", "$0.00")
+      assert has_element?(view, "#stats-model-usage-chart", "0 tokens")
+
+      model_usage_chart_html = view |> element("#stats-model-usage-chart-plot") |> render()
+
+      assert chart_json_attribute(model_usage_chart_html, "data-chart-categories") == []
+      assert chart_json_attribute(model_usage_chart_html, "data-chart-series") == []
+      assert chart_json_attribute(model_usage_chart_html, "data-chart-units") == []
+      assert chart_json_attribute(model_usage_chart_html, "data-chart-value-kinds") == []
+
+      assert [%{"seriesName" => [], "title" => "tokens", "valueKind" => "tokens"}] =
+               chart_json_attribute(model_usage_chart_html, "data-chart-yaxis")
     end
 
     test "free plan weekly-only quota is not rendered as consumed or exhausted", %{
@@ -843,7 +953,18 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       #stats-kpi-quota-health
       #stats-traffic-chart
       #stats-token-cost-chart
+      #stats-model-usage-chart
     )
+  end
+
+  defp chart_json_attribute(html, attribute) do
+    html
+    |> LazyHTML.from_fragment()
+    |> LazyHTML.attribute(attribute)
+    |> case do
+      [value] -> Jason.decode!(value)
+      [] -> flunk("missing #{attribute} in chart HTML")
+    end
   end
 
   defp log_in_scoped_admin(conn, scope, assigned_pools) do
@@ -972,6 +1093,98 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
     })
 
     %{api_key: api_key, raw_key: raw_key, identity: identity, assignment: assignment}
+  end
+
+  defp stats_model_usage_fixture(pool, model, attrs) do
+    sensitive_marker = Map.fetch!(attrs, :sensitive_marker)
+
+    %{api_key: api_key, raw_key: raw_key} =
+      active_api_key_fixture(pool, %{
+        display_name: "Stats model usage key"
+      })
+
+    %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool)
+
+    bucket = attrs |> Map.fetch!(:as_of) |> truncate_to_hour()
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        model_id: model.id,
+        requested_model: "requested-#{model.exposed_model_id}",
+        correlation_id: Map.get(attrs, :correlation_id, "stats-model-usage-live"),
+        request_metadata: %{
+          "prompt" => "raw prompt #{sensitive_marker}",
+          "authorization" => "Bearer #{sensitive_marker}"
+        }
+      })
+      |> set_request_time!(bucket)
+
+    attempt =
+      request
+      |> attempt_fixture(assignment)
+      |> set_attempt_time!(bucket, %{latency_ms: 100})
+
+    ledger_entry_fixture(request, %{
+      attempt_id: attempt.id,
+      pool_upstream_assignment_id: assignment.id,
+      upstream_identity_id: identity.id,
+      total_tokens: Map.fetch!(attrs, :total_tokens),
+      input_tokens: Map.fetch!(attrs, :input_tokens),
+      cached_input_tokens: Map.fetch!(attrs, :cached_input_tokens),
+      output_tokens: Map.fetch!(attrs, :output_tokens),
+      reasoning_tokens: Map.fetch!(attrs, :reasoning_tokens),
+      estimated_cost_micros: 0,
+      details: %{"body" => sensitive_marker}
+    })
+    |> Ecto.Changeset.change(%{model_id: model.id, occurred_at: bucket, created_at: bucket})
+    |> Repo.update!()
+
+    insert_hourly_model_usage_rollup!(pool, model, bucket, attrs)
+
+    %{api_key: api_key, raw_key: raw_key, identity: identity, assignment: assignment}
+  end
+
+  defp insert_hourly_model_usage_rollup!(pool, model, bucket, attrs) do
+    total_tokens = Map.fetch!(attrs, :total_tokens)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    Repo.insert_all("hourly_model_usage_rollups", [
+      %{
+        bucket_started_at: truncate_to_hour(bucket),
+        pool_id: Ecto.UUID.dump!(pool.id),
+        model_id: Ecto.UUID.dump!(model.id),
+        model_code: model.exposed_model_id,
+        request_count: 1,
+        success_count: 1,
+        failure_count: 0,
+        retry_count: 0,
+        input_tokens: Map.fetch!(attrs, :input_tokens),
+        cached_input_tokens: Map.fetch!(attrs, :cached_input_tokens),
+        output_tokens: Map.fetch!(attrs, :output_tokens),
+        reasoning_tokens: Map.fetch!(attrs, :reasoning_tokens),
+        total_tokens: total_tokens,
+        estimated_cost_micros: Decimal.new(0),
+        settled_cost_micros: Decimal.new(0),
+        created_at: now,
+        updated_at: now
+      }
+    ])
+  end
+
+  defp set_request_time!(request, timestamp) do
+    request
+    |> Ecto.Changeset.change(%{admitted_at: timestamp, completed_at: timestamp})
+    |> Repo.update!()
+  end
+
+  defp set_attempt_time!(attempt, timestamp, attrs) do
+    attempt
+    |> Ecto.Changeset.change(Map.merge(%{started_at: timestamp, completed_at: timestamp}, attrs))
+    |> Repo.update!()
+  end
+
+  defp truncate_to_hour(datetime) do
+    %{datetime | minute: 0, second: 0, microsecond: {0, 6}}
   end
 
   defp insert_active_session!(pool, api_key, now) do
