@@ -12,6 +12,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       gateway_setup: 2,
       gateway_upstream: 4,
       mint_websocket_new!: 4,
+      pricing_config: 1,
+      pricing_snapshot!: 2,
       prime_routing_quota!: 1,
       public_websocket_receive_text!: 3,
       public_websocket_send_text!: 4,
@@ -25,11 +27,12 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     ]
 
   alias CodexPooler.Access
-  alias CodexPooler.Accounting.{Attempt, DailyRollup, Request, RequestLogs}
+  alias CodexPooler.Accounting.{Attempt, DailyRollup, LedgerEntry, Request, RequestLogs}
   alias CodexPooler.Events
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
 
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn, SessionContinuity}
 
@@ -770,6 +773,122 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.status == "succeeded"
+  end
+
+  test "POST /v1/responses streaming settles retained terminal usage and pricing", %{
+    conn: conn
+  } do
+    padding_unit = "retained terminal padding "
+
+    retained_padding =
+      String.duplicate(
+        padding_unit,
+        div(RetainedBody.max_bytes(), byte_size(padding_unit)) + 128
+      )
+
+    terminal_payload =
+      IO.iodata_to_binary([
+        ~s({"type":"response.completed","response":{"id":"resp_v1_retained_usage_terminal","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":),
+        Jason.encode!(retained_padding),
+        ~s(}]}],"usage":{"input_tokens":16,"input_tokens_details":{"cached_tokens":0},"output_tokens":5,"reasoning_tokens":0,"total_tokens":21},"service_tier":"flex"}})
+      ])
+
+    terminal_event = "event: response.completed\ndata: " <> terminal_payload <> "\n\n"
+    assert byte_size(terminal_event) > RetainedBody.max_bytes()
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.in_progress",
+           %{
+             "type" => "response.in_progress",
+             "response" => %{
+               "id" => "resp_v1_retained_usage_progress",
+               "status" => "in_progress",
+               "service_tier" => "auto",
+               "usage" => %{
+                 "input_tokens" => 0,
+                 "cached_input_tokens" => 0,
+                 "output_tokens" => 0,
+                 "reasoning_tokens" => 0,
+                 "total_tokens" => 0
+               }
+             }
+           }},
+          terminal_event
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    flex_pricing =
+      pricing_snapshot!(setup.model, %{
+        config: pricing_config(%{"service_tier" => "flex"}),
+        input_token_micros: Decimal.new(25),
+        output_token_micros: Decimal.new(50)
+      })
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic retained usage stream request",
+        "service_tier" => "auto",
+        "stream" => true
+      })
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+    assert conn.resp_body =~ "resp_v1_retained_usage_progress"
+    assert conn.resp_body =~ "resp_v1_retained_usage_terminal"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "http_sse"
+    assert request.status == "succeeded"
+    assert request.usage_status == "usage_known"
+    assert request.requested_service_tier == "auto"
+    assert request.actual_service_tier == "flex"
+    assert request.service_tier == "flex"
+    assert request.request_metadata["pricing"]["status"] == "priced"
+    assert request.request_metadata["pricing"]["actual_service_tier"] == "flex"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+    assert attempt.usage_status == "usage_known"
+
+    settlement =
+      Repo.get_by!(LedgerEntry,
+        request_id: request.id,
+        entry_kind: "settlement",
+        amount_status: "recorded"
+      )
+
+    assert settlement.usage_status == "usage_known"
+    assert settlement.input_tokens == 16
+    assert settlement.cached_input_tokens == nil
+    assert settlement.output_tokens == 5
+    assert settlement.reasoning_tokens == nil
+    assert settlement.total_tokens == 21
+    assert settlement.pricing_snapshot_id == flex_pricing.id
+    assert Decimal.equal?(settlement.settled_cost_micros, Decimal.new(650))
+    assert settlement.details["pricing_status"] == "priced"
+    assert settlement.details["actual_service_tier"] == "flex"
+    assert settlement.details["settled_cost_micros"] == "650.000000000"
+
+    assert %{items: [log], total: 1} =
+             RequestLogs.list(setup.pool, filters: %{request_id: request.id})
+
+    assert log.usage_status == "usage_known"
+    assert log.requested_service_tier == "auto"
+    assert log.actual_service_tier == "flex"
+    assert log.token_counts.input_tokens == 16
+    assert log.token_counts.output_tokens == 5
+    assert log.token_counts.total_tokens == 21
+    assert log.cost.status == "priced"
+    assert Decimal.positive?(log.cost.usd)
   end
 
   test "POST /v1/responses rejects unsafe reasoning effort before dispatch", %{conn: conn} do

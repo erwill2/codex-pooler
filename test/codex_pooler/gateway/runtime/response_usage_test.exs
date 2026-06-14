@@ -164,6 +164,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
       body =
         sse_event("response.in_progress", %{
           "response" => %{
+            "service_tier" => "standard",
             "usage" => %{
               "input_tokens" => 0,
               "cached_input_tokens" => 0,
@@ -173,7 +174,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
             }
           }
         }) <>
-          ~s(output_text":"truncated prefix) <>
+          ~s("service_tier":"flex","output_text":"truncated prefix) <>
           ~s(","usage":{"input_tokens":16086,"input_tokens_details":{"cached_tokens":0},"output_tokens":117,"reasoning_tokens":0,"total_tokens":16203},"status":"completed"}}\n\n) <>
           "data: [DONE]\n\n"
 
@@ -185,8 +186,75 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsageTest do
                output_tokens: 117,
                reasoning_tokens: 0,
                total_tokens: 16_203,
-               service_tier: nil
+               service_tier: "flex"
              }
+    end
+
+    test "uses retained service tier serialized after terminal usage" do
+      json_like_output_text =
+        String.duplicate(
+          ~s({"usage":{"input_tokens":999,"output_tokens":999,"total_tokens":1998},"service_tier":"printed"}),
+          80
+        )
+
+      body =
+        sse_event("response.in_progress", %{
+          "response" => %{
+            "service_tier" => "auto",
+            "usage" => %{
+              "input_tokens" => 0,
+              "cached_input_tokens" => 0,
+              "output_tokens" => 0,
+              "reasoning_tokens" => 0,
+              "total_tokens" => 0
+            }
+          }
+        }) <>
+          ~s(output_text":"truncated prefix) <>
+          ~s(","usage":{"input_tokens":16,"input_tokens_details":{"cached_tokens":0},"output_tokens":5,"reasoning_tokens":0,"total_tokens":21},"output_text":) <>
+          Jason.encode!(json_like_output_text) <>
+          ~s(,"service_tier":"flex","status":"completed"}}\n\n) <>
+          "data: [DONE]\n\n"
+
+      assert ResponseUsage.from_sse(body) == %{
+               status: "usage_known",
+               source: "upstream_usage",
+               input_tokens: 16,
+               cached_input_tokens: 0,
+               output_tokens: 5,
+               reasoning_tokens: 0,
+               total_tokens: 21,
+               service_tier: "flex"
+             }
+    end
+
+    test "inherits stream service tier when retained terminal usage starts at usage" do
+      body =
+        sse_event("response.in_progress", %{
+          "response" => %{
+            "service_tier" => "priority",
+            "usage" => %{
+              "input_tokens" => 0,
+              "cached_input_tokens" => 0,
+              "output_tokens" => 0,
+              "reasoning_tokens" => 0,
+              "total_tokens" => 0
+            }
+          }
+        }) <>
+          ~s(output_text":"truncated prefix) <>
+          ~s(","usage":{"input_tokens":11,"cached_input_tokens":2,"output_tokens":5,"reasoning_tokens":1,"total_tokens":16},"status":"completed"}}\n\n) <>
+          "data: [DONE]\n\n"
+
+      assert %{
+               status: "usage_known",
+               input_tokens: 11,
+               cached_input_tokens: 2,
+               output_tokens: 5,
+               reasoning_tokens: 1,
+               total_tokens: 16,
+               service_tier: "priority"
+             } = ResponseUsage.from_sse(body)
     end
 
     test "marks SSE without usage as unknown" do

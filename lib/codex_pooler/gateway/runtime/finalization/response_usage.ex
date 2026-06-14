@@ -14,6 +14,10 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
           optional(:service_tier) => String.t() | nil
         }
 
+  @retained_usage_context_bytes 4_096
+  @usage_field_pattern ~r/(?<!\\)"usage"\s*:/
+  @service_tier_pattern ~r/(?<!\\)"service_tier"\s*:\s*"([^"\\]+)"/
+
   @spec from_json(binary()) :: usage()
   def from_json(body) when is_binary(body) do
     case Jason.decode(body) do
@@ -63,28 +67,132 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
   end
 
   defp retained_usage_candidates(body) do
-    ~r/"usage"\s*:/
+    @usage_field_pattern
     |> Regex.scan(body, return: :index)
     |> Enum.map(fn [{offset, _length} | _captures] ->
-      binary_part(body, offset, byte_size(body) - offset)
+      record_offset = retained_record_start(body, offset)
+      context_offset = max(offset - @retained_usage_context_bytes, record_offset)
+
+      %{
+        context_prefix: binary_part(body, context_offset, offset - context_offset),
+        usage_fragment: binary_part(body, offset, byte_size(body) - offset)
+      }
     end)
   end
 
-  defp usage_from_retained_usage_candidate(candidate) do
-    with {:ok, input_tokens} <- retained_int(candidate, ~r/"input_tokens"\s*:\s*(\d+)/),
-         {:ok, output_tokens} <- retained_int(candidate, ~r/"output_tokens"\s*:\s*(\d+)/),
-         {:ok, total_tokens} <- retained_int(candidate, ~r/"total_tokens"\s*:\s*(\d+)/) do
+  defp retained_record_start(body, offset) do
+    body
+    |> binary_part(0, offset)
+    |> :binary.matches("\n")
+    |> List.last()
+    |> case do
+      {newline_offset, _length} -> newline_offset + 1
+      nil -> 0
+    end
+  end
+
+  defp usage_from_retained_usage_candidate(%{
+         context_prefix: context_prefix,
+         usage_fragment: usage_fragment
+       }) do
+    with {:ok, input_tokens} <- retained_int(usage_fragment, ~r/"input_tokens"\s*:\s*(\d+)/),
+         {:ok, output_tokens} <- retained_int(usage_fragment, ~r/"output_tokens"\s*:\s*(\d+)/),
+         {:ok, total_tokens} <- retained_int(usage_fragment, ~r/"total_tokens"\s*:\s*(\d+)/) do
       %{
         "input_tokens" => input_tokens,
-        "cached_input_tokens" => retained_cached_input_tokens(candidate),
+        "cached_input_tokens" => retained_cached_input_tokens(usage_fragment),
         "output_tokens" => output_tokens,
-        "reasoning_tokens" => retained_int_or_zero(candidate, ~r/"reasoning_tokens"\s*:\s*(\d+)/),
+        "reasoning_tokens" =>
+          retained_int_or_zero(usage_fragment, ~r/"reasoning_tokens"\s*:\s*(\d+)/),
         "total_tokens" => total_tokens
       }
-      |> normalize_usage(%{})
+      |> normalize_usage(%{
+        "service_tier" => retained_service_tier(context_prefix, usage_fragment)
+      })
     else
       :error -> nil
     end
+  end
+
+  defp retained_service_tier(context_prefix, usage_fragment) do
+    retained_service_tier_after_usage(usage_fragment) ||
+      retained_service_tier_before_usage(context_prefix)
+  end
+
+  defp retained_service_tier_after_usage(usage_fragment) do
+    usage_fragment
+    |> retained_suffix_after_usage_object()
+    |> retained_line_suffix()
+    |> retained_service_tier_matches()
+    |> List.first()
+  end
+
+  defp retained_service_tier_before_usage(context_prefix) do
+    context_prefix
+    |> retained_service_tier_matches()
+    |> List.last()
+  end
+
+  defp retained_suffix_after_usage_object(usage_fragment) do
+    with {object_offset, _length} <- :binary.match(usage_fragment, "{"),
+         {:ok, object_end} <- json_object_end(usage_fragment, object_offset) do
+      binary_part(usage_fragment, object_end, byte_size(usage_fragment) - object_end)
+    else
+      _missing_or_incomplete -> ""
+    end
+  end
+
+  defp json_object_end(binary, object_offset),
+    do: scan_json_object(binary, object_offset, 0, false, false)
+
+  defp scan_json_object(binary, offset, _depth, _in_string?, _escaped?)
+       when offset >= byte_size(binary),
+       do: :error
+
+  defp scan_json_object(binary, offset, depth, true, true),
+    do: scan_json_object(binary, offset + 1, depth, true, false)
+
+  defp scan_json_object(binary, offset, depth, true, false) do
+    case :binary.at(binary, offset) do
+      ?\\ -> scan_json_object(binary, offset + 1, depth, true, true)
+      ?" -> scan_json_object(binary, offset + 1, depth, false, false)
+      _other -> scan_json_object(binary, offset + 1, depth, true, false)
+    end
+  end
+
+  defp scan_json_object(binary, offset, depth, false, false) do
+    case :binary.at(binary, offset) do
+      ?" ->
+        scan_json_object(binary, offset + 1, depth, true, false)
+
+      ?{ ->
+        scan_json_object(binary, offset + 1, depth + 1, false, false)
+
+      ?} when depth == 1 ->
+        {:ok, offset + 1}
+
+      ?} when depth > 1 ->
+        scan_json_object(binary, offset + 1, depth - 1, false, false)
+
+      ?} ->
+        :error
+
+      _other ->
+        scan_json_object(binary, offset + 1, depth, false, false)
+    end
+  end
+
+  defp retained_line_suffix(body) do
+    case :binary.match(body, "\n") do
+      {newline_offset, _length} -> binary_part(body, 0, newline_offset)
+      :nomatch -> body
+    end
+  end
+
+  defp retained_service_tier_matches(body) do
+    @service_tier_pattern
+    |> Regex.scan(body, capture: :all_but_first)
+    |> Enum.map(fn [tier] -> tier end)
   end
 
   defp retained_cached_input_tokens(body) do
@@ -167,7 +275,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
          %{status: "usage_known"} = fragment_usage
        ) do
     if total_tokens(fragment_usage) > total_tokens(line_usage),
-      do: fragment_usage,
+      do: inherit_missing_service_tier(fragment_usage, line_usage),
       else: line_usage
   end
 
@@ -180,6 +288,15 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
 
   defp total_tokens(%{total_tokens: total_tokens}) when is_integer(total_tokens), do: total_tokens
   defp total_tokens(_usage), do: 0
+
+  defp inherit_missing_service_tier(%{service_tier: tier} = usage, _fallback)
+       when is_binary(tier),
+       do: usage
+
+  defp inherit_missing_service_tier(usage, %{service_tier: tier}) when is_binary(tier),
+    do: Map.put(usage, :service_tier, tier)
+
+  defp inherit_missing_service_tier(usage, _fallback), do: usage
 
   defp normalize_usage(usage, envelope) do
     with {:ok, input_tokens} <-
