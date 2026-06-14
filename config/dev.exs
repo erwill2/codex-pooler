@@ -1,11 +1,20 @@
 import Config
 
+dev_postgres_user = System.get_env("CODEX_POOLER_DEV_POSTGRES_USER", "postgres")
+dev_postgres_password = System.get_env("CODEX_POOLER_DEV_POSTGRES_PASSWORD", "postgres")
+dev_postgres_host = System.get_env("CODEX_POOLER_DEV_POSTGRES_HOST", "localhost")
+
+dev_postgres_port =
+  System.get_env("CODEX_POOLER_DEV_POSTGRES_PORT") || System.get_env("POSTGRES_PORT", "5433")
+
+dev_postgres_database = System.get_env("CODEX_POOLER_DEV_POSTGRES_DB", "codex_pooler_dev")
+
 config :codex_pooler, CodexPooler.Repo,
-  username: System.get_env("POSTGRES_USER", "postgres"),
-  password: System.get_env("POSTGRES_PASSWORD", "postgres"),
-  hostname: System.get_env("POSTGRES_HOST", "localhost"),
-  port: String.to_integer(System.get_env("POSTGRES_PORT", "5433")),
-  database: System.get_env("POSTGRES_DB", "codex_pooler_dev"),
+  username: dev_postgres_user,
+  password: dev_postgres_password,
+  hostname: dev_postgres_host,
+  port: String.to_integer(dev_postgres_port),
+  database: dev_postgres_database,
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
   pool_size: 10

@@ -2,15 +2,30 @@ import Config
 
 config :argon2_elixir, t_cost: 1, m_cost: 8
 
+test_postgres_user =
+  System.get_env("CODEX_POOLER_TEST_POSTGRES_USER") || System.get_env("POSTGRES_USER", "postgres")
+
+test_postgres_password = System.get_env("CODEX_POOLER_TEST_POSTGRES_PASSWORD", "postgres")
+
+test_postgres_host =
+  System.get_env("CODEX_POOLER_TEST_POSTGRES_HOST") ||
+    System.get_env("POSTGRES_HOST", "localhost")
+
+test_postgres_port =
+  System.get_env("CODEX_POOLER_TEST_POSTGRES_PORT") || System.get_env("POSTGRES_PORT", "5433")
+
+test_postgres_database =
+  System.get_env("CODEX_POOLER_TEST_POSTGRES_DB") ||
+    System.get_env("POSTGRES_TEST_DB", "codex_pooler_test")
+
 # The MIX_TEST_PARTITION environment variable can be used
 # to fan out isolated test databases in CI.
 config :codex_pooler, CodexPooler.Repo,
-  username: System.get_env("POSTGRES_USER", "postgres"),
-  password: System.get_env("POSTGRES_PASSWORD", "postgres"),
-  hostname: System.get_env("POSTGRES_HOST", "localhost"),
-  port: String.to_integer(System.get_env("POSTGRES_PORT", "5433")),
-  database:
-    "#{System.get_env("POSTGRES_TEST_DB", "codex_pooler_test")}#{System.get_env("MIX_TEST_PARTITION")}",
+  username: test_postgres_user,
+  password: test_postgres_password,
+  hostname: test_postgres_host,
+  port: String.to_integer(test_postgres_port),
+  database: "#{test_postgres_database}#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: System.schedulers_online() * 2
 
