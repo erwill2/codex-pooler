@@ -180,13 +180,20 @@ operator MCP entry, change its `url` to `https://codex-pooler.example.com/mcp`.
 </details>
 
 <details>
-<summary><img src=".github/assets/codex-cli-favicon.png" alt="OpenAI logo" width="16" height="16"> Codex <code>~/.codex/config.toml</code></summary>
+<summary><img src=".github/assets/codex-cli-favicon.png" alt="Codex logo" width="16" height="16"> Codex CLI and Codex Desktop <code>~/.codex/config.toml</code></summary>
 
-![Codex Pooler Codex CLI integration](.github/assets/codex-pooler-codex.png)
+![Codex Pooler integration for Codex CLI and Codex Desktop](.github/assets/codex-pooler-codex.png)
 
-Codex should use the backend compatibility route, not the `/v1` SDK route.
-Keep the provider `name` as `OpenAI`; Codex uses that value for provider-family
-behavior even when the request is routed through Codex Pooler.
+Codex CLI and Codex Desktop should use the backend compatibility route, not the
+`/v1` SDK route. They share the same Codex configuration layers and user-level
+`~/.codex/config.toml`, so one Codex Pooler provider block can serve the terminal
+and desktop/IDE experience. Keep the provider `name` as `OpenAI`; Codex uses that
+value for provider-family behavior even when the request is routed through Codex
+Pooler.
+
+Put provider and auth settings in the user-level config file. Codex's
+project-local `.codex/config.toml` layers are trust-gated and do not override
+machine-local provider keys such as `model_provider` or `model_providers`.
 
 ```toml
 model = "gpt-5.5"
@@ -214,36 +221,38 @@ url = "http://localhost:4000/mcp"
 bearer_token_env_var = "CODEX_POOLER_MCP_KEY"
 ```
 
-Use the websocket provider for normal Codex backend behavior, and keep the HTTP
-provider when you need to force SSE-only coverage. For deployed instances,
-change both `base_url` values to `https://codex-pooler.example.com/backend-api/codex`;
-if you keep the optional operator MCP add-on, change its `url` to
-`https://codex-pooler.example.com/mcp`.
+Use the websocket provider for normal Codex CLI and Codex Desktop backend
+behavior, and keep the HTTP provider when you need to force SSE-only coverage.
+For deployed instances, change both `base_url` values to
+`https://codex-pooler.example.com/backend-api/codex`; if you keep the optional
+operator MCP add-on, change its `url` to `https://codex-pooler.example.com/mcp`.
 
 Codex filters resumable conversations by `model_provider`. If you already have
-sessions created with the built-in `openai` provider and want them to appear
-under `codex-pooler-ws`, re-tag both the JSONL transcripts and the newer SQLite
-state database. Run these with Codex closed; they edit local state in place. The
-transcript rewrite scans the whole sessions directory and can take a while on
-large installs. Set `TO_PROVIDER=codex-pooler-http` if you made the HTTP
-provider your default.
+Codex CLI or Codex Desktop sessions created with the built-in `openai` provider
+and want them to appear under `codex-pooler-ws`, re-tag both the JSONL
+transcripts and the newer SQLite state database. Close Codex first; these
+commands edit local Codex state in place. If you made the HTTP provider your
+default, replace only the destination value `codex-pooler-ws` with
+`codex-pooler-http` before copying.
+
+macOS default shell is zsh. Run these two zsh one-liners:
+
+```zsh
+if [ -d "$HOME/.codex/sessions" ]; then find "$HOME/.codex/sessions" -type f -name '*.jsonl' -exec perl -0pi -e 's/("model_provider"\s*:\s*)"openai"/$1"codex-pooler-ws"/g' {} +; fi
+```
+
+```zsh
+for db in "$HOME"/.codex/state_*.sqlite(N); do sqlite3 "$db" "UPDATE threads SET model_provider = 'codex-pooler-ws' WHERE model_provider = 'openai';"; done
+```
+
+Linux default examples assume bash. Run these two bash one-liners:
 
 ```bash
-set -eu
+if [ -d "$HOME/.codex/sessions" ]; then find "$HOME/.codex/sessions" -type f -name '*.jsonl' -exec perl -0pi -e 's/("model_provider"\s*:\s*)"openai"/$1"codex-pooler-ws"/g' {} +; fi
+```
 
-FROM_PROVIDER="openai"
-TO_PROVIDER="codex-pooler-ws"
-
-find ~/.codex/sessions -type f -name '*.jsonl' \
-  -exec perl -pi -e \
-    "s/\"model_provider\":\"${FROM_PROVIDER}\"/\"model_provider\":\"${TO_PROVIDER}\"/g" \
-    {} +
-
-for db in ~/.codex/state_*.sqlite; do
-  [ -e "$db" ] || continue
-  sqlite3 "$db" \
-    "UPDATE threads SET model_provider = '${TO_PROVIDER}' WHERE model_provider = '${FROM_PROVIDER}';"
-done
+```bash
+for db in "$HOME"/.codex/state_*.sqlite; do [ -e "$db" ] || continue; sqlite3 "$db" "UPDATE threads SET model_provider = 'codex-pooler-ws' WHERE model_provider = 'openai';"; done
 ```
 
 On Windows, run the same migration from PowerShell. This expects `sqlite3` to be
