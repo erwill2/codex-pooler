@@ -36,6 +36,7 @@ RUNBOOK.md
 /scripts/dev/
 /scripts/smoke/
 /.agents/
+/.kilo/
 /.codex/
 /.playwright-mcp/
 /.sisyphus/
