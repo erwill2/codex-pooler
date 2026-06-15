@@ -89,8 +89,6 @@ omp --model codex-pooler/gpt-5.5:xhigh \
 
 OMP is a Pi fork, but it is not configured from Pi's files. Pi uses the `pi` binary and `~/.pi/agent/models.json`; OMP uses the `omp` binary, `~/.omp/agent/models.yml`, and `modelRoles` in `~/.omp/agent/config.yml`.
 
-Keep the setup pages separate so operators don't copy a Pi JSON provider into OMP's YAML config, or miss OMP's role mapping.
-
 ## MCP boundary
 
 OMP model requests use Codex Pooler's narrow OpenAI-compatible `/v1` support for selected SDK routes. Codex Pooler doesn't provide full OpenAI API parity.
