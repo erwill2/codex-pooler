@@ -2,6 +2,7 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.AccountsFixtures
+  import CodexPooler.AccountingTestSupport
   import CodexPooler.PoolerFixtures
 
   alias CodexPooler.Accounting
@@ -241,6 +242,75 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     assert log.token_counts.total_tokens == 18
     assert log.cost.status == "priced"
     assert Decimal.equal?(log.cost.usd, Decimal.new("0.123456"))
+  end
+
+  test "request logs project suffix-inferred settlement pricing as priced" do
+    setup = accounting_setup()
+    unique = System.unique_integer([:positive])
+    base_identifier = "gpt-request-log-codex-#{unique}"
+    suffix_identifier = "#{base_identifier}-spark"
+
+    inferred_model =
+      model_fixture(setup.pool, %{
+        exposed_model_id: suffix_identifier,
+        upstream_model_id: suffix_identifier,
+        pricing_ref: suffix_identifier
+      })
+
+    pricing =
+      pricing_snapshot_fixture(setup.pricing, %{
+        model_identifier: base_identifier,
+        input_token_micros: Decimal.new(100),
+        output_token_micros: Decimal.new(200)
+      })
+
+    expected_alias = %{
+      "source" => "suffix_inference",
+      "from" => suffix_identifier,
+      "to" => base_identifier
+    }
+
+    assert {:ok, reserved} =
+             Accounting.reserve(
+               setup.auth,
+               inferred_model,
+               %{"model" => inferred_model.exposed_model_id, "max_output_tokens" => 3},
+               %{correlation_id: "req-log-suffix-priced-#{unique}"}
+             )
+
+    assert reserved.pricing_status == "priced"
+    assert reserved.pricing_snapshot.id == pricing.id
+    assert reserved.request.request_metadata["pricing"]["snapshot"]["id"] == pricing.id
+
+    assert reserved.request.request_metadata["pricing"]["snapshot"]["model_identifier"] ==
+             base_identifier
+
+    assert reserved.request.request_metadata["pricing"]["alias"] == expected_alias
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+    assert {:ok, result} =
+             Accounting.finalize_success(
+               reserved.request,
+               attempt,
+               %{status: "usage_known", input_tokens: 2, output_tokens: 3, total_tokens: 5},
+               %{response_status_code: 200, latency_ms: 123}
+             )
+
+    assert result.settlement.pricing_snapshot_id == pricing.id
+    assert result.settlement.details["pricing_status"] == "priced"
+
+    assert Decimal.equal?(
+             Decimal.new(result.settlement.details["settled_cost_micros"]),
+             Decimal.new(800)
+           )
+
+    assert result.settlement.details["alias"] == expected_alias
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(setup.pool)
+    assert log.cost.status == "priced"
+    assert %Decimal{} = log.cost.usd
+    assert Decimal.equal?(log.cost.usd, Decimal.new("0.000800"))
   end
 
   test "request logs do not infer cached cost from projected token price without a persisted cached-cost fact" do

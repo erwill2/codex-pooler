@@ -11,6 +11,12 @@ defmodule CodexPooler.Accounting.PricingResolution do
   @default_price_bucket "default"
   @long_context_price_bucket "long_context"
 
+  @typep suffix_candidate :: %{
+           from: String.t(),
+           to: String.t(),
+           distance: pos_integer()
+         }
+
   @spec lookup(Model.t(), String.t(), map(), map(), DateTime.t()) :: map()
   def lookup(%Model{} = model, requested_model, payload, opts, timestamp) do
     requested_tier = requested_service_tier(payload, opts)
@@ -92,7 +98,7 @@ defmodule CodexPooler.Accounting.PricingResolution do
   def metadata(pricing) do
     snapshot = pricing.snapshot
 
-    %{
+    pricing_metadata = %{
       "status" => pricing.status,
       "requested_service_tier" => pricing.requested_service_tier,
       "actual_service_tier" => pricing.actual_service_tier,
@@ -110,13 +116,15 @@ defmodule CodexPooler.Accounting.PricingResolution do
           else: nil
         )
     }
+
+    put_serialized_alias_metadata(pricing_metadata, Map.get(pricing, :alias))
   end
 
   @spec details(map()) :: map()
   def details(pricing) do
     snapshot = pricing.snapshot
 
-    %{
+    details = %{
       "pricing_status" => pricing.status,
       "requested_service_tier" => pricing.requested_service_tier,
       "actual_service_tier" => pricing.actual_service_tier,
@@ -126,6 +134,8 @@ defmodule CodexPooler.Accounting.PricingResolution do
       "batch_usage" => pricing.batch_usage,
       "price_version" => snapshot && snapshot.price_version
     }
+
+    put_serialized_alias_metadata(details, Map.get(pricing, :alias))
   end
 
   @spec update_request_metadata(map() | nil, map()) :: map()
@@ -216,15 +226,39 @@ defmodule CodexPooler.Accounting.PricingResolution do
             priced_snapshot(fallback, requested_tier, actual_tier, service_tier, batch_usage?)
 
           nil ->
-            missing_pricing_snapshot(
-              model,
-              identifiers,
-              requested_tier,
-              actual_tier,
-              service_tier,
-              timestamp,
-              batch_usage?
-            )
+            case suffix_inference_pricing_snapshot(
+                   identifiers,
+                   service_tier,
+                   price_bucket,
+                   timestamp
+                 ) ||
+                   fallback_suffix_inference_pricing_snapshot(
+                     identifiers,
+                     service_tier,
+                     price_bucket,
+                     timestamp
+                   ) do
+              {%PricingSnapshot{} = inferred, alias_metadata} ->
+                priced_snapshot(
+                  inferred,
+                  requested_tier,
+                  actual_tier,
+                  service_tier,
+                  batch_usage?,
+                  alias_metadata
+                )
+
+              nil ->
+                missing_pricing_snapshot(
+                  model,
+                  identifiers,
+                  requested_tier,
+                  actual_tier,
+                  service_tier,
+                  timestamp,
+                  batch_usage?
+                )
+            end
         end
     end
   end
@@ -251,6 +285,190 @@ defmodule CodexPooler.Accounting.PricingResolution do
        do: pricing_snapshot(identifiers, service_tier, @default_price_bucket, timestamp)
 
   defp fallback_pricing_snapshot(_identifiers, _service_tier, _price_bucket, _timestamp), do: nil
+
+  @spec fallback_suffix_inference_pricing_snapshot(
+          [String.t()],
+          String.t(),
+          String.t(),
+          DateTime.t()
+        ) :: {%PricingSnapshot{}, map()} | nil
+  defp fallback_suffix_inference_pricing_snapshot(
+         identifiers,
+         service_tier,
+         @long_context_price_bucket,
+         timestamp
+       ),
+       do:
+         suffix_inference_pricing_snapshot(
+           identifiers,
+           service_tier,
+           @default_price_bucket,
+           timestamp
+         )
+
+  defp fallback_suffix_inference_pricing_snapshot(
+         _identifiers,
+         _service_tier,
+         _price_bucket,
+         _timestamp
+       ),
+       do: nil
+
+  @spec suffix_inference_pricing_snapshot([String.t()], String.t(), String.t(), DateTime.t()) ::
+          {%PricingSnapshot{}, map()} | nil
+  defp suffix_inference_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) do
+    candidates = suffix_inference_candidates(identifiers)
+    candidate_identifiers = candidates |> Enum.map(& &1.to) |> Enum.uniq()
+
+    snapshots_by_identifier =
+      pricing_snapshots_by_identifier(
+        candidate_identifiers,
+        service_tier,
+        price_bucket,
+        timestamp
+      )
+
+    candidates
+    |> Enum.flat_map(&candidate_snapshot_match(&1, snapshots_by_identifier))
+    |> nearest_suffix_inference_match()
+  end
+
+  @spec pricing_snapshots_by_identifier([String.t()], String.t(), String.t(), DateTime.t()) ::
+          map()
+  defp pricing_snapshots_by_identifier([], _service_tier, _price_bucket, _timestamp), do: %{}
+
+  defp pricing_snapshots_by_identifier(identifiers, service_tier, price_bucket, timestamp) do
+    PricingSnapshot
+    |> where(
+      [ps],
+      ps.model_identifier in ^identifiers and ps.effective_at <= ^timestamp and
+        fragment("?->>'service_tier'", ps.config) == ^service_tier and
+        fragment("?->>'price_bucket'", ps.config) == ^price_bucket and
+        fragment("?->>'pricing_type'", ps.config) == "per_1m_tokens"
+    )
+    |> order_by([ps],
+      asc: ps.model_identifier,
+      desc: ps.effective_at,
+      desc: ps.captured_at,
+      desc: ps.id
+    )
+    |> Repo.all()
+    |> Enum.reduce(%{}, fn snapshot, snapshots ->
+      Map.put_new(snapshots, snapshot.model_identifier, snapshot)
+    end)
+  end
+
+  @spec suffix_inference_candidates([String.t()]) :: [suffix_candidate()]
+  defp suffix_inference_candidates(identifiers) do
+    exact_identifiers = MapSet.new(identifiers)
+
+    identifiers
+    |> Enum.flat_map(&suffix_inference_candidates_for_identifier/1)
+    |> Enum.reject(&MapSet.member?(exact_identifiers, &1.to))
+    |> Enum.uniq_by(fn candidate -> {candidate.from, candidate.to, candidate.distance} end)
+  end
+
+  @spec suffix_inference_candidates_for_identifier(term()) :: [suffix_candidate()]
+  defp suffix_inference_candidates_for_identifier(identifier) when is_binary(identifier) do
+    normalized_identifier = String.trim(identifier)
+    segments = String.split(normalized_identifier, "-", trim: true)
+
+    case segments do
+      [_single] ->
+        []
+
+      [] ->
+        []
+
+      _segments ->
+        do_suffix_inference_candidates(segments, normalized_identifier)
+    end
+  end
+
+  defp suffix_inference_candidates_for_identifier(_identifier), do: []
+
+  @spec do_suffix_inference_candidates([String.t()], String.t()) :: [suffix_candidate()]
+  defp do_suffix_inference_candidates(segments, original_identifier) do
+    segment_count = length(segments)
+
+    1..(segment_count - 1)
+    |> Enum.reduce_while({[], 0}, fn distance, {candidates, arbitrary_trim_count} ->
+      trimmed_segment = Enum.at(segments, -distance)
+
+      arbitrary_trim_count =
+        if date_or_version_suffix?(trimmed_segment),
+          do: arbitrary_trim_count,
+          else: arbitrary_trim_count + 1
+
+      if arbitrary_trim_count > 1 do
+        {:halt, {candidates, arbitrary_trim_count}}
+      else
+        candidate_identifier =
+          segments
+          |> Enum.take(segment_count - distance)
+          |> Enum.join("-")
+
+        candidate =
+          if blank?(candidate_identifier) or candidate_identifier == original_identifier do
+            nil
+          else
+            %{
+              from: original_identifier,
+              to: candidate_identifier,
+              distance: distance
+            }
+          end
+
+        candidates = if candidate, do: [candidate | candidates], else: candidates
+
+        {:cont, {candidates, arbitrary_trim_count}}
+      end
+    end)
+    |> elem(0)
+    |> Enum.reverse()
+  end
+
+  @spec date_or_version_suffix?(term()) :: boolean()
+  defp date_or_version_suffix?(segment) when is_binary(segment) do
+    Regex.match?(~r/\A(?:v)?\d+(?:[._]\d+)*\z/i, String.trim(segment))
+  end
+
+  defp date_or_version_suffix?(_segment), do: false
+
+  @spec candidate_snapshot_match(suffix_candidate(), map()) :: [map()]
+  defp candidate_snapshot_match(candidate, snapshots_by_identifier) do
+    case Map.fetch(snapshots_by_identifier, candidate.to) do
+      {:ok, snapshot} -> [Map.put(candidate, :snapshot, snapshot)]
+      :error -> []
+    end
+  end
+
+  @spec nearest_suffix_inference_match([map()]) :: {%PricingSnapshot{}, map()} | nil
+  defp nearest_suffix_inference_match([]), do: nil
+
+  defp nearest_suffix_inference_match(matches) do
+    nearest_distance = matches |> Enum.map(& &1.distance) |> Enum.min()
+    nearest_matches = Enum.filter(matches, &(&1.distance == nearest_distance))
+
+    case nearest_matches |> Enum.map(& &1.snapshot.model_identifier) |> Enum.uniq() do
+      [model_identifier] ->
+        match = Enum.find(nearest_matches, &(&1.snapshot.model_identifier == model_identifier))
+
+        {match.snapshot, suffix_alias_metadata(match.from, model_identifier)}
+
+      _ambiguous_or_missing ->
+        nil
+    end
+  end
+
+  @spec suffix_alias_metadata(String.t(), String.t()) :: map()
+  defp suffix_alias_metadata(from_identifier, to_identifier) do
+    %{
+      "source" => "suffix_inference",
+      "from" => from_identifier,
+      "to" => to_identifier
+    }
+  end
 
   defp pricing_identifiers(model, requested_model) do
     Enum.uniq(
@@ -285,8 +503,15 @@ defmodule CodexPooler.Accounting.PricingResolution do
     unpriced_snapshot(status, requested_tier, actual_tier, service_tier, batch_usage?)
   end
 
-  defp priced_snapshot(snapshot, requested_tier, actual_tier, service_tier, batch_usage?) do
-    %{
+  defp priced_snapshot(
+         snapshot,
+         requested_tier,
+         actual_tier,
+         service_tier,
+         batch_usage?,
+         alias_metadata \\ nil
+       ) do
+    pricing = %{
       snapshot: snapshot,
       status: "priced",
       requested_service_tier: requested_tier,
@@ -296,6 +521,8 @@ defmodule CodexPooler.Accounting.PricingResolution do
       pricing_type: snapshot.config["pricing_type"],
       batch_usage: batch_usage?
     }
+
+    put_pricing_alias_metadata(pricing, alias_metadata)
   end
 
   defp unpriced_snapshot(status, requested_tier, actual_tier, service_tier, batch_usage?) do
@@ -465,6 +692,16 @@ defmodule CodexPooler.Accounting.PricingResolution do
   defp blank?(value), do: is_nil(value) or String.trim(to_string(value)) == ""
   defp blank_to_nil(value), do: if(blank?(value), do: nil, else: value)
   defp truthy?(value), do: value in [true, "true", "1", 1, "yes", "batch"]
+
+  defp put_pricing_alias_metadata(pricing, nil), do: pricing
+
+  defp put_pricing_alias_metadata(pricing, alias_metadata),
+    do: Map.put(pricing, :alias, alias_metadata)
+
+  defp put_serialized_alias_metadata(serialized, nil), do: serialized
+
+  defp put_serialized_alias_metadata(serialized, alias_metadata),
+    do: Map.put(serialized, "alias", alias_metadata)
 
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
 end
