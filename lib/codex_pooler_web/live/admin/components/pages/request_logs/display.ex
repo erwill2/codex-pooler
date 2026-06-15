@@ -162,11 +162,12 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   def compression_savings_line(%{payload_compression: compression})
       when is_map(compression) do
-    with unit when unit in ["tokens", "bytes"] <- Map.get(compression, :unit),
+    with "tokens" <- Map.get(compression, :unit),
          saved when is_integer(saved) <- Map.get(compression, :saved_count),
          percent when is_number(percent) <- Map.get(compression, :savings_percent),
-         ratio when is_number(ratio) <- Map.get(compression, :compression_ratio) do
-      "compression saved #{format_compression_count(saved, unit)} (#{format_percent(percent)}) · #{format_compression_ratio(ratio, unit)}"
+         ratio when is_number(ratio) <- Map.get(compression, :compression_ratio),
+         true <- saved > 0 and ratio < 1 do
+      "#{format_compression_count(saved)} (#{format_percent(percent)})"
     else
       _value -> nil
     end
@@ -185,7 +186,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
       compression_count_title_part(
         "tokenizer input skipped",
         Map.get(compression, :tokenizer_input_skipped_count)
-      )
+      ),
+      "percent is measured against rewritten tool-output candidates, not total request tokens"
     ]
     |> Enum.reject(&is_nil/1)
     |> case do
@@ -470,11 +472,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   defp compact_cached_input_cost(_usd), do: nil
 
-  defp format_compression_count(saved, "tokens"), do: "#{Format.token_count(saved)} tokens"
-  defp format_compression_count(saved, "bytes"), do: "#{Format.integer(saved)} bytes"
-
-  defp format_compression_ratio(ratio, "bytes"), do: "byte ratio #{format_decimal(ratio)}x"
-  defp format_compression_ratio(ratio, _unit), do: "ratio #{format_decimal(ratio)}x"
+  defp format_compression_count(saved), do: Format.token_count(saved)
 
   defp format_percent(percent), do: "#{format_decimal(percent)}%"
 

@@ -1199,12 +1199,50 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
       details: %{"pricing_status" => "priced", "settled_cost_micros" => "500"}
     })
 
+    assert {:ok, %{request: zero_request}} =
+             Accounting.record_metadata_request(%{pool: pool, api_key: api_key}, %{
+               endpoint: "/backend-api/codex/responses",
+               requested_model: "gpt-compression-zero-ui",
+               transport: "http_json",
+               status: "succeeded",
+               correlation_id: "compression-zero-ui"
+             })
+
+    assert {:ok, _zero_attempt} =
+             Accounting.create_attempt(zero_request, assignment, %{
+               status: "succeeded",
+               response_metadata:
+                 ui_compression_metadata(%{
+                   route_class: "proxy_http",
+                   transport: "http_json",
+                   original_bytes: 4096,
+                   compressed_bytes: 4096,
+                   raw_candidate: sentinel,
+                   original_output: sentinel,
+                   compressed_output: compressed_sentinel
+                 })
+             })
+
+    ledger_entry_fixture(zero_request, %{
+      input_tokens: 30,
+      cached_input_tokens: 0,
+      output_tokens: 10,
+      total_tokens: 40,
+      settled_cost_micros: 400,
+      details: %{"pricing_status" => "priced", "settled_cost_micros" => "400"}
+    })
+
     {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
 
     assert has_element?(
              view,
              "#request-log-#{token_request.id}-compression-savings[data-compression-unit='tokens'][data-compression-status='compressed'][data-compression-reason='rewritten']",
-             "compression saved 600 tokens (60%) · ratio 0.4x"
+             "600 (60%)"
+           )
+
+    assert has_element?(
+             view,
+             "#request-log-#{token_request.id}-compression-savings .hero-arrows-pointing-in"
            )
 
     assert has_element?(
@@ -1214,8 +1252,18 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
+             "#request-log-#{token_request.id}-compression-savings[title*='not total request tokens']"
+           )
+
+    assert has_element?(
+             view,
              "#mobile-request-log-#{token_request.id}-compression-savings[data-compression-unit='tokens']",
-             "compression saved 600 tokens (60%) · ratio 0.4x"
+             "600 (60%)"
+           )
+
+    assert has_element?(
+             view,
+             "#mobile-request-log-#{token_request.id}-compression-savings .hero-arrows-pointing-in"
            )
 
     assert has_element?(
@@ -1223,17 +1271,11 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
              "#mobile-request-log-#{token_request.id}-compression-savings[title*='tokenizer input skipped: 1']"
            )
 
-    assert has_element?(
-             view,
-             "#request-log-#{byte_request.id}-compression-savings[data-compression-unit='bytes'][data-compression-status='compressed'][data-compression-reason='rewritten']",
-             "compression saved 4,096 bytes (50%) · byte ratio 0.5x"
-           )
+    refute has_element?(view, "#request-log-#{byte_request.id}-compression-savings")
+    refute has_element?(view, "#mobile-request-log-#{byte_request.id}-compression-savings")
 
-    assert has_element?(
-             view,
-             "#mobile-request-log-#{byte_request.id}-compression-savings[data-compression-unit='bytes']",
-             "compression saved 4,096 bytes (50%) · byte ratio 0.5x"
-           )
+    refute has_element?(view, "#request-log-#{zero_request.id}-compression-savings")
+    refute has_element?(view, "#mobile-request-log-#{zero_request.id}-compression-savings")
 
     html = render(view)
     refute html =~ sentinel

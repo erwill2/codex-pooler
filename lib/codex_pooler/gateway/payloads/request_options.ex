@@ -103,6 +103,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
                                         search_results
                                         diff
                                         json_array_lossless
+                                        json_document_lossless
                                       )
   @safe_payload_compression_value ~r/\A[a-zA-Z0-9_.:-]+\z/
 

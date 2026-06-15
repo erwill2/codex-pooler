@@ -92,9 +92,11 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation.Usage do
         data-compression-unit={compression_savings_unit(@request_log)}
         data-compression-status={compression_savings_status(@request_log)}
         data-compression-reason={compression_savings_reason(@request_log)}
-        class="block whitespace-nowrap text-base-content/60"
+        class="flex items-center gap-1 whitespace-nowrap text-base-content/60"
         title={compression_savings_title(@request_log)}
       >
+        <.icon name="hero-arrows-pointing-in" class="size-3.5 shrink-0" />
+        <span class="sr-only">compression</span>
         {compression_line}
       </span>
       <span

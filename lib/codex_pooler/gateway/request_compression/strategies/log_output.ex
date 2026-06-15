@@ -11,7 +11,7 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.LogOutput do
   @default_context_lines 2
   @default_max_important_lines 12
 
-  @important_line_regex ~r/(?:^|\b)(?:error|warning|warn|failed|failure|fatal|panic|exception|traceback|assertion|exit\s+code|caused\s+by)(?:\b|:)/i
+  @important_line_regex ~r/(?:^|\b)(?:error|warning|warn|failed|failure|fatal|panic|exception|traceback|assertion|exit\s+code|caused\s+by)(?:\b|:)|^\s*(?:Build\s+(?:FAILED|succeeded)|BUILD\s+(?:FAILED|SUCCESSFUL)|\*\*\s+BUILD\s+(?:FAILED|SUCCEEDED)\s+\*\*|Failed!\s+-\s+Failed:|Passed!\s+-\s+Failed:|Test summary:|Found\s+\d+\s+(?:errors?|warnings?)|Executed\s+\d+\s+tests?,\s+with\s+\d+|\d+\s+(?:Warning|Error)\(s\)|\d+\s+(?:tests?|examples?)\s+(?:completed|run|passed|failed)|\d+\s+actionable tasks?:)/i
 
   @spec compress(term(), Strategies.opts()) :: Strategies.result()
   def compress(content, opts \\ [])

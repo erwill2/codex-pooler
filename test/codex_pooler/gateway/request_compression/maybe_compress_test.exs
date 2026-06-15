@@ -109,6 +109,69 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_unsupported_tokenizer"
     end
 
+    test "rewrites valid top-level JSON object tool-output strings" do
+      original_output =
+        %{
+          "GlobalSettings" => %{
+            "isCrossAccountBackupEnabled" => "false",
+            "isDelegatedAdministratorEnabled" => "false",
+            "isMpaEnabled" => "false"
+          },
+          "Reports" =>
+            Enum.map(1..24, fn index ->
+              %{
+                "id" => index,
+                "status" => "complete",
+                "summary" => "sanitized report #{index}",
+                "warnings" => [],
+                "metadata" => %{"source" => "example", "priority" => rem(index, 3)}
+              }
+            end),
+          "LastUpdateTime" => "2026-05-28T09:52:17.525000+02:00"
+        }
+        |> Jason.encode!(pretty: true)
+
+      body =
+        Jason.encode!(%{
+          "model" => @supported_model,
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_json_document_compression",
+              "output" => original_output
+            }
+          ]
+        })
+
+      {context, request_options} = request_context(body)
+
+      assert {compressed_body, compressed_options} =
+               RequestCompression.maybe_compress(body, context, request_options)
+
+      assert compressed_body != body
+
+      compressed_output =
+        compressed_body
+        |> Jason.decode!()
+        |> Map.fetch!("input")
+        |> List.first()
+        |> Map.fetch!("output")
+
+      assert Jason.decode!(compressed_output) == Jason.decode!(original_output)
+      assert byte_size(compressed_output) < byte_size(original_output)
+
+      assert %{
+               "status" => "compressed",
+               "candidate_count" => 1,
+               "compressed_count" => 1,
+               "skipped_count" => 0
+             } = metadata = compressed_options.runtime.payload_compression
+
+      assert "json_document_lossless" in metadata["strategies"]
+      assert metadata["original_tokens"] > metadata["compressed_tokens"]
+      refute inspect(metadata) =~ "call_json_document_compression"
+    end
+
     test "skips when no route model is available" do
       body =
         Jason.encode!(%{

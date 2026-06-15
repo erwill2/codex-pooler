@@ -254,7 +254,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                         label="Request compression"
                       />
                       <p class="routing-option-help">
-                        Compress upstream-bound Responses tool outputs before dispatch.
+                        Shrinks eligible Responses tool outputs before upstream dispatch.
                       </p>
                     </div>
                   </div>

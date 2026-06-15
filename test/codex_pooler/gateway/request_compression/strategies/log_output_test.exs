@@ -62,6 +62,36 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.LogOutputTest do
                )
     end
 
+    test "keeps success and diagnostic summary lines as important landmarks" do
+      content =
+        [
+          "Starting a Gradle Daemon",
+          "ordinary setup line"
+        ]
+        |> Kernel.++(Enum.map(1..80, &"> Task :app:compile#{&1} UP-TO-DATE"))
+        |> Kernel.++([
+          "BUILD SUCCESSFUL in 3s",
+          "28 actionable tasks: 28 up-to-date"
+        ])
+        |> Enum.join("\n")
+
+      assert {:ok, %{content: compressed, metadata: metadata}} =
+               LogOutput.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_lines: 1,
+                 head_lines: 1,
+                 tail_lines: 0,
+                 context_lines: 1,
+                 max_important_lines: 4
+               )
+
+      assert compressed =~ "BUILD SUCCESSFUL in 3s"
+      assert compressed =~ "28 actionable tasks: 28 up-to-date"
+      assert compressed =~ "[compressed log output: omitted"
+      assert metadata.important_line_count == 2
+    end
+
     test "skips malformed, too-small, and nonmatching input" do
       assert :skip = LogOutput.compress(:not_text)
       assert :skip = LogOutput.compress(<<255>>, min_bytes: 0)

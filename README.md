@@ -1345,11 +1345,7 @@ admin, MCP, usage, and control-plane requests are not eligible; public
 dispatch.
 
 Request compression is request-side only. Codex Pooler does not store raw tool
-outputs, does not store raw response bodies, and does not implement
-CCR/retrieval. Request logs may show `payload_compression` metadata with safe
-aggregate savings only, preferring saved token count and percent when local
-token counts are available and falling back to byte savings when token counts
-are unavailable.
+outputs or raw response bodies.
 
 ## Operator MCP Service
 

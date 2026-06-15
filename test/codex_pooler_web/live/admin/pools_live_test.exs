@@ -739,7 +739,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(
              view,
              "#pool-create-routing-controls",
-             "Compress upstream-bound Responses tool outputs before dispatch."
+             "Shrinks eligible Responses tool outputs before upstream dispatch."
            )
 
     assert has_element?(view, "#pool_routing_strategy option", "Bridge ring")
@@ -1149,7 +1149,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(
              view,
              "#pool-edit-routing-controls",
-             "Compress upstream-bound Responses tool outputs before dispatch."
+             "Shrinks eligible Responses tool outputs before upstream dispatch."
            )
 
     view |> element("#pool-edit-dialog-tab-upstreams") |> render_click()

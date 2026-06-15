@@ -54,6 +54,7 @@ defmodule CodexPooler.Accounting.Metadata do
   @payload_compression_strategy_names ~w(
                                          diff
                                          json_array_lossless
+                                         json_document_lossless
                                          log_output
                                          search_results
                                        )

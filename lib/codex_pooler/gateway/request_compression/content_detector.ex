@@ -1,8 +1,10 @@
 defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
   @moduledoc false
 
-  @type kind :: :json_array | :diff | :html | :search | :build | :source_code | :text
-  @type strategy :: :json_array_lossless | :diff | :search_results | :log_output
+  @type kind ::
+          :json_array | :json_document | :diff | :html | :search | :build | :source_code | :text
+  @type strategy ::
+          :json_array_lossless | :json_document_lossless | :diff | :search_results | :log_output
   @type decision :: %{
           required(:kind) => kind(),
           required(:confidence) => float(),
@@ -12,6 +14,7 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
 
   @strategies %{
     json_array: :json_array_lossless,
+    json_document: :json_document_lossless,
     diff: :diff,
     search: :search_results,
     build: :log_output
@@ -39,6 +42,9 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
   @build_term_regex ~r/\b(?:build|building|compile|compiling|compiled|test|tests|failed|failure|running|finished|warning|error|npm|yarn|pnpm|mix|make|cargo|gradle|maven|pytest|rspec|exunit)\b/i
   @build_prefix_regex ~r/^\s*(?:\$ |==>|-->|Compiling|Running|Finished|warning:|error:|\[\w+\])/mi
   @stack_line_regex ~r/(?:^\s+at\s+\S+|^\s*File\s+"[^"]+",\s+line\s+\d+|^\s*\S+:\d+:\d+:)/m
+  @diagnostic_path_regex ~r/^\s*\S+\.(?:c|cc|cpp|cs|css|ex|exs|go|h|hpp|html|java|js|jsx|json|kt|m|md|mjs|mm|php|py|rb|rs|scss|svelte|swift|toml|ts|tsx|vue|xml|ya?ml)(?:\(\d+,\d+\)|:\d+(?::\d+)?)[:\s].+/im
+  @diagnostic_summary_regex ~r/^\s*(?:Build\s+(?:FAILED|succeeded)|BUILD\s+(?:FAILED|SUCCESSFUL)|\*\*\s+BUILD\s+(?:FAILED|SUCCEEDED)\s+\*\*|Failed!\s+-\s+Failed:|Passed!\s+-\s+Failed:|Test summary:|Found\s+\d+\s+(?:errors?|warnings?)|Executed\s+\d+\s+tests?,\s+with\s+\d+|\d+\s+(?:Warning|Error)\(s\)|\d+\s+(?:tests?|examples?)\s+(?:completed|run|passed|failed)|\d+\s+actionable tasks?:)/im
+  @lint_rule_regex ~r/\b(?:lint|style|correctness|suspicious|complexity|nursery|performance|security)\/[a-z0-9_\/-]+\b/i
 
   @source_keyword_regex ~r/^\s*(?:defmodule|defp?\s+\w+|class\s+\w+|function\s+\w+|import\s+|export\s+|const\s+\w+|let\s+\w+|var\s+\w+|pub\s+fn\s+\w+|fn\s+\w+|impl\s+\w+|module\s+\w+|alias\s+)/m
   @source_punctuation_regex ~r/[{}();]/
@@ -57,6 +63,9 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
 
       json_array?(trimmed) ->
         decision(:json_array, 100)
+
+      json_document?(trimmed) ->
+        decision(:json_document, 100)
 
       (points = diff_points(content)) >= 70 ->
         decision(:diff, points)
@@ -96,6 +105,13 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
   defp json_array?(content) do
     case Jason.decode(content) do
       {:ok, value} when is_list(value) -> true
+      _other -> false
+    end
+  end
+
+  defp json_document?(content) do
+    case Jason.decode(content) do
+      {:ok, value} when is_map(value) -> true
       _other -> false
     end
   end
@@ -151,9 +167,14 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
   defp build_points(content) do
     lines = lines(content)
     severities = scan_count(@severity_regex, content)
+    diagnostic_paths = scan_count(@diagnostic_path_regex, content)
+    diagnostic_summaries = scan_count(@diagnostic_summary_regex, content)
 
     [
       cond_score(severities, [{2, 30}, {1, 20}]),
+      cond_score(diagnostic_paths, [{2, 35}, {1, 25}]),
+      cond_score(diagnostic_summaries, [{2, 25}, {1, 15}]),
+      score(regex_match?(@lint_rule_regex, content), 15),
       score(regex_match?(@build_term_regex, content), 20),
       score(regex_match?(@build_prefix_regex, content), 20),
       score(regex_match?(@stack_line_regex, content), 25),

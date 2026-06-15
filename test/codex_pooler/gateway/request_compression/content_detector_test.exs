@@ -64,11 +64,17 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetectorTest do
   end
 
   describe "confidence thresholds" do
-    test "detects valid JSON arrays and rejects non-array JSON" do
+    test "detects valid JSON arrays and top-level JSON objects" do
       assert %{kind: :json_array, confidence: 1.0} =
                ContentDetector.detect(~S([{"status":"ok"}]))
 
-      assert_noop(:text, ContentDetector.detect(~S({"status":"ok"})))
+      assert %{
+               kind: :json_document,
+               confidence: 1.0,
+               compressible: true,
+               strategy: :json_document_lossless
+             } = ContentDetector.detect(~S({"status":"ok"}))
+
       assert_noop(:text, ContentDetector.detect(~S([{"status":])))
     end
 
@@ -151,6 +157,32 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetectorTest do
 
       assert confidence >= 0.5
       assert_noop(:text, ContentDetector.detect(negative))
+    end
+
+    test "detects compiler and linter diagnostics without command context" do
+      dotnet = """
+      /workspace/sample-app/Broken.cs(7,17): error CS1525: Invalid expression term ';' [/workspace/sample-app/sample-app.csproj]
+          0 Warning(s)
+          1 Error(s)
+
+      Time Elapsed 00:00:00.76
+      """
+
+      biome = """
+      src/app.tsx:5:3 lint/suspicious/noExplicitAny ━━━━━━━━━━━━━━━━━━━━
+        × Unexpected any. Specify a different type.
+        3 │ interface Props {
+        4 │   data: any;
+        5 │         ^^^
+
+      Found 2 errors.
+      """
+
+      assert %{kind: :build, compressible: true, strategy: :log_output} =
+               ContentDetector.detect(dotnet)
+
+      assert %{kind: :build, compressible: true, strategy: :log_output} =
+               ContentDetector.detect(biome)
     end
 
     test "detects source code at request-compression confidence but keeps it no-op" do

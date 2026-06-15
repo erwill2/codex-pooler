@@ -47,7 +47,12 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
       |> RequestOptions.put_runtime_context(
         payload_compression:
           compression_metadata(%{
-            "strategies" => ["log_output", "call_probe_secret", "json_array_lossless"],
+            "strategies" => [
+              "log_output",
+              "call_probe_secret",
+              "json_document_lossless",
+              "json_array_lossless"
+            ],
             "candidate_count" => 1
           })
       )
@@ -57,6 +62,7 @@ defmodule CodexPooler.Gateway.Runtime.FinalizationMetadataCompressionTest do
 
     assert metadata["payload_compression"]["strategies"] == [
              "log_output",
+             "json_document_lossless",
              "json_array_lossless"
            ]
 

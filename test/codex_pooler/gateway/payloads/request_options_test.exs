@@ -268,7 +268,12 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
             payload_compression: %{
               "attempted" => true,
               "status" => "compressed",
-              "strategies" => ["log_output", "call_probe_secret", "json_array_lossless"],
+              "strategies" => [
+                "log_output",
+                "call_probe_secret",
+                "json_document_lossless",
+                "json_array_lossless"
+              ],
               "candidate_count" => 1
             }
           },
@@ -278,13 +283,14 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
 
       assert options.runtime.payload_compression["strategies"] == [
                "log_output",
+               "json_document_lossless",
                "json_array_lossless"
              ]
 
       assert get_in(RequestOptions.payload_compression_attempt_metadata(options), [
                "payload_compression",
                "strategies"
-             ]) == ["log_output", "json_array_lossless"]
+             ]) == ["log_output", "json_document_lossless", "json_array_lossless"]
 
       refute inspect(options.runtime.payload_compression) =~ "call_probe_secret"
     end

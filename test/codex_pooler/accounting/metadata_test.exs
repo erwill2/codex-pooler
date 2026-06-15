@@ -38,7 +38,12 @@ defmodule CodexPooler.Accounting.MetadataTest do
             "attempted" => true,
             "status" => "compressed",
             "reason" => "tokenizer_input_limit",
-            "strategies" => ["log_output", "call_probe_secret", "diff"],
+            "strategies" => [
+              "log_output",
+              "call_probe_secret",
+              "json_document_lossless",
+              "diff"
+            ],
             "candidate_count" => 2,
             "tokenizer_input_skipped_count" => 2,
             "raw_candidate" => "Bearer sk-cxp-abcdef123456-secretValue",
@@ -51,7 +56,7 @@ defmodule CodexPooler.Accounting.MetadataTest do
       assert compression["attempted"] == true
       assert compression["status"] == "compressed"
       assert compression["reason"] == "tokenizer_input_limit"
-      assert compression["strategies"] == ["log_output", "diff"]
+      assert compression["strategies"] == ["log_output", "json_document_lossless", "diff"]
       assert compression["candidate_count"] == 2
       assert compression["tokenizer_input_skipped_count"] == 2
       assert compression["raw_candidate"] == "[REDACTED]"

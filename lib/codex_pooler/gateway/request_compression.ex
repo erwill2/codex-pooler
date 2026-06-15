@@ -13,6 +13,7 @@ defmodule CodexPooler.Gateway.RequestCompression do
   @strategy_modules %{
     diff: Strategies.Diff,
     json_array_lossless: Strategies.JsonArrayLossless,
+    json_document_lossless: Strategies.JsonDocumentLossless,
     log_output: Strategies.LogOutput,
     search_results: Strategies.SearchResults
   }

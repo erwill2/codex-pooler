@@ -576,8 +576,9 @@ defmodule CodexPooler.Accounting.RequestLogs do
   end
 
   defp payload_compression_metric_available?(saved, percent, original, compressed) do
-    is_integer(saved) and is_number(percent) and is_integer(original) and is_integer(compressed) and
-      original > 0
+    is_integer(saved) and saved > 0 and is_number(percent) and percent > 0 and
+      is_integer(original) and original > 0 and is_integer(compressed) and compressed >= 0 and
+      compressed < original
   end
 
   defp maybe_put_saved_count(metadata, original_key, compressed_key, saved_key) do
