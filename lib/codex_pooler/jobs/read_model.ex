@@ -3,27 +3,21 @@ defmodule CodexPooler.Jobs.ReadModel do
 
   import Ecto.Query
 
-  alias CodexPooler.Access.APIKey
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Pools
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
-  alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   alias CodexPooler.Jobs.{
     AccountReconciliationWorker,
-    HealthPolicy,
+    ReadModel.Explorer,
     ReadModel.FailurePresentation,
-    Schedule,
+    ReadModel.Overview,
+    ReadModel.Query,
+    ReadModel.WorkerSummaries,
     TokenRefreshWorker
   }
-
-  @admin_jobs_default_limit 15
-  @admin_jobs_max_limit 50
-  @explorer_page_size 20
-  @completed_state "completed"
-  @identity_recovered_reconciliation_error_pattern "quota_refresh_auth_unavailable|pool_account_not_reconcilable"
-  @overview_action_buckets [:active_failure, :retry_pressure, :stuck_executing, :backlog_pressure]
 
   @type job_summary :: map()
   @type explorer_job_summary :: map()
@@ -90,9 +84,9 @@ defmodule CodexPooler.Jobs.ReadModel do
   @spec list_system_jobs(keyword()) :: [job_summary()]
   def list_system_jobs(opts \\ []) do
     Oban.Job
-    |> latest_jobs_query(opts)
+    |> Query.latest_jobs_query(opts)
     |> Repo.all()
-    |> with_attention(opts)
+    |> Query.with_attention(opts)
   end
 
   @spec list_latest_jobs(scope_ref(), keyword()) :: [job_summary()]
@@ -102,10 +96,7 @@ defmodule CodexPooler.Jobs.ReadModel do
     if Pools.owner?(scope), do: list_system_jobs(opts), else: []
   end
 
-  def list_latest_jobs(:system, opts) do
-    list_system_jobs(opts)
-  end
-
+  def list_latest_jobs(:system, opts), do: list_system_jobs(opts)
   def list_latest_jobs(_scope, _opts), do: []
 
   @spec list_explorer_jobs(scope_ref(), explorer_filters(), keyword()) :: explorer_page()
@@ -114,88 +105,34 @@ defmodule CodexPooler.Jobs.ReadModel do
   def list_explorer_jobs(%Scope{} = scope, filters, opts) do
     if Pools.owner?(scope),
       do: list_explorer_jobs(:system, filters, opts),
-      else: empty_explorer_page(filters)
+      else: Explorer.empty_page(filters)
   end
 
-  def list_explorer_jobs(:system, filters, opts) do
-    filters = normalize_explorer_filters(filters)
-    limit = @explorer_page_size
-    offset = explorer_offset(filters.page, limit)
-
-    query =
-      Oban.Job
-      |> apply_explorer_filters(filters)
-      |> maybe_filter_resolved_failure_visibility(filters)
-
-    if filters.attention do
-      attention_filtered_explorer_page(query, filters.attention, limit, offset, opts)
-    else
-      total = Repo.aggregate(query, :count, :id)
-
-      items =
-        query
-        |> job_metadata_query()
-        |> order_by([job], desc: job.inserted_at, desc: job.id)
-        |> limit(^limit)
-        |> offset(^offset)
-        |> Repo.all()
-        |> FailurePresentation.sanitize_jobs()
-        |> with_attention(opts)
-
-      %{items: items, total: total, limit: limit, offset: offset}
-    end
-  end
-
-  def list_explorer_jobs(_scope, filters, _opts), do: empty_explorer_page(filters)
+  def list_explorer_jobs(:system, filters, opts), do: Explorer.list(filters, opts)
+  def list_explorer_jobs(_scope, filters, _opts), do: Explorer.empty_page(filters)
 
   @spec explorer_filter_values(scope_ref()) :: explorer_filter_values()
   def explorer_filter_values(%Scope{} = scope) do
     if Pools.owner?(scope),
       do: explorer_filter_values(:system),
-      else: empty_explorer_filter_values()
+      else: Explorer.empty_filter_values()
   end
 
-  def explorer_filter_values(:system) do
-    %{
-      workers:
-        filter_option_values(configured_worker_values(), distinct_job_field_values(:worker)),
-      queues: filter_option_values(configured_queue_values(), distinct_job_field_values(:queue))
-    }
-  end
-
-  def explorer_filter_values(_scope), do: empty_explorer_filter_values()
+  def explorer_filter_values(:system), do: Explorer.filter_values()
+  def explorer_filter_values(_scope), do: Explorer.empty_filter_values()
 
   @spec jobs_overview(scope_ref(), explorer_filters(), keyword()) :: jobs_overview()
   def jobs_overview(scope, filters, opts \\ [])
 
   def jobs_overview(%Scope{} = scope, filters, opts) do
-    if Pools.owner?(scope),
-      do: jobs_overview(:system, filters, opts),
-      else: empty_jobs_overview()
+    if Pools.owner?(scope), do: jobs_overview(:system, filters, opts), else: Overview.empty()
   end
 
-  def jobs_overview(:system, filters, opts) do
-    filters = normalize_explorer_filters(filters)
-    now = attention_now(opts)
-
-    {:ok, overview} =
-      Repo.transaction(fn ->
-        Oban.Job
-        |> apply_overview_filters(filters)
-        |> job_metadata_query()
-        |> order_by([job], desc: job.inserted_at, desc: job.id)
-        |> Repo.stream()
-        |> Enum.reduce(empty_jobs_overview(), &collect_overview_job(&1, &2, now))
-        |> finalize_jobs_overview()
-      end)
-
-    overview
-  end
-
-  def jobs_overview(_scope, _filters, _opts), do: empty_jobs_overview()
+  def jobs_overview(:system, filters, opts), do: Overview.load(filters, opts)
+  def jobs_overview(_scope, _filters, _opts), do: Overview.empty()
 
   @spec worker_job_summary(scope_ref(), [String.t()]) :: worker_job_summary()
-  def worker_job_summary(_scope, []), do: empty_worker_job_summary()
+  def worker_job_summary(_scope, []), do: WorkerSummaries.empty_summary()
 
   def worker_job_summary(scope, workers) do
     scope
@@ -215,40 +152,17 @@ defmodule CodexPooler.Jobs.ReadModel do
     if Pools.owner?(scope) do
       worker_job_summaries_by_group(:system, worker_groups)
     else
-      empty_worker_job_summaries_by_group(worker_groups)
+      WorkerSummaries.empty_by_group(worker_groups)
     end
   end
 
-  def worker_job_summaries_by_group(:system, worker_groups) do
-    now = DateTime.utc_now()
-    worker_groups = normalize_worker_groups(worker_groups)
-    latest_by_group = latest_worker_jobs_by_group(worker_groups)
-    latest_success_by_group = latest_worker_jobs_by_group(worker_groups, state: @completed_state)
-    latest_failure_by_group = latest_worker_jobs_by_group(worker_groups, states: failure_states())
-    pending_by_group = next_pending_worker_jobs_by_group(worker_groups)
-    open_by_group = open_worker_jobs_by_group(worker_groups)
-    unresolved_failures_by_group = unresolved_failure_worker_jobs_by_group(worker_groups)
-
-    Map.new(worker_groups, fn {group_key, _workers} ->
-      summary = %{
-        empty_worker_job_summary()
-        | latest: Map.get(latest_by_group, group_key),
-          latest_success: Map.get(latest_success_by_group, group_key),
-          latest_failure: Map.get(latest_failure_by_group, group_key),
-          pending: Map.get(pending_by_group, group_key),
-          open: Map.get(open_by_group, group_key, []),
-          unresolved_failures: Map.get(unresolved_failures_by_group, group_key, [])
-      }
-
-      {group_key, with_worker_summary_attention(summary, now: now)}
-    end)
-  end
+  def worker_job_summaries_by_group(:system, worker_groups),
+    do: WorkerSummaries.load(worker_groups)
 
   def worker_job_summaries_by_group(_scope, worker_groups) do
-    empty_worker_job_summaries_by_group(worker_groups)
+    WorkerSummaries.empty_by_group(worker_groups)
   end
 
-  @spec list_recent_token_refresh_jobs(identity_ref(), keyword()) :: [job_summary()]
   def list_recent_token_refresh_jobs(identity_or_id, opts \\ []) do
     identity_id = identity_id(identity_or_id)
     limit = opts |> Keyword.get(:limit, 5) |> max(1) |> min(50)
@@ -257,7 +171,7 @@ defmodule CodexPooler.Jobs.ReadModel do
       Repo.all(
         from job in Oban.Job,
           where:
-            job.worker == ^worker_name(TokenRefreshWorker) and
+            job.worker == ^Query.worker_name(TokenRefreshWorker) and
               fragment("?->>?", job.args, "upstream_identity_id") == ^identity_id,
           order_by: [
             desc:
@@ -282,10 +196,9 @@ defmodule CodexPooler.Jobs.ReadModel do
           }
       )
 
-    with_attention(results, opts)
+    Query.with_attention(results, opts)
   end
 
-  @spec list_recent_account_reconciliation_jobs(pool_ref(), keyword()) :: [job_summary()]
   def list_recent_account_reconciliation_jobs(pool_or_id, opts \\ []) do
     pool_id = pool_id(pool_or_id)
     limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(50)
@@ -294,7 +207,7 @@ defmodule CodexPooler.Jobs.ReadModel do
       Repo.all(
         from job in Oban.Job,
           where:
-            job.worker == ^worker_name(AccountReconciliationWorker) and
+            job.worker == ^Query.worker_name(AccountReconciliationWorker) and
               fragment("?->>?", job.args, "pool_id") == ^pool_id,
           order_by: [
             desc:
@@ -319,902 +232,12 @@ defmodule CodexPooler.Jobs.ReadModel do
           }
       )
 
-    with_attention(results, opts)
+    Query.with_attention(results, opts)
   end
 
   @spec sanitize_projection(term()) :: term()
   defdelegate sanitize_projection(value), to: FailurePresentation
 
-  defp reauth_required_reconciliation_failure?(%{worker: worker, target: target})
-       when is_map(target) do
-    worker == worker_name(AccountReconciliationWorker) and reauth_required_target?(target)
-  end
-
-  defp reauth_required_reconciliation_failure?(_job), do: false
-
-  defp reauth_required_target?(%{assignment_status: "reauth_required"}), do: true
-
-  defp reauth_required_target?(%{assignment_identity_status: "reauth_required"}), do: true
-
-  defp reauth_required_target?(_target), do: false
-
-  defp with_worker_summary_attention(summary, opts) do
-    now = attention_now(opts)
-
-    %{
-      summary
-      | latest: with_attention(summary.latest, now: now),
-        latest_success: with_attention(summary.latest_success, now: now),
-        latest_failure: with_attention(summary.latest_failure, now: now),
-        pending: with_attention(summary.pending, now: now),
-        open: with_attention(summary.open, now: now),
-        unresolved_failures: with_attention(summary.unresolved_failures, now: now)
-    }
-  end
-
-  defp with_attention(jobs, opts) when is_list(jobs) do
-    now = attention_now(opts)
-    Enum.map(jobs, &HealthPolicy.put_attention(&1, now: now))
-  end
-
-  defp with_attention(nil, _opts), do: nil
-
-  defp with_attention(job, opts) when is_map(job) do
-    HealthPolicy.put_attention(job, now: attention_now(opts))
-  end
-
-  defp attention_now(opts), do: Keyword.get_lazy(opts, :now, &DateTime.utc_now/0)
-
-  defp latest_worker_jobs_by_group(worker_groups, opts \\ []) do
-    {group_worker_rows, group_keys_by_index} = group_worker_rows_by_index(worker_groups)
-
-    if group_worker_rows == [] do
-      %{}
-    else
-      group_worker_rows
-      |> ranked_latest_worker_jobs_query(opts)
-      |> grouped_job_metadata_query()
-      |> Repo.all()
-      |> Map.new(fn %{group_index: group_index, job: job} ->
-        {Map.fetch!(group_keys_by_index, group_index), job}
-      end)
-    end
-  end
-
-  defp group_worker_rows_by_index(worker_groups) do
-    worker_groups = Enum.with_index(worker_groups)
-
-    group_worker_rows =
-      for {{_group_key, workers}, group_index} <- worker_groups,
-          worker <- Enum.uniq(workers) do
-        %{group_index: group_index, worker: worker}
-      end
-
-    group_keys_by_index =
-      Map.new(worker_groups, fn {{group_key, _workers}, group_index} ->
-        {group_index, group_key}
-      end)
-
-    {group_worker_rows, group_keys_by_index}
-  end
-
-  defp ranked_latest_worker_jobs_query(group_worker_rows, opts) do
-    group_worker_types = %{group_index: :integer, worker: :string}
-
-    query =
-      from job in Oban.Job,
-        join: group_worker in values(group_worker_rows, group_worker_types),
-        on: job.worker == group_worker.worker
-
-    ranked_query =
-      query
-      |> maybe_where_states(opts)
-      |> exclude_terminal_reauth_reconciliation_failures()
-      |> then(fn queryable ->
-        from [job, group_worker_row] in queryable,
-          windows: [
-            group_partition: [
-              partition_by: group_worker_row.group_index,
-              order_by: [desc: job.inserted_at, desc: job.id]
-            ]
-          ],
-          select: %{
-            id: job.id,
-            group_index: group_worker_row.group_index,
-            row_number: over(row_number(), :group_partition)
-          }
-      end)
-
-    ranked_query
-    |> subquery()
-    |> then(fn ranked ->
-      from ranked_job in ranked,
-        where: ranked_job.row_number == 1,
-        select: %{id: ranked_job.id, group_index: ranked_job.group_index}
-    end)
-  end
-
-  defmacrop job_summary_projection(
-              job,
-              pool,
-              assignment,
-              assignment_identity,
-              direct_identity,
-              api_key
-            ) do
-    quote do
-      %{
-        id: unquote(job).id,
-        worker: unquote(job).worker,
-        queue: unquote(job).queue,
-        state: unquote(job).state,
-        errors: unquote(job).errors,
-        attempt: unquote(job).attempt,
-        max_attempts: unquote(job).max_attempts,
-        inserted_at: unquote(job).inserted_at,
-        scheduled_at: unquote(job).scheduled_at,
-        attempted_at: unquote(job).attempted_at,
-        completed_at: unquote(job).completed_at,
-        discarded_at: unquote(job).discarded_at,
-        cancelled_at: unquote(job).cancelled_at,
-        target: %{
-          target_kind: fragment("?->>?", unquote(job).args, "target_kind"),
-          pool_id: fragment("?->>?", unquote(job).args, "pool_id"),
-          pool_name: unquote(pool).name,
-          pool_slug: unquote(pool).slug,
-          assignment_id: fragment("?->>?", unquote(job).args, "pool_upstream_assignment_id"),
-          assignment_label: unquote(assignment).assignment_label,
-          assignment_status: unquote(assignment).status,
-          assignment_identity_id: type(unquote(assignment).upstream_identity_id, :string),
-          upstream_identity_id: fragment("?->>?", unquote(job).args, "upstream_identity_id"),
-          assignment_identity_label: unquote(assignment_identity).account_label,
-          assignment_identity_status: unquote(assignment_identity).status,
-          direct_identity_label: unquote(direct_identity).account_label,
-          direct_identity_status: unquote(direct_identity).status,
-          api_key_id: fragment("?->>?", unquote(job).args, "api_key_id"),
-          api_key_label: unquote(api_key).display_name,
-          api_key_prefix: unquote(api_key).key_prefix,
-          rollup_date: fragment("?->>?", unquote(job).args, "rollup_date")
-        }
-      }
-    end
-  end
-
-  defp grouped_job_metadata_query(grouped_query, order \\ nil) do
-    queryable =
-      from job in Oban.Job,
-        join: grouped_job in subquery(grouped_query),
-        on: grouped_job.id == job.id
-
-    query =
-      from [
-             job,
-             grouped_job,
-             pool,
-             assignment,
-             assignment_identity,
-             direct_identity,
-             api_key
-           ] in grouped_job_target_metadata_query(queryable),
-           select: %{
-             group_index: grouped_job.group_index,
-             job:
-               job_summary_projection(
-                 job,
-                 pool,
-                 assignment,
-                 assignment_identity,
-                 direct_identity,
-                 api_key
-               )
-           }
-
-    grouped_job_metadata_order(query, order)
-  end
-
-  defp grouped_job_metadata_order(query, :scheduled) do
-    from [job, grouped_job, _pool, _assignment, _assignment_identity, _direct_identity, _api_key] in query,
-      order_by: [asc: grouped_job.group_index, asc: job.scheduled_at, desc: job.id]
-  end
-
-  defp grouped_job_metadata_order(query, :inserted_desc) do
-    from [job, grouped_job, _pool, _assignment, _assignment_identity, _direct_identity, _api_key] in query,
-      order_by: [asc: grouped_job.group_index, desc: job.inserted_at, desc: job.id]
-  end
-
-  defp grouped_job_metadata_order(query, _order), do: query
-
-  defp next_pending_worker_jobs_by_group(worker_groups) do
-    {group_worker_rows, group_keys_by_index} = group_worker_rows_by_index(worker_groups)
-
-    if group_worker_rows == [] do
-      %{}
-    else
-      group_worker_rows
-      |> ranked_next_pending_worker_jobs_query()
-      |> grouped_job_metadata_query()
-      |> Repo.all()
-      |> Map.new(fn %{group_index: group_index, job: job} ->
-        {Map.fetch!(group_keys_by_index, group_index), job}
-      end)
-    end
-  end
-
-  defp ranked_next_pending_worker_jobs_query(group_worker_rows) do
-    group_worker_types = %{group_index: :integer, worker: :string}
-
-    ranked_query =
-      from job in Oban.Job,
-        join: group_worker in values(group_worker_rows, group_worker_types),
-        on: job.worker == group_worker.worker,
-        where: job.state in ^open_job_states(),
-        windows: [
-          group_partition: [
-            partition_by: group_worker.group_index,
-            order_by: [asc: job.scheduled_at, desc: job.id]
-          ]
-        ],
-        select: %{
-          id: job.id,
-          group_index: group_worker.group_index,
-          row_number: over(row_number(), :group_partition)
-        }
-
-    ranked_query
-    |> subquery()
-    |> then(fn ranked ->
-      from ranked_job in ranked,
-        where: ranked_job.row_number == 1,
-        select: %{id: ranked_job.id, group_index: ranked_job.group_index}
-    end)
-  end
-
-  defp open_worker_jobs_by_group(worker_groups) do
-    {group_worker_rows, group_keys_by_index} = group_worker_rows_by_index(worker_groups)
-
-    if group_worker_rows == [] do
-      %{}
-    else
-      group_worker_rows
-      |> grouped_open_worker_jobs_query()
-      |> grouped_job_metadata_query(:scheduled)
-      |> Repo.all()
-      |> grouped_job_lists_by_group(group_keys_by_index)
-    end
-  end
-
-  defp grouped_open_worker_jobs_query(group_worker_rows) do
-    group_worker_types = %{group_index: :integer, worker: :string}
-
-    from job in Oban.Job,
-      join: group_worker in values(group_worker_rows, group_worker_types),
-      on: job.worker == group_worker.worker,
-      where: job.state in ^open_job_states(),
-      select: %{id: job.id, group_index: group_worker.group_index}
-  end
-
-  defp unresolved_failure_worker_jobs_by_group(worker_groups) do
-    {group_worker_rows, group_keys_by_index} = group_worker_rows_by_index(worker_groups)
-
-    if group_worker_rows == [] do
-      %{}
-    else
-      group_worker_rows
-      |> grouped_unresolved_failure_worker_jobs_query()
-      |> grouped_job_metadata_query(:inserted_desc)
-      |> Repo.all()
-      |> reject_reauth_required_grouped_reconciliation_failures()
-      |> grouped_job_lists_by_group(group_keys_by_index)
-    end
-  end
-
-  defp grouped_unresolved_failure_worker_jobs_query(group_worker_rows) do
-    group_worker_types = %{group_index: :integer, worker: :string}
-
-    query =
-      from job in Oban.Job,
-        join: group_worker in values(group_worker_rows, group_worker_types),
-        on: job.worker == group_worker.worker,
-        where: job.state in ^failure_states()
-
-    query
-    |> exclude_terminal_reauth_reconciliation_failures()
-    |> exclude_resolved_failure_matches()
-    |> then(fn queryable ->
-      from [job, group_worker_row] in queryable,
-        select: %{id: job.id, group_index: group_worker_row.group_index}
-    end)
-  end
-
-  defp reject_reauth_required_grouped_reconciliation_failures(grouped_jobs) do
-    Enum.reject(grouped_jobs, fn %{job: job} -> reauth_required_reconciliation_failure?(job) end)
-  end
-
-  defp grouped_job_lists_by_group(grouped_jobs, group_keys_by_index) do
-    grouped_jobs
-    |> Enum.reduce(%{}, fn %{group_index: group_index, job: job}, acc ->
-      group_key = Map.fetch!(group_keys_by_index, group_index)
-      Map.update(acc, group_key, [job], &[job | &1])
-    end)
-    |> Map.new(fn {group_key, jobs} -> {group_key, Enum.reverse(jobs)} end)
-  end
-
-  defp maybe_where_states(queryable, state: state) do
-    from job in queryable, where: job.state == ^state
-  end
-
-  defp maybe_where_states(queryable, states: states) do
-    from job in queryable, where: job.state in ^states
-  end
-
-  defp maybe_where_states(queryable, _opts), do: queryable
-
-  defp open_job_states, do: ["available", "scheduled", "executing", "retryable"]
-  defp failure_states, do: ["discarded", "retryable", "cancelled"]
-
-  defp empty_worker_job_summary do
-    %{
-      latest: nil,
-      latest_success: nil,
-      latest_failure: nil,
-      pending: nil,
-      open: [],
-      unresolved_failures: []
-    }
-  end
-
-  defp empty_worker_job_summaries_by_group(worker_groups) do
-    Map.new(normalize_worker_groups(worker_groups), fn {group_key, _workers} ->
-      {group_key, empty_worker_job_summary()}
-    end)
-  end
-
-  defp normalize_worker_groups(worker_groups) when is_list(worker_groups) do
-    worker_groups
-    |> Enum.map(&normalize_worker_group/1)
-    |> Enum.reject(fn {group_key, _workers} -> is_nil(group_key) end)
-  end
-
-  defp normalize_worker_groups(_worker_groups), do: []
-
-  defp normalize_worker_group(%{key: group_key, workers: workers}) do
-    {group_key, normalize_worker_names(workers)}
-  end
-
-  defp normalize_worker_group(%{"key" => group_key, "workers" => workers}) do
-    {group_key, normalize_worker_names(workers)}
-  end
-
-  defp normalize_worker_group(_group), do: {nil, []}
-
-  defp normalize_worker_names(workers) when is_list(workers) do
-    workers
-    |> Enum.map(&normalize_worker_name/1)
-    |> Enum.filter(&is_binary/1)
-  end
-
-  defp normalize_worker_names(_workers), do: []
-
-  defp normalize_worker_name(nil), do: nil
-  defp normalize_worker_name(worker) when is_binary(worker), do: worker
-  defp normalize_worker_name(worker) when is_atom(worker), do: worker_name(worker)
-  defp normalize_worker_name(_worker), do: nil
-
-  defp latest_jobs_query(queryable, opts) do
-    limit =
-      opts
-      |> Keyword.get(:limit, @admin_jobs_default_limit)
-      |> max(1)
-      |> min(@admin_jobs_max_limit)
-
-    queryable
-    |> job_metadata_query()
-    |> order_by([job], desc: job.inserted_at, desc: job.id)
-    |> limit(^limit)
-  end
-
-  defp empty_explorer_page(filters) do
-    limit = @explorer_page_size
-
-    offset =
-      filters |> normalize_explorer_filters() |> Map.fetch!(:page) |> explorer_offset(limit)
-
-    %{items: [], total: 0, limit: limit, offset: offset}
-  end
-
-  defp empty_explorer_filter_values, do: %{workers: [], queues: []}
-
-  defp configured_worker_values do
-    Schedule.entries()
-    |> Enum.flat_map(fn entry ->
-      [Map.get(entry, :scheduled_worker) | Map.get(entry, :workers, [])]
-    end)
-    |> normalize_worker_names()
-  end
-
-  defp configured_queue_values do
-    :codex_pooler
-    |> Application.get_env(Oban, [])
-    |> Keyword.get(:queues, [])
-    |> case do
-      queues when is_list(queues) -> Enum.map(queues, &queue_name/1)
-      _queues_disabled -> []
-    end
-    |> Enum.filter(&is_binary/1)
-  end
-
-  defp queue_name({queue, _limit}) when is_atom(queue), do: Atom.to_string(queue)
-  defp queue_name({queue, _limit}) when is_binary(queue), do: queue
-  defp queue_name(queue) when is_atom(queue), do: Atom.to_string(queue)
-  defp queue_name(queue) when is_binary(queue), do: queue
-  defp queue_name(_queue), do: nil
-
-  defp filter_option_values(configured_values, persisted_values) do
-    [configured_values, persisted_values]
-    |> List.flatten()
-    |> Enum.uniq()
-    |> Enum.sort()
-  end
-
-  defp distinct_job_field_values(field) when field in [:worker, :queue] do
-    Repo.all(
-      from job in Oban.Job,
-        where: not is_nil(field(job, ^field)) and field(job, ^field) != "",
-        select: field(job, ^field),
-        distinct: true,
-        order_by: field(job, ^field)
-    )
-  end
-
-  defp normalize_explorer_filters(filters) when is_map(filters) do
-    %{
-      state: filter_value(filters, :state),
-      worker: filter_value(filters, :worker),
-      queue: filter_value(filters, :queue),
-      attention: filter_value(filters, :attention),
-      target_kind: filter_value(filters, :target_kind),
-      target_id: filter_value(filters, :target_id),
-      page: normalized_page(filter_value(filters, :page)),
-      show_completed: filter_value(filters, :show_completed) == true
-    }
-  end
-
-  defp normalize_explorer_filters(_filters) do
-    normalize_explorer_filters(%{})
-  end
-
-  defp filter_value(filters, key) do
-    Map.get(filters, key) || Map.get(filters, Atom.to_string(key))
-  end
-
-  defp normalized_page(page) when is_integer(page) and page > 0, do: page
-  defp normalized_page(_page), do: 1
-
-  defp explorer_offset(page, limit), do: (page - 1) * limit
-
-  defp apply_explorer_filters(queryable, filters) do
-    queryable
-    |> maybe_filter_explorer_completed_visibility(filters)
-    |> maybe_filter_explorer_state(filters.state)
-    |> maybe_filter_explorer_worker(filters.worker)
-    |> maybe_filter_explorer_queue(filters.queue)
-    |> maybe_filter_explorer_target(filters.target_kind, filters.target_id)
-  end
-
-  defp maybe_filter_resolved_failure_visibility(queryable, %{attention: attention})
-       when attention in ["active_failure", "retry_pressure", "cancelled"] do
-    exclude_resolved_failure_jobs_query(queryable)
-  end
-
-  defp maybe_filter_resolved_failure_visibility(queryable, %{state: state})
-       when is_binary(state),
-       do: queryable
-
-  defp maybe_filter_resolved_failure_visibility(queryable, %{show_completed: true}),
-    do: queryable
-
-  defp maybe_filter_resolved_failure_visibility(queryable, _filters) do
-    exclude_resolved_failure_jobs_query(queryable)
-  end
-
-  defp maybe_filter_explorer_completed_visibility(queryable, %{show_completed: true}),
-    do: queryable
-
-  defp maybe_filter_explorer_completed_visibility(queryable, %{state: @completed_state}),
-    do: queryable
-
-  defp maybe_filter_explorer_completed_visibility(queryable, _filters) do
-    from job in queryable, where: job.state != @completed_state
-  end
-
-  defp maybe_filter_explorer_state(queryable, nil), do: queryable
-
-  defp maybe_filter_explorer_state(queryable, state) do
-    from job in queryable, where: job.state == ^state
-  end
-
-  defp maybe_filter_explorer_worker(queryable, nil), do: queryable
-
-  defp maybe_filter_explorer_worker(queryable, worker) do
-    from job in queryable, where: job.worker == ^worker
-  end
-
-  defp maybe_filter_explorer_queue(queryable, nil), do: queryable
-
-  defp maybe_filter_explorer_queue(queryable, queue) do
-    from job in queryable, where: job.queue == ^queue
-  end
-
-  defp maybe_filter_explorer_target(queryable, nil, _target_id), do: queryable
-
-  defp maybe_filter_explorer_target(queryable, "assignment", target_id),
-    do: where_arg(queryable, "pool_upstream_assignment_id", target_id)
-
-  defp maybe_filter_explorer_target(queryable, "upstream_identity", target_id),
-    do: where_arg(queryable, "upstream_identity_id", target_id)
-
-  defp maybe_filter_explorer_target(queryable, "pool", target_id),
-    do: where_arg(queryable, "pool_id", target_id)
-
-  defp maybe_filter_explorer_target(queryable, "api_key", target_id),
-    do: where_arg(queryable, "api_key_id", target_id)
-
-  defp maybe_filter_explorer_target(queryable, "rollup_date", target_id),
-    do: where_arg(queryable, "rollup_date", target_id)
-
-  defp maybe_filter_explorer_target(queryable, "system", _target_id) do
-    from job in queryable,
-      where:
-        is_nil(fragment("?->>?", job.args, "pool_id")) and
-          is_nil(fragment("?->>?", job.args, "pool_upstream_assignment_id")) and
-          is_nil(fragment("?->>?", job.args, "upstream_identity_id")) and
-          is_nil(fragment("?->>?", job.args, "api_key_id")) and
-          is_nil(fragment("?->>?", job.args, "rollup_date"))
-  end
-
-  defp maybe_filter_explorer_target(queryable, _target_kind, _target_id), do: queryable
-
-  defp where_arg(queryable, _key, nil), do: queryable
-
-  defp where_arg(queryable, key, value) do
-    from job in queryable, where: fragment("?->>?", job.args, ^key) == ^value
-  end
-
-  defp empty_jobs_overview do
-    %{
-      status: :empty,
-      empty?: true,
-      healthy?: false,
-      total: 0,
-      actionable_count: 0,
-      completed_context_count: 0,
-      buckets: Map.new(@overview_action_buckets, &{&1, empty_overview_bucket()}),
-      completed_context: empty_overview_bucket()
-    }
-  end
-
-  defp empty_overview_bucket, do: %{count: 0, newest: nil}
-
-  defp apply_overview_filters(queryable, filters) do
-    queryable
-    |> maybe_filter_explorer_worker(filters.worker)
-    |> maybe_filter_explorer_queue(filters.queue)
-    |> maybe_filter_explorer_target(filters.target_kind, filters.target_id)
-    |> exclude_resolved_failure_jobs_query()
-  end
-
-  defmacrop later_resolved_failure_absent?(
-              job,
-              account_reconciliation_worker,
-              identity_recovered_reconciliation_error_pattern
-            ) do
-    quote do
-      fragment(
-        """
-        NOT EXISTS (
-          SELECT 1
-          FROM oban_jobs resolved
-          LEFT JOIN pool_upstream_assignments resolved_assignment
-            ON resolved_assignment.id::text =
-              resolved.args->>'pool_upstream_assignment_id'
-          LEFT JOIN pool_upstream_assignments failed_assignment
-            ON failed_assignment.id::text =
-              ?->>'pool_upstream_assignment_id'
-          WHERE resolved.worker = ?
-            AND resolved.state = 'completed'
-            AND (
-              resolved.inserted_at > ?
-              OR (resolved.inserted_at = ? AND resolved.id > ?)
-            )
-            AND (
-              (
-                COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
-                AND COALESCE(resolved.args->>'pool_upstream_assignment_id', '') = COALESCE(?->>'pool_upstream_assignment_id', '')
-                AND COALESCE(resolved.args->>'upstream_identity_id', '') = COALESCE(?->>'upstream_identity_id', '')
-                AND COALESCE(resolved.args->>'api_key_id', '') = COALESCE(?->>'api_key_id', '')
-                AND COALESCE(resolved.args->>'rollup_date', '') = COALESCE(?->>'rollup_date', '')
-              )
-              OR (
-                ? = ?
-                AND COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
-                AND COALESCE(
-                  resolved.args->>'upstream_identity_id',
-                  resolved_assignment.upstream_identity_id::text
-                ) = COALESCE(
-                  ?->>'upstream_identity_id',
-                  failed_assignment.upstream_identity_id::text
-                )
-                AND COALESCE(
-                  ?->>'upstream_identity_id',
-                  failed_assignment.upstream_identity_id::text
-                ) IS NOT NULL
-              )
-              OR (
-                ? = ?
-                AND ?::text ~ ?
-                AND COALESCE(
-                  resolved.args->>'upstream_identity_id',
-                  resolved_assignment.upstream_identity_id::text
-                ) = COALESCE(
-                  ?->>'upstream_identity_id',
-                  failed_assignment.upstream_identity_id::text
-                )
-                AND COALESCE(
-                  ?->>'upstream_identity_id',
-                  failed_assignment.upstream_identity_id::text
-                ) IS NOT NULL
-              )
-            )
-        )
-        """,
-        unquote(job).args,
-        unquote(job).worker,
-        unquote(job).inserted_at,
-        unquote(job).inserted_at,
-        unquote(job).id,
-        unquote(job).args,
-        unquote(job).args,
-        unquote(job).args,
-        unquote(job).args,
-        unquote(job).args,
-        unquote(job).worker,
-        unquote(account_reconciliation_worker),
-        unquote(job).args,
-        unquote(job).args,
-        unquote(job).args,
-        unquote(job).worker,
-        unquote(account_reconciliation_worker),
-        unquote(job).errors,
-        unquote(identity_recovered_reconciliation_error_pattern),
-        unquote(job).args,
-        unquote(job).args
-      )
-    end
-  end
-
-  defp exclude_resolved_failure_jobs_query(queryable) do
-    account_reconciliation_worker = worker_name(AccountReconciliationWorker)
-
-    identity_recovered_reconciliation_error_pattern =
-      @identity_recovered_reconciliation_error_pattern
-
-    queryable
-    |> exclude_terminal_reauth_reconciliation_failures()
-    |> then(fn queryable ->
-      from job in queryable,
-        where:
-          job.state not in ^failure_states() or
-            later_resolved_failure_absent?(
-              job,
-              ^account_reconciliation_worker,
-              ^identity_recovered_reconciliation_error_pattern
-            )
-    end)
-  end
-
-  defp exclude_resolved_failure_matches(queryable) do
-    account_reconciliation_worker = worker_name(AccountReconciliationWorker)
-
-    identity_recovered_reconciliation_error_pattern =
-      @identity_recovered_reconciliation_error_pattern
-
-    from job in queryable,
-      where:
-        later_resolved_failure_absent?(
-          job,
-          ^account_reconciliation_worker,
-          ^identity_recovered_reconciliation_error_pattern
-        )
-  end
-
-  defp exclude_terminal_reauth_reconciliation_failures(queryable) do
-    account_reconciliation_worker = worker_name(AccountReconciliationWorker)
-    failure_states = failure_states()
-    assignment_reauth_required = PoolUpstreamAssignment.reauth_required_status()
-    identity_reauth_required = UpstreamIdentity.reauth_required_status()
-
-    from job in queryable,
-      where:
-        job.state not in ^failure_states or job.worker != ^account_reconciliation_worker or
-          not fragment(
-            """
-            EXISTS (
-              SELECT 1
-              FROM pool_upstream_assignments account_reconciliation_assignment
-              LEFT JOIN upstream_identities account_reconciliation_assignment_identity
-                ON account_reconciliation_assignment_identity.id =
-                  account_reconciliation_assignment.upstream_identity_id
-              WHERE account_reconciliation_assignment.id::text =
-                ?->>'pool_upstream_assignment_id'
-                AND (
-                  account_reconciliation_assignment.status = ?
-                  OR account_reconciliation_assignment_identity.status = ?
-                )
-            )
-            OR EXISTS (
-              SELECT 1
-              FROM upstream_identities account_reconciliation_direct_identity
-              WHERE account_reconciliation_direct_identity.id::text =
-                ?->>'upstream_identity_id'
-                AND account_reconciliation_direct_identity.status = ?
-            )
-            """,
-            job.args,
-            ^assignment_reauth_required,
-            ^identity_reauth_required,
-            job.args,
-            ^identity_reauth_required
-          )
-  end
-
-  defp collect_overview_job(job, overview, now) do
-    job = job |> FailurePresentation.sanitize_job() |> HealthPolicy.put_attention(now: now)
-    overview = %{overview | total: overview.total + 1}
-
-    case job.attention_state do
-      attention_state when attention_state in @overview_action_buckets ->
-        collect_overview_actionable_job(overview, attention_state, job)
-
-      :healthy_context ->
-        collect_completed_context_job(overview, job)
-
-      _other_state ->
-        overview
-    end
-  end
-
-  defp collect_overview_actionable_job(overview, attention_state, job) do
-    bucket = Map.fetch!(overview.buckets, attention_state)
-
-    bucket = %{
-      bucket
-      | count: bucket.count + 1,
-        newest: bucket.newest || job
-    }
-
-    %{
-      overview
-      | actionable_count: overview.actionable_count + 1,
-        buckets: Map.put(overview.buckets, attention_state, bucket)
-    }
-  end
-
-  defp collect_completed_context_job(overview, job) do
-    bucket = overview.completed_context
-
-    %{
-      overview
-      | completed_context_count: overview.completed_context_count + 1,
-        completed_context: %{bucket | count: bucket.count + 1, newest: bucket.newest || job}
-    }
-  end
-
-  defp finalize_jobs_overview(%{total: 0} = overview), do: overview
-
-  defp finalize_jobs_overview(%{actionable_count: actionable_count} = overview)
-       when actionable_count > 0 do
-    %{overview | status: :attention_required, empty?: false, healthy?: false}
-  end
-
-  defp finalize_jobs_overview(overview) do
-    %{overview | status: :healthy, empty?: false, healthy?: true}
-  end
-
-  defp attention_filtered_explorer_page(queryable, attention, limit, offset, opts) do
-    now = attention_now(opts)
-
-    {:ok, {total, items}} =
-      Repo.transaction(fn ->
-        queryable
-        |> job_metadata_query()
-        |> order_by([job], desc: job.inserted_at, desc: job.id)
-        |> Repo.stream()
-        |> Enum.reduce({0, []}, fn job, {total, items} ->
-          collect_attention_explorer_item({total, items}, job, attention, now, limit, offset)
-        end)
-      end)
-
-    %{
-      items: items |> Enum.reverse() |> FailurePresentation.sanitize_jobs(),
-      total: total,
-      limit: limit,
-      offset: offset
-    }
-  end
-
-  defp collect_attention_explorer_item({total, items}, job, attention, now, limit, offset) do
-    job = HealthPolicy.put_attention(job, now: now)
-
-    if Atom.to_string(job.attention_state) == attention do
-      {total + 1, maybe_collect_explorer_item(items, job, total, limit, offset)}
-    else
-      {total, items}
-    end
-  end
-
-  defp maybe_collect_explorer_item(items, job, total, limit, offset) do
-    if total >= offset and length(items) < limit do
-      [job | items]
-    else
-      items
-    end
-  end
-
-  defp job_metadata_query(queryable) do
-    from [
-           job,
-           pool,
-           assignment,
-           assignment_identity,
-           direct_identity,
-           api_key
-         ] in job_target_metadata_query(queryable),
-         select:
-           job_summary_projection(
-             job,
-             pool,
-             assignment,
-             assignment_identity,
-             direct_identity,
-             api_key
-           )
-  end
-
-  defp job_target_metadata_query(queryable) do
-    from job in queryable,
-      left_join: pool in Pool,
-      on: fragment("?->>?", job.args, "pool_id") == type(pool.id, :string),
-      left_join: assignment in PoolUpstreamAssignment,
-      on:
-        fragment("?->>?", job.args, "pool_upstream_assignment_id") ==
-          type(assignment.id, :string),
-      left_join: assignment_identity in UpstreamIdentity,
-      on: assignment.upstream_identity_id == assignment_identity.id,
-      left_join: direct_identity in UpstreamIdentity,
-      on:
-        fragment("?->>?", job.args, "upstream_identity_id") == type(direct_identity.id, :string),
-      left_join: api_key in APIKey,
-      on: fragment("?->>?", job.args, "api_key_id") == type(api_key.id, :string)
-  end
-
-  defp grouped_job_target_metadata_query(queryable) do
-    from [job, _grouped_job] in queryable,
-      left_join: pool in Pool,
-      on: fragment("?->>?", job.args, "pool_id") == type(pool.id, :string),
-      left_join: assignment in PoolUpstreamAssignment,
-      on:
-        fragment("?->>?", job.args, "pool_upstream_assignment_id") ==
-          type(assignment.id, :string),
-      left_join: assignment_identity in UpstreamIdentity,
-      on: assignment.upstream_identity_id == assignment_identity.id,
-      left_join: direct_identity in UpstreamIdentity,
-      on:
-        fragment("?->>?", job.args, "upstream_identity_id") == type(direct_identity.id, :string),
-      left_join: api_key in APIKey,
-      on: fragment("?->>?", job.args, "api_key_id") == type(api_key.id, :string)
-  end
-
-  defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
   defp pool_id(%{id: id}), do: id
   defp pool_id(id) when is_binary(id), do: id
   defp identity_id(%{id: id}), do: id
