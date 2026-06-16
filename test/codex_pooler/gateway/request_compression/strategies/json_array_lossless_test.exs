@@ -42,20 +42,16 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.JsonArrayLosslessTes
       assert compressed_tokens < original_tokens
 
       assert %{
-               strategy: "json_array_lossless",
+               strategy: :json_array_lossless,
                row_count: 2,
                original_bytes: original_bytes,
                compressed_bytes: compressed_bytes,
-               saved_bytes: saved_bytes,
                original_tokens: ^original_tokens,
-               compressed_tokens: ^compressed_tokens,
-               saved_tokens: saved_tokens
+               compressed_tokens: ^compressed_tokens
              } = metadata
 
       assert original_bytes == byte_size(original)
       assert compressed_bytes == byte_size(compressed)
-      assert saved_bytes == original_bytes - compressed_bytes
-      assert saved_tokens == original_tokens - compressed_tokens
     end
 
     test "preserves every row, key, value, and nested item" do
@@ -158,14 +154,10 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.JsonArrayLosslessTes
              |> Enum.sort() == [
                :compressed_bytes,
                :compressed_tokens,
-               :encoding,
                :original_bytes,
                :original_tokens,
                :row_count,
-               :saved_bytes,
-               :saved_tokens,
-               :strategy,
-               :tokenizer
+               :strategy
              ]
     end
 
