@@ -72,7 +72,7 @@ defmodule CodexPooler.MailerTest do
       }
       |> InstanceSettings.put_smtp_password("PaSSw0rd")
 
-    assert {:ok, _updated} = InstanceSettings.update(settings, attrs)
+    assert {:ok, _updated} = InstanceSettings.update_system_settings(settings, attrs)
     assert Mailer.configured?()
     assert Mailer.default_sender() == {"Codex Pooler", "instance-sender@example.com"}
 

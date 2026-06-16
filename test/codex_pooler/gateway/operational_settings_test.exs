@@ -82,7 +82,7 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     :ok = Cache.subscribe()
 
     assert {:ok, updated} =
-             InstanceSettings.update(instance_settings, %{
+             InstanceSettings.update_system_settings(instance_settings, %{
                "files" => %{
                  "max_size_bytes" => 1024,
                  "upload_ttl_seconds" => 60,

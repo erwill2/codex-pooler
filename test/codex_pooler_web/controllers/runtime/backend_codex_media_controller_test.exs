@@ -331,7 +331,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexMediaControllerTest do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, _updated} =
-             InstanceSettings.update(settings, %{
+             InstanceSettings.update_system_settings(settings, %{
                "transcription" => %{"max_upload_bytes" => limit}
              })
   end

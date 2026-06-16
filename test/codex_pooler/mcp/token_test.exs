@@ -235,13 +235,19 @@ defmodule CodexPooler.MCP.TokenTest do
 
   defp enable_global_mcp! do
     settings = InstanceSettings.ensure_singleton!()
-    assert {:ok, updated} = InstanceSettings.update(settings, %{"mcp" => %{"enabled" => true}})
+
+    assert {:ok, updated} =
+             InstanceSettings.update_system_settings(settings, %{"mcp" => %{"enabled" => true}})
+
     updated
   end
 
   defp disable_global_mcp! do
     settings = InstanceSettings.get!()
-    assert {:ok, updated} = InstanceSettings.update(settings, %{"mcp" => %{"enabled" => false}})
+
+    assert {:ok, updated} =
+             InstanceSettings.update_system_settings(settings, %{"mcp" => %{"enabled" => false}})
+
     updated
   end
 

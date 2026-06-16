@@ -551,7 +551,10 @@ defmodule CodexPoolerWeb.Admin.SettingsLiveTest do
 
   defp enable_global_mcp! do
     settings = InstanceSettings.ensure_singleton!()
-    assert {:ok, updated} = InstanceSettings.update(settings, %{"mcp" => %{"enabled" => true}})
+
+    assert {:ok, updated} =
+             InstanceSettings.update_system_settings(settings, %{"mcp" => %{"enabled" => true}})
+
     updated
   end
 end

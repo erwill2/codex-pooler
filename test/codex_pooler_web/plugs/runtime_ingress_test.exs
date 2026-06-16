@@ -703,7 +703,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
     instance_settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, _updated} =
-             InstanceSettings.update(instance_settings, %{
+             InstanceSettings.update_system_settings(instance_settings, %{
                "ingress" => %{
                  "firewall_allowlist" => settings.firewall_allowlist,
                  "trusted_proxies" => settings.trusted_proxies,

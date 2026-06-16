@@ -761,7 +761,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
     Application.put_env(:codex_pooler, :dev_features_enabled, true)
 
     assert {:ok, settings} =
-             InstanceSettings.update(InstanceSettings.ensure_singleton!(), %{
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
                "development" => %{
                  "impeccable_live_enabled" => false,
                  "account_reconciliation_paused" => true

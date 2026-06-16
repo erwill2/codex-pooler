@@ -42,44 +42,21 @@ defmodule CodexPooler.InstanceSettings do
     |> Settings.mark_loaded(:database)
   end
 
-  @spec update(settings() | Scope.t(), map()) :: update_result()
+  @spec update(Scope.t(), map()) :: update_result()
   def update(%Scope{} = scope, attrs) when is_map(attrs) do
     with {:ok, _decision} <- Pools.require_capability(scope, Pools.capability(:pool_manage)) do
-      __MODULE__.update(ensure_scoped_settings(scope), put_scope(attrs, scope))
+      do_update(ensure_scoped_settings(scope), put_scope(attrs, scope))
     end
   end
 
-  def update(%Settings{} = settings, attrs) when is_map(attrs) do
-    scope = extract_scope(attrs)
-    attrs = attrs |> strip_context_attrs() |> put_updated_by(scope)
-    before = Settings.mark_loaded(settings, :database)
-
-    settings
-    |> Settings.changeset(attrs)
-    |> Repo.update(
-      stale_error_field: :lock_version,
-      stale_error_message: "was updated by another operator"
-    )
-    |> tap(fn
-      {:ok, updated} ->
-        updated = Settings.mark_loaded(updated, :database)
-        Cache.put(updated)
-        _ = Cache.broadcast_update(updated)
-        record_update_audit(scope, before, updated)
-
-      _result ->
-        :ok
-    end)
-    |> case do
-      {:ok, updated} -> {:ok, Settings.mark_loaded(updated, :database)}
-      {:error, changeset} -> {:error, changeset}
-    end
-  end
+  @spec update_system_settings(settings(), map()) :: update_result()
+  def update_system_settings(%Settings{} = settings, attrs) when is_map(attrs),
+    do: do_update(settings, attrs)
 
   @spec update(Scope.t(), settings(), map()) :: update_result()
   def update(%Scope{} = scope, %Settings{} = settings, attrs) when is_map(attrs) do
     with {:ok, _decision} <- Pools.require_capability(scope, Pools.capability(:pool_manage)) do
-      __MODULE__.update(settings, put_scope(attrs, scope))
+      do_update(settings, put_scope(attrs, scope))
     end
   end
 
@@ -149,19 +126,20 @@ defmodule CodexPooler.InstanceSettings do
   end
 
   @spec send_smtp_test_email(map(), Scope.t()) ::
-          {:ok, map()} | {:error, Ecto.Changeset.t() | map()}
+          {:ok, map()} | {:error, Ecto.Changeset.t() | map() | Pools.access_error()}
   def send_smtp_test_email(attrs, %Scope{} = scope) when is_map(attrs) do
     send_smtp_test_email(ensure_singleton!(), attrs, scope)
   end
 
   @spec send_smtp_test_email(settings(), map(), Scope.t()) ::
-          {:ok, map()} | {:error, Ecto.Changeset.t() | map()}
+          {:ok, map()} | {:error, Ecto.Changeset.t() | map() | Pools.access_error()}
   def send_smtp_test_email(%Settings{} = settings, attrs, %Scope{} = scope) when is_map(attrs) do
     attrs = strip_context_attrs(attrs)
 
     changeset = Settings.changeset(settings, attrs)
 
-    with {:ok, candidate} <- Ecto.Changeset.apply_action(changeset, :update),
+    with {:ok, _decision} <- Pools.require_capability(scope, Pools.capability(:pool_manage)),
+         {:ok, candidate} <- Ecto.Changeset.apply_action(changeset, :update),
          {:ok, recipient_email} <- smtp_test_operator_email(scope),
          {:ok, delivery_config} <- MailerConfig.from_settings(candidate),
          {:ok, delivery_config} <- smtp_test_delivery_config(delivery_config) do
@@ -181,6 +159,33 @@ defmodule CodexPooler.InstanceSettings do
   def reset_cache_for_test, do: Cache.reset_for_test()
 
   defp ensure_scoped_settings(%Scope{}), do: ensure_singleton!()
+
+  defp do_update(%Settings{} = settings, attrs) when is_map(attrs) do
+    scope = extract_scope(attrs)
+    attrs = attrs |> strip_context_attrs() |> put_updated_by(scope)
+    before = Settings.mark_loaded(settings, :database)
+
+    settings
+    |> Settings.changeset(attrs)
+    |> Repo.update(
+      stale_error_field: :lock_version,
+      stale_error_message: "was updated by another operator"
+    )
+    |> tap(fn
+      {:ok, updated} ->
+        updated = Settings.mark_loaded(updated, :database)
+        Cache.put(updated)
+        _ = Cache.broadcast_update(updated)
+        record_update_audit(scope, before, updated)
+
+      _result ->
+        :ok
+    end)
+    |> case do
+      {:ok, updated} -> {:ok, Settings.mark_loaded(updated, :database)}
+      {:error, changeset} -> {:error, changeset}
+    end
+  end
 
   defp extract_scope(attrs) do
     Map.get(attrs, :current_scope) || Map.get(attrs, "current_scope") || Map.get(attrs, :scope) ||

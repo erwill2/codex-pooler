@@ -226,7 +226,7 @@ defmodule CodexPooler.JobsTest do
       source_url = FakeUpstream.url(upstream)
 
       assert {:ok, _settings} =
-               InstanceSettings.update(InstanceSettings.ensure_singleton!(), %{
+               InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
                  "catalog" => %{"openai_pricing_url" => source_url}
                })
 

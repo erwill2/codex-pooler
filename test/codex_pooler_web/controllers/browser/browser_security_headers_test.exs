@@ -102,7 +102,7 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     Application.put_env(:codex_pooler, :dev_features_enabled, false)
 
     assert {:ok, _settings} =
-             InstanceSettings.update(InstanceSettings.ensure_singleton!(), %{
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
                "development" => %{"impeccable_live_enabled" => true}
              })
 

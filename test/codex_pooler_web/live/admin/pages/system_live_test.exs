@@ -39,7 +39,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
 
   test "denies instance admins before loading global settings or MCP counts", %{scope: scope} do
     assert {:ok, _settings} =
-             InstanceSettings.update(InstanceSettings.ensure_singleton!(), %{
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
                "files" => %{"upload_ttl_seconds" => 777}
              })
 
@@ -83,7 +83,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     Application.put_env(:codex_pooler, :dev_features_enabled, true)
 
     assert {:ok, settings} =
-             InstanceSettings.update(InstanceSettings.ensure_singleton!(), %{
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
                "files" => %{"upload_ttl_seconds" => 321},
                "mcp" => %{"enabled" => false}
              })
@@ -211,7 +211,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     Application.put_env(:codex_pooler, :dev_features_enabled, false)
 
     assert {:ok, _settings} =
-             InstanceSettings.update(InstanceSettings.ensure_singleton!(), %{
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
                "development" => %{
                  "impeccable_live_enabled" => true,
                  "account_reconciliation_paused" => true
@@ -396,7 +396,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     source_url = FakeUpstream.url(upstream)
 
     assert {:ok, _settings} =
-             InstanceSettings.update(InstanceSettings.ensure_singleton!(), %{
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), %{
                "catalog" => %{"openai_pricing_url" => source_url}
              })
 
@@ -972,7 +972,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     smtp_password = "ingress-isolation-smtp-#{System.unique_integer([:positive])}"
 
     assert {:ok, _configured} =
-             InstanceSettings.update(
+             InstanceSettings.update_system_settings(
                InstanceSettings.ensure_singleton!(),
                %{
                  "smtp" => %{
@@ -994,7 +994,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
 
     assert {:ok, _other_card_update} =
-             InstanceSettings.update(InstanceSettings.get!(), %{
+             InstanceSettings.update_system_settings(InstanceSettings.get!(), %{
                "files" => %{"upload_ttl_seconds" => 777}
              })
 
@@ -1085,7 +1085,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     {:ok, view, _html} = live(conn, ~p"/admin/system?#{%{"tab" => "gateway"}}")
 
     assert {:ok, _updated} =
-             InstanceSettings.update(InstanceSettings.get!(), %{
+             InstanceSettings.update_system_settings(InstanceSettings.get!(), %{
                "files" => %{"upload_ttl_seconds" => 444}
              })
 
@@ -1214,7 +1214,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     stored_password = "stored-password-#{System.unique_integer([:positive])}"
 
     assert {:ok, _configured} =
-             InstanceSettings.update(
+             InstanceSettings.update_system_settings(
                InstanceSettings.ensure_singleton!(),
                %{
                  "smtp" => %{

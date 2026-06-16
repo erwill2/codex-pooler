@@ -830,6 +830,6 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuityTest do
     instance_settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, _updated} =
-             InstanceSettings.update(instance_settings, %{"gateway" => attrs})
+             InstanceSettings.update_system_settings(instance_settings, %{"gateway" => attrs})
   end
 end

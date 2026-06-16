@@ -117,6 +117,8 @@ defmodule CodexPooler.Accounts.OperatorEmailTest do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, _updated} =
-             InstanceSettings.update(settings, %{"operator" => %{"login_base_url" => url}})
+             InstanceSettings.update_system_settings(settings, %{
+               "operator" => %{"login_base_url" => url}
+             })
   end
 end

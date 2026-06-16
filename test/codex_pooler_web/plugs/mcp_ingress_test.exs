@@ -195,7 +195,7 @@ defmodule CodexPoolerWeb.Plugs.McpIngressTest do
     instance_settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, _updated} =
-             InstanceSettings.update(instance_settings, %{
+             InstanceSettings.update_system_settings(instance_settings, %{
                "ingress" => %{
                  "firewall_allowlist" => settings.firewall_allowlist,
                  "trusted_proxies" => settings.trusted_proxies,
@@ -217,7 +217,10 @@ defmodule CodexPoolerWeb.Plugs.McpIngressTest do
 
   defp enabled_mcp_token!(user) do
     settings = InstanceSettings.ensure_singleton!()
-    assert {:ok, _updated} = InstanceSettings.update(settings, %{"mcp" => %{"enabled" => true}})
+
+    assert {:ok, _updated} =
+             InstanceSettings.update_system_settings(settings, %{"mcp" => %{"enabled" => true}})
+
     assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(user, true)
 
     assert {:ok, %{raw_token: raw_token}} =

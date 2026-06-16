@@ -100,7 +100,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:error, changeset} =
-             InstanceSettings.update(settings, %{
+             InstanceSettings.update_system_settings(settings, %{
                "ingress" => %{"firewall_allowlist" => ["not-an-ip"]},
                "files" => %{"upload_ttl_seconds" => -1},
                "smtp" => %{"tls" => "sometimes"},
@@ -121,14 +121,14 @@ defmodule CodexPooler.InstanceSettingsTest do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, updated} =
-             InstanceSettings.update(settings, %{
+             InstanceSettings.update_system_settings(settings, %{
                "development" => %{"impeccable_live_enabled" => true}
              })
 
     assert updated.development.impeccable_live_enabled == true
 
     assert {:error, changeset} =
-             InstanceSettings.update(updated, %{
+             InstanceSettings.update_system_settings(updated, %{
                "development" => %{"impeccable_live_enabled" => "http://localhost:8400/live.js"}
              })
 
@@ -139,7 +139,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, updated} =
-             InstanceSettings.update(settings, %{
+             InstanceSettings.update_system_settings(settings, %{
                "operator" => %{"login_base_url" => "https://codex-pooler.example.com/"}
              })
 
@@ -150,7 +150,7 @@ defmodule CodexPooler.InstanceSettingsTest do
           "https://codex-pooler.example.com/login/"
         ] do
       assert {:error, changeset} =
-               InstanceSettings.update(updated, %{
+               InstanceSettings.update_system_settings(updated, %{
                  "operator" => %{"login_base_url" => login_url}
                })
 
@@ -158,7 +158,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     end
 
     assert {:error, changeset} =
-             InstanceSettings.update(updated, %{
+             InstanceSettings.update_system_settings(updated, %{
                "operator" => %{"login_base_url" => "ftp://pooler.example.com"}
              })
 
@@ -169,7 +169,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, updated} =
-             InstanceSettings.update(settings, %{
+             InstanceSettings.update_system_settings(settings, %{
                "catalog" => %{
                  "openai_pricing_url" => " https://pricing.example.com/catalog.json "
                }
@@ -178,7 +178,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert updated.catalog.openai_pricing_url == "https://pricing.example.com/catalog.json"
 
     assert {:error, changeset} =
-             InstanceSettings.update(updated, %{
+             InstanceSettings.update_system_settings(updated, %{
                "catalog" => %{"openai_pricing_url" => "s3://pricing/catalog.json"}
              })
 
@@ -192,7 +192,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert settings.mcp.enabled == false
 
     assert {:ok, updated} =
-             InstanceSettings.update(settings, %{
+             InstanceSettings.update_system_settings(settings, %{
                "mcp" => %{"enabled" => true}
              })
 
@@ -201,7 +201,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert InstanceSettings.current().mcp.enabled == true
 
     assert {:ok, disabled} =
-             InstanceSettings.update(InstanceSettings.get!(), %{
+             InstanceSettings.update_system_settings(InstanceSettings.get!(), %{
                "mcp" => %{"enabled" => false}
              })
 
@@ -220,7 +220,7 @@ defmodule CodexPooler.InstanceSettingsTest do
              "https://icoretech.github.io/openai-json-pricing/pricing.json"
 
     assert {:ok, updated} =
-             InstanceSettings.update(Repo.reload!(legacy), %{
+             InstanceSettings.update_system_settings(Repo.reload!(legacy), %{
                "files" => %{"upload_ttl_seconds" => 600}
              })
 
@@ -239,7 +239,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert InstanceSettings.current().mcp.enabled == false
 
     assert {:ok, updated} =
-             InstanceSettings.update(Repo.reload!(legacy), %{
+             InstanceSettings.update_system_settings(Repo.reload!(legacy), %{
                "files" => %{"upload_ttl_seconds" => 600}
              })
 
@@ -256,7 +256,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert InstanceSettings.current().gateway.upstream_user_agent == "codex_cli_rs/0.0.0"
 
     assert {:ok, updated} =
-             InstanceSettings.update(Repo.reload!(legacy), %{
+             InstanceSettings.update_system_settings(Repo.reload!(legacy), %{
                "files" => %{"upload_ttl_seconds" => 600}
              })
 
@@ -277,7 +277,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert InstanceSettings.current().development.account_reconciliation_paused == false
 
     assert {:ok, updated} =
-             InstanceSettings.update(Repo.reload!(legacy), %{
+             InstanceSettings.update_system_settings(Repo.reload!(legacy), %{
                "catalog" => %{"openai_pricing_url" => "https://pricing.example.com/catalog.json"}
              })
 
@@ -291,7 +291,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     :ok = Cache.subscribe()
 
     assert {:ok, updated} =
-             InstanceSettings.update(settings, %{
+             InstanceSettings.update_system_settings(settings, %{
                "gateway" => %{"gateway_debug" => true},
                "files" => %{"upload_ttl_seconds" => 120}
              })
@@ -308,7 +308,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     log =
       capture_log(fn ->
         assert {:ok, _updated} =
-                 InstanceSettings.update(settings, %{
+                 InstanceSettings.update_system_settings(settings, %{
                    "gateway" => %{"gateway_debug" => true}
                  })
 
@@ -380,7 +380,7 @@ defmodule CodexPooler.InstanceSettingsTest do
       }
       |> InstanceSettings.put_smtp_password(password)
 
-    assert {:ok, updated} = InstanceSettings.update(settings, attrs)
+    assert {:ok, updated} = InstanceSettings.update_system_settings(settings, attrs)
     assert updated.smtp.password_status == :configured
     assert updated.smtp.password_ciphertext != password
     assert {:ok, ^password} = InstanceSettings.decrypt_smtp_password(updated)
@@ -418,7 +418,7 @@ defmodule CodexPooler.InstanceSettingsTest do
       }
       |> InstanceSettings.put_smtp_password("preserved-secret")
 
-    assert {:ok, configured} = InstanceSettings.update(settings, attrs)
+    assert {:ok, configured} = InstanceSettings.update_system_settings(settings, attrs)
     assert {:ok, "preserved-secret"} = InstanceSettings.decrypt_smtp_password(configured)
 
     preserve_attrs =
@@ -433,7 +433,7 @@ defmodule CodexPooler.InstanceSettingsTest do
       }
       |> InstanceSettings.preserve_smtp_password()
 
-    assert {:ok, preserved} = InstanceSettings.update(configured, preserve_attrs)
+    assert {:ok, preserved} = InstanceSettings.update_system_settings(configured, preserve_attrs)
     assert {:ok, "preserved-secret"} = InstanceSettings.decrypt_smtp_password(preserved)
     assert preserved.smtp.username == "mailer-renamed"
 
@@ -447,7 +447,7 @@ defmodule CodexPooler.InstanceSettingsTest do
       }
       |> InstanceSettings.clear_smtp_password()
 
-    assert {:ok, cleared} = InstanceSettings.update(preserved, clear_attrs)
+    assert {:ok, cleared} = InstanceSettings.update_system_settings(preserved, clear_attrs)
     assert cleared.smtp.password_status == :intentionally_unset
 
     assert {:error, %{code: :smtp_password_unavailable}} =
@@ -469,7 +469,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:error, changeset} =
-             InstanceSettings.update(settings, %{
+             InstanceSettings.update_system_settings(settings, %{
                "smtp" => %{
                  "enabled" => true,
                  "host" => "smtp.example.com",
@@ -516,7 +516,7 @@ defmodule CodexPooler.InstanceSettingsTest do
       }
       |> InstanceSettings.put_smtp_password("stored-password")
 
-    assert {:ok, configured} = InstanceSettings.update(settings, configured_attrs)
+    assert {:ok, configured} = InstanceSettings.update_system_settings(settings, configured_attrs)
     before = InstanceSettings.get!()
     expected_password_hash = :crypto.hash(:sha256, "stored-password")
 
@@ -637,7 +637,9 @@ defmodule CodexPooler.InstanceSettingsTest do
 
     assert {:ok, updated} =
              settings
-             |> InstanceSettings.update(InstanceSettings.put_metrics_bearer_token(%{}, token))
+             |> InstanceSettings.update_system_settings(
+               InstanceSettings.put_metrics_bearer_token(%{}, token)
+             )
 
     assert updated.metrics.bearer_token_status == :configured
     assert updated.metrics.bearer_token_fingerprint =~ "sha256:"
@@ -652,10 +654,14 @@ defmodule CodexPooler.InstanceSettingsTest do
     fresh = InstanceSettings.get!()
 
     assert {:ok, _updated} =
-             InstanceSettings.update(fresh, %{"files" => %{"upload_ttl_seconds" => 300}})
+             InstanceSettings.update_system_settings(fresh, %{
+               "files" => %{"upload_ttl_seconds" => 300}
+             })
 
     assert {:error, changeset} =
-             InstanceSettings.update(stale, %{"files" => %{"upload_ttl_seconds" => 600}})
+             InstanceSettings.update_system_settings(stale, %{
+               "files" => %{"upload_ttl_seconds" => 600}
+             })
 
     assert "was updated by another operator" in errors_on(changeset).lock_version
     assert InstanceSettings.get!().files.upload_ttl_seconds == 300

@@ -20,7 +20,10 @@ defmodule CodexPooler.MCP.UpstreamsToolsTest do
 
     %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
     settings = InstanceSettings.ensure_singleton!()
-    assert {:ok, _settings} = InstanceSettings.update(settings, %{"mcp" => %{"enabled" => true}})
+
+    assert {:ok, _settings} =
+             InstanceSettings.update_system_settings(settings, %{"mcp" => %{"enabled" => true}})
+
     assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(owner, true)
 
     assert {:ok, %{raw_token: raw_token}} =

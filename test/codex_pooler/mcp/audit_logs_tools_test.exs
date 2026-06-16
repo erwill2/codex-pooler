@@ -28,7 +28,10 @@ defmodule CodexPooler.MCP.AuditLogsToolsTest do
       |> Repo.update!()
 
     settings = InstanceSettings.ensure_singleton!()
-    assert {:ok, _updated} = InstanceSettings.update(settings, %{"mcp" => %{"enabled" => true}})
+
+    assert {:ok, _updated} =
+             InstanceSettings.update_system_settings(settings, %{"mcp" => %{"enabled" => true}})
+
     assert {:ok, _operator_settings} = MCP.set_operator_mcp_enabled(user, true)
 
     assert {:ok, %{raw_token: raw_token}} = MCP.create_operator_token(user, %{label: "Logs MCP"})

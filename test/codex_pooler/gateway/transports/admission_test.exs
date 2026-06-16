@@ -286,7 +286,7 @@ defmodule CodexPooler.Gateway.Transports.AdmissionTest do
     instance_settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, _updated} =
-             InstanceSettings.update(instance_settings, %{
+             InstanceSettings.update_system_settings(instance_settings, %{
                "gateway" => %{
                  "bulkheads" => string_keyed_map(settings.bulkheads)
                }

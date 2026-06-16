@@ -504,7 +504,8 @@ defmodule CodexPoolerWeb.Admin.AuditLogsLiveTest do
       |> InstanceSettings.put_metrics_bearer_token(metrics_token)
       |> InstanceSettings.put_smtp_password(smtp_password)
 
-    assert {:ok, updated} = InstanceSettings.update(InstanceSettings.ensure_singleton!(), attrs)
+    assert {:ok, updated} =
+             InstanceSettings.update_system_settings(InstanceSettings.ensure_singleton!(), attrs)
 
     event =
       Repo.one!(

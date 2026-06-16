@@ -88,14 +88,31 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
     assert current.lock_version == settings.lock_version
   end
 
+  test "only owner scopes can send SMTP test email through the context", %{scope: owner_scope} do
+    settings = InstanceSettings.ensure_singleton!()
+
+    %{user: admin} =
+      AccountsFixtures.operator_fixture(owner_scope, %{
+        "email" => AccountsFixtures.unique_user_email()
+      })
+
+    admin_scope = Scope.for_user(admin)
+
+    assert {:error, %{code: :capability_denied}} =
+             InstanceSettings.send_smtp_test_email(
+               settings,
+               %{"smtp" => %{"enabled" => true}},
+               admin_scope
+             )
+
+    assert InstanceSettings.get!().lock_version == settings.lock_version
+  end
+
   test "mcp service updates are audited as non-secret setting changes only", %{scope: scope} do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, updated} =
-             InstanceSettings.update(settings, %{
-               "mcp" => %{"enabled" => true},
-               :current_scope => scope
-             })
+             InstanceSettings.update(scope, settings, %{"mcp" => %{"enabled" => true}})
 
     assert updated.mcp.enabled == true
 

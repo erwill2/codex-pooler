@@ -42,7 +42,7 @@ defmodule CodexPoolerWeb.Operations.MetricsControllerTest do
     configure_metrics_token!("metrics-secret")
 
     assert {:ok, _updated} =
-             InstanceSettings.update(
+             InstanceSettings.update_system_settings(
                InstanceSettings.get!(),
                InstanceSettings.clear_metrics_bearer_token(%{})
              )
@@ -208,7 +208,7 @@ defmodule CodexPoolerWeb.Operations.MetricsControllerTest do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:ok, _updated} =
-             InstanceSettings.update(
+             InstanceSettings.update_system_settings(
                settings,
                InstanceSettings.put_metrics_bearer_token(%{}, token)
              )
