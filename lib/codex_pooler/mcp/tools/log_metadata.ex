@@ -45,7 +45,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
   end
 
   @spec get_request_log(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_request_log(%{"id" => id}, context) do
+  def get_request_log(%{"id" => id}, context) when is_binary(id) do
     with {:ok, scope} <- scope_from_context(context) do
       scope
       |> request_log_detail(id)
@@ -53,6 +53,8 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
       |> then(fn structured -> {:ok, structured, RequestLogPresenter.detail_text(structured)} end)
     end
   end
+
+  def get_request_log(_arguments, _context), do: required_argument("id")
 
   @spec list_audit_logs(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
   def list_audit_logs(arguments, context) do
@@ -68,7 +70,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
   end
 
   @spec get_audit_log(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_audit_log(%{"id" => id}, context) do
+  def get_audit_log(%{"id" => id}, context) when is_binary(id) do
     with {:ok, scope} <- scope_from_context(context) do
       scope
       |> audit_log_detail(id)
@@ -77,7 +79,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
     end
   end
 
-  def get_audit_log(_arguments, _context), do: mcp_actor_unavailable()
+  def get_audit_log(_arguments, _context), do: required_argument("id")
 
   defp list_request_logs_tool do
     %{
@@ -379,6 +381,10 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
 
   defp mcp_actor_unavailable do
     {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
+  end
+
+  defp required_argument(name) do
+    {:error, %{code: :invalid_arguments, message: "#{name} is required"}}
   end
 
   defp request_log_filters(arguments) do

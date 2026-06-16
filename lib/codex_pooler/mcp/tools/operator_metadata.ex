@@ -98,7 +98,7 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
   end
 
   @spec get_operator(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_operator(%{"selector" => selector}, context) do
+  def get_operator(%{"selector" => selector}, context) when is_binary(selector) do
     with {:ok, scope} <- scope_from_context(context),
          true <- Pools.owner?(scope) do
       selector
@@ -109,6 +109,8 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
       error -> error
     end
   end
+
+  def get_operator(_arguments, _context), do: required_argument("selector")
 
   @spec list_invites(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
   def list_invites(arguments, context) do
@@ -130,7 +132,7 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
   end
 
   @spec get_invite(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_invite(%{"selector" => selector}, context) do
+  def get_invite(%{"selector" => selector}, context) when is_binary(selector) do
     with {:ok, scope} <- scope_from_context(context) do
       selector = String.trim(selector)
 
@@ -152,6 +154,8 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
       end
     end
   end
+
+  def get_invite(_arguments, _context), do: required_argument("selector")
 
   defp operator_match_result(selector) do
     case operator_matches(selector) do
@@ -398,6 +402,10 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
 
   defp scope_from_context(_context) do
     {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
+  end
+
+  defp required_argument(name) do
+    {:error, %{code: :invalid_arguments, message: "#{name} is required"}}
   end
 
   defp bounded_limit(arguments) do

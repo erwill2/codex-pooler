@@ -96,7 +96,7 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
   end
 
   @spec get_pool(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_pool(%{"selector" => selector}, context) do
+  def get_pool(%{"selector" => selector}, context) when is_binary(selector) do
     with {:ok, scope} <- scope_from_context(context),
          {:ok, pools} <- load_pools(scope) do
       case resolve_pool(pools, selector) do
@@ -117,6 +117,8 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
       end
     end
   end
+
+  def get_pool(_arguments, _context), do: required_argument("selector")
 
   @spec list_upstreams(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
   def list_upstreams(arguments, context) do
@@ -147,7 +149,7 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
   end
 
   @spec get_upstream(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_upstream(%{"selector" => selector}, context) do
+  def get_upstream(%{"selector" => selector}, context) when is_binary(selector) do
     with {:ok, scope} <- scope_from_context(context),
          {:ok, pools} <- load_pools(scope) do
       upstreams = Upstreams.list_visible_upstream_identities(scope)
@@ -173,6 +175,8 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
       end
     end
   end
+
+  def get_upstream(_arguments, _context), do: required_argument("selector")
 
   @spec list_pool_api_keys(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
   def list_pool_api_keys(arguments, context) do
@@ -203,7 +207,7 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
   end
 
   @spec get_pool_api_key(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_pool_api_key(%{"selector" => selector}, context) do
+  def get_pool_api_key(%{"selector" => selector}, context) when is_binary(selector) do
     with {:ok, scope} <- scope_from_context(context),
          {:ok, pools} <- load_pools(scope),
          {:ok, api_keys_with_policy} <- Access.list_api_keys_with_policy(scope) do
@@ -240,6 +244,8 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
       end
     end
   end
+
+  def get_pool_api_key(_arguments, _context), do: required_argument("selector")
 
   defp pool_list_text(items) do
     ReadableText.list(
@@ -507,6 +513,10 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata do
 
   defp scope_from_context(_context) do
     {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
+  end
+
+  defp required_argument(name) do
+    {:error, %{code: :invalid_arguments, message: "#{name} is required"}}
   end
 
   defp load_pools(scope), do: {:ok, Pools.list_visible_pools(scope)}

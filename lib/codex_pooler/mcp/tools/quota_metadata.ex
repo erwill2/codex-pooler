@@ -99,7 +99,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
   end
 
   @spec get_upstream_quota(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
-  def get_upstream_quota(%{"selector" => selector}, context) do
+  def get_upstream_quota(%{"selector" => selector}, context) when is_binary(selector) do
     with {:ok, scope} <- scope_from_context(context) do
       accounts =
         scope
@@ -136,7 +136,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
   end
 
   def get_upstream_quota(_arguments, _context) do
-    {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
+    required_argument("selector")
   end
 
   defp list_upstream_quotas_tool do
@@ -189,6 +189,10 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
 
   defp scope_from_context(_context) do
     {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
+  end
+
+  defp required_argument(name) do
+    {:error, %{code: :invalid_arguments, message: "#{name} is required"}}
   end
 
   defp load_pools(scope), do: {:ok, Pools.list_visible_pools(scope)}

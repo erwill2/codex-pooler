@@ -15,6 +15,7 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
   alias CodexPooler.InstanceSettings
   alias CodexPooler.MCP
   alias CodexPooler.MCP.{OperatorMCPKey, OperatorMCPSettings, Redaction, ToolDispatch}
+  alias CodexPooler.MCP.Tools.{LogMetadata, OperatorMetadata, PoolMetadata, QuotaMetadata}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
 
@@ -99,6 +100,45 @@ defmodule CodexPooler.MCP.ToolDispatchTest do
     refute inspect(result) =~ auth.key.key_prefix
     refute inspect(result) =~ Base.encode16(auth.key.key_hash)
     assert :ok = Redaction.assert_mcp_output_safe!(result)
+  end
+
+  test "get metadata handlers report malformed direct arguments separately from auth failures", %{
+    auth: auth
+  } do
+    selector_handlers = [
+      &PoolMetadata.get_pool/2,
+      &PoolMetadata.get_upstream/2,
+      &PoolMetadata.get_pool_api_key/2,
+      &OperatorMetadata.get_operator/2,
+      &OperatorMetadata.get_invite/2,
+      &QuotaMetadata.get_upstream_quota/2
+    ]
+
+    for handler <- selector_handlers do
+      assert {:error, %{code: :invalid_arguments, message: "selector is required"}} =
+               handler.(%{}, %{auth: auth})
+
+      assert {:error, %{code: :invalid_arguments, message: "selector is required"}} =
+               handler.(%{"selector" => 123}, %{auth: auth})
+    end
+
+    id_handlers = [&LogMetadata.get_request_log/2, &LogMetadata.get_audit_log/2]
+
+    for handler <- id_handlers do
+      assert {:error, %{code: :invalid_arguments, message: "id is required"}} =
+               handler.(%{}, %{auth: auth})
+
+      assert {:error, %{code: :invalid_arguments, message: "id is required"}} =
+               handler.(%{"id" => 123}, %{auth: auth})
+    end
+
+    assert {:error,
+            %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}} =
+             PoolMetadata.get_pool(%{"selector" => "missing"}, %{})
+
+    assert {:error,
+            %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}} =
+             LogMetadata.get_request_log(%{"id" => Ecto.UUID.generate()}, %{})
   end
 
   test "all metadata list/get tools return one readable text item and safe structured content", %{
