@@ -8,6 +8,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
   alias CodexPoolerWeb.Admin.AlertIncidentsReadModel
   alias CodexPoolerWeb.Admin.AlertRuleForm
   alias CodexPoolerWeb.Admin.AlertsPageComponents
+  alias CodexPoolerWeb.Admin.AlertsPageComponents.{Channels, Incidents, Rules}
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
 
   @default_tab "rules"
@@ -48,319 +49,67 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
   end
 
   @impl true
-  def handle_event("filter_incidents", %{"filters" => filter_params}, socket) do
-    {:noreply,
-     push_patch(socket,
-       to: ~p"/admin/alerts?#{AlertIncidentsReadModel.query_params(filter_params)}"
-     )}
-  end
+  def handle_event("filter_incidents", params, socket),
+    do: {:noreply, filter_incidents(socket, params)}
 
-  def handle_event("select_incident_pool_filter", %{"pool-id" => pool_id}, socket) do
-    params = Map.put(socket.assigns.incident_filter_values, "pool_id", pool_id)
+  def handle_event("select_incident_pool_filter", params, socket),
+    do: {:noreply, select_incident_pool_filter(socket, params)}
 
-    {:noreply,
-     push_patch(socket, to: ~p"/admin/alerts?#{AlertIncidentsReadModel.query_params(params)}")}
-  end
+  def handle_event("acknowledge_incident", params, socket),
+    do: {:noreply, acknowledge_incident(socket, params)}
 
-  def handle_event("acknowledge_incident", %{"id" => incident_id}, socket) do
-    case Alerts.acknowledge_incident(socket.assigns.current_scope, incident_id) do
-      {:ok, _incident} ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:info, "Alert incident acknowledged")}
+  def handle_event("resolve_incident", params, socket),
+    do: {:noreply, resolve_incident(socket, params)}
 
-      {:error, _reason} ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert incident could not be acknowledged")}
-    end
-  end
+  def handle_event("open_create_rule", _params, socket), do: {:noreply, open_create_rule(socket)}
 
-  def handle_event("resolve_incident", %{"id" => incident_id}, socket) do
-    case Alerts.resolve_incident(socket.assigns.current_scope, incident_id) do
-      {:ok, _incident} ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:info, "Alert incident resolved")}
+  def handle_event("open_edit_rule", params, socket),
+    do: {:noreply, open_edit_rule(socket, params)}
 
-      {:error, _reason} ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert incident could not be resolved")}
-    end
-  end
+  def handle_event("cancel_rule_form", _params, socket), do: {:noreply, cancel_rule_form(socket)}
 
-  @impl true
-  def handle_event("open_create_rule", _params, socket) do
-    {:noreply,
-     socket
-     |> assign(rule_form_mode: :create, editing_rule: nil)
-     |> reset_rule_form()}
-  end
+  def handle_event("change_rule_form", params, socket),
+    do: {:noreply, change_rule_form(socket, params)}
 
-  def handle_event("open_edit_rule", %{"id" => rule_id}, socket) do
-    case find_visible_rule(socket.assigns.rules, rule_id) do
-      %AlertRule{} = rule ->
-        {:noreply,
-         assign(socket,
-           rule_form_mode: :edit,
-           editing_rule: rule,
-           deleting_rule: nil,
-           rule_delete_form: AlertRuleForm.delete_form(nil),
-           rule_form: AlertRuleForm.edit_form(rule)
-         )}
+  def handle_event("save_rule", params, socket), do: {:noreply, save_rule_event(socket, params)}
 
-      nil ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert rule was not found")}
-    end
-  end
+  def handle_event("disable_rule", params, socket), do: {:noreply, disable_rule(socket, params)}
 
-  def handle_event("cancel_rule_form", _params, socket) do
-    {:noreply,
-     socket
-     |> assign(rule_form_mode: :create, editing_rule: nil)
-     |> reset_rule_form()}
-  end
+  def handle_event("open_delete_rule", params, socket),
+    do: {:noreply, open_delete_rule(socket, params)}
 
-  def handle_event("change_rule_form", %{"alert_rule" => params}, socket) do
-    {:noreply, assign(socket, :rule_form, rule_form(socket, params))}
-  end
+  def handle_event("cancel_delete_rule", _params, socket),
+    do: {:noreply, cancel_delete_rule(socket)}
 
-  def handle_event("save_rule", %{"alert_rule" => params}, socket) do
-    attrs = AlertRuleForm.normalize_submit(params)
+  def handle_event("confirm_delete_rule", params, socket),
+    do: {:noreply, confirm_delete_rule(socket, params)}
 
-    case save_rule(
-           socket.assigns.rule_form_mode,
-           socket.assigns.current_scope,
-           socket.assigns.editing_rule,
-           attrs
-         ) do
-      {:ok, _rule} ->
-        {:noreply,
-         socket
-         |> assign(rule_form_mode: :create, editing_rule: nil)
-         |> assign_alert_state()
-         |> reset_rule_form()
-         |> put_flash(:info, success_message(socket.assigns.rule_form_mode))}
+  def handle_event("open_create_channel", _params, socket),
+    do: {:noreply, open_create_channel(socket)}
 
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:noreply,
-         assign(
-           socket,
-           :rule_form,
-           rule_form(socket, params, AlertRuleForm.changeset_errors(changeset))
-         )}
+  def handle_event("open_edit_channel", params, socket),
+    do: {:noreply, open_edit_channel(socket, params)}
 
-      {:error, %{code: code}} ->
-        {:noreply,
-         socket
-         |> assign(:rule_form, rule_form(socket, params, access_errors(code)))
-         |> put_flash(:error, access_error_message(code))}
-    end
-  end
+  def handle_event("cancel_channel_form", _params, socket),
+    do: {:noreply, cancel_channel_form(socket)}
 
-  def handle_event("open_create_channel", _params, socket) do
-    {:noreply,
-     socket
-     |> assign(channel_form_mode: :create, editing_channel: nil)
-     |> reset_channel_form()}
-  end
+  def handle_event("change_channel_form", params, socket),
+    do: {:noreply, change_channel_form(socket, params)}
 
-  def handle_event("open_edit_channel", %{"id" => channel_id}, socket) do
-    case find_visible_channel(socket.assigns.channels, channel_id) do
-      %{} = channel ->
-        {:noreply,
-         assign(socket,
-           channel_form_mode: :edit,
-           editing_channel: channel,
-           deleting_channel: nil,
-           channel_delete_form: AlertChannelForm.delete_form(nil),
-           channel_form: AlertChannelForm.edit_form(channel)
-         )}
+  def handle_event("save_channel", params, socket),
+    do: {:noreply, save_channel_event(socket, params)}
 
-      nil ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert channel was not found")}
-    end
-  end
+  def handle_event("disable_channel", params, socket),
+    do: {:noreply, disable_channel(socket, params)}
 
-  def handle_event("cancel_channel_form", _params, socket) do
-    {:noreply,
-     socket
-     |> assign(channel_form_mode: :create, editing_channel: nil)
-     |> reset_channel_form()}
-  end
+  def handle_event("open_delete_channel", params, socket),
+    do: {:noreply, open_delete_channel(socket, params)}
 
-  def handle_event("change_channel_form", %{"alert_channel" => params}, socket) do
-    {:noreply, assign(socket, :channel_form, channel_form(socket, params))}
-  end
+  def handle_event("cancel_delete_channel", _params, socket),
+    do: {:noreply, cancel_delete_channel(socket)}
 
-  def handle_event("save_channel", %{"alert_channel" => params}, socket) do
-    attrs = AlertChannelForm.normalize_submit(params, socket.assigns.channel_form_mode)
-
-    case save_channel(
-           socket.assigns.channel_form_mode,
-           socket.assigns.current_scope,
-           socket.assigns.editing_channel,
-           attrs
-         ) do
-      {:ok, _channel} ->
-        {:noreply,
-         socket
-         |> assign(channel_form_mode: :create, editing_channel: nil)
-         |> assign_alert_state()
-         |> reset_channel_form()
-         |> put_flash(:info, channel_success_message(socket.assigns.channel_form_mode))}
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:noreply,
-         assign(
-           socket,
-           :channel_form,
-           channel_form(socket, params, AlertChannelForm.changeset_errors(changeset))
-         )}
-
-      {:error, %{code: code}} ->
-        {:noreply,
-         socket
-         |> assign(:channel_form, channel_form(socket, params, channel_access_errors(code)))
-         |> put_flash(:error, channel_access_error_message(code))}
-    end
-  end
-
-  def handle_event("disable_channel", %{"id" => channel_id}, socket) do
-    case Alerts.update_channel(socket.assigns.current_scope, channel_id, %{
-           state: AlertChannel.disabled_state()
-         }) do
-      {:ok, _channel} ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:info, "Alert channel disabled")}
-
-      {:error, _reason} ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert channel could not be disabled")}
-    end
-  end
-
-  def handle_event("open_delete_channel", %{"id" => channel_id}, socket) do
-    case find_visible_channel(socket.assigns.channels, channel_id) do
-      %{} = channel ->
-        {:noreply,
-         assign(socket,
-           deleting_channel: channel,
-           channel_delete_form: AlertChannelForm.delete_form(channel)
-         )}
-
-      nil ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert channel was not found")}
-    end
-  end
-
-  def handle_event("cancel_delete_channel", _params, socket) do
-    {:noreply,
-     assign(socket,
-       deleting_channel: nil,
-       channel_delete_form: AlertChannelForm.delete_form(nil)
-     )}
-  end
-
-  def handle_event(
-        "confirm_delete_channel",
-        %{"alert_channel_delete" => %{"id" => channel_id}},
-        socket
-      ) do
-    case Alerts.delete_channel(socket.assigns.current_scope, channel_id) do
-      {:ok, _channel} ->
-        {:noreply,
-         socket
-         |> assign(deleting_channel: nil, channel_delete_form: AlertChannelForm.delete_form(nil))
-         |> assign_alert_state()
-         |> reset_channel_form()
-         |> put_flash(:info, "Alert channel deleted")}
-
-      {:error, _reason} ->
-        {:noreply,
-         socket
-         |> assign(deleting_channel: nil, channel_delete_form: AlertChannelForm.delete_form(nil))
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert channel could not be deleted")}
-    end
-  end
-
-  def handle_event("disable_rule", %{"id" => rule_id}, socket) do
-    case Alerts.update_rule(socket.assigns.current_scope, rule_id, %{
-           state: AlertRule.disabled_state()
-         }) do
-      {:ok, _rule} ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:info, "Alert rule disabled")}
-
-      {:error, _reason} ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert rule could not be disabled")}
-    end
-  end
-
-  def handle_event("open_delete_rule", %{"id" => rule_id}, socket) do
-    case find_visible_rule(socket.assigns.rules, rule_id) do
-      %AlertRule{} = rule ->
-        {:noreply,
-         assign(socket,
-           deleting_rule: rule,
-           rule_delete_form: AlertRuleForm.delete_form(rule)
-         )}
-
-      nil ->
-        {:noreply,
-         socket
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert rule was not found")}
-    end
-  end
-
-  def handle_event("cancel_delete_rule", _params, socket) do
-    {:noreply,
-     assign(socket, deleting_rule: nil, rule_delete_form: AlertRuleForm.delete_form(nil))}
-  end
-
-  def handle_event("confirm_delete_rule", %{"alert_rule_delete" => %{"id" => rule_id}}, socket) do
-    case Alerts.delete_rule(socket.assigns.current_scope, rule_id) do
-      {:ok, _rule} ->
-        {:noreply,
-         socket
-         |> assign(deleting_rule: nil, rule_delete_form: AlertRuleForm.delete_form(nil))
-         |> assign_alert_state()
-         |> reset_rule_form()
-         |> put_flash(:info, "Alert rule deleted")}
-
-      {:error, _reason} ->
-        {:noreply,
-         socket
-         |> assign(deleting_rule: nil, rule_delete_form: AlertRuleForm.delete_form(nil))
-         |> assign_alert_state()
-         |> put_flash(:error, "Alert rule could not be deleted")}
-    end
-  end
+  def handle_event("confirm_delete_channel", params, socket),
+    do: {:noreply, confirm_delete_channel(socket, params)}
 
   @impl true
   def render(assigns) do
@@ -403,7 +152,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
         <section id="alerts-workspace" class="grid gap-4">
           <AlertsPageComponents.workspace_header selected_tab={@selected_tab} />
 
-          <AlertsPageComponents.rules_section
+          <Rules.rules_section
             selected_tab={@selected_tab}
             manageable_pools={@manageable_pools}
             rules={@rules}
@@ -412,7 +161,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
             rule_form={@rule_form}
           />
 
-          <AlertsPageComponents.channels_section
+          <Channels.channels_section
             selected_tab={@selected_tab}
             channels={@channels}
             channel_form_mode={@channel_form_mode}
@@ -420,7 +169,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
             editing_channel={@editing_channel}
           />
 
-          <AlertsPageComponents.incidents_section
+          <Incidents.incidents_section
             selected_tab={@selected_tab}
             incident_filter_form={@incident_filter_form}
             incident_filter_values={@incident_filter_values}
@@ -535,6 +284,270 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
       </section>
     </AdminComponents.admin_shell>
     """
+  end
+
+  defp filter_incidents(socket, %{"filters" => filter_params}) do
+    push_patch(socket,
+      to: ~p"/admin/alerts?#{AlertIncidentsReadModel.query_params(filter_params)}"
+    )
+  end
+
+  defp select_incident_pool_filter(socket, %{"pool-id" => pool_id}) do
+    params = Map.put(socket.assigns.incident_filter_values, "pool_id", pool_id)
+
+    push_patch(socket, to: ~p"/admin/alerts?#{AlertIncidentsReadModel.query_params(params)}")
+  end
+
+  defp acknowledge_incident(socket, %{"id" => incident_id}) do
+    case Alerts.acknowledge_incident(socket.assigns.current_scope, incident_id) do
+      {:ok, _incident} ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:info, "Alert incident acknowledged")
+
+      {:error, _reason} ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert incident could not be acknowledged")
+    end
+  end
+
+  defp resolve_incident(socket, %{"id" => incident_id}) do
+    case Alerts.resolve_incident(socket.assigns.current_scope, incident_id) do
+      {:ok, _incident} ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:info, "Alert incident resolved")
+
+      {:error, _reason} ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert incident could not be resolved")
+    end
+  end
+
+  defp open_create_rule(socket) do
+    socket
+    |> assign(rule_form_mode: :create, editing_rule: nil)
+    |> reset_rule_form()
+  end
+
+  defp open_edit_rule(socket, %{"id" => rule_id}) do
+    case find_visible_rule(socket.assigns.rules, rule_id) do
+      %AlertRule{} = rule ->
+        assign(socket,
+          rule_form_mode: :edit,
+          editing_rule: rule,
+          deleting_rule: nil,
+          rule_delete_form: AlertRuleForm.delete_form(nil),
+          rule_form: AlertRuleForm.edit_form(rule)
+        )
+
+      nil ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert rule was not found")
+    end
+  end
+
+  defp cancel_rule_form(socket) do
+    socket
+    |> assign(rule_form_mode: :create, editing_rule: nil)
+    |> reset_rule_form()
+  end
+
+  defp change_rule_form(socket, %{"alert_rule" => params}) do
+    assign(socket, :rule_form, rule_form(socket, params))
+  end
+
+  defp save_rule_event(socket, %{"alert_rule" => params}) do
+    mode = socket.assigns.rule_form_mode
+    attrs = AlertRuleForm.normalize_submit(params)
+
+    case save_rule(mode, socket.assigns.current_scope, socket.assigns.editing_rule, attrs) do
+      {:ok, _rule} ->
+        socket
+        |> assign(rule_form_mode: :create, editing_rule: nil)
+        |> assign_alert_state()
+        |> reset_rule_form()
+        |> put_flash(:info, success_message(mode))
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        assign(
+          socket,
+          :rule_form,
+          rule_form(socket, params, AlertRuleForm.changeset_errors(changeset))
+        )
+
+      {:error, %{code: code}} ->
+        socket
+        |> assign(:rule_form, rule_form(socket, params, access_errors(code)))
+        |> put_flash(:error, access_error_message(code))
+    end
+  end
+
+  defp disable_rule(socket, %{"id" => rule_id}) do
+    case Alerts.update_rule(socket.assigns.current_scope, rule_id, %{
+           state: AlertRule.disabled_state()
+         }) do
+      {:ok, _rule} ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:info, "Alert rule disabled")
+
+      {:error, _reason} ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert rule could not be disabled")
+    end
+  end
+
+  defp open_delete_rule(socket, %{"id" => rule_id}) do
+    case find_visible_rule(socket.assigns.rules, rule_id) do
+      %AlertRule{} = rule ->
+        assign(socket, deleting_rule: rule, rule_delete_form: AlertRuleForm.delete_form(rule))
+
+      nil ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert rule was not found")
+    end
+  end
+
+  defp cancel_delete_rule(socket) do
+    assign(socket, deleting_rule: nil, rule_delete_form: AlertRuleForm.delete_form(nil))
+  end
+
+  defp confirm_delete_rule(socket, %{"alert_rule_delete" => %{"id" => rule_id}}) do
+    case Alerts.delete_rule(socket.assigns.current_scope, rule_id) do
+      {:ok, _rule} ->
+        socket
+        |> assign(deleting_rule: nil, rule_delete_form: AlertRuleForm.delete_form(nil))
+        |> assign_alert_state()
+        |> reset_rule_form()
+        |> put_flash(:info, "Alert rule deleted")
+
+      {:error, _reason} ->
+        socket
+        |> assign(deleting_rule: nil, rule_delete_form: AlertRuleForm.delete_form(nil))
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert rule could not be deleted")
+    end
+  end
+
+  defp open_create_channel(socket) do
+    socket
+    |> assign(channel_form_mode: :create, editing_channel: nil)
+    |> reset_channel_form()
+  end
+
+  defp open_edit_channel(socket, %{"id" => channel_id}) do
+    case find_visible_channel(socket.assigns.channels, channel_id) do
+      %{} = channel ->
+        assign(socket,
+          channel_form_mode: :edit,
+          editing_channel: channel,
+          deleting_channel: nil,
+          channel_delete_form: AlertChannelForm.delete_form(nil),
+          channel_form: AlertChannelForm.edit_form(channel)
+        )
+
+      nil ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert channel was not found")
+    end
+  end
+
+  defp cancel_channel_form(socket) do
+    socket
+    |> assign(channel_form_mode: :create, editing_channel: nil)
+    |> reset_channel_form()
+  end
+
+  defp change_channel_form(socket, %{"alert_channel" => params}) do
+    assign(socket, :channel_form, channel_form(socket, params))
+  end
+
+  defp save_channel_event(socket, %{"alert_channel" => params}) do
+    mode = socket.assigns.channel_form_mode
+    attrs = AlertChannelForm.normalize_submit(params, mode)
+
+    case save_channel(mode, socket.assigns.current_scope, socket.assigns.editing_channel, attrs) do
+      {:ok, _channel} ->
+        socket
+        |> assign(channel_form_mode: :create, editing_channel: nil)
+        |> assign_alert_state()
+        |> reset_channel_form()
+        |> put_flash(:info, channel_success_message(mode))
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        assign(
+          socket,
+          :channel_form,
+          channel_form(socket, params, AlertChannelForm.changeset_errors(changeset))
+        )
+
+      {:error, %{code: code}} ->
+        socket
+        |> assign(:channel_form, channel_form(socket, params, channel_access_errors(code)))
+        |> put_flash(:error, channel_access_error_message(code))
+    end
+  end
+
+  defp disable_channel(socket, %{"id" => channel_id}) do
+    case Alerts.update_channel(socket.assigns.current_scope, channel_id, %{
+           state: AlertChannel.disabled_state()
+         }) do
+      {:ok, _channel} ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:info, "Alert channel disabled")
+
+      {:error, _reason} ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert channel could not be disabled")
+    end
+  end
+
+  defp open_delete_channel(socket, %{"id" => channel_id}) do
+    case find_visible_channel(socket.assigns.channels, channel_id) do
+      %{} = channel ->
+        assign(socket,
+          deleting_channel: channel,
+          channel_delete_form: AlertChannelForm.delete_form(channel)
+        )
+
+      nil ->
+        socket
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert channel was not found")
+    end
+  end
+
+  defp cancel_delete_channel(socket) do
+    assign(socket,
+      deleting_channel: nil,
+      channel_delete_form: AlertChannelForm.delete_form(nil)
+    )
+  end
+
+  defp confirm_delete_channel(socket, %{"alert_channel_delete" => %{"id" => channel_id}}) do
+    case Alerts.delete_channel(socket.assigns.current_scope, channel_id) do
+      {:ok, _channel} ->
+        socket
+        |> assign(deleting_channel: nil, channel_delete_form: AlertChannelForm.delete_form(nil))
+        |> assign_alert_state()
+        |> reset_channel_form()
+        |> put_flash(:info, "Alert channel deleted")
+
+      {:error, _reason} ->
+        socket
+        |> assign(deleting_channel: nil, channel_delete_form: AlertChannelForm.delete_form(nil))
+        |> assign_alert_state()
+        |> put_flash(:error, "Alert channel could not be deleted")
+    end
   end
 
   defp assign_alert_state(socket) do
