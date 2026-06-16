@@ -1,7 +1,7 @@
 defmodule CodexPoolerWeb.V1.UnsupportedController do
   use CodexPoolerWeb, :controller
 
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
 
   @not_implemented %{
     status: 404,

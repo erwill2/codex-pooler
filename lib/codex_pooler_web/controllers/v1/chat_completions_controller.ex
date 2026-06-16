@@ -2,8 +2,8 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsController do
   use CodexPoolerWeb, :controller
 
   alias CodexPooler.Gateway.OpenAICompatibility.{Chat, ChatCompletions}
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.V1.PublicGatewayDispatch
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.PublicGatewayDispatch
 
   def create(conn, params) do
     PublicGatewayDispatch.coerced(

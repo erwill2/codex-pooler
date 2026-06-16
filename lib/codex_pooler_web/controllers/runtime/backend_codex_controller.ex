@@ -9,9 +9,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
   alias CodexPooler.Gateway.Payloads.{CompactionTrigger, RequestOptions}
   alias CodexPooler.Pools
   alias CodexPooler.RouteClass
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.PublicGatewayDispatch
   alias CodexPoolerWeb.Runtime.ControlPlaneJson
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.Runtime.PublicGatewayResult
 
   def models(conn, _params) do
     serve_models(conn, "/backend-api/codex/models")
@@ -308,36 +308,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
   end
 
   defp chat_completions(conn, params, local_endpoint, accounting_endpoint) do
-    case GatewayHelpers.authenticate(conn) do
-      {:ok, auth} ->
-        chat_completions_authenticated(conn, auth, params, local_endpoint, accounting_endpoint)
-
-      {:error, reason} ->
-        GatewayHelpers.send_error(conn, reason)
-    end
-  end
-
-  defp chat_completions_authenticated(conn, auth, params, local_endpoint, accounting_endpoint) do
-    with {:ok, payload} <- GatewayHelpers.read_json_body(conn),
-         {:ok, coerced} <- Chat.coerce(payload, chat_request_opts(conn, params)) do
-      result = chat_completions_dispatch(conn, auth, coerced, local_endpoint, accounting_endpoint)
-
-      PublicGatewayResult.send(conn, result, fn decoded ->
-        ChatCompletions.normalize_response(decoded, coerced.chat_payload)
-      end)
-    else
-      {:error, reason} -> GatewayHelpers.send_error(conn, reason)
-    end
-  end
-
-  defp chat_completions_dispatch(conn, auth, coerced, local_endpoint, accounting_endpoint) do
-    GatewayHelpers.admit(
+    PublicGatewayDispatch.coerced(
       conn,
-      RequestOptions.route_class(coerced.request_options),
-      %{endpoint: local_endpoint},
       fn ->
-        Gateway.execute(auth, accounting_endpoint, coerced.payload, coerced.request_options)
-      end
+        with {:ok, payload} <- GatewayHelpers.read_json_body(conn) do
+          Chat.coerce(payload, chat_request_opts(conn, params))
+        end
+      end,
+      fn decoded, %{chat_payload: chat_payload} ->
+        ChatCompletions.normalize_response(decoded, chat_payload)
+      end,
+      authenticator: &GatewayHelpers.authenticate/1,
+      local_endpoint: local_endpoint,
+      accounting_endpoint: accounting_endpoint
     )
   end
 

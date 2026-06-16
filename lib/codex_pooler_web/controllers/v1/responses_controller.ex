@@ -3,8 +3,8 @@ defmodule CodexPoolerWeb.V1.ResponsesController do
 
   alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.V1.PublicGatewayDispatch
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.PublicGatewayDispatch
 
   @public_responses_endpoint "/v1/responses"
   @backend_responses_endpoint "/backend-api/codex/responses"

@@ -1,4 +1,4 @@
-defmodule CodexPoolerWeb.Runtime.PublicGatewayResult do
+defmodule CodexPoolerWeb.PublicGatewayResult do
   @moduledoc false
 
   import Phoenix.Controller, only: [json: 2]
@@ -6,7 +6,7 @@ defmodule CodexPoolerWeb.Runtime.PublicGatewayResult do
 
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.OpenAICompatibility.PublicResponse
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
 
   @type success_normalizer :: (map() -> map())
   @type gateway_call_result ::

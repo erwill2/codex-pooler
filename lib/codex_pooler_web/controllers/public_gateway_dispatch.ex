@@ -1,11 +1,11 @@
-defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
+defmodule CodexPoolerWeb.PublicGatewayDispatch do
   @moduledoc false
 
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.Runtime.PublicGatewayResult
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.PublicGatewayResult
 
   @type auth :: CodexPooler.Access.auth_context()
   @type conn :: Plug.Conn.t()
@@ -17,15 +17,35 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
           required(:request_options) => RequestOptions.t(),
           optional(atom()) => term()
         }
+  @type authenticator :: (conn() -> {:ok, auth()} | {:error, term()})
   @type coercer :: (-> {:ok, coerced_request()} | {:error, Contracts.gateway_error()})
   @type gateway_executor :: (auth(), String.t(), map(), RequestOptions.t() ->
                                gateway_call_result())
   @type success_normalizer :: (map(), coerced_request() -> map())
+  @type auth_opts :: [
+          authenticator: authenticator()
+        ]
+  @type dispatch_opts :: [
+          authenticator: authenticator(),
+          local_endpoint: String.t(),
+          accounting_endpoint: String.t(),
+          gateway_executor: gateway_executor()
+        ]
 
   @spec authenticated(conn(), String.t(), String.t(), (auth() -> gateway_call_result())) :: conn()
-  def authenticated(conn, route_class, endpoint, fun)
+  @spec authenticated(
+          conn(),
+          String.t(),
+          String.t(),
+          (auth() -> gateway_call_result()),
+          auth_opts()
+        ) ::
+          conn()
+  def authenticated(conn, route_class, endpoint, fun, opts \\ [])
       when is_binary(route_class) and is_binary(endpoint) and is_function(fun, 1) do
-    case GatewayHelpers.authenticate_v1(conn) do
+    authenticator = Keyword.get(opts, :authenticator, &GatewayHelpers.authenticate_v1/1)
+
+    case authenticator.(conn) do
       {:ok, auth} ->
         result =
           GatewayHelpers.admit(conn, route_class, %{endpoint: endpoint}, fn ->
@@ -40,8 +60,11 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
   end
 
   @spec websocket(conn(), (auth() -> conn())) :: conn()
-  def websocket(conn, upgrade_fun) when is_function(upgrade_fun, 1) do
-    case GatewayHelpers.authenticate_v1(conn) do
+  @spec websocket(conn(), (auth() -> conn()), auth_opts()) :: conn()
+  def websocket(conn, upgrade_fun, opts \\ []) when is_function(upgrade_fun, 1) do
+    authenticator = Keyword.get(opts, :authenticator, &GatewayHelpers.authenticate_v1/1)
+
+    case authenticator.(conn) do
       {:ok, auth} ->
         upgrade_fun.(auth)
 
@@ -50,24 +73,28 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
     end
   end
 
-  @spec coerced(conn(), coercer(), success_normalizer()) :: conn()
-  def coerced(conn, coercer, normalize_success)
+  @spec coerced(conn(), coercer(), success_normalizer(), dispatch_opts()) :: conn()
+  def coerced(conn, coercer, normalize_success, opts \\ [])
       when is_function(coercer, 0) and is_function(normalize_success, 2) do
-    execute_coerced(conn, coercer, normalize_success, &Gateway.execute/4)
+    opts = Keyword.put_new(opts, :gateway_executor, &Gateway.execute/4)
+    execute_coerced(conn, coercer, normalize_success, opts)
   end
 
-  @spec coerced_multipart(conn(), coercer(), success_normalizer()) :: conn()
-  def coerced_multipart(conn, coercer, normalize_success)
+  @spec coerced_multipart(conn(), coercer(), success_normalizer(), dispatch_opts()) :: conn()
+  def coerced_multipart(conn, coercer, normalize_success, opts \\ [])
       when is_function(coercer, 0) and is_function(normalize_success, 2) do
-    execute_coerced(conn, coercer, normalize_success, &Gateway.execute_multipart/4)
+    opts = Keyword.put(opts, :gateway_executor, &Gateway.execute_multipart/4)
+    execute_coerced(conn, coercer, normalize_success, opts)
   end
 
-  defp execute_coerced(conn, coercer, normalize_success, gateway_executor) do
-    case GatewayHelpers.authenticate_v1(conn) do
+  defp execute_coerced(conn, coercer, normalize_success, opts) do
+    authenticator = Keyword.get(opts, :authenticator, &GatewayHelpers.authenticate_v1/1)
+
+    case authenticator.(conn) do
       {:ok, auth} ->
         case coercer.() do
           {:ok, coerced} ->
-            result = execute_coerced_service(conn, auth, coerced, gateway_executor)
+            result = execute_coerced_service(conn, auth, coerced, opts)
             PublicGatewayResult.send(conn, result, &normalize_success.(&1, coerced))
 
           {:error, reason} ->
@@ -79,7 +106,7 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
     end
   end
 
-  @spec execute_coerced_service(conn(), auth(), coerced_request(), gateway_executor()) ::
+  @spec execute_coerced_service(conn(), auth(), coerced_request(), dispatch_opts()) ::
           gateway_call_result()
   defp execute_coerced_service(
          conn,
@@ -89,8 +116,12 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
            payload: payload,
            request_options: %RequestOptions{} = request_options
          },
-         gateway_executor
+         opts
        ) do
+    local_endpoint = Keyword.get(opts, :local_endpoint, endpoint)
+    accounting_endpoint = Keyword.get(opts, :accounting_endpoint, endpoint)
+    gateway_executor = Keyword.fetch!(opts, :gateway_executor)
+
     request_options =
       RequestOptions.mark_openai_compatibility_origin(
         request_options,
@@ -100,8 +131,8 @@ defmodule CodexPoolerWeb.V1.PublicGatewayDispatch do
 
     route_class = RequestOptions.route_class(request_options)
 
-    GatewayHelpers.admit(conn, route_class, %{endpoint: endpoint}, fn ->
-      gateway_executor.(auth, endpoint, payload, request_options)
+    GatewayHelpers.admit(conn, route_class, %{endpoint: local_endpoint}, fn ->
+      gateway_executor.(auth, accounting_endpoint, payload, request_options)
     end)
   end
 end

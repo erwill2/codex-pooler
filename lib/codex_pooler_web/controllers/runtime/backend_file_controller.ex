@@ -5,7 +5,7 @@ defmodule CodexPoolerWeb.Runtime.BackendFileController do
   alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.RouteClass
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
 
   def create(conn, _params) do
     with_authenticated_file_admission(conn, "/backend-api/files", fn auth ->

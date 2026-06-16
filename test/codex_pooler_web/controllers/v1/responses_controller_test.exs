@@ -38,7 +38,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Repo
-  alias CodexPoolerWeb.Runtime.PublicGatewayResult
+  alias CodexPoolerWeb.PublicGatewayResult
   alias Ecto.Adapters.SQL.Sandbox
 
   @websocket_frame_timeout 1_000

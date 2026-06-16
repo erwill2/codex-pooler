@@ -1,11 +1,11 @@
-defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpersTest do
+defmodule CodexPoolerWeb.GatewayControllerHelpersTest do
   use CodexPoolerWeb.ConnCase, async: false
 
   import ExUnit.CaptureLog
   import CodexPooler.PoolerFixtures
 
   alias CodexPooler.Gateway.Contracts
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers
+  alias CodexPoolerWeb.GatewayControllerHelpers
 
   test "body results do not require a headers key", %{conn: conn} do
     conn =

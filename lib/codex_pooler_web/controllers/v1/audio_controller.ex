@@ -2,8 +2,8 @@ defmodule CodexPoolerWeb.V1.AudioController do
   use CodexPoolerWeb, :controller
 
   alias CodexPooler.Gateway.OpenAICompatibility.Audio
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.V1.PublicGatewayDispatch
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.PublicGatewayDispatch
 
   def transcriptions(conn, params) do
     PublicGatewayDispatch.coerced_multipart(

@@ -6,8 +6,8 @@ defmodule CodexPoolerWeb.V1.FilesController do
   alias CodexPooler.Gateway.OpenAICompatibility.Files, as: FilesAdapter
   alias CodexPooler.Gateway.Payloads.{FileRequestMetadata, RequestOptions}
   alias CodexPooler.RouteClass
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.V1.PublicGatewayDispatch
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.PublicGatewayDispatch
 
   @unsupported_content %{
     status: 404,

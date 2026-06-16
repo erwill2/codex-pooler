@@ -1,4 +1,4 @@
-defmodule CodexPoolerWeb.Runtime.GatewayControllerHelpers do
+defmodule CodexPoolerWeb.GatewayControllerHelpers do
   @moduledoc false
 
   import Phoenix.Controller

@@ -4,8 +4,8 @@ defmodule CodexPoolerWeb.V1.ModelsController do
   alias CodexPooler.Gateway.Metadata
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.RouteClass
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.V1.PublicGatewayDispatch
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.PublicGatewayDispatch
 
   def index(conn, _params) do
     PublicGatewayDispatch.authenticated(conn, RouteClass.proxy_http(), "/v1/models", fn auth ->

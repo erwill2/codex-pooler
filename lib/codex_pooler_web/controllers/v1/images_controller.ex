@@ -2,8 +2,8 @@ defmodule CodexPoolerWeb.V1.ImagesController do
   use CodexPoolerWeb, :controller
 
   alias CodexPooler.Gateway.OpenAICompatibility.Images
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
-  alias CodexPoolerWeb.V1.PublicGatewayDispatch
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.PublicGatewayDispatch
 
   def generations(conn, params) do
     PublicGatewayDispatch.coerced(

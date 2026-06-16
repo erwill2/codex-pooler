@@ -4,7 +4,7 @@ defmodule CodexPoolerWeb.Runtime.CodexUsageController do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Usage
   alias CodexPooler.RouteClass
-  alias CodexPoolerWeb.Runtime.GatewayControllerHelpers, as: GatewayHelpers
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
 
   def show(conn, _params) do
     endpoint = conn.request_path
