@@ -1,8 +1,7 @@
 defmodule CodexPoolerWeb.Admin.SystemLive do
   use CodexPoolerWeb, :admin_live_view
 
-  alias CodexPooler.{Catalog, InstanceSettings, MCP, Pools}
-  alias CodexPooler.Dev.Seeds, as: DevSeeds
+  alias CodexPooler.{Catalog, Dev, InstanceSettings, MCP, Pools}
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.SystemPageComponents
   alias CodexPoolerWeb.Admin.SystemSettingsForm
@@ -411,9 +410,10 @@ defmodule CodexPoolerWeb.Admin.SystemLive do
   end
 
   defp import_sample_data do
-    {:ok, DevSeeds.full()}
-  rescue
-    error in RuntimeError -> {:error, Exception.message(error)}
+    case Dev.seed_full() do
+      {:ok, result} -> {:ok, result}
+      {:error, %{message: message}} -> {:error, message}
+    end
   end
 
   defp sample_data_import_status(result) do
