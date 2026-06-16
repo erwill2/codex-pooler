@@ -300,7 +300,7 @@ defmodule CodexPooler.Dev.Seeds.Perf do
   defp seed_perf_metrics_token!(metrics_token) do
     settings = InstanceSettings.ensure_singleton!()
     attrs = InstanceSettings.put_metrics_bearer_token(%{}, metrics_token)
-    {:ok, updated} = InstanceSettings.update(settings, attrs)
+    {:ok, updated} = InstanceSettings.update_system_settings(settings, attrs)
     updated
   end
 

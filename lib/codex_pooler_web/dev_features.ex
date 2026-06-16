@@ -10,7 +10,8 @@ defmodule CodexPoolerWeb.DevFeatures do
 
   if @build_enabled do
     def enabled? do
-      Application.get_env(:codex_pooler, :dev_features_enabled, false) == true
+      Application.get_env(:codex_pooler, :dev_features_enabled, false) == true and
+        CodexPooler.Dev.support_available?()
     end
   else
     def enabled?, do: false
