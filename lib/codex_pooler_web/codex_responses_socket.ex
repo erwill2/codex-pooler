@@ -10,6 +10,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Websocket
+  alias CodexPooler.Gateway.Websocket.DownstreamSession
   alias CodexPoolerWeb.WebsocketConnectionLogger
 
   require Logger
@@ -25,18 +26,21 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     case Websocket.prepare_websocket_session(state.auth, state.opts) do
       {:ok,
        %{
-         codex_session: session,
-         websocket_owner_lease_token: owner_lease_token,
-         websocket_owner_downstream: downstream
+         codex_session: _session,
+         websocket_owner_lease_token: _owner_lease_token,
+         websocket_owner_downstream: _downstream
        } = runtime} ->
-        {:ok, put_owner_runtime_state(state, session, owner_lease_token, downstream, runtime)}
+        {:ok,
+         state
+         |> put_socket_lifecycle_state()
+         |> put_response_task_state()
+         |> DownstreamSession.put_runtime(runtime)}
 
       {:ok, %{codex_session: session, upstream_websocket_session: upstream_websocket_session}} ->
         {:ok,
          state
          |> put_socket_lifecycle_state()
-         |> Map.put(:tasks, MapSet.new())
-         |> Map.put(:task_monitors, %{})
+         |> put_response_task_state()
          |> Map.put(:codex_session, session)
          |> Map.put(:upstream_websocket_session, upstream_websocket_session)}
 
@@ -60,7 +64,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   def handle_info({:websocket_owner_frame, _correlation_id, _epoch, _payload} = message, state) do
-    case accept_owner_downstream_message(message, state) do
+    case DownstreamSession.accept_downstream_message(message, state) do
       {:ok, {:data, data}} ->
         {:push, {:text, downstream_response_chunk(data)}, state}
 
@@ -97,33 +101,12 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   def handle_info({:DOWN, ref, :process, pid, reason}, %{websocket_owner_monitor: ref} = state) do
-    state = clear_websocket_owner_monitor(state, pid)
-
-    case owner_monitor_down_reason(reason) do
-      :stale_owner ->
+    case DownstreamSession.handle_monitor_down(state, pid, reason) do
+      {:ok, state} ->
         {:ok, state}
 
-      :owner_drained ->
-        {:error, :owner_drained}
-        |> recover_owner_lifecycle_leftovers(state)
-        |> log_owner_monitor_recovery(state, reason)
-
-        state
-        |> release_owner_lease("owner_drained")
-        |> log_owner_monitor_lease_release(state, reason)
-
-        {:ok, state}
-
-      :owner_crashed ->
-        {:error, :owner_crashed}
-        |> recover_owner_lifecycle_leftovers(state)
-        |> log_owner_monitor_recovery(state, reason)
-
-        state
-        |> release_owner_lease("owner_crashed")
-        |> log_owner_monitor_lease_release(state, reason)
-
-        {:stop, :normal, owner_close_detail(:owner_crashed), state}
+      {:stop, close_detail, state} ->
+        {:stop, :normal, close_detail, state}
     end
   end
 
@@ -207,71 +190,23 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   defp failure_reason(%module{}), do: inspect(module)
   defp failure_reason(_reason), do: "unknown"
 
-  defp put_owner_runtime_state(state, session, owner_lease_token, downstream, runtime) do
-    state
-    |> put_socket_lifecycle_state()
-    |> Map.put(:tasks, MapSet.new())
-    |> Map.put(:task_monitors, %{})
-    |> Map.put(:codex_session, session)
-    |> Map.put(:websocket_owner_lease_token, owner_lease_token)
-    |> Map.put(:websocket_owner_downstream, downstream)
-    |> Map.put(
-      :websocket_owner_active_turn_reconnect?,
-      Map.get(runtime, :websocket_owner_active_turn_reconnect?, false)
-    )
-    |> put_websocket_owner_monitor(session)
-  end
-
   defp put_socket_lifecycle_state(state) do
     state
     |> Map.put(:connection_started_at_monotonic_ms, System.monotonic_time(:millisecond))
     |> Map.put(:request_response_work_started?, false)
   end
 
-  defp put_websocket_owner_monitor(state, session) do
-    case Websocket.monitor_websocket_owner(session) do
-      {:ok, owner_pid, owner_monitor} ->
-        state
-        |> Map.put(:websocket_owner_pid, owner_pid)
-        |> Map.put(:websocket_owner_monitor, owner_monitor)
-
-      {:error, _reason} ->
-        state
-    end
-  end
-
-  defp clear_websocket_owner_monitor(state, owner_pid) do
-    if Map.get(state, :websocket_owner_pid) == owner_pid do
-      state
-      |> Map.delete(:websocket_owner_pid)
-      |> Map.delete(:websocket_owner_monitor)
-    else
-      state
-    end
-  end
-
-  defp clear_websocket_owner_monitor(state) do
-    if owner_monitor = Map.get(state, :websocket_owner_monitor) do
-      Process.demonitor(owner_monitor, [:flush])
-    end
-
+  defp put_response_task_state(state) do
     state
-    |> Map.delete(:websocket_owner_pid)
-    |> Map.delete(:websocket_owner_monitor)
+    |> Map.put(:tasks, MapSet.new())
+    |> Map.put(:task_monitors, %{})
   end
-
-  defp owner_monitor_down_reason(:stale_owner), do: :stale_owner
-  defp owner_monitor_down_reason({:shutdown, :stale_owner}), do: :stale_owner
-  defp owner_monitor_down_reason(:normal), do: :owner_drained
-  defp owner_monitor_down_reason(:shutdown), do: :owner_drained
-  defp owner_monitor_down_reason({:shutdown, _details}), do: :owner_drained
-  defp owner_monitor_down_reason(_reason), do: :owner_crashed
 
   defp init_error(reason, state, started_at) do
     log_init_failed_before_request_reservation(reason, state, started_at)
 
     if WebsocketOwnerContract.owner_error?(reason) do
-      {:stop, :normal, owner_close_detail(reason), state}
+      {:stop, :normal, DownstreamSession.close_detail(reason), state}
     else
       {:stop, reason, state}
     end
@@ -317,56 +252,6 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     }
   end
 
-  defp owner_close_detail(:owner_crashed), do: {1011, "websocket owner crashed"}
-
-  defp owner_close_detail(:owner_forward_timeout),
-    do: {1011, "websocket owner forwarding timed out"}
-
-  defp owner_close_detail(:owner_unavailable), do: {1011, "websocket owner is unavailable"}
-  defp owner_close_detail(:owner_drained), do: {1001, "websocket owner is draining"}
-  defp owner_close_detail(:stale_owner), do: {1011, "websocket owner lease is stale"}
-  defp owner_close_detail(_reason), do: {1011, "websocket owner unavailable"}
-
-  defp log_owner_monitor_recovery({:ok, _result}, _state, _reason), do: :ok
-
-  defp log_owner_monitor_recovery({:error, recovery_reason}, state, owner_reason) do
-    Logger.warning(
-      "websocket owner monitor recovery failed " <>
-        "codex_session_id=#{codex_session_id(state)} " <>
-        "owner_instance_id=#{owner_instance_id(state)} " <>
-        "request_id=#{request_id(Map.get(state, :opts))} " <>
-        "owner_reason=#{failure_reason(owner_reason)} " <>
-        "failure_reason=#{failure_reason(recovery_reason)}"
-    )
-
-    :ok
-  end
-
-  defp release_owner_lease(state, reason) do
-    Websocket.release_websocket_owner_lease(
-      Map.get(state, :codex_session),
-      Map.get(state, :websocket_owner_lease_token),
-      reason
-    )
-  end
-
-  defp log_owner_monitor_lease_release(:ok, _state, _reason), do: :ok
-
-  defp log_owner_monitor_lease_release({:error, :stale_owner}, _state, _reason), do: :ok
-
-  defp log_owner_monitor_lease_release({:error, release_reason}, state, owner_reason) do
-    Logger.warning(
-      "websocket owner monitor lease release failed " <>
-        "codex_session_id=#{codex_session_id(state)} " <>
-        "owner_instance_id=#{owner_instance_id(state)} " <>
-        "request_id=#{request_id(Map.get(state, :opts))} " <>
-        "owner_reason=#{failure_reason(owner_reason)} " <>
-        "failure_reason=#{failure_reason(release_reason)}"
-    )
-
-    :ok
-  end
-
   defp start_response_task(parent, payload, state) do
     Task.start(fn ->
       Process.flag(:sensitive, true)
@@ -406,7 +291,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp start_tracked_response_task(payload, state) do
-    case maybe_retarget_owner_runtime_before_start(payload, state) do
+    case DownstreamSession.maybe_retarget_before_start(payload, state) do
       {:ok, state} ->
         state = maybe_mark_request_response_work_started(state, payload)
         parent = self()
@@ -427,69 +312,6 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       :queue.from_list([payload]),
       &:queue.in(payload, &1)
     )
-  end
-
-  @spec maybe_retarget_owner_runtime_before_start(binary(), map()) ::
-          {:ok, map()} | {:error, WebsocketOwnerContract.owner_error()}
-  defp maybe_retarget_owner_runtime_before_start(
-         payload,
-         %{websocket_owner_downstream: downstream} = state
-       )
-       when is_binary(payload) and is_map(downstream) do
-    with {:ok, %{} = decoded_payload} <- Jason.decode(payload),
-         {:ok, runtime} <-
-           Websocket.retarget_websocket_owner_runtime(
-             state.auth,
-             owner_runtime_state(state),
-             decoded_payload,
-             Map.get(state, :opts, %{})
-           ) do
-      {:ok, maybe_put_retargeted_owner_runtime_state(state, runtime)}
-    else
-      {:error, %Jason.DecodeError{}} -> {:ok, state}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp maybe_retarget_owner_runtime_before_start(_payload, state),
-    do: {:ok, state}
-
-  defp owner_runtime_state(state) do
-    %{
-      codex_session: Map.get(state, :codex_session),
-      websocket_owner_lease_token: Map.get(state, :websocket_owner_lease_token),
-      websocket_owner_downstream: Map.get(state, :websocket_owner_downstream),
-      websocket_owner_active_turn_reconnect?:
-        Map.get(state, :websocket_owner_active_turn_reconnect?, false)
-    }
-  end
-
-  defp maybe_put_retargeted_owner_runtime_state(state, runtime) do
-    if runtime == owner_runtime_state(state) do
-      state
-    else
-      put_retargeted_owner_runtime_state(state, runtime)
-    end
-  end
-
-  defp put_retargeted_owner_runtime_state(
-         state,
-         %{
-           codex_session: session,
-           websocket_owner_lease_token: owner_lease_token,
-           websocket_owner_downstream: downstream
-         } = runtime
-       ) do
-    state
-    |> clear_websocket_owner_monitor()
-    |> Map.put(:codex_session, session)
-    |> Map.put(:websocket_owner_lease_token, owner_lease_token)
-    |> Map.put(:websocket_owner_downstream, downstream)
-    |> Map.put(
-      :websocket_owner_active_turn_reconnect?,
-      Map.get(runtime, :websocket_owner_active_turn_reconnect?, false)
-    )
-    |> put_websocket_owner_monitor(session)
   end
 
   defp start_owner_retarget_error_task(reason, state) do
@@ -518,7 +340,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     WebsocketCodec.continuity_ordered_payload?(payload)
   end
 
-  defp owner_forwarded_socket?(state), do: is_map(Map.get(state, :websocket_owner_downstream))
+  defp owner_forwarded_socket?(state), do: DownstreamSession.owner?(state)
 
   defp active_response_task?(state), do: MapSet.size(Map.get(state, :tasks, MapSet.new())) > 0
 
@@ -562,7 +384,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   defp safe_run_response(_parent, {:owner_retarget_error, reason}, _state) do
-    owner_retarget_error_payload(reason)
+    DownstreamSession.retarget_error_payload(reason)
   end
 
   defp safe_run_response(parent, payload, state) do
@@ -581,32 +403,9 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     end
   end
 
-  defp accept_owner_downstream_message(message, %{websocket_owner_downstream: downstream})
-       when is_map(downstream) do
-    WebsocketOwnerContract.accept_downstream_message(
-      message,
-      Map.get(downstream, :epoch),
-      Map.get(downstream, :correlation_id)
-    )
-  end
-
-  defp accept_owner_downstream_message(_message, _state), do: :drop
-
-  defp owner_retarget_error_payload(reason) do
-    case WebsocketOwnerContract.safe_error_payload(reason, nil) do
-      {:ok, payload} -> {:error, payload}
-      {:error, _reason} -> {:error, reason}
-    end
-  end
-
   defp response_task_opts(state) do
-    if Map.has_key?(state, :websocket_owner_downstream) do
-      Websocket.websocket_owner_response_options(
-        Map.get(state, :opts, %{}),
-        Map.get(state, :codex_session),
-        Map.get(state, :websocket_owner_lease_token),
-        Map.get(state, :websocket_owner_downstream)
-      )
+    if DownstreamSession.owner?(state) do
+      DownstreamSession.response_options(state)
     else
       local_response_task_opts(state)
     end
@@ -623,14 +422,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
 
   defp cleanup_websocket_session(%{websocket_owner_downstream: downstream} = state)
        when is_map(downstream) do
-    state
-    |> Map.get(:codex_session)
-    |> Websocket.detach_websocket_owner_downstream(
-      Map.get(state, :websocket_owner_lease_token),
-      downstream,
-      Map.get(state, :opts, %{})
-    )
-    |> after_owner_detach(state)
+    DownstreamSession.cleanup(state)
   end
 
   defp cleanup_websocket_session(state) do
@@ -638,125 +430,6 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     |> Map.get(:codex_session)
     |> Websocket.interrupt_codex_session(state.opts)
     |> log_interrupt_failure(state)
-  end
-
-  defp log_owner_detach_failure(:ok, _state, _recovery_result), do: :ok
-  defp log_owner_detach_failure(:detached_stale_downstream, _state, _recovery_result), do: :ok
-
-  defp log_owner_detach_failure({:error, reason}, state, {:ok, recovery}) do
-    if interrupted_turn_count(recovery) > 0 do
-      log_owner_detach_failure({:error, reason}, state, :log_warning)
-    else
-      :ok
-    end
-  end
-
-  defp log_owner_detach_failure({:error, reason}, state, :log_warning) do
-    Logger.warning(
-      "websocket owner detach failed " <>
-        "codex_session_id=#{codex_session_id(state)} " <>
-        "owner_instance_id=#{owner_instance_id(state)} " <>
-        "request_id=#{request_id(Map.get(state, :opts))} " <>
-        "downstream_epoch=#{downstream_epoch(Map.get(state, :websocket_owner_downstream))} " <>
-        "failure_reason=#{failure_reason(reason)}"
-    )
-
-    :ok
-  end
-
-  defp log_owner_detach_failure({:error, reason}, state, {:error, _recovery_failure}) do
-    log_owner_detach_failure({:error, reason}, state, :log_warning)
-  end
-
-  defp interrupted_turn_count(%{interrupted_turn_count: count}) when is_integer(count), do: count
-  defp interrupted_turn_count(_recovery), do: 0
-
-  defp after_owner_detach(result, state) do
-    recovery_result = recover_owner_lifecycle_leftovers(result, state)
-    _interrupt_result = interrupt_owner_downstream_turn(result, state)
-    log_owner_detach_failure(result, state, recovery_result)
-  end
-
-  defp interrupt_owner_downstream_turn(:ok, state) do
-    state
-    |> Map.get(:codex_session)
-    |> Websocket.interrupt_codex_turn(owner_downstream_interrupt_opts(state))
-    |> log_interrupt_failure(state)
-  end
-
-  defp interrupt_owner_downstream_turn(_result, _state), do: :ok
-
-  defp recover_owner_lifecycle_leftovers({:error, reason}, state)
-       when reason in [:owner_unavailable, :owner_forward_timeout, :owner_crashed, :owner_drained] do
-    state
-    |> Map.get(:codex_session)
-    |> Websocket.recover_owner_lifecycle_leftovers(
-      reason,
-      owner_lifecycle_recovery_opts(state, reason)
-    )
-    |> log_owner_lifecycle_recovery_failure(state)
-  end
-
-  defp recover_owner_lifecycle_leftovers(_result, _state), do: :ok
-
-  defp owner_lifecycle_recovery_opts(state, reason) do
-    interrupt_reason = reason |> failure_reason() |> owner_lifecycle_interrupt_reason()
-
-    put_owner_lifecycle_recovery_opts(state, interrupt_reason)
-  end
-
-  defp put_owner_lifecycle_recovery_opts(%{opts: %RequestOptions{} = opts}, interrupt_reason) do
-    opts
-    |> RequestOptions.put_runtime_context(interrupt_reason: interrupt_reason)
-    |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
-  end
-
-  defp put_owner_lifecycle_recovery_opts(state, interrupt_reason) do
-    state
-    |> Map.get(:opts, %{})
-    |> RequestOptions.for_websocket()
-    |> RequestOptions.put_runtime_context(interrupt_reason: interrupt_reason)
-    |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
-  end
-
-  defp owner_lifecycle_interrupt_reason(reason)
-       when reason in [
-              "owner_unavailable",
-              "owner_forward_timeout",
-              "owner_crashed",
-              "owner_drained"
-            ],
-       do: reason
-
-  defp owner_lifecycle_interrupt_reason(_reason), do: "owner_unavailable"
-
-  defp owner_downstream_interrupt_opts(%{opts: %RequestOptions{} = opts}) do
-    opts
-    |> RequestOptions.put_runtime_context(interrupt_reason: "client_disconnected")
-    |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
-  end
-
-  defp owner_downstream_interrupt_opts(state) do
-    state
-    |> Map.get(:opts, %{})
-    |> RequestOptions.for_websocket()
-    |> RequestOptions.put_runtime_context(interrupt_reason: "client_disconnected")
-    |> RequestOptions.put_continuity(reconnect_window_seconds: 300)
-  end
-
-  defp log_owner_lifecycle_recovery_failure({:ok, _result} = result, _state), do: result
-
-  defp log_owner_lifecycle_recovery_failure({:error, reason}, state) do
-    Logger.warning(
-      "websocket owner lifecycle recovery failed " <>
-        "codex_session_id=#{codex_session_id(state)} " <>
-        "owner_instance_id=#{owner_instance_id(state)} " <>
-        "request_id=#{request_id(Map.get(state, :opts))} " <>
-        "downstream_epoch=#{downstream_epoch(Map.get(state, :websocket_owner_downstream))} " <>
-        "failure_reason=#{failure_reason(reason)}"
-    )
-
-    {:error, reason}
   end
 
   defp run_response(parent, auth, payload, opts) do
@@ -815,12 +488,6 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   defp request_id(%RequestOptions{} = opts), do: opts.request_metadata.request_id
   defp request_id(%{request_id: request_id}) when is_binary(request_id), do: request_id
   defp request_id(_opts), do: "none"
-
-  defp owner_instance_id(%{codex_session: %{owner_instance_id: owner_instance_id}})
-       when is_binary(owner_instance_id),
-       do: owner_instance_id
-
-  defp owner_instance_id(_state), do: "none"
 
   defp downstream_epoch(%{epoch: epoch}) when is_integer(epoch), do: Integer.to_string(epoch)
   defp downstream_epoch(_downstream), do: "none"
