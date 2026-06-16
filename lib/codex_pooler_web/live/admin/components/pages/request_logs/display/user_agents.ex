@@ -1,11 +1,12 @@
 defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.UserAgents do
   @moduledoc false
 
+  @type css_class :: String.t() | [String.t() | false | nil]
   @type classification :: %{
           kind: String.t(),
           label: String.t(),
           icon: String.t(),
-          icon_class: String.t()
+          icon_class: css_class()
         }
 
   @patterns [

@@ -10,7 +10,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsUserAgentsTest do
                  "Codex Desktop/0.133.0-alpha.1 (Mac OS 26.5.0; arm64) unknown (Codex Desktop; 26.519.41501)"
                )
 
-      assert %{kind: "codex", label: "Codex"} =
+      assert %{kind: "codex", label: "Codex", icon_class: ["size-3.5 shrink-0", "text-info"]} =
                UserAgents.classify("codex-tui/0.133.0 (Mac OS 26.5.0; arm64)")
 
       assert %{kind: "codex", label: "Codex"} =
