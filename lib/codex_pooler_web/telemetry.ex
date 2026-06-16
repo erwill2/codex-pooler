@@ -2,8 +2,6 @@ defmodule CodexPoolerWeb.Telemetry do
   use Supervisor
   import Telemetry.Metrics
 
-  alias CodexPooler.Dev.GatewayPerfProbe
-
   @type metric :: Telemetry.Metrics.t()
   @type repo_query_tags :: %{source: String.t(), command: String.t()}
   @type http_tags :: %{method: String.t(), status_class: String.t()}
@@ -394,7 +392,7 @@ defmodule CodexPoolerWeb.Telemetry do
   end
 
   defp perf_probe_child do
-    if GatewayPerfProbe.enabled?(), do: GatewayPerfProbe
+    CodexPooler.Dev.gateway_perf_probe_child()
   end
 
   @spec prometheus_reporter_child() :: {module(), keyword()} | nil
