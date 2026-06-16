@@ -540,7 +540,7 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
       latest_success: nil,
       latest_failure: nil,
       pending: nil,
-      active: [],
+      open: [],
       unresolved_failures: []
     }
   end

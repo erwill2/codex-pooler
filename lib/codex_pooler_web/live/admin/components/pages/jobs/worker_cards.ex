@@ -116,7 +116,7 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
   defp worker_activity_strip(assigns) do
     ~H"""
     <section
-      :if={@card.active_markers != [] or @card.failure_markers != []}
+      :if={@card.open_markers != [] or @card.failure_markers != []}
       data-role="worker-activity-strip"
       class="border-t border-base-300 bg-base-200/35 px-5 py-3"
     >
@@ -125,14 +125,14 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
 
         <div class="flex min-w-0 flex-wrap items-center gap-1.5">
           <span
-            :for={marker <- @card.visible_active_markers}
+            :for={marker <- @card.visible_open_markers}
             id={"job-activity-#{marker.id}"}
-            data-role="active-worker-marker"
+            data-role="open-worker-marker"
             aria-label={marker.title}
             title={marker.title}
             data-has-avatar={marker.avatar_email && "true"}
             class={[
-              "avatar avatar-online relative size-8 shrink-0 rounded-full text-[0.6875rem] font-semibold leading-none shadow-sm",
+              "avatar relative size-8 shrink-0 rounded-full text-[0.6875rem] font-semibold leading-none shadow-sm",
               !marker.avatar_email && "avatar-placeholder"
             ]}
           >
@@ -155,12 +155,12 @@ defmodule CodexPoolerWeb.Admin.JobWorkerCards do
             </div>
           </span>
           <span
-            :if={@card.active_marker_overflow_count > 0}
-            data-role="active-worker-overflow"
-            title={"#{@card.active_marker_overflow_count} more running targets"}
+            :if={@card.open_marker_overflow_count > 0}
+            data-role="open-worker-overflow"
+            title={"#{@card.open_marker_overflow_count} more open targets"}
             class="grid size-8 shrink-0 place-items-center rounded-full border border-info/30 bg-info/5 text-[0.6875rem] font-semibold text-info"
           >
-            +{@card.active_marker_overflow_count}
+            +{@card.open_marker_overflow_count}
           </span>
 
           <button

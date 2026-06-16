@@ -13,6 +13,7 @@ defmodule CodexPooler.Jobs.ReadModel do
   alias CodexPooler.Jobs.{
     AccountReconciliationWorker,
     HealthPolicy,
+    ReadModel.FailurePresentation,
     Schedule,
     TokenRefreshWorker
   }
@@ -23,7 +24,6 @@ defmodule CodexPooler.Jobs.ReadModel do
   @completed_state "completed"
   @identity_recovered_reconciliation_error_pattern "quota_refresh_auth_unavailable|pool_account_not_reconcilable"
   @overview_action_buckets [:active_failure, :retry_pressure, :stuck_executing, :backlog_pressure]
-  @sensitive_projection_keys [:args, :meta, :errors, "args", "meta", "errors"]
 
   @type job_summary :: map()
   @type explorer_job_summary :: map()
@@ -72,7 +72,7 @@ defmodule CodexPooler.Jobs.ReadModel do
           latest_success: job_summary() | nil,
           latest_failure: job_summary() | nil,
           pending: job_summary() | nil,
-          active: [job_summary()],
+          open: [job_summary()],
           unresolved_failures: [job_summary()]
         }
   @type worker_group_key :: atom() | String.t()
@@ -139,7 +139,7 @@ defmodule CodexPooler.Jobs.ReadModel do
         |> limit(^limit)
         |> offset(^offset)
         |> Repo.all()
-        |> sanitize_explorer_error_summaries()
+        |> FailurePresentation.sanitize_jobs()
         |> with_attention(opts)
 
       %{items: items, total: total, limit: limit, offset: offset}
@@ -226,7 +226,7 @@ defmodule CodexPooler.Jobs.ReadModel do
     latest_success_by_group = latest_worker_jobs_by_group(worker_groups, state: @completed_state)
     latest_failure_by_group = latest_worker_jobs_by_group(worker_groups, states: failure_states())
     pending_by_group = next_pending_worker_jobs_by_group(worker_groups)
-    active_by_group = active_worker_jobs_by_group(worker_groups)
+    open_by_group = open_worker_jobs_by_group(worker_groups)
     unresolved_failures_by_group = unresolved_failure_worker_jobs_by_group(worker_groups)
 
     Map.new(worker_groups, fn {group_key, _workers} ->
@@ -236,7 +236,7 @@ defmodule CodexPooler.Jobs.ReadModel do
           latest_success: Map.get(latest_success_by_group, group_key),
           latest_failure: Map.get(latest_failure_by_group, group_key),
           pending: Map.get(pending_by_group, group_key),
-          active: Map.get(active_by_group, group_key, []),
+          open: Map.get(open_by_group, group_key, []),
           unresolved_failures: Map.get(unresolved_failures_by_group, group_key, [])
       }
 
@@ -323,26 +323,7 @@ defmodule CodexPooler.Jobs.ReadModel do
   end
 
   @spec sanitize_projection(term()) :: term()
-  def sanitize_projection(value) when is_list(value), do: Enum.map(value, &sanitize_projection/1)
-
-  def sanitize_projection(%DateTime{} = value), do: value
-  def sanitize_projection(%NaiveDateTime{} = value), do: value
-  def sanitize_projection(%Date{} = value), do: value
-
-  def sanitize_projection(%{errors: errors} = value) when is_list(errors) do
-    value
-    |> Map.drop(@sensitive_projection_keys)
-    |> maybe_put_failure_summary(latest_error_by_attempt(errors))
-    |> Map.new(fn {key, nested_value} -> {key, sanitize_projection(nested_value)} end)
-  end
-
-  def sanitize_projection(value) when is_map(value) do
-    value
-    |> Map.drop(@sensitive_projection_keys)
-    |> Map.new(fn {key, nested_value} -> {key, sanitize_projection(nested_value)} end)
-  end
-
-  def sanitize_projection(value), do: value
+  defdelegate sanitize_projection(value), to: FailurePresentation
 
   defp reauth_required_reconciliation_failure?(%{worker: worker, target: target})
        when is_map(target) do
@@ -366,7 +347,7 @@ defmodule CodexPooler.Jobs.ReadModel do
         latest_success: with_attention(summary.latest_success, now: now),
         latest_failure: with_attention(summary.latest_failure, now: now),
         pending: with_attention(summary.pending, now: now),
-        active: with_attention(summary.active, now: now),
+        open: with_attention(summary.open, now: now),
         unresolved_failures: with_attention(summary.unresolved_failures, now: now)
     }
   end
@@ -566,7 +547,7 @@ defmodule CodexPooler.Jobs.ReadModel do
       from job in Oban.Job,
         join: group_worker in values(group_worker_rows, group_worker_types),
         on: job.worker == group_worker.worker,
-        where: job.state in ^pending_states(),
+        where: job.state in ^open_job_states(),
         windows: [
           group_partition: [
             partition_by: group_worker.group_index,
@@ -588,27 +569,27 @@ defmodule CodexPooler.Jobs.ReadModel do
     end)
   end
 
-  defp active_worker_jobs_by_group(worker_groups) do
+  defp open_worker_jobs_by_group(worker_groups) do
     {group_worker_rows, group_keys_by_index} = group_worker_rows_by_index(worker_groups)
 
     if group_worker_rows == [] do
       %{}
     else
       group_worker_rows
-      |> grouped_active_worker_jobs_query()
+      |> grouped_open_worker_jobs_query()
       |> grouped_job_metadata_query(:scheduled)
       |> Repo.all()
       |> grouped_job_lists_by_group(group_keys_by_index)
     end
   end
 
-  defp grouped_active_worker_jobs_query(group_worker_rows) do
+  defp grouped_open_worker_jobs_query(group_worker_rows) do
     group_worker_types = %{group_index: :integer, worker: :string}
 
     from job in Oban.Job,
       join: group_worker in values(group_worker_rows, group_worker_types),
       on: job.worker == group_worker.worker,
-      where: job.state in ^pending_states(),
+      where: job.state in ^open_job_states(),
       select: %{id: job.id, group_index: group_worker.group_index}
   end
 
@@ -668,7 +649,7 @@ defmodule CodexPooler.Jobs.ReadModel do
 
   defp maybe_where_states(queryable, _opts), do: queryable
 
-  defp pending_states, do: ["available", "scheduled", "executing", "retryable"]
+  defp open_job_states, do: ["available", "scheduled", "executing", "retryable"]
   defp failure_states, do: ["discarded", "retryable", "cancelled"]
 
   defp empty_worker_job_summary do
@@ -677,7 +658,7 @@ defmodule CodexPooler.Jobs.ReadModel do
       latest_success: nil,
       latest_failure: nil,
       pending: nil,
-      active: [],
+      open: [],
       unresolved_failures: []
     }
   end
@@ -1087,7 +1068,7 @@ defmodule CodexPooler.Jobs.ReadModel do
   end
 
   defp collect_overview_job(job, overview, now) do
-    job = job |> sanitize_explorer_error_summary() |> HealthPolicy.put_attention(now: now)
+    job = job |> FailurePresentation.sanitize_job() |> HealthPolicy.put_attention(now: now)
     overview = %{overview | total: overview.total + 1}
 
     case job.attention_state do
@@ -1154,7 +1135,7 @@ defmodule CodexPooler.Jobs.ReadModel do
       end)
 
     %{
-      items: items |> Enum.reverse() |> sanitize_explorer_error_summaries(),
+      items: items |> Enum.reverse() |> FailurePresentation.sanitize_jobs(),
       total: total,
       limit: limit,
       offset: offset
@@ -1198,203 +1179,6 @@ defmodule CodexPooler.Jobs.ReadModel do
              api_key
            )
   end
-
-  defp sanitize_explorer_error_summaries(jobs),
-    do: sanitize_projection(jobs)
-
-  defp sanitize_explorer_error_summary(job), do: sanitize_projection(job)
-
-  defp maybe_put_failure_summary(job, latest_error) when is_map(latest_error),
-    do: Map.put(job, :failure_summary, failure_summary(latest_error))
-
-  defp maybe_put_failure_summary(job, _latest_error), do: job
-
-  defp failure_summary(error) do
-    %{
-      title: failure_title(error),
-      message: error |> Map.get("error") |> safe_failure_message()
-    }
-  end
-
-  defp latest_error_by_attempt(errors) do
-    errors
-    |> Enum.filter(&is_map/1)
-    |> Enum.max_by(&error_attempt_number/1, fn -> nil end)
-  end
-
-  defp error_attempt_number(%{"attempt" => attempt}) when is_integer(attempt), do: attempt
-
-  defp error_attempt_number(%{"attempt" => attempt}) when is_binary(attempt) do
-    case Integer.parse(attempt) do
-      {attempt, ""} -> attempt
-      _not_integer -> -1
-    end
-  end
-
-  defp error_attempt_number(_error), do: -1
-
-  defp failure_title(%{"error" => message} = error) when is_binary(message) do
-    [failure_attempt(error), operator_failure_title(message) || failure_kind(error)]
-    |> Enum.reject(&is_nil/1)
-    |> case do
-      [] -> "Failure detail"
-      parts -> Enum.join(parts, " · ")
-    end
-  end
-
-  defp failure_title(error) do
-    [failure_attempt(error), failure_kind(error)]
-    |> Enum.reject(&is_nil/1)
-    |> case do
-      [] -> "Failure detail"
-      parts -> Enum.join(parts, " · ")
-    end
-  end
-
-  defp failure_attempt(%{"attempt" => attempt}) when is_integer(attempt), do: "Attempt #{attempt}"
-  defp failure_attempt(%{"attempt" => attempt}) when is_binary(attempt), do: "Attempt #{attempt}"
-  defp failure_attempt(_error), do: nil
-
-  defp failure_kind(%{"kind" => kind}) when is_binary(kind) and kind != "", do: kind
-  defp failure_kind(_error), do: nil
-
-  defp safe_failure_message(message) when is_binary(message) do
-    message
-    |> String.replace(~r/[\r\n\t]+/, " ")
-    |> redact_failure_secrets()
-    |> unwrap_oban_failure_message()
-    |> operator_failure_message()
-    |> String.trim()
-    |> truncate_failure_message()
-    |> case do
-      "" -> "No diagnostic message recorded."
-      message -> message
-    end
-  end
-
-  defp safe_failure_message(_message), do: "No diagnostic message recorded."
-
-  defp redact_failure_secrets(message) do
-    message
-    |> String.replace(~r/(?i)bearer\s+[a-z0-9._~+\/=:-]+/, "Bearer [redacted]")
-    |> String.replace(~r/(?i)\bsecret[-_a-z0-9]*\b/, "[redacted]")
-    |> String.replace(
-      ~r/(?i)\b(authorization|cookie|set-cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|password|prompt|secret|token)\b\s*[:=]\s*[^,;\s]+/,
-      "[redacted]"
-    )
-  end
-
-  defp unwrap_oban_failure_message(message) do
-    cond do
-      match = Regex.run(~r/failed with \{:error, "([^"]+)"\}/, message) ->
-        [_full, inner] = match
-        inner
-
-      match = Regex.run(~r/failed with \{:error, %\{[^}]*message: "([^"]+)"/, message) ->
-        [_full, inner] = match
-        inner
-
-      oban_discard_failure?(message) ->
-        "The job stopped without additional diagnostics."
-
-      true ->
-        message
-    end
-  end
-
-  defp operator_failure_title(message) do
-    code = message |> unwrap_oban_failure_message() |> reconciliation_failure_code()
-    code = code || oban_map_failure_code(message)
-
-    cond do
-      oban_discard_failure?(message) ->
-        "Run discarded"
-
-      catalog_sync_invalid_trigger_kind?(message) ->
-        "Invalid catalog sync trigger"
-
-      catalog_sync_in_progress?(message) ->
-        "Catalog sync already running"
-
-      title = quota_failure_title(code) ->
-        title
-
-      is_binary(code) ->
-        humanize_failure_code(code)
-
-      true ->
-        nil
-    end
-  end
-
-  defp quota_failure_title("quota_refresh_auth_unavailable"), do: "Quota refresh blocked"
-  defp quota_failure_title("quota_refresh_unavailable"), do: "Quota unavailable"
-  defp quota_failure_title("quota_refresh_failed"), do: "Quota refresh failed"
-  defp quota_failure_title(_code), do: nil
-
-  defp operator_failure_message(message) do
-    cond do
-      catalog_sync_invalid_trigger_kind?(message) ->
-        "Manual catalog sync could not start because the enqueue action used an unsupported trigger kind."
-
-      catalog_sync_in_progress?(message) ->
-        "Catalog sync could not start because this pool already has a sync run marked as running."
-
-      true ->
-        case reconciliation_failure_code(message) do
-          "quota_refresh_auth_unavailable" ->
-            "Quota refresh needs account reauthentication."
-
-          "quota_refresh_unavailable" ->
-            "Quota data was not available from the upstream account."
-
-          "quota_refresh_failed" ->
-            "Quota refresh failed for the upstream account."
-
-          code when is_binary(code) ->
-            "Account reconciliation needs attention: #{humanize_failure_code(code)}."
-
-          nil ->
-            message
-        end
-    end
-  end
-
-  defp reconciliation_failure_code("account reconciliation partial: " <> code),
-    do: String.trim(code)
-
-  defp reconciliation_failure_code(_message), do: nil
-
-  defp oban_map_failure_code(message) do
-    case Regex.run(~r/failed with \{:error, %\{[^}]*code: :([a-z0-9_]+)/, message) do
-      [_full, code] -> code
-      _no_match -> nil
-    end
-  end
-
-  defp oban_discard_failure?(message), do: Regex.match?(~r/failed with :discard\b/, message)
-
-  defp catalog_sync_invalid_trigger_kind?(message) do
-    String.contains?(message, "CodexPooler.Jobs.CatalogSyncWorker") and
-      String.contains?(message, "trigger_kind:") and
-      String.contains?(message, "is invalid")
-  end
-
-  defp catalog_sync_in_progress?(message) do
-    String.contains?(message, "catalog sync already running") or
-      String.contains?(message, "code: :catalog_sync_in_progress")
-  end
-
-  defp humanize_failure_code(code) do
-    code
-    |> String.replace("_", " ")
-    |> String.capitalize()
-  end
-
-  defp truncate_failure_message(message) when byte_size(message) > 240,
-    do: message |> binary_part(0, 240) |> String.trim() |> Kernel.<>("…")
-
-  defp truncate_failure_message(message), do: message
 
   defp job_target_metadata_query(queryable) do
     from job in queryable,

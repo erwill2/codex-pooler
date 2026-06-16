@@ -21,7 +21,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     :ok
   end
 
-  test "worker cards render active markers and unresolved failure panels by target", %{
+  test "worker cards render open markers and unresolved failure panels by target", %{
     conn: conn
   } do
     active_pool = pool_fixture(%{name: "Active Pool", slug: "active-pool"})
@@ -393,7 +393,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     assert has_element?(view, "#{card} [data-role='worker-state-badge']", "Executing")
     assert has_element?(view, "#{card} [data-role='next-run']", "Running now")
     refute has_element?(view, "#{card} [data-role='worker-activity-strip']")
-    refute has_element?(view, "#{card} [data-role='active-worker-marker']")
+    refute has_element?(view, "#{card} [data-role='open-worker-marker']")
     refute has_element?(view, "#{card} [data-role='target-initial']", "R2")
   end
 
@@ -552,7 +552,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     assert render(view) =~ "Alert evaluation has no active alert rules to evaluate"
   end
 
-  test "account reconciliation card renders one compact active marker per assignment", %{
+  test "account reconciliation card renders one compact open marker per assignment", %{
     conn: conn
   } do
     pool = pool_fixture(%{name: "Fanout Pool", slug: "fanout-pool"})
@@ -621,12 +621,12 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
 
     assert has_element?(
              view,
-             "#{card} #job-activity-#{first_job.id}[data-has-avatar='true'].avatar.avatar-online img[src='#{AvatarComponents.gravatar_url("codex01@example.com", size: 64)}']"
+             "#{card} #job-activity-#{first_job.id}[data-has-avatar='true'].avatar img[src='#{AvatarComponents.gravatar_url("codex01@example.com", size: 64)}']"
            )
 
     assert has_element?(
              view,
-             "#{card} #job-activity-#{second_job.id}[data-has-avatar='true'].avatar.avatar-online img[src='#{AvatarComponents.gravatar_url("codex02@example.com", size: 64)}']"
+             "#{card} #job-activity-#{second_job.id}[data-has-avatar='true'].avatar img[src='#{AvatarComponents.gravatar_url("codex02@example.com", size: 64)}']"
            )
 
     refute has_element?(view, "#{card} #job-activity-#{first_job.id} > img")
@@ -690,7 +690,7 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     refute has_element?(view, "#{card} #job-failure-#{job.id} > img")
   end
 
-  test "account reconciliation card caps active target markers", %{conn: conn} do
+  test "account reconciliation card caps open target markers", %{conn: conn} do
     pool = pool_fixture(%{name: "Fanout Pool", slug: "fanout-pool"})
 
     for index <- 1..10 do
@@ -712,8 +712,8 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     card = worker_card_selector(:account_reconciliation)
     rendered = render(view)
 
-    assert count_occurrences(rendered, "data-role=\"active-worker-marker\"") == 8
-    assert has_element?(view, "#{card} [data-role='active-worker-overflow']", "+2")
+    assert count_occurrences(rendered, "data-role=\"open-worker-marker\"") == 8
+    assert has_element?(view, "#{card} [data-role='open-worker-overflow']", "+2")
     refute rendered =~ "Account fan-out slots are always visible"
   end
 

@@ -131,7 +131,7 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
 
       assert %{
                latest: %{id: latest_id},
-               active: [_active | _],
+               open: [_open | _],
                unresolved_failures: []
              } = Jobs.worker_job_summary(scope, [worker_name(TokenRefreshWorker)])
 
@@ -147,7 +147,7 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
                latest_success: nil,
                latest_failure: nil,
                pending: nil,
-               active: [],
+               open: [],
                unresolved_failures: []
              }
 
@@ -283,7 +283,7 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
                latest_success: %{id: success_id},
                latest_failure: %{state: "discarded"},
                pending: nil,
-               active: [],
+               open: [],
                unresolved_failures: unresolved_failures
              } = Jobs.worker_job_summary(scope, [worker_name(CatalogSyncWorker)])
 
@@ -472,12 +472,12 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
       refute serialized =~ "Bearer hidden"
     end
 
-    test "grouped worker summaries preserve pending winner and active ordering across groups" do
+    test "grouped worker summaries preserve pending winner and open-job ordering across groups" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
       scope = Scope.for_user(owner, ["instance_owner"])
       same_scheduled_at = ~U[2026-05-04 12:00:00Z]
 
-      catalog_later_active =
+      catalog_later_open =
         insert_listing_job(1,
           worker: CatalogSyncWorker,
           state: "available",
@@ -501,7 +501,7 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
           scheduled_at: same_scheduled_at
         )
 
-      token_active =
+      token_open =
         insert_listing_job(4,
           worker: TokenRefreshWorker,
           state: "retryable",
@@ -518,24 +518,24 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
 
       assert summaries.catalog_card.pending.id == newer_catalog_pending.id
 
-      assert Enum.map(summaries.catalog_card.active, & &1.id) == [
+      assert Enum.map(summaries.catalog_card.open, & &1.id) == [
                newer_catalog_pending.id,
                older_catalog_pending.id,
-               catalog_later_active.id
+               catalog_later_open.id
              ]
 
       assert summaries.overlap_card.pending.id == newer_catalog_pending.id
 
-      assert Enum.map(summaries.overlap_card.active, & &1.id) == [
+      assert Enum.map(summaries.overlap_card.open, & &1.id) == [
                newer_catalog_pending.id,
                older_catalog_pending.id,
-               token_active.id,
-               catalog_later_active.id
+               token_open.id,
+               catalog_later_open.id
              ]
 
       assert summaries.missing_card.pending == nil
-      assert summaries.missing_card.active == []
-      assert Enum.all?(summaries.overlap_card.active, &safe_job_shape?/1)
+      assert summaries.missing_card.open == []
+      assert Enum.all?(summaries.overlap_card.open, &safe_job_shape?/1)
     end
 
     test "grouped worker summaries support overlapping worker groups and empty group entries" do
@@ -573,7 +573,7 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
                latest_success: nil,
                latest_failure: nil,
                pending: nil,
-               active: [],
+               open: [],
                unresolved_failures: []
              }
     end
@@ -1028,7 +1028,7 @@ defmodule CodexPooler.Jobs.LatestJobsTest do
       latest_success: nil,
       latest_failure: nil,
       pending: nil,
-      active: [],
+      open: [],
       unresolved_failures: []
     }
   end

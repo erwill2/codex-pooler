@@ -10,7 +10,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
   alias CodexPoolerWeb.DateTimeDisplay
   alias Oban.Cron.Expression
 
-  @visible_active_marker_limit 8
+  @visible_open_marker_limit 8
   @visible_failure_marker_limit 3
 
   @spec worker_cards(map(), DateTimeDisplay.preferences(), DateTime.t()) :: [map()]
@@ -108,7 +108,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
     failure_job = summary.latest_failure
     state = worker_card_state(group, summary, latest_job)
     next_run = next_run_summary(group, summary.pending, datetime_preferences, now)
-    active_markers = activity_markers(summary.active)
+    open_markers = activity_markers(summary.open)
     failure_markers = failure_markers(summary.unresolved_failures)
     latest_unresolved_failure = List.first(summary.unresolved_failures)
 
@@ -129,16 +129,15 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
       cadence_label: next_run.cadence_label,
       on_demand: !is_binary(group.cadence.cron),
       attempts: if(latest_job, do: format_attempts(latest_job), else: "0/-"),
-      active_markers: active_markers,
+      open_markers: open_markers,
       failure_markers: failure_markers,
-      visible_active_markers: Enum.take(active_markers, @visible_active_marker_limit),
-      active_marker_overflow_count:
-        marker_overflow_count(active_markers, @visible_active_marker_limit),
+      visible_open_markers: Enum.take(open_markers, @visible_open_marker_limit),
+      open_marker_overflow_count: marker_overflow_count(open_markers, @visible_open_marker_limit),
       visible_failure_markers: Enum.take(failure_markers, @visible_failure_marker_limit),
       failure_marker_overflow_count:
         marker_overflow_count(failure_markers, @visible_failure_marker_limit),
       latest_failure: latest_failure_summary(latest_unresolved_failure),
-      activity_label: activity_label(active_markers, failure_markers),
+      activity_label: activity_label(open_markers, failure_markers),
       last_seen_at: job_event_timestamp(latest_job),
       last_success_at: job_event_timestamp(success_job),
       last_failure_at: job_event_timestamp(failure_job)
@@ -159,17 +158,16 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
   defp manual_enqueue_worker_group?(worker_group),
     do: Jobs.worker_group_manual_enqueueable?(worker_group)
 
-  defp worker_card_state(_group, %{active: [_active | _rest]}, _latest_job), do: "executing"
   defp worker_card_state(_group, %{pending: %{state: state}}, _latest_job), do: state
   defp worker_card_state(_group, _summary, %{state: state}), do: state
   defp worker_card_state(group, _summary, _latest_job), do: empty_worker_state(group)
 
-  defp activity_label(active, failures) when active != [] and failures != [],
-    do: "Live targets and failures"
+  defp activity_label(open, failures) when open != [] and failures != [],
+    do: "Open targets and failures"
 
-  defp activity_label(active, _failures) when active != [], do: "Live targets"
-  defp activity_label(_active, failures) when failures != [], do: "Needs attention"
-  defp activity_label(_active, _failures), do: nil
+  defp activity_label(open, _failures) when open != [], do: "Open targets"
+  defp activity_label(_open, failures) when failures != [], do: "Needs attention"
+  defp activity_label(_open, _failures), do: nil
 
   defp empty_worker_state(%{cadence: %{cron: cron}}) when is_binary(cron),
     do: "awaiting_first_run"
@@ -257,7 +255,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
       latest_success: nil,
       latest_failure: nil,
       pending: nil,
-      active: [],
+      open: [],
       unresolved_failures: []
     }
   end
