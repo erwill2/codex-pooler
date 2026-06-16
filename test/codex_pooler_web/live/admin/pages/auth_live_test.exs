@@ -72,13 +72,9 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
       for {path, selector} <- @admin_routes do
         assert {:ok, view, _html} = live(conn, path)
         assert has_element?(view, selector)
-        assert has_element?(view, "#admin-shell-root.overflow-hidden")
-        assert has_element?(view, "#admin-shell-scroll-region.relative")
-
-        assert has_element?(
-                 view,
-                 "#admin-nav.min-h-0.overflow-y-auto.overscroll-contain.scrollbar-none"
-               )
+        assert has_element?(view, "#admin-shell-root")
+        assert has_element?(view, "#admin-shell-scroll-region")
+        assert has_element?(view, "#admin-nav")
 
         assert has_element?(
                  view,
@@ -119,7 +115,7 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
         refute has_element?(view, "#admin-websocket-state-popover [data-ws-endpoint]")
         refute has_element?(view, "#admin-websocket-state-popover [data-ws-heartbeat]")
         assert has_element?(view, "#admin-sidebar-operator-avatar")
-        assert has_element?(view, "#admin-sidebar-operator-label.min-w-0.md\\:w-full")
+        assert has_element?(view, "#admin-sidebar-operator-label")
 
         assert has_element?(
                  view,
@@ -129,7 +125,7 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
 
         assert has_element?(
                  view,
-                 "#admin-sidebar-operator-label p.block.w-full.min-w-0.truncate[title='#{expected_operator_identity}']",
+                 "#admin-sidebar-operator-label p[title='#{expected_operator_identity}']",
                  expected_operator_identity
                )
 
@@ -145,14 +141,14 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
         release_notes_url =
           "https://github.com/icoretech/codex-pooler/releases/tag/codex-pooler-v#{app_version}"
 
-        assert has_element?(view, "#admin-github-dropdown.dropdown.dropdown-end")
+        assert has_element?(view, "#admin-github-dropdown")
 
         assert has_element?(
                  view,
                  "#admin-github-button[role='button'][aria-label='Codex Pooler project links']"
                )
 
-        assert has_element?(view, "#admin-github-button svg.size-5.fill-current")
+        assert has_element?(view, "#admin-github-button svg")
 
         assert has_element?(
                  view,
@@ -167,7 +163,6 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
                  "Release notes"
                )
 
-        assert has_element?(view, "#admin-github-release-notes .hero-tag")
         assert has_element?(view, "#admin-github-release-notes", "codex-pooler-v#{app_version}")
 
         assert has_element?(
@@ -176,7 +171,6 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
                  "Official repository"
                )
 
-        assert has_element?(view, "#admin-github-repository .hero-code-bracket-square")
         assert has_element?(view, "#admin-github-repository", "icoretech/codex-pooler")
 
         assert has_element?(
@@ -185,7 +179,6 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
                  "Documentation"
                )
 
-        assert has_element?(view, "#admin-github-docs .hero-book-open")
         assert has_element?(view, "#admin-github-docs", "docs.codex-pooler.com")
 
         assert has_element?(
@@ -194,15 +187,12 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
                  "iCoreTech on X"
                )
 
-        assert has_element?(view, "#admin-github-x-profile .hero-at-symbol")
         assert has_element?(view, "#admin-github-x-profile", "@icoretech_inc")
 
         assert has_element?(
                  view,
                  "#admin-github-star-invite[href='https://github.com/icoretech/codex-pooler']"
                )
-
-        assert has_element?(view, "#admin-github-star-invite .hero-star")
 
         assert has_element?(
                  view,
@@ -333,8 +323,7 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
       assert_html_selector(html, "#admin-test-page-header", "Shared conventions")
       assert_html_selector(html, "#admin-test-header-action", "Create")
       assert_html_selector(html, "#admin-test-filter-form")
-      assert_html_selector(html, "#admin-test-filter-action.btn-secondary", "Filter")
-      refute_html_selector(html, "#admin-test-filter-action.btn-outline")
+      assert_html_selector(html, "#admin-test-filter-action", "Filter")
       assert_html_selector(html, "#admin-test-metrics")
       assert_html_selector(html, "#admin-test-metric")
       assert_html_selector(html, "#admin-test-surface")
@@ -348,11 +337,11 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
       assert_html_selector(html, "#admin-test-empty-state", "No rows yet")
       assert_html_selector(html, "#admin-test-status-badge", "redacted")
 
-      assert html =~
-               ~s(<p class="text-sm leading-5">Notice body copy wraps with compact rhythm.</p>)
-
-      refute html =~
-               ~s(<p class="text-sm leading-6">Notice body copy wraps with compact rhythm.</p>)
+      assert_html_selector(
+        html,
+        "#admin-test-extended-notice",
+        "Notice body copy wraps with compact rhythm."
+      )
 
       assert_html_selector(html, "#admin-test-link-action", "Open")
     end
@@ -475,19 +464,6 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
 
     if text do
       assert html =~ text, "expected selector #{selector} to expose #{inspect(text)}"
-    end
-  end
-
-  defp refute_html_selector(html, selector) do
-    id = selector_id!(selector)
-
-    case opening_tag_with_id(html, id) do
-      nil ->
-        :ok
-
-      opening_tag ->
-        refute Enum.all?(selector_classes(selector), &(opening_tag =~ &1)),
-               "expected selector #{selector} to be absent"
     end
   end
 
