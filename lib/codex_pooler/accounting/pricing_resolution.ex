@@ -18,6 +18,19 @@ defmodule CodexPooler.Accounting.PricingResolution do
            distance: pos_integer()
          }
 
+  @typep pricing_context :: %{
+           identifiers: [String.t()],
+           requested_tier: String.t() | nil,
+           actual_tier: String.t() | nil,
+           service_tier: String.t(),
+           price_bucket: String.t(),
+           timestamp: DateTime.t(),
+           batch_usage: boolean()
+         }
+
+  @typep pricing_resolution_step ::
+           {:exact | :suffix, :priced | :unavailable, String.t()}
+
   @spec lookup(Model.t(), String.t(), map(), map(), DateTime.t()) :: map()
   def lookup(%Model{} = model, requested_model, payload, opts, timestamp) do
     requested_tier = requested_service_tier(payload, opts)
@@ -189,7 +202,6 @@ defmodule CodexPooler.Accounting.PricingResolution do
     case priceable_service_tier(requested_tier, actual_tier, batch_usage?) do
       {:ok, service_tier} ->
         lookup_for_service_tier(
-          model,
           identifiers,
           requested_tier,
           actual_tier,
@@ -206,7 +218,6 @@ defmodule CodexPooler.Accounting.PricingResolution do
   end
 
   defp lookup_for_service_tier(
-         model,
          identifiers,
          requested_tier,
          actual_tier,
@@ -215,224 +226,120 @@ defmodule CodexPooler.Accounting.PricingResolution do
          timestamp,
          batch_usage?
        ) do
-    case pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) do
-      %PricingSnapshot{} = snapshot ->
-        priced_snapshot(snapshot, requested_tier, actual_tier, service_tier, batch_usage?)
+    context = %{
+      identifiers: identifiers,
+      requested_tier: requested_tier,
+      actual_tier: actual_tier,
+      service_tier: service_tier,
+      price_bucket: price_bucket,
+      timestamp: timestamp,
+      batch_usage: batch_usage?
+    }
 
-      nil ->
-        lookup_unavailable_or_fallback_tier(
-          model,
-          identifiers,
-          requested_tier,
-          actual_tier,
-          service_tier,
-          price_bucket,
-          timestamp,
-          batch_usage?
-        )
+    context
+    |> pricing_resolution_steps()
+    |> Enum.find_value(&resolve_pricing_step(context, &1))
+    |> case do
+      nil -> missing_pricing_snapshot(context)
+      pricing -> pricing
     end
   end
 
-  @spec lookup_unavailable_or_fallback_tier(
-          Model.t(),
-          [String.t()],
-          String.t() | nil,
-          String.t() | nil,
-          String.t(),
-          String.t(),
-          DateTime.t(),
-          boolean()
-        ) :: map()
-  defp lookup_unavailable_or_fallback_tier(
-         model,
-         identifiers,
-         requested_tier,
-         actual_tier,
-         service_tier,
-         price_bucket,
-         timestamp,
-         batch_usage?
-       ) do
-    cond do
-      unavailable_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) ->
-        unavailable_price_bucket_snapshot(
-          requested_tier,
-          actual_tier,
-          service_tier,
-          price_bucket,
-          batch_usage?
-        )
-
-      snapshot = fallback_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) ->
-        priced_snapshot(snapshot, requested_tier, actual_tier, service_tier, batch_usage?)
-
-      true ->
-        lookup_inferred_service_tier(
-          model,
-          identifiers,
-          requested_tier,
-          actual_tier,
-          service_tier,
-          price_bucket,
-          timestamp,
-          batch_usage?
-        )
-    end
+  @spec pricing_resolution_steps(pricing_context()) :: [pricing_resolution_step()]
+  defp pricing_resolution_steps(%{price_bucket: @long_context_price_bucket}) do
+    [
+      {:exact, :priced, @long_context_price_bucket},
+      {:exact, :unavailable, @long_context_price_bucket},
+      {:exact, :priced, @default_price_bucket},
+      {:suffix, :priced, @long_context_price_bucket},
+      {:suffix, :unavailable, @long_context_price_bucket},
+      {:suffix, :priced, @default_price_bucket}
+    ]
   end
 
-  @spec lookup_inferred_service_tier(
-          Model.t(),
-          [String.t()],
-          String.t() | nil,
-          String.t() | nil,
-          String.t(),
-          String.t(),
-          DateTime.t(),
-          boolean()
-        ) :: map()
-  defp lookup_inferred_service_tier(
-         model,
-         identifiers,
-         requested_tier,
-         actual_tier,
-         service_tier,
-         price_bucket,
-         timestamp,
-         batch_usage?
-       ) do
-    case inferred_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) do
-      {%PricingSnapshot{} = inferred, alias_metadata} ->
-        priced_snapshot(
-          inferred,
-          requested_tier,
-          actual_tier,
-          service_tier,
-          batch_usage?,
-          alias_metadata
-        )
-
-      nil ->
-        lookup_inferred_unavailable_or_missing_pricing(
-          model,
-          identifiers,
-          requested_tier,
-          actual_tier,
-          service_tier,
-          price_bucket,
-          timestamp,
-          batch_usage?
-        )
-    end
+  defp pricing_resolution_steps(%{price_bucket: price_bucket}) do
+    [
+      {:exact, :priced, price_bucket},
+      {:exact, :unavailable, price_bucket},
+      {:suffix, :priced, price_bucket},
+      {:suffix, :unavailable, price_bucket}
+    ]
   end
 
-  @spec lookup_inferred_unavailable_or_missing_pricing(
-          Model.t(),
-          [String.t()],
-          String.t() | nil,
-          String.t() | nil,
-          String.t(),
-          String.t(),
-          DateTime.t(),
-          boolean()
-        ) :: map()
-  defp lookup_inferred_unavailable_or_missing_pricing(
-         model,
-         identifiers,
-         requested_tier,
-         actual_tier,
-         service_tier,
-         price_bucket,
-         timestamp,
-         batch_usage?
-       ) do
-    case inferred_unavailable_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) do
-      {%PricingSnapshot{}, alias_metadata} ->
-        unavailable_price_bucket_snapshot(
-          requested_tier,
-          actual_tier,
-          service_tier,
-          price_bucket,
-          batch_usage?,
-          alias_metadata
-        )
-
-      nil ->
-        lookup_inferred_fallback_or_missing_pricing(
-          model,
-          identifiers,
-          requested_tier,
-          actual_tier,
-          service_tier,
-          price_bucket,
-          timestamp,
-          batch_usage?
-        )
-    end
-  end
-
-  @spec lookup_inferred_fallback_or_missing_pricing(
-          Model.t(),
-          [String.t()],
-          String.t() | nil,
-          String.t() | nil,
-          String.t(),
-          String.t(),
-          DateTime.t(),
-          boolean()
-        ) :: map()
-  defp lookup_inferred_fallback_or_missing_pricing(
-         model,
-         identifiers,
-         requested_tier,
-         actual_tier,
-         service_tier,
-         price_bucket,
-         timestamp,
-         batch_usage?
-       ) do
-    case fallback_suffix_inference_pricing_snapshot(
-           identifiers,
-           service_tier,
+  @spec resolve_pricing_step(pricing_context(), pricing_resolution_step()) :: map() | nil
+  defp resolve_pricing_step(context, {:exact, :priced, price_bucket}) do
+    case pricing_snapshot(
+           context.identifiers,
+           context.service_tier,
            price_bucket,
-           timestamp
+           context.timestamp
          ) do
-      {%PricingSnapshot{} = fallback, alias_metadata} ->
-        priced_snapshot(
-          fallback,
-          requested_tier,
-          actual_tier,
-          service_tier,
-          batch_usage?,
-          alias_metadata
-        )
-
-      nil ->
-        missing_pricing_snapshot(
-          model,
-          identifiers,
-          requested_tier,
-          actual_tier,
-          service_tier,
-          timestamp,
-          batch_usage?
-        )
+      %PricingSnapshot{} = snapshot -> priced_snapshot(context, snapshot)
+      nil -> nil
     end
   end
 
-  @spec inferred_pricing_snapshot([String.t()], String.t(), String.t(), DateTime.t()) ::
-          {PricingSnapshot.t(), map()} | nil
-  defp inferred_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) do
-    suffix_inference_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp)
+  defp resolve_pricing_step(context, {:exact, :unavailable, price_bucket}) do
+    case unavailable_pricing_snapshot(
+           context.identifiers,
+           context.service_tier,
+           price_bucket,
+           context.timestamp
+         ) do
+      %PricingSnapshot{} -> unavailable_price_bucket_snapshot(context, price_bucket)
+      nil -> nil
+    end
   end
 
-  @spec inferred_unavailable_pricing_snapshot([String.t()], String.t(), String.t(), DateTime.t()) ::
-          {PricingSnapshot.t(), map()} | nil
-  defp inferred_unavailable_pricing_snapshot(identifiers, service_tier, price_bucket, timestamp) do
-    suffix_inference_unavailable_pricing_snapshot(
-      identifiers,
-      service_tier,
+  defp resolve_pricing_step(context, {:suffix, :priced, price_bucket}) do
+    case suffix_inference_pricing_snapshot(
+           context.identifiers,
+           context.service_tier,
+           price_bucket,
+           context.timestamp
+         ) do
+      {%PricingSnapshot{} = snapshot, alias_metadata} ->
+        priced_snapshot(context, snapshot, alias_metadata)
+
+      nil ->
+        nil
+    end
+  end
+
+  defp resolve_pricing_step(context, {:suffix, :unavailable, price_bucket}) do
+    case suffix_inference_unavailable_pricing_snapshot(
+           context.identifiers,
+           context.service_tier,
+           price_bucket,
+           context.timestamp
+         ) do
+      {%PricingSnapshot{}, alias_metadata} ->
+        unavailable_price_bucket_snapshot(context, price_bucket, alias_metadata)
+
+      nil ->
+        nil
+    end
+  end
+
+  defp priced_snapshot(context, snapshot, alias_metadata \\ nil) do
+    priced_snapshot(
+      snapshot,
+      context.requested_tier,
+      context.actual_tier,
+      context.service_tier,
+      context.batch_usage,
+      alias_metadata
+    )
+  end
+
+  defp unavailable_price_bucket_snapshot(context, price_bucket, alias_metadata \\ nil) do
+    unavailable_price_bucket_snapshot(
+      context.requested_tier,
+      context.actual_tier,
+      context.service_tier,
       price_bucket,
-      timestamp
+      context.batch_usage,
+      alias_metadata
     )
   end
 
@@ -474,44 +381,6 @@ defmodule CodexPooler.Accounting.PricingResolution do
         limit: 1
     )
   end
-
-  defp fallback_pricing_snapshot(
-         identifiers,
-         service_tier,
-         @long_context_price_bucket,
-         timestamp
-       ),
-       do: pricing_snapshot(identifiers, service_tier, @default_price_bucket, timestamp)
-
-  defp fallback_pricing_snapshot(_identifiers, _service_tier, _price_bucket, _timestamp), do: nil
-
-  @spec fallback_suffix_inference_pricing_snapshot(
-          [String.t()],
-          String.t(),
-          String.t(),
-          DateTime.t()
-        ) :: {PricingSnapshot.t(), map()} | nil
-  defp fallback_suffix_inference_pricing_snapshot(
-         identifiers,
-         service_tier,
-         @long_context_price_bucket,
-         timestamp
-       ),
-       do:
-         suffix_inference_pricing_snapshot(
-           identifiers,
-           service_tier,
-           @default_price_bucket,
-           timestamp
-         )
-
-  defp fallback_suffix_inference_pricing_snapshot(
-         _identifiers,
-         _service_tier,
-         _price_bucket,
-         _timestamp
-       ),
-       do: nil
 
   @spec suffix_inference_pricing_snapshot([String.t()], String.t(), String.t(), DateTime.t()) ::
           {PricingSnapshot.t(), map()} | nil
@@ -785,20 +654,13 @@ defmodule CodexPooler.Accounting.PricingResolution do
     )
   end
 
-  defp missing_pricing_snapshot(
-         _model,
-         identifiers,
-         requested_tier,
-         actual_tier,
-         service_tier,
-         timestamp,
-         batch_usage?
-       ) do
+  @spec missing_pricing_snapshot(pricing_context()) :: map()
+  defp missing_pricing_snapshot(context) do
     model_snapshot_exists? =
       Repo.exists?(
         from ps in PricingSnapshot,
           where:
-            ps.model_identifier in ^identifiers and ps.effective_at <= ^timestamp and
+            ps.model_identifier in ^context.identifiers and ps.effective_at <= ^context.timestamp and
               fragment("?->>'price_bucket'", ps.config) == "default" and
               fragment("?->>'pricing_type'", ps.config) == "per_1m_tokens"
       )
@@ -806,7 +668,13 @@ defmodule CodexPooler.Accounting.PricingResolution do
     status =
       if model_snapshot_exists?, do: "unpriced_missing_tier", else: "unpriced_missing_model"
 
-    unpriced_snapshot(status, requested_tier, actual_tier, service_tier, batch_usage?)
+    unpriced_snapshot(
+      status,
+      context.requested_tier,
+      context.actual_tier,
+      context.service_tier,
+      context.batch_usage
+    )
   end
 
   defp priced_snapshot(
@@ -815,7 +683,7 @@ defmodule CodexPooler.Accounting.PricingResolution do
          actual_tier,
          service_tier,
          batch_usage?,
-         alias_metadata \\ nil
+         alias_metadata
        ) do
     pricing = %{
       snapshot: snapshot,
@@ -847,13 +715,6 @@ defmodule CodexPooler.Accounting.PricingResolution do
           String.t() | nil,
           String.t(),
           String.t(),
-          boolean()
-        ) :: map()
-  @spec unavailable_price_bucket_snapshot(
-          String.t() | nil,
-          String.t() | nil,
-          String.t(),
-          String.t(),
           boolean(),
           map() | nil
         ) :: map()
@@ -863,7 +724,7 @@ defmodule CodexPooler.Accounting.PricingResolution do
          service_tier,
          price_bucket,
          batch_usage?,
-         alias_metadata \\ nil
+         alias_metadata
        ) do
     "unpriced_unavailable_price_bucket"
     |> unpriced_snapshot(requested_tier, actual_tier, service_tier, batch_usage?, price_bucket)
