@@ -18,7 +18,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
     ["backend-api", "transcribe"],
     ["api", "codex", "usage"],
     ["wham", "usage"],
-    ["backend-api", "wham", "agent-identities", "jwks"],
     ["backend-api", "wham", "usage"],
     ["v1"]
   ]
@@ -365,37 +364,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
   def protected_backend_json_request?(%Plug.Conn{
         method: "POST",
-        path_info: ["backend-api", "codex", "thread", "goal", action]
-      })
-      when action in ["get", "set", "clear"],
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "analytics-events", "events"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "memories", "trace_summarize"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "alpha", "search"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "safety", "arc"]
-      }),
-      do: true
-
-  def protected_backend_json_request?(%Plug.Conn{
-        method: "POST",
         path_info: ["backend-api", "files"]
       }),
       do: true
@@ -408,13 +376,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
       do: true
 
   def protected_backend_json_request?(_conn), do: false
-
-  @spec protected_backend_raw_request?(Plug.Conn.t() | term()) :: boolean()
-  def protected_backend_raw_request?(%Plug.Conn{
-        method: "POST",
-        path_info: ["backend-api", "codex", "realtime", "calls"]
-      }),
-      do: true
 
   def protected_backend_raw_request?(_conn), do: false
 

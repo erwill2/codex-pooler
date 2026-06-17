@@ -3,7 +3,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
 
   import CodexPooler.PoolerFixtures
 
-  alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.Catalog.PricingSnapshot
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OperationalSettings
@@ -121,7 +120,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
 
       for {method, path} <- [
             {:get, "/backend-api/codex/models"},
-            {:get, "/backend-api/codex/agent-identities/jwks"},
             {:post, "/backend-api/codex/responses"},
             {:get, "/backend-api/codex/v1/responses"},
             {:post, "/backend-api/codex/v1/responses"},
@@ -131,7 +129,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
             {:post, "/backend-api/files/file_123/uploaded"},
             {:post, "/backend-api/transcribe"},
             {:get, "/wham/usage"},
-            {:get, "/backend-api/wham/agent-identities/jwks"},
             {:get, "/backend-api/wham/usage"}
           ] do
         conn = conn |> recycle() |> remote_ip({198, 51, 100, 20}) |> dispatch(method, path)
@@ -270,7 +267,6 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
             "/backend-api/codex/v1/chat/completions",
             "/backend-api/codex/images/generations",
             "/backend-api/codex/images/edits",
-            "/backend-api/codex/alpha/search",
             "/backend-api/files",
             "/backend-api/files/file_123/uploaded"
           ] do
@@ -284,56 +280,29 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
       end
     end
 
-    @tag :feature_control_plane_alpha_search
-    test "authenticates alpha search before malformed, compressed, or large bodies", %{conn: conn} do
-      setup_runtime_ingress(%OperationalSettings{max_compressed_body_bytes: 1})
-      upstream = start_upstream(FakeUpstream.json_response(%{"unexpected" => true}))
-      _setup = gateway_setup(upstream)
-
-      malformed_conn =
-        conn
-        |> recycle()
-        |> put_req_header("content-type", "application/json")
-        |> post("/backend-api/codex/alpha/search", ~s({"id":))
-
-      assert json_response(malformed_conn, 401)["error"]["code"] == "api_key_missing"
-
-      compressed_conn =
-        conn
-        |> recycle()
-        |> compressed_post(
-          "/backend-api/codex/alpha/search",
-          "gzip",
-          :zlib.gzip(~s({"id":"search_alpha_fixture"}))
-        )
-
-      assert json_response(compressed_conn, 401)["error"]["code"] == "api_key_missing"
-
-      large_conn =
-        conn
-        |> recycle()
-        |> put_req_header("content-type", "application/json")
-        |> post(
-          "/backend-api/codex/alpha/search",
-          ~s({"id":"search_alpha_fixture","input":") <>
-            String.duplicate("a", 10_000) <> ~s("})
-        )
-
-      assert json_response(large_conn, 401)["error"]["code"] == "api_key_missing"
-      assert FakeUpstream.count(upstream) == 0
-      assert Repo.aggregate(Request, :count, :id) == 0
-      assert Repo.aggregate(Attempt, :count, :id) == 0
-    end
-
-    test "authenticates realtime SDP before controller raw body handling", %{conn: conn} do
+    test "pruned backend helper routes fall through as absent without ingress auth", %{conn: conn} do
       setup_runtime_ingress(%OperationalSettings{})
 
-      conn =
-        conn
-        |> put_req_header("content-type", "application/sdp")
-        |> post("/backend-api/codex/realtime/calls", "v=0\r\ns=codex-pooler-test\r\n")
+      for {method, path, content_type, body} <- [
+            {"GET", "/backend-api/codex/agent-identities/jwks?kid=absent", nil, nil},
+            {"GET", "/backend-api/wham/agent-identities/jwks?kid=absent", nil, nil},
+            {"POST", "/backend-api/codex/thread/goal/get", "application/json", "{}"},
+            {"POST", "/backend-api/codex/thread/goal/set", "application/json", "{}"},
+            {"POST", "/backend-api/codex/thread/goal/clear", "application/json", "{}"},
+            {"POST", "/backend-api/codex/analytics-events/events", "application/json", "{}"},
+            {"POST", "/backend-api/codex/memories/trace_summarize", "application/json", "{}"},
+            {"POST", "/backend-api/codex/alpha/search", "application/json", "{}"},
+            {"POST", "/backend-api/codex/realtime/calls", "application/sdp",
+             "v=0\r\ns=codex-pooler-test\r\n"},
+            {"POST", "/backend-api/codex/safety/arc", "application/json", "{}"}
+          ] do
+        conn =
+          conn
+          |> recycle()
+          |> dispatch_absent_backend_helper(method, path, content_type, body)
 
-      assert json_response(conn, 401)["error"]["code"] == "api_key_missing"
+        assert response(conn, 404) =~ "Not Found"
+      end
     end
   end
 
@@ -741,6 +710,15 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
 
   defp dispatch(conn, :get, path), do: get(conn, path)
   defp dispatch(conn, :post, path), do: post(conn, path, %{})
+
+  defp dispatch_absent_backend_helper(conn, "GET", path, _content_type, _body),
+    do: get(conn, path)
+
+  defp dispatch_absent_backend_helper(conn, "POST", path, content_type, body) do
+    conn
+    |> put_req_header("content-type", content_type)
+    |> post(path, body)
+  end
 
   defp deflate(body) when is_map(body), do: body |> Jason.encode!() |> :zlib.compress()
 
