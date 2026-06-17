@@ -35,6 +35,12 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
   @search_heading_regex ~r/\b(?:search results|results for|matches for|found\s+\d+\s+(?:results|matches))\b/i
   @numbered_result_regex ~r/^\s*(?:\d+[\).]\s+|[-*]\s+).+\s-\s.+$/m
   @path_match_regex ~r/^\s*[\w.\/-]+:\d+(?::\d+)?:\s*\S/m
+  @nul_path_match_regex ~r/^[^\x00\r\n]+\x00\d+(?::\d+)?:\s*\S/m
+  @grouped_line_match_regex ~r/^\s*\d+(?::\d+)?:\s*\S/
+  @grouped_heading_path_regex ~r/^[\w.\/-]+$/u
+  @grouped_heading_extension_regex ~r/(?:^|\/)[\w.-]+\.[A-Za-z0-9][A-Za-z0-9_-]*$/u
+  @grouped_heading_sentence_punctuation_regex ~r/[!?;]|\.\s*$/
+  @max_grouped_heading_bytes 240
   @url_regex ~r/https?:\/\/\S+/i
   @snippet_separator_regex ~r/\s-\s/
 
@@ -167,14 +173,18 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
   defp search_points(content) do
     numbered_results = scan_count(@numbered_result_regex, content)
     path_matches = scan_count(@path_match_regex, content)
+    nul_matches = scan_count(@nul_path_match_regex, content)
+    grouped_matches = grouped_search_match_count(content)
+    structural_matches = path_matches + nul_matches + grouped_matches
     urls = scan_count(@url_regex, content)
     separators = scan_count(@snippet_separator_regex, content)
 
     [
       score(regex_match?(@search_heading_regex, content), 30),
       cond_score(numbered_results, [{2, 30}, {1, 15}]),
-      cond_score(path_matches, [{3, 45}, {2, 35}, {1, 15}]),
-      score(path_matches >= 2, 15),
+      cond_score(structural_matches, [{3, 45}, {2, 35}, {1, 15}]),
+      score(structural_matches >= 2, 15),
+      score(nul_matches >= 2 or grouped_matches >= 2, 10),
       cond_score(urls, [{2, 20}, {1, 10}]),
       score(separators >= 2, 10)
     ]
@@ -221,6 +231,40 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
     ]
     |> Enum.sum()
     |> min(100)
+  end
+
+  defp grouped_search_match_count(content) do
+    content
+    |> lines()
+    |> Enum.with_index()
+    |> Enum.map(fn {line, index} ->
+      path = String.trim(line)
+
+      if grouped_heading?(path) do
+        count_grouped_lines_after(content, index)
+      else
+        0
+      end
+    end)
+    |> Enum.sum()
+  end
+
+  defp count_grouped_lines_after(content, heading_index) do
+    matches =
+      content
+      |> lines()
+      |> Enum.drop(heading_index + 1)
+      |> Enum.take_while(&Regex.match?(@grouped_line_match_regex, &1))
+      |> length()
+
+    if matches >= 2, do: matches, else: 0
+  end
+
+  defp grouped_heading?(path) do
+    byte_size(path) in 1..@max_grouped_heading_bytes and
+      Regex.match?(@grouped_heading_path_regex, path) and
+      (String.contains?(path, "/") or Regex.match?(@grouped_heading_extension_regex, path)) and
+      not Regex.match?(@grouped_heading_sentence_punctuation_regex, path)
   end
 
   defp repeated_line?(lines) do

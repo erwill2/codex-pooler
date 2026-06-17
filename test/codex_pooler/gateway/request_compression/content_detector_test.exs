@@ -186,6 +186,50 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetectorTest do
       assert_noop(:text, ContentDetector.detect(negative))
     end
 
+    test "detects classic grouped and nul-delimited search output" do
+      classic =
+        1..3
+        |> Enum.map_join("\n", &"lib/example_#{&1}.ex:#{&1}: found match #{&1}")
+
+      grouped = """
+      lib/grouped.ex
+      12: first grouped match
+      14:3: second grouped match
+      """
+
+      nul_delimited =
+        1..3
+        |> Enum.map_join("\n", &"lib/nul_result.ex\0#{&1}: nul match #{&1}")
+
+      for body <- [classic, grouped, nul_delimited] do
+        assert %{
+                 kind: :search,
+                 confidence: confidence,
+                 compressible: true,
+                 strategy: :search_results
+               } = ContentDetector.detect(body)
+
+        assert confidence >= 0.6
+      end
+    end
+
+    test "keeps prose headings and malformed nul fragments out of search detection" do
+      prose_heading = """
+      Search results from the last review.
+      1: this is prose, not a grouped file match
+      2: this is also prose
+      """
+
+      malformed_nul = """
+      lib/example.ex\0not-a-match-line
+      lib/example.ex\0: missing line number
+      lib/example.ex\0one: missing numeric line
+      """
+
+      assert_noop(:text, ContentDetector.detect(prose_heading))
+      assert_noop(:text, ContentDetector.detect(malformed_nul))
+    end
+
     test "detects build or log output at and above request-compression confidence" do
       positive = """
       example command output line

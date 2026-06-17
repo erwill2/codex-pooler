@@ -9,8 +9,14 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResults do
   @default_max_files 20
   @default_max_matches 60
   @default_max_matches_per_file 3
+  @default_model "gpt-4o"
+  @max_heading_bytes 240
 
   @match_line_regex ~r/^\s*(?<path>[\w.\/-][\w.\/-]*):(?<line>\d+)(?::(?<column>\d+))?:\s*(?<text>\S.*)$/u
+  @line_match_regex ~r/^\s*(?<line>\d+)(?::(?<column>\d+))?:\s*(?<text>\S.*)$/u
+  @heading_path_regex ~r/^[\w.\/-]+$/u
+  @heading_extension_regex ~r/(?:^|\/)[\w.-]+\.[A-Za-z0-9][A-Za-z0-9_-]*$/u
+  @heading_sentence_punctuation_regex ~r/[!?;]|\.\s*$/
 
   @spec compress(term(), Strategies.opts()) :: Strategies.result()
   def compress(content, opts \\ [])
@@ -30,7 +36,7 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResults do
         compressed_lines = render_groups(groups, selected_groups, compressed_match_count)
         compressed = Strategies.join_lines(compressed_lines)
 
-        Strategies.finalize(
+        finalize(
           @strategy,
           content,
           compressed,
@@ -66,39 +72,113 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResults do
   def compress(_content, _opts), do: :skip
 
   defp parse_matches(lines) do
-    lines
-    |> Enum.with_index()
-    |> Enum.reduce([], fn {line, index}, matches ->
-      case parse_match(line, index) do
-        {:ok, match} -> [match | matches]
-        :skip -> matches
-      end
-    end)
-    |> Enum.reverse()
+    direct_matches =
+      lines
+      |> Enum.with_index()
+      |> Enum.reduce([], fn {line, index}, matches ->
+        case parse_match(line, index) do
+          {:ok, match} -> [match | matches]
+          :skip -> matches
+        end
+      end)
+
+    grouped_matches = parse_grouped_matches(lines)
+
+    (direct_matches ++ grouped_matches)
+    |> Enum.sort_by(& &1.index)
   end
 
   defp parse_match(line, index) do
+    if String.contains?(line, <<0>>) do
+      parse_nul_match(line, index)
+    else
+      parse_classic_match(line, index)
+    end
+  end
+
+  defp parse_nul_match(line, index) do
+    case String.split(line, <<0>>) do
+      [path, fragment] ->
+        parse_line_fragment(path, fragment, index)
+
+      _malformed ->
+        :skip
+    end
+  end
+
+  defp parse_classic_match(line, index) do
     case Regex.named_captures(@match_line_regex, line) do
       %{"path" => path, "line" => line_number, "column" => column, "text" => text} ->
-        path = String.trim(path)
-        text = String.trim(text)
-
-        if path == "" or text == "" do
-          :skip
-        else
-          {:ok,
-           %{
-             path: path,
-             line: line_number,
-             column: column,
-             text: text,
-             index: index
-           }}
-        end
+        build_match(path, line_number, column, text, index)
 
       _no_match ->
         :skip
     end
+  end
+
+  defp parse_grouped_matches(lines) do
+    lines
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {line, index} ->
+      path = String.trim(line)
+
+      if path_like_heading?(path) do
+        grouped_matches_after(lines, path, index)
+      else
+        []
+      end
+    end)
+  end
+
+  defp grouped_matches_after(lines, path, heading_index) do
+    matches =
+      lines
+      |> Enum.drop(heading_index + 1)
+      |> Enum.with_index(heading_index + 1)
+      |> Enum.reduce_while([], fn {line, index}, matches ->
+        case parse_line_fragment(path, line, index) do
+          {:ok, match} -> {:cont, [match | matches]}
+          :skip -> {:halt, matches}
+        end
+      end)
+      |> Enum.reverse()
+
+    if length(matches) >= 2, do: matches, else: []
+  end
+
+  defp parse_line_fragment(path, fragment, index) do
+    case Regex.named_captures(@line_match_regex, fragment) do
+      %{"line" => line_number, "column" => column, "text" => text} ->
+        build_match(path, line_number, column, text, index)
+
+      _no_match ->
+        :skip
+    end
+  end
+
+  defp build_match(path, line_number, column, text, index) do
+    path = String.trim(path)
+    text = String.trim(text)
+
+    if path == "" or text == "" or String.contains?(path, <<0>>) do
+      :skip
+    else
+      {:ok,
+       %{
+         path: path,
+         line: line_number,
+         column: column,
+         text: text,
+         index: index
+       }}
+    end
+  end
+
+  defp path_like_heading?(path) do
+    byte_size(path) in 1..@max_heading_bytes and
+      Regex.match?(@heading_path_regex, path) and
+      (String.contains?(path, "/") or Regex.match?(@heading_extension_regex, path)) and
+      not Regex.match?(@heading_sentence_punctuation_regex, path)
   end
 
   defp group_matches(matches) do
@@ -201,5 +281,21 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResults do
     selected_groups
     |> Enum.map(&length(&1.matches))
     |> Enum.sum()
+  end
+
+  defp finalize(strategy, original, compressed, counts, opts) do
+    Strategies.finalize(strategy, original, compressed, counts, default_model_opts(opts))
+  end
+
+  defp default_model_opts(opts) when is_list(opts) do
+    if Keyword.has_key?(opts, :model), do: opts, else: Keyword.put(opts, :model, @default_model)
+  end
+
+  defp default_model_opts(opts) when is_map(opts) do
+    if Map.has_key?(opts, :model) or Map.has_key?(opts, "model") do
+      opts
+    else
+      Map.put(opts, :model, @default_model)
+    end
   end
 end

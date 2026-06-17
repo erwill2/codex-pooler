@@ -172,6 +172,54 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_json_document_compression"
     end
 
+    test "rewrites nul-delimited search-result tool-output strings" do
+      omitted_sentinel = "nul search omitted sentinel"
+      original_output = compression_nul_search_fixture(omitted_sentinel)
+
+      body =
+        Jason.encode!(%{
+          "model" => @supported_model,
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_nul_search_compression",
+              "output" => original_output
+            }
+          ]
+        })
+
+      {context, request_options} = request_context(body)
+
+      assert {compressed_body, compressed_options} =
+               RequestCompression.maybe_compress(body, context, request_options)
+
+      assert compressed_body != body
+
+      compressed_output =
+        compressed_body
+        |> Jason.decode!()
+        |> Map.fetch!("input")
+        |> List.first()
+        |> Map.fetch!("output")
+
+      assert compressed_output =~ "[compressed search results:"
+      assert compressed_output =~ "lib/nul_result.ex"
+      refute compressed_output =~ <<0>>
+      refute compressed_output =~ omitted_sentinel
+
+      assert %{
+               "status" => "compressed",
+               "candidate_count" => 1,
+               "compressed_count" => 1,
+               "skipped_count" => 0
+             } = metadata = compressed_options.runtime.payload_compression
+
+      assert "search_results" in metadata["strategies"]
+      assert metadata["original_tokens"] > metadata["compressed_tokens"]
+      refute inspect(metadata) =~ omitted_sentinel
+      refute inspect(metadata) =~ "call_nul_search_compression"
+    end
+
     test "skips when no route model is available" do
       body =
         Jason.encode!(%{
@@ -288,5 +336,16 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       "context after final"
     ])
     |> Enum.join("\n")
+  end
+
+  defp compression_nul_search_fixture(omitted_sentinel) do
+    1..24
+    |> Enum.map_join("\n", fn
+      11 ->
+        "lib/nul_result.ex\011: nul search result 11 #{omitted_sentinel} with extra context"
+
+      index ->
+        "lib/nul_result.ex\0#{index}: nul search result #{index} with enough context to compress"
+    end)
   end
 end

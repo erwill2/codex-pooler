@@ -39,6 +39,67 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResultsTest do
       assert_safe_metadata(metadata, :search_results, sentinel)
     end
 
+    test "compresses grouped heading output when headings are file paths" do
+      sentinel = "DROP_ME_GROUPED_SEARCH_SENTINEL"
+      content = grouped_search_fixture(sentinel)
+
+      assert {:ok, %{content: compressed, metadata: metadata}} =
+               SearchResults.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_matches: 2,
+                 max_files: 2,
+                 max_matches_per_file: 2,
+                 max_matches: 3
+               )
+
+      assert compressed =~ "lib/grouped_1.ex"
+      assert compressed =~ "  1: grouped result 1-1 kept"
+      assert compressed =~ "  2: grouped result 1-2 kept"
+      assert compressed =~ "lib/grouped_2.ex"
+      assert compressed =~ "[compressed search results: omitted 1 files]"
+      refute compressed =~ sentinel
+
+      assert metadata.strategy == :search_results
+      assert metadata.original_file_count == 3
+      assert metadata.compressed_file_count == 2
+      assert metadata.original_match_count == 18
+      assert metadata.compressed_match_count == 3
+      assert metadata.omitted_match_count == 15
+      assert_safe_metadata(metadata, :search_results, sentinel)
+    end
+
+    test "compresses nul-delimited output without retaining nul bytes in metadata" do
+      sentinel = "DROP_ME_NUL_SEARCH_SENTINEL"
+      content = nul_search_fixture(sentinel)
+
+      assert {:ok, %{content: compressed, metadata: metadata}} =
+               SearchResults.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_matches: 2,
+                 max_files: 1,
+                 max_matches_per_file: 3,
+                 max_matches: 3
+               )
+
+      assert compressed =~ "lib/nul_result.ex"
+      assert compressed =~ "  1: nul result 1 kept"
+      assert compressed =~ "  2: nul result 2 kept"
+      assert compressed =~ "  3: nul result 3 kept"
+      refute compressed =~ <<0>>
+      refute compressed =~ sentinel
+
+      assert metadata.strategy == :search_results
+      assert metadata.original_file_count == 1
+      assert metadata.compressed_file_count == 1
+      assert metadata.original_match_count == 12
+      assert metadata.compressed_match_count == 3
+      assert Jason.encode!(metadata)
+      refute inspect(metadata) =~ <<0>>
+      assert_safe_metadata(metadata, :search_results, sentinel)
+    end
+
     test "rejects byte-shrinking rewrites that do not shrink tokens" do
       padding = String.duplicate(" ", 20)
 
@@ -74,6 +135,23 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResultsTest do
       assert :skip = SearchResults.compress(nonmatching, min_bytes: 0, min_matches: 1)
     end
 
+    test "skips prose headings and malformed nul fragments" do
+      prose_heading = """
+      Search results from the last review.
+      1: this is prose, not a grouped file match
+      2: this is also prose
+      """
+
+      malformed_nul = """
+      lib/example.ex\0not-a-match-line
+      lib/example.ex\0: missing line number
+      lib/example.ex\0one: missing numeric line
+      """
+
+      assert :skip = SearchResults.compress(prose_heading, min_bytes: 0, min_matches: 2)
+      assert :skip = SearchResults.compress(malformed_nul, min_bytes: 0, min_matches: 1)
+    end
+
     test "does not retain state between calls" do
       assert {:ok, _result} =
                SearchResults.compress(search_fixture("DROP_ME_STALE_SEARCH"),
@@ -93,6 +171,33 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResultsTest do
                )
     end
   end
+
+  defp grouped_search_fixture(sentinel) do
+    1..3
+    |> Enum.flat_map(fn file ->
+      ["lib/grouped_#{file}.ex" | grouped_file_lines(file, sentinel)]
+    end)
+    |> Enum.join("\n")
+  end
+
+  defp nul_search_fixture(sentinel) do
+    1..12
+    |> Enum.map_join("\n", fn
+      8 -> "lib/nul_result.ex\08: nul result 8 #{sentinel}"
+      index -> "lib/nul_result.ex\0#{index}: nul result #{index} kept"
+    end)
+  end
+
+  defp grouped_file_lines(file, sentinel) do
+    1..6
+    |> Enum.map(fn match ->
+      marker = grouped_marker(file, match, sentinel)
+      "#{match}: grouped result #{file}-#{match} #{marker}"
+    end)
+  end
+
+  defp grouped_marker(1, 4, sentinel), do: sentinel
+  defp grouped_marker(_file, _match, _sentinel), do: "kept"
 
   defp search_fixture(sentinel) do
     for file <- 1..4, match <- 1..5 do
