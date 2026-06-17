@@ -141,7 +141,7 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy.Metadata do
          request_metadata
        ) do
     %{
-      endpoint: request.local_endpoint,
+      endpoint: accounting_endpoint(request),
       transport: "http_json",
       status: status,
       correlation_id: RequestOptions.server_correlation_id(request_options),
@@ -175,6 +175,7 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy.Metadata do
       "auth_refresh" => refresh_metadata
     })
     |> Map.merge(RequestOptions.client_request_metadata(request_options))
+    |> maybe_put_operation(request.operation)
   end
 
   defp control_plane_routing_metadata(model, selection) do
@@ -188,6 +189,16 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy.Metadata do
   defp status_error_code(401), do: "upstream_unauthorized"
   defp status_error_code(status) when status >= 500, do: "upstream_5xx"
   defp status_error_code(_status), do: "upstream_status"
+
+  defp accounting_endpoint(%ProxyRequest{accounting_endpoint: endpoint}) when is_binary(endpoint),
+    do: endpoint
+
+  defp accounting_endpoint(%ProxyRequest{local_endpoint: endpoint}), do: endpoint
+
+  defp maybe_put_operation(metadata, operation) when is_binary(operation) and operation != "",
+    do: Map.put(metadata, "operation", operation)
+
+  defp maybe_put_operation(metadata, _operation), do: metadata
 
   defp metadata_request_options(%ProxyRequest{} = request, body) do
     request.request_opts

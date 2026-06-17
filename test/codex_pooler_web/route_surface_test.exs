@@ -64,6 +64,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:get, "/v1/usage"},
                {:get, "/wham/usage"},
                {:options, "/mcp"},
+               {:post, "/api/codex/rate-limit-reset-credits/consume"},
                {:post, "/backend-api/codex/alpha/search"},
                {:post, "/backend-api/codex/analytics-events/events"},
                {:post, "/backend-api/codex/images/edits"},
@@ -82,6 +83,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:post, "/backend-api/files"},
                {:post, "/backend-api/files/:file_id/uploaded"},
                {:post, "/backend-api/transcribe"},
+               {:post, "/backend-api/wham/rate-limit-reset-credits/consume"},
                {:post, "/bootstrap"},
                {:post, "/login"},
                {:post, "/mcp"},
@@ -98,7 +100,8 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:post, "/v1/moderations"},
                {:post, "/v1/responses"},
                {:post, "/v1/responses/:response_id/cancel"},
-               {:post, "/v1/responses/compact"}
+               {:post, "/v1/responses/compact"},
+               {:post, "/wham/rate-limit-reset-credits/consume"}
              ]
 
     refute Enum.any?(application_routes, fn {_verb, path} ->

@@ -17,9 +17,12 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
     ["backend-api", "files"],
     ["backend-api", "transcribe"],
     ["api", "codex", "usage"],
+    ["api", "codex", "rate-limit-reset-credits", "consume"],
     ["wham", "usage"],
+    ["wham", "rate-limit-reset-credits", "consume"],
     ["backend-api", "wham", "agent-identities", "jwks"],
     ["backend-api", "wham", "usage"],
+    ["backend-api", "wham", "rate-limit-reset-credits", "consume"],
     ["v1"]
   ]
 
@@ -391,6 +394,24 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   def protected_backend_json_request?(%Plug.Conn{
         method: "POST",
         path_info: ["backend-api", "codex", "safety", "arc"]
+      }),
+      do: true
+
+  def protected_backend_json_request?(%Plug.Conn{
+        method: "POST",
+        path_info: ["api", "codex", "rate-limit-reset-credits", "consume"]
+      }),
+      do: true
+
+  def protected_backend_json_request?(%Plug.Conn{
+        method: "POST",
+        path_info: ["wham", "rate-limit-reset-credits", "consume"]
+      }),
+      do: true
+
+  def protected_backend_json_request?(%Plug.Conn{
+        method: "POST",
+        path_info: ["backend-api", "wham", "rate-limit-reset-credits", "consume"]
       }),
       do: true
 

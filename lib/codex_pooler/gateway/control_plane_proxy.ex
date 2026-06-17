@@ -16,11 +16,13 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy do
 
     defstruct [
       :local_endpoint,
+      :accounting_endpoint,
       :upstream_endpoint,
       :method,
       :query_string,
       :body,
       :body_mode,
+      :operation,
       :request_headers,
       :request_opts
     ]
@@ -28,11 +30,13 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy do
     @type body_mode :: :no_body | :sdp | {:json, :object | :object_or_array}
     @type t :: %__MODULE__{
             local_endpoint: String.t(),
+            accounting_endpoint: String.t() | nil,
             upstream_endpoint: String.t(),
             method: String.t(),
             query_string: String.t(),
             body: binary(),
             body_mode: body_mode(),
+            operation: String.t() | nil,
             request_headers: [{String.t(), String.t()}],
             request_opts: map()
           }
@@ -43,11 +47,13 @@ defmodule CodexPooler.Gateway.ControlPlaneProxy do
 
       %__MODULE__{
         local_endpoint: Map.fetch!(attrs, :local_endpoint),
+        accounting_endpoint: Map.get(attrs, :accounting_endpoint),
         upstream_endpoint: Map.fetch!(attrs, :upstream_endpoint),
         method: Map.fetch!(attrs, :method),
         query_string: Map.get(attrs, :query_string, ""),
         body: Map.get(attrs, :body, ""),
         body_mode: Map.get(attrs, :body_mode, :no_body),
+        operation: Map.get(attrs, :operation),
         request_headers: Map.get(attrs, :request_headers, []),
         request_opts: attrs |> Map.get(:request_opts, %{}) |> Map.new()
       }
