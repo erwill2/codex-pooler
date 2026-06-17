@@ -116,6 +116,17 @@ defmodule CodexPooler.CompatibilityMatrix do
       contract: "minimal reasoning is rewritten to low before upstream dispatch"
     },
     %{
+      slug: :reasoning_context,
+      status: :supported,
+      current: :openai_sdk_literal_normalization,
+      categories: [:route, :auth, :error, :ownership],
+      routes: [%{method: :post, path: "/v1/responses"}],
+      future_routes: [],
+      fixture: :reasoning_context,
+      contract:
+        "OpenAI Responses reasoning.context accepts SDK literals auto, current_turn, and all_turns after trimming and lowercasing, forwards accepted values through the Responses adapter, and rejects unknown or non-string context values before upstream dispatch"
+    },
+    %{
       slug: :unsupported_upstream_fields,
       status: :supported,
       current: :rejected_or_stripped_by_scope,
@@ -232,7 +243,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :request_compression,
       contract:
-        "Request compression is Pool-gated by request_compression_enabled, request-side only, fail-open to the original upstream request when scanning, token counting, rewriting, or limits fail, and metadata-only through safe payload_compression request-log metadata; eligible routes are backend Responses, backend /v1 Responses/chat aliases, public /v1 Responses/chat translations, backend compact routes, and backend or narrow public websocket response.create dispatches, while public /v1/responses/compact remains unsupported with no upstream compact dispatch or compression eligibility"
+        "Request compression is Pool-gated by request_compression_enabled, request-side only, fail-open to the original upstream request when scanning, token counting, rewriting, or limits fail, and metadata-only through safe payload_compression request-log metadata; eligible routes are backend Responses, backend /v1 Responses/chat aliases, public /v1 Responses/chat translations, backend compact routes, and backend or narrow public websocket response.create dispatches; search-result compression covers classic path-line matches, grouped heading matches, and portable NUL-delimited matches, and diff compression covers hunk-based additions-only, deletions-only, replacement, and minimal unified diffs without treating ordinary prose as diff/search input; public /v1/responses/compact remains unsupported with no upstream compact dispatch or compression eligibility"
     },
     %{
       slug: :control_plane_surface,
@@ -244,6 +255,39 @@ defmodule CodexPooler.CompatibilityMatrix do
       fixture: :control_plane_surface,
       contract:
         "control-plane endpoints are explicit authenticated proxy routes under the runtime API, use the proxy_control route class, forward to exact upstream control-plane paths, preserve opaque realtime SDP bodies, forward raw AVAS SDP proxy query strings exactly on /backend-api/codex/realtime/calls only, do not expand /v1/realtime, hosted realtime routes, Codex app-server account reset-credit methods, or thread/realtime app-server controls, allowlist response headers, and keep logs metadata-only"
+    },
+    %{
+      slug: :backend_reset_credit_consume,
+      status: :supported,
+      current: :explicit_authenticated_backend_http_proxy_routes,
+      categories: [:route, :auth, :error, :ownership],
+      routes: [
+        %{method: :post, path: "/api/codex/rate-limit-reset-credits/consume"},
+        %{method: :post, path: "/wham/rate-limit-reset-credits/consume"},
+        %{method: :post, path: "/backend-api/wham/rate-limit-reset-credits/consume"}
+      ],
+      future_routes: [],
+      fixture: :backend_reset_credit_consume,
+      contract:
+        "backend reset-credit consume compatibility is limited to explicit authenticated backend HTTP routes, forwards only the redeem_request_id JSON field to the mapped upstream reset-credit consume path, never forwards inbound idempotency-key headers, records metadata-only operation rate_limit_reset_credit_consume under the matching usage accounting endpoint, and keeps app-server account/rateLimitResetCredit/consume JSON-RPC unsupported"
+    },
+    %{
+      slug: :function_tool_schema_lowering,
+      status: :supported,
+      current: :non_strict_function_tool_schema_lowering,
+      categories: [:route, :auth, :error, :streaming, :ownership],
+      routes: [
+        %{method: :post, path: "/backend-api/codex/responses"},
+        %{method: :post, path: "/backend-api/codex/v1/responses"},
+        %{method: :get, path: "/backend-api/codex/responses", transport: "websocket"},
+        %{method: :get, path: "/backend-api/codex/v1/responses", transport: "websocket"},
+        %{method: :post, path: "/v1/responses"},
+        %{method: :get, path: "/v1/responses", transport: "websocket"}
+      ],
+      future_routes: [],
+      fixture: :function_tool_schema_lowering,
+      contract:
+        "non-strict function tool schemas are lowered for backend Responses HTTP, backend Responses websocket response.create, and public /v1 Responses compatibility before local validation or upstream dispatch; lowering is limited to function tools including nested namespace function tools, converts boolean schemas and const values into supported schema shapes, infers missing object or array structure, drops unsupported JSON Schema keywords, preserves supported refs/definitions/combinators recursively, and never weakens strict function tools or strict structured-output schemas"
     },
     %{
       slug: :backend_alpha_search,
@@ -468,6 +512,17 @@ defmodule CodexPooler.CompatibilityMatrix do
         "reasoning" => %{"effort" => "minimal"}
       }
     },
+    reasoning_context: %{
+      accepted_values: ["auto", "current_turn", "all_turns"],
+      normalization: "trim_and_lowercase",
+      rejected_values: ["unknown_strings", "empty_strings", "non_strings", "arrays", "maps"],
+      routes: ["/v1/responses"],
+      json: %{
+        "model" => "gpt-fixture-text",
+        "input" => "synthetic reasoning context request",
+        "reasoning" => %{"context" => " current_turn "}
+      }
+    },
     unsupported_upstream_fields: %{
       json: %{
         "model" => "gpt-fixture-text",
@@ -562,6 +617,24 @@ defmodule CodexPooler.CompatibilityMatrix do
         ccr_retrieval: false,
         request_log_metadata: "payload_compression",
         metadata_only: true
+      },
+      supported_input_shapes: %{
+        search_results: [
+          "classic_path_line",
+          "grouped_heading",
+          "portable_nul_delimited"
+        ],
+        diffs: [
+          "hunk_additions_only",
+          "hunk_deletions_only",
+          "hunk_replacement",
+          "minimal_unified_hunk"
+        ],
+        false_positive_guards: [
+          "path_like_group_heading",
+          "minimum_grouped_matches",
+          "hunk_header_required"
+        ]
       }
     },
     control_plane_surface: %{
@@ -599,6 +672,72 @@ defmodule CodexPooler.CompatibilityMatrix do
       ],
       privacy: "metadata_only",
       routes: @control_plane_fixture_routes
+    },
+    backend_reset_credit_consume: %{
+      auth: "required_bearer_api_key",
+      route_class: "proxy_http",
+      operation: "rate_limit_reset_credit_consume",
+      body_fields_forwarded: ["redeem_request_id"],
+      stripped_headers: ["idempotency-key"],
+      privacy: "metadata_only",
+      routes: [
+        %{
+          local_path: "/api/codex/rate-limit-reset-credits/consume",
+          upstream_path: "/api/codex/rate-limit-reset-credits/consume",
+          accounting_endpoint: "/api/codex/usage"
+        },
+        %{
+          local_path: "/wham/rate-limit-reset-credits/consume",
+          upstream_path: "/wham/rate-limit-reset-credits/consume",
+          accounting_endpoint: "/wham/usage"
+        },
+        %{
+          local_path: "/backend-api/wham/rate-limit-reset-credits/consume",
+          upstream_path: "/wham/rate-limit-reset-credits/consume",
+          accounting_endpoint: "/backend-api/wham/usage"
+        }
+      ],
+      unsupported_app_server_json_rpc_methods: ["account/rateLimitResetCredit/consume"]
+    },
+    function_tool_schema_lowering: %{
+      lowered_tool_types: [
+        "flat_function",
+        "nested_function",
+        "namespace_nested_function"
+      ],
+      strict_function_tools_lowered: false,
+      strict_structured_outputs_lowered: false,
+      unsupported_json_schema_keywords_dropped: ["$schema", "title", "default"],
+      supported_schema_keywords_preserved: [
+        "$ref",
+        "description",
+        "enum",
+        "required",
+        "items",
+        "additionalProperties",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "$defs",
+        "definitions"
+      ],
+      schema_repairs: [
+        "boolean_schema_to_object",
+        "const_to_single_value_enum",
+        "infer_object_type",
+        "infer_array_type",
+        "default_object_properties",
+        "default_array_items"
+      ],
+      routes: [
+        "/backend-api/codex/responses",
+        "/backend-api/codex/v1/responses",
+        "/backend-api/codex/responses websocket",
+        "/backend-api/codex/v1/responses websocket",
+        "/v1/responses",
+        "/v1/responses websocket"
+      ],
+      privacy: "schema_shape_only"
     },
     backend_alpha_search: %{
       auth: "required_bearer_api_key",

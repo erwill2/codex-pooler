@@ -27,6 +27,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
     backend_v1_alias_surface
     websocket_continuity
     reasoning_minimal
+    reasoning_context
     unsupported_upstream_fields
     firewall
     decompression
@@ -37,6 +38,8 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
     first_event_stream_retry
     request_compression
     control_plane_surface
+    backend_reset_credit_consume
+    function_tool_schema_lowering
     backend_alpha_search
     v1_supported_surface
     v1_unsupported_public_surface
@@ -169,6 +172,102 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
       assert unsupported_upstream_fields.contract =~
                "strips backend-only upstream-unsupported controls"
+    end
+
+    test "documents OpenAI reasoning context literal support" do
+      feature = CompatibilityMatrix.by_slug!(:reasoning_context)
+      fixture = CompatibilityMatrix.fixture!(:reasoning_context)
+
+      assert feature.status == :supported
+      assert feature.current == :openai_sdk_literal_normalization
+      assert feature.routes == [%{method: :post, path: "/v1/responses"}]
+      assert feature.contract =~ "reasoning.context"
+      assert feature.contract =~ "auto"
+      assert feature.contract =~ "current_turn"
+      assert feature.contract =~ "all_turns"
+      assert feature.contract =~ "trimming and lowercasing"
+      assert feature.contract =~ "rejects unknown or non-string"
+
+      assert fixture.accepted_values == ["auto", "current_turn", "all_turns"]
+      assert fixture.normalization == "trim_and_lowercase"
+
+      assert fixture.rejected_values == [
+               "unknown_strings",
+               "empty_strings",
+               "non_strings",
+               "arrays",
+               "maps"
+             ]
+
+      assert fixture.routes == ["/v1/responses"]
+    end
+
+    test "documents non-strict function tool schema lowering scope" do
+      feature = CompatibilityMatrix.by_slug!(:function_tool_schema_lowering)
+      fixture = CompatibilityMatrix.fixture!(:function_tool_schema_lowering)
+
+      assert feature.status == :supported
+      assert feature.current == :non_strict_function_tool_schema_lowering
+      assert :streaming in feature.categories
+      assert feature.contract =~ "non-strict function tool schemas"
+      assert feature.contract =~ "before local validation"
+      assert feature.contract =~ "nested namespace function tools"
+      assert feature.contract =~ "never weakens strict function tools"
+      assert feature.contract =~ "strict structured-output schemas"
+      refute feature.contract =~ "hosted tools"
+
+      assert fixture.lowered_tool_types == [
+               "flat_function",
+               "nested_function",
+               "namespace_nested_function"
+             ]
+
+      assert fixture.strict_function_tools_lowered == false
+      assert fixture.strict_structured_outputs_lowered == false
+      assert "$schema" in fixture.unsupported_json_schema_keywords_dropped
+      assert "$ref" in fixture.supported_schema_keywords_preserved
+      assert "const_to_single_value_enum" in fixture.schema_repairs
+
+      assert fixture.routes == [
+               "/backend-api/codex/responses",
+               "/backend-api/codex/v1/responses",
+               "/backend-api/codex/responses websocket",
+               "/backend-api/codex/v1/responses websocket",
+               "/v1/responses",
+               "/v1/responses websocket"
+             ]
+    end
+
+    test "documents request compression search and diff input shapes" do
+      feature = CompatibilityMatrix.by_slug!(:request_compression)
+      fixture = CompatibilityMatrix.fixture!(:request_compression)
+
+      assert feature.status == :supported
+      assert feature.contract =~ "grouped heading matches"
+      assert feature.contract =~ "portable NUL-delimited matches"
+      assert feature.contract =~ "additions-only"
+      assert feature.contract =~ "deletions-only"
+      assert feature.contract =~ "minimal unified diffs"
+      assert feature.contract =~ "ordinary prose"
+
+      assert fixture.supported_input_shapes == %{
+               search_results: [
+                 "classic_path_line",
+                 "grouped_heading",
+                 "portable_nul_delimited"
+               ],
+               diffs: [
+                 "hunk_additions_only",
+                 "hunk_deletions_only",
+                 "hunk_replacement",
+                 "minimal_unified_hunk"
+               ],
+               false_positive_guards: [
+                 "path_like_group_heading",
+                 "minimum_grouped_matches",
+                 "hunk_header_required"
+               ]
+             }
     end
 
     test "documents narrow chat input fallback and non-executable additional_tools" do
@@ -591,6 +690,72 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         refute MapSet.member?(matrix_route_set, {route.method, route.path})
         refute MapSet.member?(control_plane_route_set, {route.method, route.path})
       end
+    end
+
+    test "exposes only the backend HTTP reset-credit consume routes" do
+      route_set =
+        CodexPoolerWeb.Router
+        |> Phoenix.Router.routes()
+        |> Enum.map(&{router_method(&1.verb), &1.path})
+        |> MapSet.new()
+
+      feature = CompatibilityMatrix.by_slug!(:backend_reset_credit_consume)
+      fixture = CompatibilityMatrix.fixture!(:backend_reset_credit_consume)
+
+      expected_routes = [
+        {:post, "/api/codex/rate-limit-reset-credits/consume"},
+        {:post, "/wham/rate-limit-reset-credits/consume"},
+        {:post, "/backend-api/wham/rate-limit-reset-credits/consume"}
+      ]
+
+      for route <- expected_routes do
+        assert MapSet.member?(route_set, route)
+      end
+
+      assert Enum.map(feature.routes, &{&1.method, &1.path}) == expected_routes
+      assert feature.current == :explicit_authenticated_backend_http_proxy_routes
+      assert feature.contract =~ "explicit authenticated backend HTTP routes"
+      assert feature.contract =~ "redeem_request_id"
+      assert feature.contract =~ "idempotency-key"
+      assert feature.contract =~ "rate_limit_reset_credit_consume"
+      assert feature.contract =~ "matching usage accounting endpoint"
+
+      assert feature.contract =~
+               "app-server account/rateLimitResetCredit/consume JSON-RPC unsupported"
+
+      assert fixture.auth == "required_bearer_api_key"
+      assert fixture.route_class == "proxy_http"
+      assert fixture.operation == "rate_limit_reset_credit_consume"
+      assert fixture.body_fields_forwarded == ["redeem_request_id"]
+      assert fixture.stripped_headers == ["idempotency-key"]
+      assert fixture.privacy == "metadata_only"
+
+      assert fixture.routes == [
+               %{
+                 local_path: "/api/codex/rate-limit-reset-credits/consume",
+                 upstream_path: "/api/codex/rate-limit-reset-credits/consume",
+                 accounting_endpoint: "/api/codex/usage"
+               },
+               %{
+                 local_path: "/wham/rate-limit-reset-credits/consume",
+                 upstream_path: "/wham/rate-limit-reset-credits/consume",
+                 accounting_endpoint: "/wham/usage"
+               },
+               %{
+                 local_path: "/backend-api/wham/rate-limit-reset-credits/consume",
+                 upstream_path: "/wham/rate-limit-reset-credits/consume",
+                 accounting_endpoint: "/backend-api/wham/usage"
+               }
+             ]
+
+      assert fixture.unsupported_app_server_json_rpc_methods == [
+               "account/rateLimitResetCredit/consume"
+             ]
+
+      refute MapSet.member?(
+               route_set,
+               {:post, "/backend-api/codex/account/rateLimitResetCredit/consume"}
+             )
     end
 
     test "documents unsupported v1 public surface with exact OpenAI-shaped error contract" do

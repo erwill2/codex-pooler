@@ -356,8 +356,33 @@ These routes live under `/backend-api` or legacy usage paths. They are still Poo
       <td>Supported</td>
       <td>Backend usage alias.</td>
     </tr>
+    <tr>
+      <td><code>POST /api/codex/rate-limit-reset-credits/consume</code></td>
+      <td><code>/api/codex/rate-limit-reset-credits/consume</code></td>
+      <td>No</td>
+      <td>Supported</td>
+      <td>Backend HTTP reset-credit consume route. It accepts a JSON object with <code>redeem_request_id</code>, forwards only that field, strips inbound <code>idempotency-key</code>, and records metadata under <code>/api/codex/usage</code>.</td>
+    </tr>
+    <tr>
+      <td><code>POST /wham/rate-limit-reset-credits/consume</code></td>
+      <td><code>/wham/rate-limit-reset-credits/consume</code></td>
+      <td>No</td>
+      <td>Supported</td>
+      <td>Backend HTTP reset-credit consume route. It records metadata under <code>/wham/usage</code>.</td>
+    </tr>
+    <tr>
+      <td><code>POST /backend-api/wham/rate-limit-reset-credits/consume</code></td>
+      <td><code>/wham/rate-limit-reset-credits/consume</code></td>
+      <td>No</td>
+      <td>Supported</td>
+      <td>Backend HTTP reset-credit consume route. It records metadata under <code>/backend-api/wham/usage</code>.</td>
+    </tr>
   </tbody>
 </table>
+
+The app-server JSON-RPC reset-credit method
+`account/rateLimitResetCredit/consume` remains unsupported. Codex Pooler does
+not add a wildcard backend app-server proxy for reset-credit methods.
 
 ## OpenAI-compatible `/v1` routes
 
@@ -473,6 +498,18 @@ Supported work is translated into Codex-compatible requests and then routed thro
     </tr>
   </tbody>
 </table>
+
+`POST /v1/responses` accepts `reasoning.context` only for `auto`,
+`current_turn`, and `all_turns` after trimming and lowercasing. Unknown, empty,
+or non-string context values fail before dispatch with
+`param: "reasoning.context"`.
+
+Non-strict function tool schemas are lowered before local validation and
+upstream dispatch for backend Responses HTTP, backend Responses websocket
+`response.create`, and public `/v1/responses` compatibility paths. Lowering is
+limited to function tools, including nested function tools inside accepted
+namespace tools. Strict function tools and strict structured-output schemas stay
+on the strict validation path and are not made looser.
 
 ### Routed but unsupported `/v1` endpoints
 
@@ -597,6 +634,14 @@ Prompt-cache routing locality is a local routing hint. It can apply on `POST /ba
 ## Request compression boundaries
 
 Request compression is a per-Pool routing option named `request_compression_enabled`. It is disabled by default. When enabled, Codex Pooler may compress upstream-bound Responses tool-output content before dispatch. This is request-side only: raw outputs and upstream response bodies are not stored, and CCR/retrieval is not implemented.
+
+Supported input shapes are explicit. Search-result compression accepts classic
+`path:line[:column]: text`, grouped heading output when a path-like heading has
+enough line matches below it, and portable NUL-delimited output shaped as
+`path\0line[:column]: text`. Diff compression requires a hunk header and accepts
+additions-only, deletions-only, replacement, and minimal unified hunks without a
+leading `diff --git` header. Malformed NUL fragments, prose headings, and
+ordinary prose with plus/minus lines stay text/skip.
 
 Eligible route families are exact:
 
