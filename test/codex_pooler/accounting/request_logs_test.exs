@@ -2191,8 +2191,8 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     refute inspect(log) =~ "raw routing prompt"
   end
 
-  @tag :feature_control_plane_redaction
-  test "control-plane request logs persist metadata-only route details and redact request and attempt secrets" do
+  @tag :feature_proxy_control_legacy_redaction
+  test "historical proxy-control request logs keep metadata-only route details and redact request and attempt secrets" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
 
     %{identity: identity, assignment: assignment} =
@@ -2239,6 +2239,9 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
       })
       |> Ecto.Changeset.change(%{last_error_code: "upstream_status"})
       |> Repo.update!()
+
+    assert CodexPooler.RouteClass.classify(request.endpoint, %{}, request.transport) ==
+             CodexPooler.RouteClass.proxy_http()
 
     attempt =
       request
@@ -2288,8 +2291,8 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     assert attempt.id
   end
 
-  @tag :feature_control_plane_redaction
-  test "analytics-disabled control-plane request logs stay local metadata-only with a 204 and no attempts" do
+  @tag :feature_proxy_control_legacy_redaction
+  test "historical analytics-disabled proxy-control request logs stay local metadata-only with a 204 and no attempts" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
 
     assert {:ok, %{request: request}} =

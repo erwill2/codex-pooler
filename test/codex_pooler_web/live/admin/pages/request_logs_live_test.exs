@@ -1817,8 +1817,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
            )
   end
 
-  @tag :feature_control_plane_request_logs
-  test "renders metadata-only control-plane request log rows without leaking request or control-plane secrets",
+  @tag :feature_proxy_control_legacy_request_logs
+  test "renders historical metadata-only proxy-control request log rows without leaking request or control-plane secrets",
        %{
          conn: conn,
          scope: scope
