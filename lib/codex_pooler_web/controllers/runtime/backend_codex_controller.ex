@@ -1,17 +1,13 @@
 defmodule CodexPoolerWeb.Runtime.BackendCodexController do
   use CodexPoolerWeb, :controller
 
-  alias CodexPooler.ControlPlaneRoutes
   alias CodexPooler.Gateway
-  alias CodexPooler.Gateway.ControlPlaneProxy
   alias CodexPooler.Gateway.Metadata
   alias CodexPooler.Gateway.OpenAICompatibility.{Chat, ChatCompletions}
   alias CodexPooler.Gateway.Payloads.{CompactionTrigger, RequestOptions}
-  alias CodexPooler.Pools
   alias CodexPooler.RouteClass
   alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
   alias CodexPoolerWeb.PublicGatewayDispatch
-  alias CodexPoolerWeb.Runtime.ControlPlaneJson
 
   def models(conn, _params) do
     serve_models(conn, "/backend-api/codex/models")
@@ -62,71 +58,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
       "/backend-api/codex/v1/chat/completions",
       "/backend-api/codex/responses"
     )
-  end
-
-  def thread_goal_get(conn, params), do: control_plane_proxy(conn, params, :thread_goal_get)
-
-  def thread_goal_get_post(conn, params),
-    do: control_plane_proxy(conn, params, :thread_goal_get_post)
-
-  def thread_goal_set(conn, params), do: control_plane_proxy(conn, params, :thread_goal_set)
-
-  def thread_goal_clear(conn, params),
-    do: control_plane_proxy(conn, params, :thread_goal_clear)
-
-  def analytics_events(conn, params), do: control_plane_proxy(conn, params, :analytics_events)
-
-  def memories_trace_summarize(conn, params),
-    do: control_plane_proxy(conn, params, :memories_trace_summarize)
-
-  def alpha_search(conn, params), do: control_plane_proxy(conn, params, :alpha_search)
-
-  def realtime_calls(conn, params), do: control_plane_proxy(conn, params, :realtime_calls)
-
-  def safety_arc(conn, params), do: control_plane_proxy(conn, params, :safety_arc)
-
-  def agent_identities_jwks(conn, params),
-    do: control_plane_proxy(conn, params, :agent_identities_jwks)
-
-  def wham_agent_identities_jwks(conn, params),
-    do: control_plane_proxy(conn, params, :wham_agent_identities_jwks)
-
-  defp control_plane_proxy(conn, _params, action) do
-    endpoint = request_path(conn)
-    route = ControlPlaneRoutes.fetch_by_action!(action)
-
-    result =
-      with {:ok, auth} <- GatewayHelpers.authenticate(conn),
-           {:ok, body, conn} <- read_control_plane_body(conn, route.body_mode) do
-        dispatch_control_plane_proxy(conn, auth, endpoint, route, body)
-      end
-
-    GatewayHelpers.send_or_error(conn, result)
-  end
-
-  defp dispatch_control_plane_proxy(conn, auth, endpoint, route, body) do
-    GatewayHelpers.admit(conn, RouteClass.proxy_control(), %{endpoint: endpoint}, fn ->
-      request =
-        ControlPlaneProxy.build_request!(%{
-          local_endpoint: endpoint,
-          upstream_endpoint: route.upstream_path,
-          method: conn.method,
-          query_string: conn.query_string,
-          body: body,
-          body_mode: route.body_mode,
-          request_headers: conn.req_headers,
-          request_opts: GatewayHelpers.request_opts(conn)
-        })
-
-      routing_settings = Pools.routing_settings_with_defaults(auth.pool)
-
-      if endpoint == "/backend-api/codex/analytics-events/events" and
-           analytics_forwarding_disabled?(routing_settings) do
-        ControlPlaneProxy.record_disabled_analytics(auth, request)
-      else
-        ControlPlaneProxy.execute(auth, request, routing_settings: routing_settings)
-      end
-    end)
   end
 
   def transcribe(conn, _params) do
@@ -365,54 +296,4 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexController do
   end
 
   defp trimmed_header_value(_value), do: nil
-
-  defp request_path(conn), do: "/" <> Enum.join(conn.path_info, "/")
-
-  defp analytics_forwarding_disabled?(%{control_plane_analytics_forwarding_enabled: false}),
-    do: true
-
-  defp analytics_forwarding_disabled?(_routing_settings), do: false
-
-  defp read_control_plane_body(conn, :no_body), do: {:ok, "", conn}
-
-  defp read_control_plane_body(conn, {:json, _contract} = body_mode) do
-    ControlPlaneJson.read_body(conn, body_mode)
-  end
-
-  defp read_control_plane_body(conn, :sdp) do
-    if sdp_content_type?(conn) do
-      read_raw_body(conn)
-    else
-      {:error,
-       %{status: 400, code: "invalid_request", message: "request body must be application/sdp"}}
-    end
-  end
-
-  defp read_raw_body(conn) do
-    case Plug.Conn.read_body(conn) do
-      {:ok, body, conn} ->
-        {:ok, body, conn}
-
-      {:more, _body, _conn} ->
-        {:error, %{status: 413, code: "request_too_large", message: "request body is too large"}}
-
-      {:error, _reason} ->
-        {:error,
-         %{status: 400, code: "invalid_request", message: "request body could not be read"}}
-    end
-  end
-
-  defp sdp_content_type?(conn) do
-    conn
-    |> get_req_header("content-type")
-    |> List.first()
-    |> case do
-      nil ->
-        false
-
-      content_type ->
-        content_type |> String.downcase() |> String.split(";", parts: 2) |> hd() ==
-          "application/sdp"
-    end
-  end
 end

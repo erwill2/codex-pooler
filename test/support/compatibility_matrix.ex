@@ -6,15 +6,6 @@ defmodule CodexPooler.CompatibilityMatrix do
   tests can keep supported behavior pinned.
   """
 
-  alias CodexPooler.ControlPlaneRoutes
-
-  @control_plane_feature_routes Enum.map(ControlPlaneRoutes.all(), fn route ->
-                                  %{method: route.method, path: route.local_path}
-                                end)
-  @control_plane_fixture_routes ControlPlaneRoutes.all()
-                                |> Enum.map(& &1.local_path)
-                                |> Enum.uniq()
-
   @required_categories ~w(
     route
     auth
@@ -246,17 +237,6 @@ defmodule CodexPooler.CompatibilityMatrix do
         "Request compression is Pool-gated by request_compression_enabled, request-side only, fail-open to the original upstream request when scanning, token counting, rewriting, or limits fail, and metadata-only through safe payload_compression request-log metadata; eligible routes are backend Responses, backend /v1 Responses/chat aliases, public /v1 Responses/chat translations, backend compact routes, and backend or narrow public websocket response.create dispatches; search-result compression covers classic path-line matches, grouped heading matches, and portable NUL-delimited matches, and diff compression covers hunk-based additions-only, deletions-only, replacement, and minimal unified diffs without treating ordinary prose as diff/search input; public /v1/responses/compact remains unsupported with no upstream compact dispatch or compression eligibility"
     },
     %{
-      slug: :control_plane_surface,
-      status: :supported,
-      current: :explicit_authenticated_proxy_routes,
-      categories: [:route, :auth, :error, :degraded],
-      routes: @control_plane_feature_routes,
-      future_routes: [],
-      fixture: :control_plane_surface,
-      contract:
-        "control-plane endpoints are explicit authenticated proxy routes under the runtime API, use the proxy_control route class, forward to exact upstream control-plane paths, preserve opaque realtime SDP bodies, forward raw AVAS SDP proxy query strings exactly on /backend-api/codex/realtime/calls only, do not expand /v1/realtime, hosted realtime routes, Codex app-server account reset-credit methods, or thread/realtime app-server controls, allowlist response headers, and keep logs metadata-only"
-    },
-    %{
       slug: :function_tool_schema_lowering,
       status: :supported,
       current: :non_strict_function_tool_schema_lowering,
@@ -273,17 +253,6 @@ defmodule CodexPooler.CompatibilityMatrix do
       fixture: :function_tool_schema_lowering,
       contract:
         "non-strict function tool schemas are lowered for backend Responses HTTP, backend Responses websocket response.create, and public /v1 Responses compatibility before local validation or upstream dispatch; lowering is limited to function tools including nested namespace function tools, converts boolean schemas and const values into supported schema shapes, infers missing object or array structure, drops unsupported JSON Schema keywords, preserves supported refs/definitions/combinators recursively, and never weakens strict function tools or strict structured-output schemas"
-    },
-    %{
-      slug: :backend_alpha_search,
-      status: :supported,
-      current: :explicit_authenticated_control_plane_route,
-      categories: [:route, :auth, :error, :degraded],
-      routes: [%{method: :post, path: "/backend-api/codex/alpha/search"}],
-      future_routes: [],
-      fixture: :backend_alpha_search,
-      contract:
-        "backend alpha search is an explicit authenticated Codex backend compatibility control-plane route, uses the proxy_control route class, forwards only to upstream /alpha/search, and keeps request logs metadata-only"
     },
     %{
       slug: :v1_supported_surface,
@@ -622,42 +591,6 @@ defmodule CodexPooler.CompatibilityMatrix do
         ]
       }
     },
-    control_plane_surface: %{
-      auth: "required_bearer_api_key",
-      route_class: "proxy_control",
-      analytics_forwarding_enabled_default: true,
-      analytics_forwarding_disabled: %{status: 204, upstream_call: false},
-      response_header_allowlist: [
-        "cache-control",
-        "content-type",
-        "etag",
-        "last-modified",
-        "location",
-        "openai-processing-ms",
-        "request-id",
-        "x-request-id"
-      ],
-      raw_realtime_query: %{
-        route: "/backend-api/codex/realtime/calls",
-        upstream_path: "/codex/realtime/calls",
-        avas_query_example: "intent=example-intent&architecture=avas",
-        exact_query_forwarding: true,
-        route_expansion: false,
-        unsupported_public_routes: ["/v1/realtime"]
-      },
-      unsupported_app_server_json_rpc_methods: [
-        "account/rateLimits/read",
-        "account/rateLimitResetCredit/consume",
-        "thread/realtime/appendSpeech"
-      ],
-      unsupported_app_server_fields: [
-        "rateLimitResetCredits",
-        "codexResponsesAsItems",
-        "codexResponseItemPrefix"
-      ],
-      privacy: "metadata_only",
-      routes: @control_plane_fixture_routes
-    },
     function_tool_schema_lowering: %{
       lowered_tool_types: [
         "flat_function",
@@ -697,13 +630,6 @@ defmodule CodexPooler.CompatibilityMatrix do
         "/v1/responses websocket"
       ],
       privacy: "schema_shape_only"
-    },
-    backend_alpha_search: %{
-      auth: "required_bearer_api_key",
-      route_class: "proxy_control",
-      privacy: "metadata_only",
-      routes: ["/backend-api/codex/alpha/search"],
-      upstream_path: "/alpha/search"
     },
     v1_supported_surface: %{
       auth: "required_bearer_api_key",

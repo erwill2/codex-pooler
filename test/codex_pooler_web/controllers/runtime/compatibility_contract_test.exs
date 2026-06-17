@@ -9,7 +9,6 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.Catalog.PricingSnapshot
   alias CodexPooler.CompatibilityMatrix
-  alias CodexPooler.ControlPlaneRoutes
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Files
   alias CodexPooler.Files.FileRecord
@@ -37,9 +36,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
     unsupported_input_image_reference
     first_event_stream_retry
     request_compression
-    control_plane_surface
     function_tool_schema_lowering
-    backend_alpha_search
     v1_supported_surface
     v1_unsupported_public_surface
   )a
@@ -82,83 +79,6 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
 
     test "has no pending compatibility gaps" do
       assert CompatibilityMatrix.pending_gaps() == []
-    end
-
-    test "documents control-plane route support as explicit proxy routes" do
-      feature = CompatibilityMatrix.by_slug!(:control_plane_surface)
-      fixture = CompatibilityMatrix.fixture!(:control_plane_surface)
-
-      assert feature.status == :supported
-      assert feature.current == :explicit_authenticated_proxy_routes
-      assert :route in feature.categories
-      assert :auth in feature.categories
-      assert :degraded in feature.categories
-
-      assert Enum.map(feature.routes, &{&1.method, &1.path}) ==
-               Enum.map(ControlPlaneRoutes.all(), &{&1.method, &1.local_path})
-
-      assert feature.contract =~ "explicit authenticated proxy routes"
-      assert feature.contract =~ "proxy_control"
-      assert feature.contract =~ "metadata-only"
-      assert feature.contract =~ "raw AVAS SDP proxy query strings exactly"
-      assert feature.contract =~ "do not expand /v1/realtime"
-      assert feature.contract =~ "account reset-credit methods"
-      assert feature.contract =~ "thread/realtime app-server controls"
-      refute feature.contract =~ "placeholder"
-      refute feature.contract =~ "not implemented"
-      assert fixture.route_class == "proxy_control"
-      assert fixture.analytics_forwarding_disabled == %{status: 204, upstream_call: false}
-      assert "location" in fixture.response_header_allowlist
-
-      assert fixture.raw_realtime_query == %{
-               route: "/backend-api/codex/realtime/calls",
-               upstream_path: "/codex/realtime/calls",
-               avas_query_example: "intent=example-intent&architecture=avas",
-               exact_query_forwarding: true,
-               route_expansion: false,
-               unsupported_public_routes: ["/v1/realtime"]
-             }
-
-      assert fixture.unsupported_app_server_json_rpc_methods == [
-               "account/rateLimits/read",
-               "account/rateLimitResetCredit/consume",
-               "thread/realtime/appendSpeech"
-             ]
-
-      assert fixture.unsupported_app_server_fields == [
-               "rateLimitResetCredits",
-               "codexResponsesAsItems",
-               "codexResponseItemPrefix"
-             ]
-
-      assert fixture.privacy == "metadata_only"
-    end
-
-    test "documents backend alpha search as scoped metadata-only control-plane compatibility" do
-      feature = CompatibilityMatrix.by_slug!(:backend_alpha_search)
-      fixture = CompatibilityMatrix.fixture!(:backend_alpha_search)
-
-      assert feature.status == :supported
-      assert feature.current == :explicit_authenticated_control_plane_route
-      assert :route in feature.categories
-      assert :auth in feature.categories
-      assert :error in feature.categories
-      assert :degraded in feature.categories
-
-      assert feature.routes == [%{method: :post, path: "/backend-api/codex/alpha/search"}]
-      assert feature.contract =~ "Codex backend compatibility control-plane route"
-      assert feature.contract =~ "proxy_control"
-      assert feature.contract =~ "metadata-only"
-      assert feature.contract =~ "upstream /alpha/search"
-      refute feature.contract =~ "/v1/alpha"
-      refute feature.contract =~ "product search UI"
-      refute feature.contract =~ "generic search API"
-
-      assert fixture.auth == "required_bearer_api_key"
-      assert fixture.route_class == "proxy_control"
-      assert fixture.privacy == "metadata_only"
-      assert fixture.routes == ["/backend-api/codex/alpha/search"]
-      assert fixture.upstream_path == "/alpha/search"
     end
 
     test "documents reject versus strip behavior for unsupported OpenAI controls" do
@@ -640,11 +560,6 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         |> Enum.map(&{&1.method, &1.path})
         |> MapSet.new()
 
-      control_plane_route_set =
-        ControlPlaneRoutes.all()
-        |> Enum.map(&{&1.method, &1.local_path})
-        |> MapSet.new()
-
       unsupported_routes = [
         %{method: :post, path: "/backend-api/codex/thread/start", family: :app_server},
         %{method: :post, path: "/backend-api/codex/thread/resume", family: :app_server},
@@ -687,7 +602,6 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       for route <- unsupported_routes do
         refute MapSet.member?(route_set, {route.method, route.path})
         refute MapSet.member?(matrix_route_set, {route.method, route.path})
-        refute MapSet.member?(control_plane_route_set, {route.method, route.path})
       end
     end
 

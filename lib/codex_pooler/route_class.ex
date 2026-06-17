@@ -1,8 +1,6 @@
 defmodule CodexPooler.RouteClass do
   @moduledoc false
 
-  alias CodexPooler.ControlPlaneRoutes
-
   @proxy_http "proxy_http"
   @proxy_control "proxy_control"
   @proxy_stream "proxy_stream"
@@ -75,9 +73,6 @@ defmodule CodexPooler.RouteClass do
   @spec classify(String.t(), map(), String.t() | nil) :: t()
   def classify(endpoint, payload, transport) do
     cond do
-      ControlPlaneRoutes.local_path?(endpoint) ->
-        @proxy_control
-
       endpoint in [
         "/backend-api/codex/responses/compact",
         "/backend-api/codex/v1/responses/compact"

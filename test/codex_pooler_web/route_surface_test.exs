@@ -3,8 +3,6 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
 
   import CodexPooler.AccountsFixtures
 
-  alias CodexPooler.ControlPlaneRoutes
-
   test "router exposes only the documented Phoenix-native application surface" do
     routes = Phoenix.Router.routes(CodexPoolerWeb.Router)
 
@@ -37,13 +35,10 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:get, "/admin/upstreams"},
                {:get, "/admin/upstreams/:id"},
                {:get, "/api/codex/usage"},
-               {:get, "/backend-api/codex/agent-identities/jwks"},
                {:get, "/backend-api/codex/models"},
                {:get, "/backend-api/codex/responses"},
-               {:get, "/backend-api/codex/thread/goal/get"},
                {:get, "/backend-api/codex/v1/models"},
                {:get, "/backend-api/codex/v1/responses"},
-               {:get, "/backend-api/wham/agent-identities/jwks"},
                {:get, "/backend-api/wham/usage"},
                {:get, "/bootstrap"},
                {:get, "/bootstrap/status"},
@@ -64,18 +59,10 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:get, "/v1/usage"},
                {:get, "/wham/usage"},
                {:options, "/mcp"},
-               {:post, "/backend-api/codex/alpha/search"},
-               {:post, "/backend-api/codex/analytics-events/events"},
                {:post, "/backend-api/codex/images/edits"},
                {:post, "/backend-api/codex/images/generations"},
-               {:post, "/backend-api/codex/memories/trace_summarize"},
-               {:post, "/backend-api/codex/realtime/calls"},
                {:post, "/backend-api/codex/responses"},
                {:post, "/backend-api/codex/responses/compact"},
-               {:post, "/backend-api/codex/safety/arc"},
-               {:post, "/backend-api/codex/thread/goal/clear"},
-               {:post, "/backend-api/codex/thread/goal/get"},
-               {:post, "/backend-api/codex/thread/goal/set"},
                {:post, "/backend-api/codex/v1/chat/completions"},
                {:post, "/backend-api/codex/v1/responses"},
                {:post, "/backend-api/codex/v1/responses/compact"},
@@ -101,12 +88,8 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
                {:post, "/v1/responses/compact"}
              ]
 
-    for path <- [
-          "/api/codex/rate-limit-reset-credits/consume",
-          "/wham/rate-limit-reset-credits/consume",
-          "/backend-api/wham/rate-limit-reset-credits/consume"
-        ] do
-      refute {:post, path} in application_routes
+    for route <- pruned_runtime_routes() do
+      refute route in application_routes
     end
 
     refute Enum.any?(application_routes, fn {_verb, path} ->
@@ -146,7 +129,7 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
            end)
   end
 
-  test "control-plane route contract is explicit and has no wildcard proxy route" do
+  test "backend control-plane proxy routes are absent and no wildcard proxy route remains" do
     routes =
       CodexPoolerWeb.Router
       |> Phoenix.Router.routes()
@@ -154,10 +137,17 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
 
     route_set = MapSet.new(routes)
 
-    for route <- control_plane_routes() do
-      assert MapSet.member?(route_set, route),
-             "expected explicit control-plane route #{inspect(route)}"
+    for route <- pruned_runtime_routes() do
+      refute MapSet.member?(route_set, route),
+             "expected pruned control-plane route #{inspect(route)} to be absent"
     end
+
+    assert MapSet.member?(route_set, {:get, "/backend-api/codex/models"})
+    assert MapSet.member?(route_set, {:post, "/backend-api/codex/responses"})
+    assert MapSet.member?(route_set, {:post, "/backend-api/codex/responses/compact"})
+    assert MapSet.member?(route_set, {:post, "/backend-api/codex/v1/chat/completions"})
+    assert MapSet.member?(route_set, {:post, "/backend-api/codex/images/generations"})
+    assert MapSet.member?(route_set, {:post, "/backend-api/codex/images/edits"})
 
     refute MapSet.member?(route_set, {:post, "/backend-api/codex/not-added"})
     refute MapSet.member?(route_set, {:get, "/backend-api/codex/not-added"})
@@ -168,8 +158,23 @@ defmodule CodexPoolerWeb.RouteSurfaceTest do
            end)
   end
 
-  defp control_plane_routes do
-    Enum.map(ControlPlaneRoutes.all(), &{&1.method, &1.local_path})
+  defp pruned_runtime_routes do
+    [
+      {:post, "/api/codex/rate-limit-reset-credits/consume"},
+      {:post, "/wham/rate-limit-reset-credits/consume"},
+      {:post, "/backend-api/wham/rate-limit-reset-credits/consume"},
+      {:get, "/backend-api/codex/thread/goal/get"},
+      {:post, "/backend-api/codex/thread/goal/get"},
+      {:post, "/backend-api/codex/thread/goal/set"},
+      {:post, "/backend-api/codex/thread/goal/clear"},
+      {:post, "/backend-api/codex/analytics-events/events"},
+      {:post, "/backend-api/codex/memories/trace_summarize"},
+      {:post, "/backend-api/codex/alpha/search"},
+      {:post, "/backend-api/codex/realtime/calls"},
+      {:post, "/backend-api/codex/safety/arc"},
+      {:get, "/backend-api/codex/agent-identities/jwks"},
+      {:get, "/backend-api/wham/agent-identities/jwks"}
+    ]
   end
 
   test "GET /status falls through to the standard 404 response for anonymous users" do

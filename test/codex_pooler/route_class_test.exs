@@ -1,7 +1,6 @@
 defmodule CodexPooler.RouteClassTest do
   use CodexPooler.DataCase, async: true
 
-  alias CodexPooler.ControlPlaneRoutes
   alias CodexPooler.RouteClass
 
   test "detects streaming payloads for string and atom keys" do
@@ -45,10 +44,20 @@ defmodule CodexPooler.RouteClassTest do
     end
   end
 
-  test "classifies shared control-plane route definitions as proxy control" do
-    for %{local_path: local_path} <- ControlPlaneRoutes.all() do
-      assert RouteClass.classify(local_path, %{"stream" => true}, nil) ==
-               RouteClass.proxy_control()
+  test "removed backend control-plane proxy paths fall back to ordinary HTTP classification" do
+    for endpoint <- [
+          "/backend-api/codex/thread/goal/get",
+          "/backend-api/codex/thread/goal/set",
+          "/backend-api/codex/thread/goal/clear",
+          "/backend-api/codex/analytics-events/events",
+          "/backend-api/codex/memories/trace_summarize",
+          "/backend-api/codex/alpha/search",
+          "/backend-api/codex/realtime/calls",
+          "/backend-api/codex/safety/arc",
+          "/backend-api/codex/agent-identities/jwks",
+          "/backend-api/wham/agent-identities/jwks"
+        ] do
+      assert RouteClass.classify(endpoint, %{}, nil) == RouteClass.proxy_http()
     end
   end
 end

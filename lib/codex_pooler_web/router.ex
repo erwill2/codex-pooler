@@ -1,7 +1,6 @@
 defmodule CodexPoolerWeb.Router do
   use CodexPoolerWeb, :router
 
-  alias CodexPooler.ControlPlaneRoutes
   import CodexPoolerWeb.UserAuth
   alias CodexPoolerWeb.V1.UnsupportedRoutes
   require CodexPoolerWeb.DevRoutes
@@ -83,11 +82,6 @@ defmodule CodexPoolerWeb.Router do
     post "/v1/chat/completions", Runtime.BackendCodexController, :v1_chat_completions
     get "/responses", Runtime.BackendCodexController, :responses_stream
     get "/v1/responses", Runtime.BackendCodexController, :responses_stream
-
-    for %{method: method, local_path: "/backend-api/codex" <> path, action: action} <-
-          ControlPlaneRoutes.all() do
-      match method, path, Runtime.BackendCodexController, action
-    end
   end
 
   scope "/backend-api", CodexPoolerWeb do
@@ -97,15 +91,6 @@ defmodule CodexPoolerWeb.Router do
     post "/files", Runtime.BackendFileController, :create
     post "/files/:file_id/uploaded", Runtime.BackendFileController, :uploaded
     get "/wham/usage", Runtime.CodexUsageController, :show
-
-    for %{
-          method: method,
-          local_path: "/backend-api" <> path,
-          action: action
-        } <- ControlPlaneRoutes.all(),
-        String.starts_with?(path, "/wham/") do
-      match method, path, Runtime.BackendCodexController, action
-    end
   end
 
   scope "/v1", CodexPoolerWeb do

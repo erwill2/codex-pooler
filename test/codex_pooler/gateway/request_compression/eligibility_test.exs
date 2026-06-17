@@ -148,7 +148,6 @@ defmodule CodexPooler.Gateway.RequestCompression.EligibilityTest do
         {"/backend-api/transcribe", RouteClass.audio_transcription(), "http_multipart"},
         {"/backend-api/codex/images/generations", RouteClass.proxy_http(), "http_json"},
         {"/api/codex/usage", RouteClass.proxy_http(), "http_json"},
-        {"/backend-api/codex/alpha/search", RouteClass.proxy_control(), "http_json"},
         {"/admin/request-logs", RouteClass.admin_browser(), "http_json"},
         {"/mcp", RouteClass.mcp(), "http_json"}
       ]
