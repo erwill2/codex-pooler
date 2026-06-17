@@ -181,4 +181,4 @@ Get-ChildItem -Path $CodexHome -Filter "state_*.sqlite" |
 
 The backend route family includes `GET /backend-api/codex/models`, `POST /backend-api/codex/responses`, backend websocket response-stream compatibility on `GET /backend-api/codex/responses`, and `POST /backend-api/codex/responses/compact`.
 
-`POST /backend-api/codex/realtime/calls` is a Codex backend control-plane SDP proxy route. It is not OpenAI Realtime SDK compatibility.
+Codex Pooler supports Codex model-provider traffic only. Do not point `chatgpt_base_url` at Codex Pooler for account, realtime, identity, or other app-server helper calls.

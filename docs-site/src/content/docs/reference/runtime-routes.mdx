@@ -204,100 +204,13 @@ Some Codex clients use `/backend-api/codex/v1` as their base URL. Codex Pooler e
   </tbody>
 </table>
 
-## Backend control-plane proxy routes
+## Backend app-server helper routes
 
-Control-plane routes are exact authenticated proxy routes. They use the `proxy_control` route class, forward only to the listed upstream path, allowlist safe response headers, and keep request logs metadata-only.
-
-<table>
-  <thead>
-    <tr>
-      <th>Exposed endpoint</th>
-      <th>Upstream destination</th>
-      <th>Body mode</th>
-      <th>Translation</th>
-      <th>Support</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><code>GET /backend-api/codex/thread/goal/get</code></td>
-      <td><code>/codex/thread/goal/get</code></td>
-      <td>No body</td>
-      <td>No</td>
-      <td>Supported</td>
-    </tr>
-    <tr>
-      <td><code>POST /backend-api/codex/thread/goal/get</code></td>
-      <td><code>/codex/thread/goal/get</code></td>
-      <td>JSON</td>
-      <td>No</td>
-      <td>Supported</td>
-    </tr>
-    <tr>
-      <td><code>POST /backend-api/codex/thread/goal/set</code></td>
-      <td><code>/codex/thread/goal/set</code></td>
-      <td>JSON</td>
-      <td>No</td>
-      <td>Supported</td>
-    </tr>
-    <tr>
-      <td><code>POST /backend-api/codex/thread/goal/clear</code></td>
-      <td><code>/codex/thread/goal/clear</code></td>
-      <td>JSON</td>
-      <td>No</td>
-      <td>Supported</td>
-    </tr>
-    <tr>
-      <td><code>POST /backend-api/codex/analytics-events/events</code></td>
-      <td><code>/codex/analytics-events/events</code></td>
-      <td>JSON</td>
-      <td>No</td>
-      <td>Supported</td>
-    </tr>
-    <tr>
-      <td><code>POST /backend-api/codex/memories/trace_summarize</code></td>
-      <td><code>/codex/memories/trace_summarize</code></td>
-      <td>JSON</td>
-      <td>No</td>
-      <td>Supported</td>
-    </tr>
-    <tr>
-      <td><code>POST /backend-api/codex/alpha/search</code></td>
-      <td><code>/alpha/search</code></td>
-      <td>JSON</td>
-      <td>No</td>
-      <td>Supported. This is an explicit backend alpha-search proxy only.</td>
-    </tr>
-    <tr>
-      <td><code>POST /backend-api/codex/realtime/calls</code></td>
-      <td><code>/codex/realtime/calls</code></td>
-      <td>Raw SDP</td>
-      <td>No</td>
-      <td>Partial. This is Codex backend SDP proxying, not OpenAI Realtime SDK compatibility.</td>
-    </tr>
-    <tr>
-      <td><code>POST /backend-api/codex/safety/arc</code></td>
-      <td><code>/codex/safety/arc</code></td>
-      <td>JSON</td>
-      <td>No</td>
-      <td>Supported</td>
-    </tr>
-    <tr>
-      <td><code>GET /backend-api/codex/agent-identities/jwks</code></td>
-      <td><code>/codex/agent-identities/jwks</code></td>
-      <td>No body</td>
-      <td>No</td>
-      <td>Supported</td>
-    </tr>
-    <tr>
-      <td><code>GET /backend-api/wham/agent-identities/jwks</code></td>
-      <td><code>/wham/agent-identities/jwks</code></td>
-      <td>No body</td>
-      <td>No</td>
-      <td>Supported</td>
-    </tr>
-  </tbody>
-</table>
+Codex Pooler is a model-provider runtime boundary. It does not proxy Codex
+account helpers, analytics posting, thread-goal helpers, memory summaries,
+search helpers, realtime helper calls, safety helper calls, identity JWKS, or
+reset-credit consume operations. Configure Codex clients by pointing
+`model_providers.*.base_url` at `/backend-api/codex`.
 
 ## Backend bridge and usage routes
 
@@ -355,27 +268,6 @@ These routes live under `/backend-api` or legacy usage paths. They are still Poo
       <td>No</td>
       <td>Supported</td>
       <td>Backend usage alias.</td>
-    </tr>
-    <tr>
-      <td><code>POST /api/codex/rate-limit-reset-credits/consume</code></td>
-      <td><code>/api/codex/rate-limit-reset-credits/consume</code></td>
-      <td>No</td>
-      <td>Supported</td>
-      <td>Backend HTTP reset-credit consume route. It accepts a JSON object with <code>redeem_request_id</code>, forwards only that field, strips inbound <code>idempotency-key</code>, and records metadata under <code>/api/codex/usage</code>.</td>
-    </tr>
-    <tr>
-      <td><code>POST /wham/rate-limit-reset-credits/consume</code></td>
-      <td><code>/wham/rate-limit-reset-credits/consume</code></td>
-      <td>No</td>
-      <td>Supported</td>
-      <td>Backend HTTP reset-credit consume route. It records metadata under <code>/wham/usage</code>.</td>
-    </tr>
-    <tr>
-      <td><code>POST /backend-api/wham/rate-limit-reset-credits/consume</code></td>
-      <td><code>/wham/rate-limit-reset-credits/consume</code></td>
-      <td>No</td>
-      <td>Supported</td>
-      <td>Backend HTTP reset-credit consume route. It records metadata under <code>/backend-api/wham/usage</code>.</td>
     </tr>
   </tbody>
 </table>
@@ -629,7 +521,7 @@ MCP output is metadata-only and scoped by the operator's owner or assigned-Pool 
 
 ## Prompt-cache and continuity boundaries
 
-Prompt-cache routing locality is a local routing hint. It can apply on `POST /backend-api/codex/responses`, `POST /backend-api/codex/v1/responses`, `POST /backend-api/codex/v1/chat/completions`, `POST /v1/responses`, and `POST /v1/chat/completions`. It is excluded from websocket, compact, file, audio, image, and control-plane routes.
+Prompt-cache routing locality is a local routing hint. It can apply on `POST /backend-api/codex/responses`, `POST /backend-api/codex/v1/responses`, `POST /backend-api/codex/v1/chat/completions`, `POST /v1/responses`, and `POST /v1/chat/completions`. It is excluded from websocket, compact, file, audio, image, usage, and app-server helper routes.
 
 ## Request compression boundaries
 
@@ -680,7 +572,7 @@ Eligible route families are exact:
   </tbody>
 </table>
 
-Unsupported surfaces are multipart, file, audio, image, admin, MCP, usage, and control-plane routes. `POST /v1/responses/compact` remains unsupported because the public compact route has no upstream dispatch.
+Unsupported surfaces are multipart, file, audio, image, admin, MCP, usage, and other non-Responses routes. `POST /v1/responses/compact` remains unsupported because the public compact route has no upstream dispatch.
 
 Compression is fail-open. Scanner, tokenizer, compression, and limit errors preserve the original upstream request body and record safe `payload_compression` metadata. JSON request bodies over 1 MiB skip before scanning, and a dispatch processes at most 50 output candidates. Token counting is local and in-process with tokenizer data shipped by the application; it does not call OpenAI or load a local model.
 

@@ -18,7 +18,7 @@ Use this page with [Runtime Routes](/reference/runtime-routes/) and [Operator ad
 Every runtime request follows the same broad path:
 
 1. Codex Pooler authenticates the bearer token as a Pool API key.
-2. It admits the request into the route family and route class, such as normal HTTP, stream, websocket, compact, file upload, audio transcription, or backend control-plane proxy.
+2. It admits the request into the route family and route class, such as normal HTTP, stream, websocket, compact, file upload, or audio transcription.
 3. It classifies the requested model and route surface, either the Codex backend compatibility route or the narrow OpenAI-compatible `/v1` surface.
 4. It finds the authenticated Pool and starts from that Pool's configured upstream assignments.
 5. It applies hard eligibility checks for assignment status, upstream status, model support, requested capabilities, quota, health, route-class circuit state, file affinity, and session continuity.

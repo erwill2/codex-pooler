@@ -1340,7 +1340,7 @@ dispatch for these routes only: `POST /backend-api/codex/responses`,
 `POST /v1/chat/completions`, `POST /backend-api/codex/responses/compact`,
 `POST /backend-api/codex/v1/responses/compact`, and backend or narrow public
 Responses websocket `response.create` work. Multipart, file, audio, image,
-admin, MCP, usage, and control-plane requests are not eligible; public
+admin, MCP, usage, and other non-Responses requests are not eligible; public
 `/v1/responses/compact` remains unsupported because it has no upstream compact
 dispatch.
 

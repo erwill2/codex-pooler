@@ -62,7 +62,7 @@ Unsupported boundaries:
 - Unsupported /v1 examples include /v1/responses/compact, /v1/files/:file_id/content, DELETE /v1/files/:file_id, /v1/embeddings, /v1/batches, /v1/moderations, /v1/fine_tuning/jobs, /v1/images/variations, response retrieve, response cancel, and response delete routes.
 - /v1/realtime and OpenAI Realtime SDK websocket or session routes are unsupported.
 - GET /v1/responses is narrow Responses websocket compatibility, not /v1/realtime support.
-- POST /backend-api/codex/realtime/calls is a Codex backend control-plane SDP proxy route, not OpenAI Realtime SDK compatibility.
+- Codex Pooler supports Codex model-provider traffic only; it does not proxy Codex app-server helper routes.
 - GET /mcp stateless SSE is unavailable today.
 
 Credential boundaries:

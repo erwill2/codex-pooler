@@ -8,7 +8,7 @@ The Audit logs page is the operator surface for administrative and security-rele
 Use this page when you need to answer:
 
 1. who changed a Pool, upstream, API key, invite, operator, setting, or session
-2. when a control-plane action happened
+2. when an administrative action happened
 3. whether the action succeeded or failed
 4. which Pool or target record was involved
 5. which sanitized detail fields changed
@@ -131,11 +131,11 @@ Common audit events include:
 6. system setting updates
 7. MCP token creation, rename, or deletion
 
-Use Audit logs with Request logs when routing behavior changes unexpectedly. Request logs show runtime symptoms; Audit logs show whether an operator or system action changed the control plane around the same time.
+Use Audit logs with Request logs when routing behavior changes unexpectedly. Request logs show runtime symptoms; Audit logs show whether an operator or system action changed routing or policy around the same time.
 
 ## Operational Checklist
 
-When investigating a control-plane change, check audit logs in this order:
+When investigating an administrative change, check audit logs in this order:
 
 1. filter by Pool if the issue is Pool-scoped
 2. filter by Event if you know the action family

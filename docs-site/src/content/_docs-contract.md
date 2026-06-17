@@ -35,7 +35,11 @@ Allowed public claims:
 - `POST /backend-api/files/:file_id/uploaded` finalizes an upstream-backed file upload
 - `POST /backend-api/transcribe` is backend audio transcription compatibility
 - `GET /backend-api/wham/usage`, `GET /api/codex/usage`, and `GET /wham/usage` are usage routes
-- `POST /backend-api/codex/realtime/calls` is a backend control-plane SDP proxy route only. Do not describe it as OpenAI Realtime SDK support
+
+Do not describe Codex app-server helper routes as supported backend
+compatibility. Codex Pooler is a model-provider runtime boundary, not an
+account, analytics, thread-goal, memory, search, realtime, safety, identity, or
+reset-credit proxy.
 
 ### `/v1`
 
@@ -119,7 +123,7 @@ Use precise unsupported language:
 - Say `It does not provide full OpenAI API parity`
 - Say `OpenAI Realtime SDK websocket and session routes are not supported`
 - Say `GET /v1/responses is narrow Responses websocket compatibility, not /v1/realtime support`
-- Say `POST /backend-api/codex/realtime/calls is a Codex backend control-plane SDP proxy route, not OpenAI Realtime SDK compatibility`
+- Say `Codex Pooler does not proxy Codex app-server realtime helper routes`
 - Say `unsupported /v1 routes return deterministic OpenAI-shaped unsupported endpoint errors when explicitly routed`
 
 Do not write `OpenAI-compatible` without a nearby qualifier when the page could imply full parity.
@@ -153,7 +157,6 @@ Use these tracked sources as the source of truth for public route claims. Do not
 | --- | --- | --- |
 | Root route split | `lib/codex_pooler_web/router.ex`, `test/codex_pooler_web/route_surface_test.exs` | `/backend-api`, `/v1`, `/mcp`, browser auth, admin LiveViews, usage, health, and metrics are separate route families |
 | Backend Codex routes | `lib/codex_pooler_web/router.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/controllers/runtime/compatibility_contract_test.exs` | `/backend-api/codex/*` is explicit authenticated Codex backend compatibility, not wildcard proxy |
-| Control-plane routes | `lib/codex_pooler/control_plane_routes.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/route_surface_test.exs`, `test/codex_pooler_web/controllers/runtime/compatibility_contract_test.exs` | Control-plane routes are exact authenticated proxy routes, including `POST /backend-api/codex/realtime/calls` as SDP proxy only |
 | Backend file bridge | `lib/codex_pooler_web/router.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/controllers/runtime/compatibility_contract_test.exs` | `/backend-api/files` stores metadata only and returns upstream upload or download URLs. Bytes are not stored locally |
 | OpenAI-compatible `/v1` supported routes | `lib/codex_pooler_web/router.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/route_surface_test.exs`, `test/codex_pooler_web/controllers/v1/route_auth_test.exs`, `test/codex_pooler_web/controllers/runtime/compatibility_contract_test.exs` | `/v1` is narrow authenticated compatibility, not full OpenAI parity. `GET /v1/responses` is narrow Responses websocket compatibility only |
 | Unsupported `/v1` routes | `lib/codex_pooler_web/controllers/v1/unsupported_routes.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/controllers/v1/route_auth_test.exs`, `test/codex_pooler_web/controllers/runtime/compatibility_contract_test.exs` | Explicit unsupported `/v1` routes return deterministic OpenAI-shaped unsupported endpoint errors before gateway dispatch |
@@ -168,7 +171,7 @@ Before publishing or editing a public page:
 1. Check every route claim against the source map above
 2. Use only allowed hosts and placeholders
 3. Include narrow `/v1` compatibility language when mentioning OpenAI SDKs
-4. Keep `/backend-api/codex/realtime/calls` separate from OpenAI Realtime SDK support
+4. Keep Codex app-server helper routes outside the supported runtime surface
 5. Keep `/mcp` token language separate from Pool API key language
 6. Remove raw payloads, secrets, private hosts, and internal evidence from examples
 7. If the route claim isn't in the tracked sources above, don't publish it yet
