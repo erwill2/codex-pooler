@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
 
   import CodexPooler.PoolerFixtures
 
+  alias CodexPooler.Accounting.Request
   alias CodexPooler.Catalog.PricingSnapshot
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OperationalSettings
@@ -303,6 +304,34 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngressTest do
 
         assert response(conn, 404) =~ "Not Found"
       end
+    end
+
+    test "malformed pruned thread goal set returns absent before parsing or side effects", %{
+      conn: conn
+    } do
+      setup_runtime_ingress(%OperationalSettings{})
+
+      conn =
+        conn
+        |> put_req_header("content-type", "application/json")
+        |> post("/backend-api/codex/thread/goal/set", ~s({"goal":))
+
+      assert response(conn, 404) =~ "Not Found"
+      assert Repo.aggregate(Request, :count) == 0
+    end
+
+    test "malformed pruned reset-credit consume returns absent before parsing or side effects", %{
+      conn: conn
+    } do
+      setup_runtime_ingress(%OperationalSettings{})
+
+      conn =
+        conn
+        |> put_req_header("content-type", "application/json")
+        |> post("/api/codex/rate-limit-reset-credits/consume", ~s({"redeem_request_id":))
+
+      assert response(conn, 404) =~ "Not Found"
+      assert Repo.aggregate(Request, :count) == 0
     end
   end
 

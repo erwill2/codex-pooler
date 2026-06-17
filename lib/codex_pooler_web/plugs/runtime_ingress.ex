@@ -24,6 +24,22 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
   @json_error_type "invalid_request_error"
 
+  @pruned_runtime_helper_routes [
+    {"GET", ["backend-api", "codex", "agent-identities", "jwks"]},
+    {"GET", ["backend-api", "wham", "agent-identities", "jwks"]},
+    {"POST", ["api", "codex", "rate-limit-reset-credits", "consume"]},
+    {"POST", ["wham", "rate-limit-reset-credits", "consume"]},
+    {"POST", ["backend-api", "wham", "rate-limit-reset-credits", "consume"]},
+    {"POST", ["backend-api", "codex", "thread", "goal", "get"]},
+    {"POST", ["backend-api", "codex", "thread", "goal", "set"]},
+    {"POST", ["backend-api", "codex", "thread", "goal", "clear"]},
+    {"POST", ["backend-api", "codex", "analytics-events", "events"]},
+    {"POST", ["backend-api", "codex", "memories", "trace_summarize"]},
+    {"POST", ["backend-api", "codex", "alpha", "search"]},
+    {"POST", ["backend-api", "codex", "realtime", "calls"]},
+    {"POST", ["backend-api", "codex", "safety", "arc"]}
+  ]
+
   def init(opts), do: opts
 
   def call(conn, _opts) do
@@ -35,6 +51,9 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
         |> enforce_mcp_firewall(settings)
         |> admit_mcp_request()
         |> prepare_mcp_body(settings)
+
+      pruned_runtime_helper_request?(conn) ->
+        send_pruned_runtime_helper_absent(conn)
 
       runtime_path?(conn.path_info) ->
         settings = OperationalSettings.current()
@@ -379,12 +398,24 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
 
   def protected_backend_raw_request?(_conn), do: false
 
+  @spec pruned_runtime_helper_request?(Plug.Conn.t()) :: boolean()
+  defp pruned_runtime_helper_request?(%Plug.Conn{method: method, path_info: path_info}) do
+    {method, path_info} in @pruned_runtime_helper_routes
+  end
+
   defp decode_or_send_compressed_body(conn, settings) do
     case CompressedBody.decode(conn, settings) do
       {:ok, conn} -> conn
       {:error, reason, conn} -> send_runtime_error(conn, reason)
       {:error, reason} -> send_runtime_error(conn, reason)
     end
+  end
+
+  defp send_pruned_runtime_helper_absent(conn) do
+    conn
+    |> put_resp_content_type("text/html")
+    |> send_resp(404, "Not Found")
+    |> halt()
   end
 
   defp runtime_path?(path_info) do
