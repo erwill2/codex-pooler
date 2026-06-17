@@ -4,6 +4,7 @@ defmodule CodexPooler.Gateway.RequestCompression do
   require Logger
 
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.RequestCompression.Metadata
   alias CodexPooler.Gateway.RequestCompression.Eligibility
   alias CodexPooler.Gateway.RequestCompression.JsonStringRanges
   alias CodexPooler.Gateway.RequestCompression.ResponsesLiveZone
@@ -409,7 +410,7 @@ defmodule CodexPooler.Gateway.RequestCompression do
     strategies =
       strategy_metadata
       |> Enum.map(&metadata_value(&1, :strategy))
-      |> Enum.map(&safe_strategy_name/1)
+      |> Enum.map(&Metadata.strategy_name/1)
       |> Enum.reject(&is_nil/1)
       |> Enum.uniq()
       |> Enum.sort()
@@ -446,14 +447,6 @@ defmodule CodexPooler.Gateway.RequestCompression do
       end
     end)
   end
-
-  defp safe_strategy_name(value) when is_atom(value), do: Atom.to_string(value)
-
-  defp safe_strategy_name(value) when is_binary(value) do
-    if String.match?(value, ~r/\A[a-zA-Z0-9_.:-]+\z/), do: value
-  end
-
-  defp safe_strategy_name(_value), do: nil
 
   defp strategy_opts(context, request_options) do
     case supported_model(context, request_options) do
@@ -537,12 +530,7 @@ defmodule CodexPooler.Gateway.RequestCompression do
   end
 
   defp put_compression_metadata(request_options, metadata, status, reason, started) do
-    metadata =
-      metadata
-      |> Map.put(:attempted, true)
-      |> Map.put(:status, status)
-      |> Map.put(:reason, reason)
-      |> Map.put(:elapsed_ms, elapsed_ms(started))
+    metadata = Metadata.put_writer_fields(metadata, status, reason, elapsed_ms(started))
 
     RequestOptions.put_runtime_context(request_options, payload_compression: metadata)
   end
