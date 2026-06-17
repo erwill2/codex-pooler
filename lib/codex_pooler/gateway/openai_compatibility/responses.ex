@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
   alias CodexPooler.Gateway.OpenAICompatibility.Responses.{Input, SSE}
   alias CodexPooler.Gateway.Payloads.{InputShape, RequestOptions, StrictSchema}
 
+  @reasoning_contexts ~w(auto current_turn all_turns)
   @reasoning_summaries ~w(auto concise detailed)
   @service_tiers ~w(auto default flex priority scale)
   @truncation_modes ~w(auto disabled)
@@ -160,7 +161,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     do: {:error, Error.invalid_request("reasoning summary is not supported", "reasoning.summary")}
 
   defp validate_reasoning_context(nil), do: :ok
-  defp validate_reasoning_context("all_turns"), do: :ok
+
+  defp validate_reasoning_context(context) when is_binary(context) do
+    if normalize_enum(context) in @reasoning_contexts do
+      :ok
+    else
+      {:error, Error.invalid_request("reasoning context is not supported", "reasoning.context")}
+    end
+  end
 
   defp validate_reasoning_context(_context),
     do: {:error, Error.invalid_request("reasoning context is not supported", "reasoning.context")}
@@ -277,6 +285,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
       reasoning
       |> normalize_string_field("effort")
       |> normalize_string_field("summary")
+      |> normalize_string_field("context")
 
     Map.put(payload, "reasoning", reasoning)
   end

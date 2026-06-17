@@ -775,6 +775,37 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert attempt.status == "succeeded"
   end
 
+  test "POST /v1/responses forwards normalized reasoning context", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_reasoning_context",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic reasoning context request",
+        "reasoning" => %{"context" => " Current_Turn "}
+      })
+
+    assert %{"id" => "resp_v1_reasoning_context", "object" => "response"} =
+             json_response(conn, 200)
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["stream"] == true
+    assert captured.json["store"] == false
+    assert captured.json["reasoning"] == %{"context" => "current_turn"}
+  end
+
   test "POST /v1/responses compresses eligible translated tool output before dispatch",
        %{conn: conn} do
     upstream =
@@ -989,6 +1020,33 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert error["code"] == "invalid_request"
     assert error["param"] == "reasoning.effort"
     refute conn.resp_body =~ unsafe_effort
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  test "POST /v1/responses rejects unsafe reasoning context before dispatch", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    invalid_contexts = ["recent_turns", "", " ", 1, ["all_turns"], %{"mode" => "all_turns"}]
+
+    Enum.each(invalid_contexts, fn invalid_context ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic unsafe context request",
+          "reasoning" => %{"context" => invalid_context}
+        })
+
+      assert %{"error" => error} = json_response(response, 400)
+      assert error["code"] == "invalid_request"
+      assert error["param"] == "reasoning.context"
+    end)
+
     assert FakeUpstream.count(upstream) == 0
     assert Repo.aggregate(Request, :count) == 0
     assert Repo.aggregate(Attempt, :count) == 0

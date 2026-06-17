@@ -102,6 +102,26 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
   end
 
   @tag :responses_coercion
+  test "Responses accepts SDK reasoning context variants and forwards normalized values" do
+    accepted_contexts = [
+      {"auto", "auto"},
+      {" Current_Turn ", "current_turn"},
+      {"ALL_TURNS", "all_turns"}
+    ]
+
+    Enum.each(accepted_contexts, fn {context, expected_context} ->
+      assert {:ok, result} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => "synthetic input",
+                 "reasoning" => %{"context" => context}
+               })
+
+      assert result.payload["reasoning"] == %{"context" => expected_context}
+    end)
+  end
+
+  @tag :responses_coercion
   test "string Responses input coerces to a backend-compatible input_text message" do
     assert {:ok, result} =
              Responses.coerce(
@@ -2681,7 +2701,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         {%{"effort" => "low", "unsupported" => true}, "reasoning.unsupported"},
         {"low", "reasoning"},
         {%{"effort" => 1}, "reasoning.effort"},
-        {%{"summary" => false}, "reasoning.summary"}
+        {%{"summary" => false}, "reasoning.summary"},
+        {%{"context" => "recent_turns"}, "reasoning.context"},
+        {%{"context" => ""}, "reasoning.context"},
+        {%{"context" => " "}, "reasoning.context"},
+        {%{"context" => 1}, "reasoning.context"},
+        {%{"context" => ["all_turns"]}, "reasoning.context"},
+        {%{"context" => %{"mode" => "all_turns"}}, "reasoning.context"}
       ]
 
       Enum.each(invalid_reasoning_payloads, fn {reasoning, expected_param} ->
