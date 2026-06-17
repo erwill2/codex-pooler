@@ -412,11 +412,6 @@ defmodule CodexPooler.Alerts.AlertsContextTest do
         resolved_at: now()
       })
 
-    assert {:ok, query} = Alerts.bell_eligible_incidents_query(admin_scope)
-
-    assert Enum.sort(Repo.all(from(incident in query, select: incident.id))) ==
-             Enum.sort([visible_open.id, visible_acknowledged.id])
-
     assert {:ok, 2} = Alerts.dismiss_all_visible_incident_notifications(admin_scope)
 
     dismissed_ids =

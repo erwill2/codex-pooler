@@ -74,9 +74,6 @@ defmodule CodexPooler.Alerts do
   @spec resolve_incident(term(), AlertIncident.t() | Ecto.UUID.t()) :: incident_result()
   defdelegate resolve_incident(scope, incident_or_id), to: IncidentNotifications
 
-  @spec bell_eligible_incidents_query(term()) :: {:ok, Ecto.Query.t()} | {:error, access_error()}
-  defdelegate bell_eligible_incidents_query(scope), to: IncidentNotifications
-
   @spec mark_incident_notification_read(term(), incident_ref()) :: notification_receipt_result()
   defdelegate mark_incident_notification_read(scope, incident_or_id), to: IncidentNotifications
 

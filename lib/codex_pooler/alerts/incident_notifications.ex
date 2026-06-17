@@ -80,16 +80,6 @@ defmodule CodexPooler.Alerts.IncidentNotifications do
   def resolve_incident(scope, incident_or_id),
     do: transition_incident(scope, incident_or_id, :resolve)
 
-  @spec bell_eligible_incidents_query(term()) :: {:ok, Ecto.Query.t()} | {:error, access_error()}
-  def bell_eligible_incidents_query(%Scope{} = scope) do
-    with {:ok, pool_ids} <- Authorization.authorized_pool_filter(scope, nil) do
-      {:ok, bell_eligible_incidents_query_for_pool_ids(pool_ids)}
-    end
-  end
-
-  def bell_eligible_incidents_query(_scope),
-    do: {:error, Authorization.access_error(:invalid_request, "user scope is required")}
-
   @spec mark_incident_notification_read(term(), incident_ref()) :: notification_receipt_result()
   def mark_incident_notification_read(scope, incident_or_id) do
     scope
