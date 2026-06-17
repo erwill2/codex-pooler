@@ -624,8 +624,12 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   defp maybe_put_websocket_owner_update(updates, key, value, normalizer \\ & &1)
   defp maybe_put_websocket_owner_update(updates, _key, nil, _normalizer), do: updates
 
-  defp maybe_put_websocket_owner_update(updates, key, value, normalizer),
-    do: Map.put(updates, key, normalizer.(value))
+  defp maybe_put_websocket_owner_update(updates, key, value, normalizer) do
+    case normalizer.(value) do
+      nil -> updates
+      value -> Map.put(updates, key, value)
+    end
+  end
 
   defp websocket_owner_forwarder_opts(values) when is_list(values), do: values
   defp websocket_owner_forwarder_opts(_value), do: []
@@ -679,6 +683,13 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   end
 
   defp forwarded_headers(_headers), do: []
+
+  defp forwarded_headers_update(headers) do
+    case forwarded_headers(headers) do
+      [] -> nil
+      headers -> headers
+    end
+  end
 
   defp safe_client_request_id(value) when is_binary(value) do
     value
@@ -772,9 +783,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   defp normalize_continuity_updates(updates) do
     updates
-    |> normalize_update(:bridge_owner_lease_ttl_seconds, &optional_positive_integer/1)
-    |> normalize_update(:reconnect_window_seconds, &optional_non_negative_integer/1)
-    |> normalize_update(:session_header_source, &normalized_session_header_source/1)
+    |> normalize_optional_update(:bridge_owner_lease_ttl_seconds, &optional_positive_integer/1)
+    |> normalize_optional_update(:reconnect_window_seconds, &optional_non_negative_integer/1)
+    |> normalize_optional_update(:session_header_source, &normalized_session_header_source/1)
   end
 
   defp normalize_transport_updates(updates, %WebsocketOwnerContext{} = current_owner) do
@@ -792,7 +803,11 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       ])
 
     transport_updates =
-      normalize_update(transport_updates, :forwarded_metadata_headers, &forwarded_headers/1)
+      normalize_optional_update(
+        transport_updates,
+        :forwarded_metadata_headers,
+        &forwarded_headers_update/1
+      )
 
     if map_size(owner_updates) == 0 do
       transport_updates
@@ -807,22 +822,25 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   defp normalize_file_bridge_updates(updates) do
     updates
-    |> normalize_update(:forwarded_headers, &forwarded_headers/1)
-    |> normalize_update(:finalize_retry_timeout_ms, &optional_non_negative_integer/1)
-    |> normalize_update(:finalize_retry_interval_ms, &optional_non_negative_integer/1)
+    |> normalize_optional_update(:forwarded_headers, &forwarded_headers_update/1)
+    |> normalize_optional_update(:finalize_retry_timeout_ms, &optional_non_negative_integer/1)
+    |> normalize_optional_update(:finalize_retry_interval_ms, &optional_non_negative_integer/1)
   end
 
   defp normalize_runtime_updates(updates) do
-    normalize_update(
+    normalize_optional_update(
       updates,
       :payload_compression,
       &RequestCompressionMetadata.runtime_metadata/1
     )
   end
 
-  defp normalize_update(updates, key, normalizer) do
+  defp normalize_optional_update(updates, key, normalizer) do
     if Map.has_key?(updates, key) do
-      Map.update!(updates, key, normalizer)
+      case normalizer.(Map.fetch!(updates, key)) do
+        nil -> Map.delete(updates, key)
+        value -> Map.put(updates, key, value)
+      end
     else
       updates
     end

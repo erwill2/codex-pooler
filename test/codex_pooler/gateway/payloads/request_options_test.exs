@@ -1006,6 +1006,99 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       assert options.file_bridge.pool_upstream_assignment_id == "assignment-id"
     end
 
+    test "optional normalizers ignore invalid updates instead of clearing existing values" do
+      options =
+        RequestOptions.build(
+          %{
+            session_header_source: "session-id",
+            forwarded_headers: [{"x-codex-client", "fixture"}],
+            finalize_retry_timeout_ms: 500,
+            payload_compression: %{"attempted" => true, "status" => "compressed"},
+            websocket_owner_forwarding_enabled?: true,
+            websocket_owner_downstream: %{pid: self()},
+            websocket_owner_downstream_epoch: 3
+          },
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      updated =
+        options
+        |> RequestOptions.put_continuity(
+          session_header_source: "x-unsafe-header",
+          reconnect_window_seconds: -1
+        )
+        |> RequestOptions.put_transport(
+          forwarded_metadata_headers: [{"x-codex-client", :invalid}],
+          websocket_owner_downstream_epoch: "stale"
+        )
+        |> RequestOptions.put_file_bridge(
+          forwarded_headers: [{"x-codex-client", :invalid}],
+          finalize_retry_timeout_ms: -1
+        )
+        |> RequestOptions.put_runtime_context(
+          payload_compression: %{"enabled" => true, "attempted" => false, "status" => "disabled"}
+        )
+
+      assert updated.continuity.session_header_source == "session-id"
+      assert updated.continuity.reconnect_window_seconds == nil
+      assert updated.transport.forwarded_metadata_headers == [{"x-codex-client", "fixture"}]
+      assert updated.transport.websocket_owner.downstream_epoch == 3
+      assert updated.file_bridge.forwarded_headers == [{"x-codex-client", "fixture"}]
+      assert updated.file_bridge.finalize_retry_timeout_ms == 500
+
+      assert updated.runtime.payload_compression == %{
+               "attempted" => true,
+               "status" => "compressed"
+             }
+    end
+
+    test "optional normalizers still accept explicit valid replacements" do
+      options =
+        RequestOptions.build(
+          %{
+            session_header_source: "session-id",
+            forwarded_headers: [{"x-codex-client", "fixture"}],
+            finalize_retry_timeout_ms: 500,
+            payload_compression: %{"attempted" => true, "status" => "compressed"},
+            websocket_owner_forwarding_enabled?: true,
+            websocket_owner_downstream_epoch: 3
+          },
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      updated =
+        options
+        |> RequestOptions.put_continuity(session_header_source: "x-session-id")
+        |> RequestOptions.put_transport(
+          forwarded_metadata_headers: [{"x-openai-client-user-agent", "synthetic"}],
+          websocket_owner_downstream_epoch: 4
+        )
+        |> RequestOptions.put_file_bridge(
+          forwarded_headers: [{"user-agent", "codex_cli_rs/0.0.0"}],
+          finalize_retry_timeout_ms: 0
+        )
+        |> RequestOptions.put_runtime_context(
+          payload_compression: %{"attempted" => true, "status" => "no_change"}
+        )
+
+      assert updated.continuity.session_header_source == "x-session-id"
+
+      assert updated.transport.forwarded_metadata_headers == [
+               {"x-openai-client-user-agent", "synthetic"}
+             ]
+
+      assert updated.transport.websocket_owner.downstream_epoch == 4
+      assert updated.file_bridge.forwarded_headers == [{"user-agent", "codex_cli_rs/0.0.0"}]
+      assert updated.file_bridge.finalize_retry_timeout_ms == 0
+
+      assert updated.runtime.payload_compression == %{
+               "attempted" => true,
+               "status" => "no_change"
+             }
+    end
+
     test "reject unknown section fields" do
       options =
         RequestOptions.build(%{}, "/backend-api/codex/responses", %{"model" => "example-model"})
