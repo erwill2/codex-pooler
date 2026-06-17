@@ -1848,7 +1848,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
             "content_type" => "application/json"
           },
           "control_plane" => %{
-            "analytics_forwarding" => "enabled"
+            "trace" => "trace-secret-payload"
           }
         }
       })
@@ -1887,7 +1887,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
                    "content_type" => "application/json"
                  },
                  "control_plane" => %{
-                   "analytics_forwarding" => "disabled"
+                   "analytics" => "analytics-secret-payload"
                  }
                }
              })

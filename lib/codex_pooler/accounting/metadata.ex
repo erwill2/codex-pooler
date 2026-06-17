@@ -28,7 +28,6 @@ defmodule CodexPooler.Accounting.Metadata do
                                "reservation_snapshot_inputs",
                                "token_refresh_reason_code_preview"
                              ])
-  @safe_control_plane_keys MapSet.new(["analytics_forwarding"])
   @payload_compression_statuses ~w(disabled ineligible compressed no_change skipped error_passthrough)
   @payload_compression_reasons ~w(
                                   pool_disabled
@@ -379,7 +378,7 @@ defmodule CodexPooler.Accounting.Metadata do
         @redacted
 
       normalized == "control_plane" ->
-        sanitize_control_plane_map(value)
+        @redacted
 
       true ->
         Map.new(value, fn {child_key, child_value} ->
@@ -405,21 +404,6 @@ defmodule CodexPooler.Accounting.Metadata do
   end
 
   defp sanitize_value(value, _key), do: value
-
-  defp sanitize_control_plane_map(value) when is_map(value) do
-    Map.new(value, fn {child_key, child_value} ->
-      normalized = normalize_key(child_key)
-
-      sanitized_value =
-        if MapSet.member?(@safe_control_plane_keys, normalized) do
-          sanitize_value(child_value, child_key)
-        else
-          @redacted
-        end
-
-      {child_key, sanitized_value}
-    end)
-  end
 
   defp sanitize_payload_compression_map(value) when is_map(value) do
     Map.new(value, fn {child_key, child_value} ->

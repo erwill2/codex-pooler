@@ -2308,7 +2308,6 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
                    "body" => "ship sanitized control route tests"
                  },
                  "control_plane" => %{
-                   "analytics_forwarding" => "disabled",
                    "authorization" => "Bearer client-secret",
                    "cookie" => "session=secret",
                    "trace" => "trace-secret-payload",

@@ -724,12 +724,6 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              "Optional client surfaces."
            )
 
-    removed_field = "control_plane" <> "_analytics_forwarding_enabled"
-    removed_label = "Forward " <> "analytics"
-
-    refute has_element?(view, "#pool_#{removed_field}")
-    refute has_element?(view, "#pool-create-routing-controls", removed_label)
-
     assert has_element?(
              view,
              "#pool-create-routing-controls",
@@ -1083,11 +1077,6 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert has_element?(view, "#pool_edit_v1_compatibility_enabled")
     refute has_element?(view, "#pool_edit_request_compression_enabled[checked]")
 
-    removed_field = "control_plane" <> "_analytics_forwarding_enabled"
-    removed_label = "Forward " <> "analytics"
-
-    refute has_element?(view, "#pool_edit_#{removed_field}")
-
     assert has_element?(
              view,
              "#pool-edit-routing-controls",
@@ -1117,8 +1106,6 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              "#pool-edit-routing-controls",
              "Optional client surfaces."
            )
-
-    refute has_element?(view, "#pool-edit-routing-controls", removed_label)
 
     assert has_element?(
              view,
