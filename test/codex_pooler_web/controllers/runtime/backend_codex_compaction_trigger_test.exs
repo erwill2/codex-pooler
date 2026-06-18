@@ -108,7 +108,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexCompactionTriggerTest do
     assert captured.json["instructions"] == "compact bridge instruction"
     assert captured.json["input"] == input
     assert captured.json["reasoning"] == %{"effort" => "low"}
-    assert captured.json["store"] == false
+    refute Map.has_key?(captured.json, "store")
     assert captured.json["service_tier"] == "priority"
     assert captured.json["prompt_cache_key"] == "compact-camel-cache-key"
     assert captured.json["previous_response_id"] == "resp_previous_compact"

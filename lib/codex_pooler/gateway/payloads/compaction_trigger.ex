@@ -13,7 +13,6 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
     instructions
     input
     reasoning
-    store
     service_tier
     prompt_cache_key
     previous_response_id
