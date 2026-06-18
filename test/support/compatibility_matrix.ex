@@ -66,7 +66,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :responses_chat,
       contract:
-        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path; chat completions use messages when present and fall back to top-level input only when messages is absent or empty, with omitted fallback instructions defaulting to a blank string; request-shaped additional_tools input items are preserved as non-executable input, never merged into executable tools, and never used to satisfy tool_choice; Responses namespace tool definitions are accepted only for non-empty namespace name/description values and nested function tools; Responses truncation accepts auto and disabled locally but is not forwarded upstream; terminal compaction_trigger backend payloads bridge through /backend-api/codex/responses/compact with compact accounting and backend Responses SSE compaction output, while malformed trigger placement is rejected before dispatch; backend regular HTTP Responses and compact routes forward approved metadata headers, including request-scoped x-codex-turn-state, x-codex-window-id, and x-codex-installation-id, and relay upstream x-codex-turn-state response headers downstream, while public /v1 and websocket request-header lanes do not; context-overflow recovery stays client/upstream-owned with no server-side hidden replay or stored prompt/frame reconstruction; Hermes assistant replay may include safe assistant status metadata; OpenClaw assistant replay drops thinking metadata and normalizes text before upstream dispatch; safe OpenAI Responses fields, prompt-cache locality, SDK-control rejection, and backend-only control stripping stay scope-specific"
+        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path; chat completions use messages when present and fall back to top-level input only when messages is absent or empty, with omitted fallback instructions defaulting to a blank string; request-shaped additional_tools input items are preserved as non-executable input, never merged into executable tools, and never used to satisfy tool_choice; OpenAI Responses remote MCP tool definitions are rejected before dispatch in both top-level tools and nested additional_tools.tools locations; Responses namespace tool definitions are accepted only for non-empty namespace name/description values and nested function tools; Responses truncation accepts auto and disabled locally but is not forwarded upstream; terminal compaction_trigger backend payloads bridge through /backend-api/codex/responses/compact with compact accounting and backend Responses SSE compaction output, while malformed trigger placement is rejected before dispatch; backend regular HTTP Responses and compact routes forward approved metadata headers, including request-scoped x-codex-turn-state, x-codex-window-id, and x-codex-installation-id, and relay upstream x-codex-turn-state response headers downstream, while public /v1 and websocket request-header lanes do not; context-overflow recovery stays client/upstream-owned with no server-side hidden replay or stored prompt/frame reconstruction; Hermes assistant replay may include safe assistant status metadata; OpenClaw assistant replay drops thinking metadata and normalizes text before upstream dispatch; safe OpenAI Responses fields, prompt-cache locality, SDK-control rejection, and backend-only control stripping stay scope-specific"
     },
     %{
       slug: :backend_v1_alias_surface,
@@ -278,7 +278,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :v1_supported_surface,
       contract:
-        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, include narrow GET /v1/responses Responses websocket compatibility only, exclude broad /v1/realtime routes, keep POST /v1/responses/compact routed only to deterministic unsupported_endpoint with no upstream compact dispatch, consume continuity headers using the documented local precedence without forwarding session-id, x-session-id, or x-session-affinity upstream, fail closed for pinned /v1/responses continuations whose upstream account needs revoked-refresh-token reauthentication with the shared restart_with_full_context recovery guidance, allow prompt-cache routing locality only on POST responses and chat completions, accept Responses truncation auto and disabled locally without forwarding it upstream, lift Responses system/developer input-message text into top-level instructions, emit early public streaming terminal errors without synthetic success prefixes, redact server-class/internal/upstream public /v1 errors while preserving invalid_request_error validation details, map Responses content_filter/content-filter incomplete reasons to chat finish_reason content_filter while other incomplete reasons remain length, forward structured tool-result/function_call_output payloads unchanged, translate chat-style role=tool continuation messages and Hermes assistant tool-call replays into Responses function_call/function_call_output input items before validation, accept safe Hermes assistant replay status values, translate OpenClaw assistant thinking replays before validation, and keep chat input fallback, Responses additional_tools support narrow and non-executable, and Responses namespace-tool support narrow"
+        "OpenAI-compatible /v1 routes are default-on for pools, require bearer API-key auth, return OpenAI-shaped errors without anonymous local or CIDR bypasses, include narrow GET /v1/responses Responses websocket compatibility only, exclude broad /v1/realtime routes, keep POST /v1/responses/compact routed only to deterministic unsupported_endpoint with no upstream compact dispatch, reject OpenAI Responses remote MCP tool definitions before upstream dispatch in both top-level tools and nested additional_tools.tools locations with OpenAI-shaped invalid_request errors, consume continuity headers using the documented local precedence without forwarding session-id, x-session-id, or x-session-affinity upstream, fail closed for pinned /v1/responses continuations whose upstream account needs revoked-refresh-token reauthentication with the shared restart_with_full_context recovery guidance, allow prompt-cache routing locality only on POST responses and chat completions, accept Responses truncation auto and disabled locally without forwarding it upstream, lift Responses system/developer input-message text into top-level instructions, emit early public streaming terminal errors without synthetic success prefixes, redact server-class/internal/upstream public /v1 errors while preserving invalid_request_error validation details, map Responses content_filter/content-filter incomplete reasons to chat finish_reason content_filter while other incomplete reasons remain length, forward structured tool-result/function_call_output payloads unchanged, translate chat-style role=tool continuation messages and Hermes assistant tool-call replays into Responses function_call/function_call_output input items before validation, accept safe Hermes assistant replay status values, translate OpenClaw assistant thinking replays before validation, and keep chat input fallback, Responses additional_tools support narrow and non-executable, and Responses namespace-tool support narrow"
     },
     %{
       slug: :v1_unsupported_public_surface,
@@ -348,7 +348,14 @@ defmodule CodexPooler.CompatibilityMatrix do
         role: "developer",
         executable: false,
         merges_into_tools: false,
-        satisfies_tool_choice: false
+        satisfies_tool_choice: false,
+        unsupported_nested_tool_types: ["mcp"]
+      },
+      remote_mcp_tools: %{
+        supported: false,
+        locations: ["tools", "input.additional_tools.tools"],
+        error_code: "invalid_request",
+        dispatch: false
       },
       namespace_tool: %{
         shape: "top_level_namespace_tool",
@@ -676,7 +683,14 @@ defmodule CodexPooler.CompatibilityMatrix do
         role: "developer",
         executable: false,
         merges_into_tools: false,
-        satisfies_tool_choice: false
+        satisfies_tool_choice: false,
+        unsupported_nested_tool_types: ["mcp"]
+      },
+      remote_mcp_tools: %{
+        supported: false,
+        locations: ["tools", "input.additional_tools.tools"],
+        error_code: "invalid_request",
+        dispatch: false
       },
       responses_truncation: %{
         accepted_values: ["auto", "disabled"],

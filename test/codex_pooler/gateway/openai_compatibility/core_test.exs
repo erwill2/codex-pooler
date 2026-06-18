@@ -372,6 +372,50 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                  Responses.coerce(%{"model" => "gpt-fixture-text", "input" => [item]})
       end)
     end
+
+    @tag :unsupported_fields
+    test "Responses rejects remote MCP tools inside additional_tools input items" do
+      remote_mcp_tools = [
+        %{
+          "type" => "mcp",
+          "server_label" => "fixture-mcp",
+          "server_url" => "https://mcp.example.com"
+        },
+        %{
+          "type" => "mcp",
+          "server_label" => "fixture-mcp",
+          "connector_id" => "connector_googledrive"
+        },
+        %{
+          "type" => "mcp",
+          "server_label" => "fixture-mcp",
+          "tunnel_id" => "mcp_tunnel_fixture"
+        }
+      ]
+
+      Enum.each(remote_mcp_tools, fn tool ->
+        additional_tools_item = %{
+          "type" => "additional_tools",
+          "role" => "developer",
+          "tools" => [tool]
+        }
+
+        for coerce <- [&Responses.coerce/1, &Chat.coerce/1] do
+          assert {:error, reason} =
+                   coerce.(%{
+                     "model" => "gpt-fixture-text",
+                     "input" => [additional_tools_item]
+                   })
+
+          assert reason == %{
+                   status: 400,
+                   code: "invalid_request",
+                   message: "remote MCP tools are not supported",
+                   param: "input"
+                 }
+        end
+      end)
+    end
   end
 
   @tag :responses_coercion
@@ -2202,7 +2246,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         %{"type" => "file_search", "vector_store_ids" => ["vs_fixture"]},
         %{"type" => "code_interpreter", "container" => %{"type" => "auto"}},
         %{"type" => "computer_use", "environment" => "browser"},
-        %{"type" => "mcp", "server_label" => "fixture-mcp"},
         %{"type" => "shell", "description" => "synthetic shell"},
         %{"type" => "local_shell", "description" => "synthetic local shell"},
         %{"type" => "apply_patch", "description" => "synthetic patch"},
@@ -2228,6 +2271,42 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                    "input" => "synthetic input",
                    "tools" => [tool]
                  })
+      end)
+    end
+
+    test "Responses rejects remote MCP tools with explicit errors" do
+      remote_mcp_tools = [
+        %{
+          "type" => "mcp",
+          "server_label" => "fixture-mcp",
+          "server_url" => "https://mcp.example.com"
+        },
+        %{
+          "type" => "mcp",
+          "server_label" => "fixture-mcp",
+          "connector_id" => "connector_googledrive"
+        },
+        %{
+          "type" => "mcp",
+          "server_label" => "fixture-mcp",
+          "tunnel_id" => "mcp_tunnel_fixture"
+        }
+      ]
+
+      Enum.each(remote_mcp_tools, fn tool ->
+        assert {:error, reason} =
+                 Responses.coerce(%{
+                   "model" => "gpt-fixture-text",
+                   "input" => "synthetic input",
+                   "tools" => [tool]
+                 })
+
+        assert reason == %{
+                 status: 400,
+                 code: "invalid_request",
+                 message: "remote MCP tools are not supported",
+                 param: "tools"
+               }
       end)
     end
   end

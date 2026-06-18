@@ -59,6 +59,8 @@ Allowed public claims:
 - `POST /v1/images/generations`
 - `POST /v1/images/edits`
 
+OpenAI Responses remote MCP tool definitions are unsupported request shapes inside `POST /v1/responses`, not unsupported routes. This includes top-level `tools[type=mcp]` and nested `input[type=additional_tools].tools[type=mcp]`.
+
 Routed public `/v1` endpoints that must be described as deterministic unsupported behavior:
 
 - `POST /v1/responses/compact`, deterministic unsupported compact route before gateway dispatch
@@ -89,6 +91,7 @@ Allowed public claims:
 - MCP uses operator-owned bearer MCP tokens
 - MCP does not accept Pool API keys, browser sessions, cookies, query tokens, invite tokens, upstream tokens, or custom headers as authentication
 - MCP output is metadata-only and scoped by the operator's owner or assigned-Pool visibility
+- `/mcp` is not used to execute or proxy OpenAI Responses remote MCP tools
 
 ## Glossary
 
@@ -125,6 +128,7 @@ Use precise unsupported language:
 - Say `GET /v1/responses is narrow Responses websocket compatibility, not /v1/realtime support`
 - Say `Codex Pooler does not proxy Codex app-server realtime helper routes`
 - Say `unsupported /v1 routes return deterministic OpenAI-shaped unsupported endpoint errors when explicitly routed`
+- Say `OpenAI Responses remote MCP tool definitions are unsupported request shapes inside POST /v1/responses, not unsupported routes`
 
 Do not write `OpenAI-compatible` without a nearby qualifier when the page could imply full parity.
 
@@ -159,6 +163,7 @@ Use these tracked sources as the source of truth for public route claims. Do not
 | Backend Codex routes | `lib/codex_pooler_web/router.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/controllers/runtime/compatibility_contract_test.exs` | `/backend-api/codex/*` is explicit authenticated Codex backend compatibility, not wildcard proxy |
 | Backend file bridge | `lib/codex_pooler_web/router.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/controllers/runtime/compatibility_contract_test.exs` | `/backend-api/files` stores metadata only and returns upstream upload or download URLs. Bytes are not stored locally |
 | OpenAI-compatible `/v1` supported routes | `lib/codex_pooler_web/router.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/route_surface_test.exs`, `test/codex_pooler_web/controllers/v1/route_auth_test.exs`, `test/codex_pooler_web/controllers/runtime/compatibility_contract_test.exs` | `/v1` is narrow authenticated compatibility, not full OpenAI parity. `GET /v1/responses` is narrow Responses websocket compatibility only |
+| OpenAI Responses request-shape rejections | `lib/codex_pooler/gateway/openai_compatibility/responses.ex`, `lib/codex_pooler/gateway/openai_compatibility/responses/input.ex`, `test/support/compatibility_matrix.ex`, `test/fixtures/openai_compatibility/sdk_shapes/MATRIX.md`, `test/codex_pooler/gateway/openai_compatibility/core_test.exs`, `test/codex_pooler_web/controllers/v1/responses_controller_test.exs`, `test/codex_pooler_web/controllers/v1/chat_completions_controller_test.exs` | OpenAI Responses remote MCP tool definitions are rejected before upstream dispatch in both top-level `tools` and nested `additional_tools.tools` locations |
 | Unsupported `/v1` routes | `lib/codex_pooler_web/controllers/v1/unsupported_routes.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/controllers/v1/route_auth_test.exs`, `test/codex_pooler_web/controllers/runtime/compatibility_contract_test.exs` | Explicit unsupported `/v1` routes return deterministic OpenAI-shaped unsupported endpoint errors before gateway dispatch |
 | Realtime exclusion | `lib/codex_pooler_web/router.ex`, `test/support/compatibility_matrix.ex`, `test/codex_pooler_web/route_surface_test.exs`, `test/codex_pooler_web/controllers/v1/route_auth_test.exs` | `/v1/realtime` and OpenAI Realtime SDK websocket or session routes are not supported |
 | MCP endpoint | `lib/codex_pooler_web/router.ex`, `test/codex_pooler_web/route_surface_test.exs`, `test/codex_pooler_web/controllers/mcp_contract_test.exs`, `test/codex_pooler_web/controllers/mcp_controller_test.exs` | `/mcp` is a root metadata-only, read-only operator endpoint using operator MCP bearer tokens, not Pool API keys or browser sessions |

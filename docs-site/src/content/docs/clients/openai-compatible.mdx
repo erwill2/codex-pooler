@@ -17,7 +17,7 @@ For a short citable summary, see [OpenAI-compatible Codex gateway](/discovery/op
 
 ## What OpenAI-Compatible Means Here
 
-OpenAI-compatible means selected SDK request shapes can use a `/v1` base URL and a Pool API key. Codex Pooler still routes the request through Codex account Pools, not through a separate OpenAI engine. Unsupported OpenAI API areas remain unsupported, including embeddings, batches, fine-tuning, moderation, response retrieve/cancel/delete, image variations, and OpenAI Realtime SDK routes.
+OpenAI-compatible means selected SDK request shapes can use a `/v1` base URL and a Pool API key. Codex Pooler still routes the request through Codex account Pools, not through a separate OpenAI engine. Unsupported OpenAI API areas remain unsupported, including embeddings, batches, fine-tuning, moderation, response retrieve/cancel/delete, image variations, OpenAI Responses remote MCP tool definitions, and OpenAI Realtime SDK routes.
 
 ## Base URL and authentication
 
@@ -127,6 +127,8 @@ The `/v1` surface is compatibility over Codex routing, not a separate OpenAI eng
 
 `POST /v1/responses` lifts system and developer input-message text into top-level `instructions` before dispatching to Codex-compatible work. Streaming `/v1/responses` and `/v1/chat/completions` return early upstream terminal errors as the first public SSE event or data chunk, without synthetic assistant/success prefixes. Non-streaming failures remain OpenAI-shaped JSON errors.
 
+Accepted `POST /v1/responses` tool definitions are narrow. OpenAI Responses remote MCP tool definitions are rejected before dispatch.
+
 ## Request compression behavior
 
 Per-Pool request compression can apply to `POST /v1/responses`, `POST /v1/chat/completions`, and narrow Responses websocket `response.create` traffic. It is transparent to SDK clients and does not require a client flag. Operators enable it with the Pool setting `request_compression_enabled`.
@@ -154,9 +156,13 @@ These `/v1` routes are unsupported and may return deterministic OpenAI-shaped un
 
 `GET /v1/responses` is narrow Responses websocket compatibility, not `/v1/realtime` support. OpenAI Realtime SDK websocket and session routes are not supported.
 
+Within `POST /v1/responses`, OpenAI Responses remote MCP tool definitions are unsupported. A top-level `tools` entry with `type: "mcp"`, or an `input` item with `type: "additional_tools"` whose `tools` list contains `type: "mcp"`, is rejected before upstream dispatch with an OpenAI-shaped `invalid_request` error.
+
 ## MCP stays separate
 
 The operator MCP endpoint is rooted at `/mcp`, not under `/v1`. It uses operator-owned MCP bearer tokens and returns metadata only.
+
+The root `/mcp` endpoint is not a `/v1/responses` remote MCP bridge and is not invoked by Responses `tools[type=mcp]` definitions.
 
 ```text
 MCP URL:

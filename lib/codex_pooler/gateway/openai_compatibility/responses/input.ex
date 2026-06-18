@@ -520,10 +520,16 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
   defp validate_additional_tools_role(_role),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
-  defp validate_additional_tools_tools(tools) when is_list(tools), do: :ok
+  defp validate_additional_tools_tools(tools) when is_list(tools),
+    do: validate_each(tools, &validate_additional_tool/1)
 
   defp validate_additional_tools_tools(_tools),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_additional_tool(%{"type" => "mcp"}),
+    do: {:error, Error.invalid_request("remote MCP tools are not supported", "input")}
+
+  defp validate_additional_tool(_tool), do: :ok
 
   defp validate_item_reference(%{"id" => id} = item, payload) when is_binary(id) do
     cond do

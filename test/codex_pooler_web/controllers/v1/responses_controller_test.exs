@@ -1260,6 +1260,53 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
+  test "POST /v1/responses rejects remote MCP tool definitions before dispatch", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    mcp_tool = %{
+      "type" => "mcp",
+      "server_label" => "fixture-mcp",
+      "tunnel_id" => "mcp_tunnel_fixture"
+    }
+
+    cases = [
+      {%{"tools" => [mcp_tool]}, "tools"},
+      {%{
+         "input" => [
+           %{
+             "type" => "additional_tools",
+             "role" => "developer",
+             "tools" => [mcp_tool]
+           }
+         ]
+       }, "input"}
+    ]
+
+    Enum.each(cases, fn {payload_update, expected_param} ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/v1/responses",
+          payload_update
+          |> Map.put_new("input", "synthetic remote MCP request")
+          |> Map.put("model", setup.model.exposed_model_id)
+        )
+
+      assert %{"error" => error} = json_response(response, 400)
+      assert error["type"] == "invalid_request_error"
+      assert error["code"] == "invalid_request"
+      assert error["message"] == "remote MCP tools are not supported"
+      assert error["param"] == expected_param
+    end)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
   test "POST /v1/responses rejects malformed instruction-role content before dispatch", %{
     conn: conn
   } do

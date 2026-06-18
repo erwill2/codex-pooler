@@ -1123,6 +1123,21 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
            }
          ]
        }, "invalid_request", "input", nil},
+      {%{
+         "input" => [
+           %{
+             "type" => "additional_tools",
+             "role" => "developer",
+             "tools" => [
+               %{
+                 "type" => "mcp",
+                 "server_label" => "fixture-mcp",
+                 "tunnel_id" => "mcp_tunnel_fixture"
+               }
+             ]
+           }
+         ]
+       }, "invalid_request", "input", "remote MCP tools are not supported"},
       {%{"input" => "synthetic fallback input", "additional_tools" => []},
        "unsupported_parameter", "additional_tools", "Unsupported parameter: additional_tools"}
     ]

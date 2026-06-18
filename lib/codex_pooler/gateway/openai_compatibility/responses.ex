@@ -330,6 +330,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
     end
   end
 
+  defp validate_tool(%{"type" => "mcp"}),
+    do: {:error, Error.invalid_request("remote MCP tools are not supported", "tools")}
+
   defp validate_tool(%{"namespace" => _namespace}),
     do: {:error, Error.invalid_request("tool shape is not translatable", "tools")}
 

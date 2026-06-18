@@ -309,7 +309,7 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td><code>/backend-api/codex/responses</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>OpenAI Responses payloads are coerced to Codex-compatible work. System/developer input-message text is lifted into top-level instructions. Streaming responses use the public Responses stream adapter, and early terminal errors emit first without synthetic success prefixes.</td>
+      <td>OpenAI Responses payloads are coerced to Codex-compatible work. System/developer input-message text is lifted into top-level instructions. Remote MCP tool definitions are rejected before dispatch. Streaming responses use the public Responses stream adapter, and early terminal errors emit first without synthetic success prefixes.</td>
     </tr>
     <tr>
       <td><code>GET /v1/responses</code></td>
@@ -402,6 +402,13 @@ upstream dispatch for backend Responses HTTP, backend Responses websocket
 limited to function tools, including nested function tools inside accepted
 namespace tools. Strict function tools and strict structured-output schemas stay
 on the strict validation path and are not made looser.
+
+### Unsupported `/v1` Responses request shapes
+
+These `POST /v1/responses` request shapes return OpenAI-shaped `invalid_request` before gateway dispatch, not `unsupported_endpoint`:
+
+- top-level `tools[].type = "mcp"`
+- nested `input[].type = "additional_tools"` with `tools[].type = "mcp"`
 
 ### Routed but unsupported `/v1` endpoints
 
@@ -518,6 +525,8 @@ The operator MCP endpoint is rooted at `/mcp`, not under `/backend-api` or `/v1`
 MCP uses operator-owned bearer MCP tokens. It doesn't accept Pool API keys, browser sessions, cookies, query tokens, invite tokens, upstream tokens, or custom headers as authentication.
 
 MCP output is metadata-only and scoped by the operator's owner or assigned-Pool visibility. It is an operator inspection endpoint, not a runtime client endpoint.
+
+The root `/mcp` operator endpoint is not a bridge for `/v1/responses` remote MCP tools.
 
 ## Prompt-cache and continuity boundaries
 

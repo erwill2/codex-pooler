@@ -1298,6 +1298,8 @@ translated into Codex-compatible calls, then routed through the same Pool rules,
 limit checks, accounting, and account selection path. `/v1/realtime` and OpenAI
 Realtime SDK websocket or session routes are not supported.
 
+OpenAI Responses remote MCP tool definitions such as top-level tools[type=mcp] and nested additional_tools tools[type=mcp] are rejected before upstream dispatch; use client-side MCP configuration or Codex Pooler's separate /mcp operator endpoint for metadata tooling.
+
 Public `/v1` responses preserve client-facing OpenAI shapes where possible:
 
 - `/v1/chat/completions` returns content-filter stops as

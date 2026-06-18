@@ -205,6 +205,8 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert responses_chat.contract =~ "never merged into executable tools"
       assert responses_chat.contract =~ "never used to satisfy tool_choice"
       assert responses_chat.contract =~ "truncation accepts auto and disabled locally"
+      assert responses_chat.contract =~ "remote MCP tool definitions"
+      assert responses_chat.contract =~ "additional_tools.tools"
       assert responses_chat.contract =~ "not forwarded upstream"
 
       assert responses_chat.contract =~
@@ -230,13 +232,23 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
         role: "developer",
         executable: false,
         merges_into_tools: false,
-        satisfies_tool_choice: false
+        satisfies_tool_choice: false,
+        unsupported_nested_tool_types: ["mcp"]
+      }
+
+      expected_remote_mcp_tools = %{
+        supported: false,
+        locations: ["tools", "input.additional_tools.tools"],
+        error_code: "invalid_request",
+        dispatch: false
       }
 
       assert responses_fixture.chat_input_fallback == expected_chat_fallback
       assert v1_fixture.chat_input_fallback == expected_chat_fallback
       assert responses_fixture.additional_tools_input_item == expected_additional_tools
       assert v1_fixture.additional_tools_input_item == expected_additional_tools
+      assert responses_fixture.remote_mcp_tools == expected_remote_mcp_tools
+      assert v1_fixture.remote_mcp_tools == expected_remote_mcp_tools
 
       assert responses_fixture.responses_truncation == %{
                accepted_values: ["auto", "disabled"],
