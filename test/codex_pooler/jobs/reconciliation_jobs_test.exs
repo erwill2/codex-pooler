@@ -332,6 +332,442 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert window.observed_at == DateTime.truncate(stale_observed_at, :microsecond)
     end
 
+    test "reuses fresh persisted quota when live usage is temporarily unavailable" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/codex/usage" => {404, %{"error" => "missing"}},
+             "/wham/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/wham/usage" => {404, %{"error" => "missing"}}
+           }}
+        )
+
+      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, [_primary_5h, _weekly_secondary]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   used_percent: Decimal.new("47"),
+                   reset_at: DateTime.add(observed_at, 3_600, :second),
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 },
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "secondary",
+                   window_minutes: 10_080,
+                   used_percent: Decimal.new("12"),
+                   reset_at: DateTime.add(observed_at, 3_600, :second),
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :succeeded
+      assert result.quota.status == :succeeded
+      assert result.quota.code == "quota_reused_fresh"
+      assert result.quota.details["window_count"] == 1
+
+      windows = QuotaWindows.list_quota_windows(identity)
+      assert length(windows) == 2
+      assert Enum.all?(windows, &(&1.observed_at == observed_at))
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/api/codex/usage",
+               "/backend-api/codex/usage",
+               "/wham/usage",
+               "/backend-api/wham/usage"
+             ]
+    end
+
+    test "reuses fresh persisted monthly account primary quota when live usage is unavailable" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/codex/usage" => {404, %{"error" => "missing"}},
+             "/wham/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/wham/usage" => {404, %{"error" => "missing"}}
+           }}
+        )
+
+      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, [_monthly_primary, _weekly_secondary]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 43_200,
+                   used_percent: Decimal.new("47"),
+                   reset_at: DateTime.add(observed_at, 86_400, :second),
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 },
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "secondary",
+                   window_minutes: 10_080,
+                   used_percent: Decimal.new("12"),
+                   reset_at: DateTime.add(observed_at, 3_600, :second),
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :succeeded
+      assert result.quota.status == :succeeded
+      assert result.quota.code == "quota_reused_fresh"
+      assert result.quota.details["window_count"] == 1
+
+      windows = QuotaWindows.list_quota_windows(identity)
+      assert length(windows) == 2
+      assert Enum.all?(windows, &(&1.observed_at == observed_at))
+    end
+
+    test "scheduled worker completes by reusing fresh persisted 5h and monthly quota when live usage is unavailable" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      for window_attrs <- [
+            persisted_account_primary_window_attrs(observed_at, %{window_minutes: 300}),
+            persisted_account_primary_window_attrs(observed_at, %{
+              window_minutes: 43_200,
+              reset_at: DateTime.add(observed_at, 86_400, :second)
+            })
+          ] do
+        upstream = start_upstream(unavailable_usage_paths())
+
+        {pool, assignment} =
+          active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+        identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+        persist_quota_windows!(identity, [window_attrs])
+
+        assert {:ok, job} =
+                 Jobs.enqueue_account_reconciliation(pool, assignment, trigger_kind: "scheduled")
+
+        assert %{success: 1, discard: 0} = Oban.drain_queue(queue: :jobs)
+
+        completed_job = Repo.get!(Oban.Job, job.id)
+        assert completed_job.state == "completed"
+        assert completed_job.errors == []
+
+        assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+        assert assignment.metadata["quota_priming"]["status"] == "known"
+        assert assignment.metadata["last_reconciliation"]["status"] == "succeeded"
+
+        assert [
+                 %{
+                   "status" => "succeeded",
+                   "code" => "quota_reused_fresh",
+                   "details" => %{"window_count" => 1}
+                 }
+               ] =
+                 Enum.filter(
+                   assignment.metadata["last_reconciliation"]["steps"],
+                   &(&1["code"] == "quota_reused_fresh")
+                 )
+
+        assert [window] = QuotaWindows.list_quota_windows(identity)
+        assert window.observed_at == observed_at
+
+        assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+                 "/api/codex/usage",
+                 "/backend-api/codex/usage",
+                 "/wham/usage",
+                 "/backend-api/wham/usage"
+               ]
+      end
+    end
+
+    test "does not reuse unknown-duration persisted account primary quota when live usage is unavailable" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/codex/usage" => {404, %{"error" => "missing"}},
+             "/wham/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/wham/usage" => {404, %{"error" => "missing"}}
+           }}
+        )
+
+      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 60,
+                   used_percent: Decimal.new("47"),
+                   reset_at: DateTime.add(observed_at, 3_600, :second),
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :partial
+      assert result.quota.status == :failed
+      assert result.quota.code == "quota_refresh_unavailable"
+
+      [window] = QuotaWindows.list_quota_windows(identity)
+      assert window.observed_at == observed_at
+    end
+
+    test "does not reuse fresh persisted model-scoped quota when live usage is unavailable" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/codex/usage" => {404, %{"error" => "missing"}},
+             "/wham/usage" => {404, %{"error" => "missing"}},
+             "/backend-api/wham/usage" => {404, %{"error" => "missing"}}
+           }}
+        )
+
+      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "sample-codex-spark",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "sample-codex-spark",
+                   upstream_model: "sample-codex-spark-upstream",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   used_percent: Decimal.new("47"),
+                   reset_at: DateTime.add(observed_at, 3_600, :second),
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :partial
+      assert result.quota.status == :failed
+      assert result.quota.code == "quota_refresh_unavailable"
+
+      [window] = QuotaWindows.list_quota_windows(identity)
+      assert window.observed_at == observed_at
+    end
+
+    test "does not reuse fresh persisted quota when live usage returns 429" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {429, %{"error" => "rate_limited"}}
+           }}
+        )
+
+      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   used_percent: Decimal.new("47"),
+                   reset_at: DateTime.add(observed_at, 3_600, :second),
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :partial
+      assert result.quota.status == :failed
+      assert result.quota.code == "quota_refresh_unavailable"
+
+      [window] = QuotaWindows.list_quota_windows(identity)
+      assert window.observed_at == observed_at
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == ["/api/codex/usage"]
+    end
+
+    test "scheduled worker does not reuse stale expired resetless exhausted or weekly-only persisted quota" do
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      scenarios = [
+        {"stale",
+         persisted_account_primary_window_attrs(DateTime.add(now, -3_600, :second), %{
+           reset_at: DateTime.add(now, 3_600, :second)
+         })},
+        {"expired",
+         persisted_account_primary_window_attrs(now, %{
+           reset_at: DateTime.add(now, -60, :second)
+         })},
+        {"resetless", persisted_account_primary_window_attrs(now, %{reset_at: nil})},
+        {"exhausted",
+         persisted_account_primary_window_attrs(now, %{used_percent: Decimal.new("100")})},
+        {"weekly_only",
+         persisted_account_primary_window_attrs(now, %{
+           window_kind: "secondary",
+           window_minutes: 10_080,
+           quota_family: "account"
+         })}
+      ]
+
+      for {_name, window_attrs} <- scenarios do
+        upstream = start_upstream(unavailable_usage_paths())
+
+        {pool, assignment} =
+          active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+        identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+        persist_quota_windows!(identity, [window_attrs])
+
+        assert_scheduled_worker_quota_failure(pool, assignment, "quota_refresh_unavailable")
+
+        [window] = QuotaWindows.list_quota_windows(identity)
+        assert window.observed_at == window_attrs.observed_at
+      end
+    end
+
+    test "scheduled worker does not reuse unknown-duration primary or model-scoped persisted quota" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      scenarios = [
+        {"unknown_duration",
+         persisted_account_primary_window_attrs(observed_at, %{window_minutes: 60})},
+        {"model_scoped",
+         persisted_account_primary_window_attrs(observed_at, %{
+           quota_key: "sample-codex-spark",
+           quota_scope: "model",
+           quota_family: "codex_model",
+           model: "sample-codex-spark",
+           upstream_model: "sample-codex-spark-upstream"
+         })}
+      ]
+
+      for {_name, window_attrs} <- scenarios do
+        upstream = start_upstream(unavailable_usage_paths())
+
+        {pool, assignment} =
+          active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+        identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+        persist_quota_windows!(identity, [window_attrs])
+
+        assert_scheduled_worker_quota_failure(pool, assignment, "quota_refresh_unavailable")
+
+        [window] = QuotaWindows.list_quota_windows(identity)
+        assert window.observed_at == observed_at
+      end
+    end
+
+    test "scheduled worker does not reuse fresh persisted quota after auth rejection 401 or 403" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      future_expiry = observed_at |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+
+      for status <- [401, 403] do
+        upstream =
+          start_upstream(
+            {:path_json, %{"/api/codex/usage" => {status, %{"error" => "rejected"}}}}
+          )
+
+        {pool, assignment} =
+          active_assignment_fixture(
+            %{"base_url" => FakeUpstream.url(upstream)},
+            identity_metadata: %{
+              "base_url" => FakeUpstream.url(upstream),
+              "access_token_expires_at" => future_expiry
+            }
+          )
+
+        identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+        persist_quota_windows!(identity, [persisted_account_primary_window_attrs(observed_at)])
+
+        assert_scheduled_worker_quota_failure(pool, assignment, "quota_refresh_unavailable")
+
+        [window] = QuotaWindows.list_quota_windows(identity)
+        assert window.observed_at == observed_at
+        assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == ["/api/codex/usage"]
+      end
+    end
+
+    test "scheduled worker does not reuse fresh persisted quota after 429" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {429, %{"error" => "rate_limited"}}
+           }}
+        )
+
+      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+      persist_quota_windows!(identity, [persisted_account_primary_window_attrs(observed_at)])
+
+      assert_scheduled_worker_quota_failure(pool, assignment, "quota_refresh_unavailable")
+
+      [window] = QuotaWindows.list_quota_windows(identity)
+      assert window.observed_at == observed_at
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == ["/api/codex/usage"]
+    end
+
     test "does not refresh OAuth or disable routing when usage rejects a fresh access token" do
       access_token = "token-access-fresh-usage-rejected-do-not-leak"
       refresh_token = "token-refresh-fresh-usage-rejected-do-not-leak"
@@ -363,6 +799,22 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         )
 
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   used_percent: Decimal.new("47"),
+                   reset_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh"
+                 }
+               ])
 
       assert {:ok, _secret} =
                Upstreams.store_encrypted_secret(identity, %{
@@ -403,7 +855,8 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       end
     end
 
-    test "transient account reconciliation token refresh failure enqueues token refresh recovery" do
+    test "transient account reconciliation token refresh failure does not reuse persisted quota" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       access_token = "token-access-reconciliation-recovery-do-not-leak"
       refresh_token = "token-refresh-reconciliation-recovery-do-not-leak"
       provider_body = "raw-provider-body-reconciliation-recovery-do-not-leak"
@@ -425,6 +878,8 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         )
 
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      persist_quota_windows!(identity, [persisted_account_primary_window_attrs(observed_at)])
 
       assert {:ok, _secret} =
                Upstreams.store_encrypted_secret(identity, %{
@@ -449,9 +904,21 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
       last_reconciliation = assignment.metadata["last_reconciliation"]
       assert last_reconciliation["status"] == "partial"
+      assert assignment.metadata["quota_priming"]["status"] == "failed"
+
+      assert assignment.metadata["quota_priming"]["reason"]["code"] ==
+               "quota_refresh_auth_unavailable"
 
       assert [%{"code" => "quota_refresh_auth_unavailable"}] =
                Enum.filter(last_reconciliation["steps"], &(&1["status"] == "failed"))
+
+      refute Enum.any?(
+               last_reconciliation["steps"],
+               &(&1["code"] == "quota_reused_fresh")
+             )
+
+      assert [window] = QuotaWindows.list_quota_windows(identity)
+      assert window.observed_at == observed_at
 
       assert [recovery_job] = incomplete_token_refresh_jobs(identity.id)
 
@@ -822,6 +1289,66 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   end
 
   defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
+
+  defp unavailable_usage_paths(status \\ 404, body \\ %{"error" => "missing"}) do
+    {:path_json,
+     %{
+       "/api/codex/usage" => {status, body},
+       "/backend-api/codex/usage" => {status, body},
+       "/wham/usage" => {status, body},
+       "/backend-api/wham/usage" => {status, body}
+     }}
+  end
+
+  defp persisted_account_primary_window_attrs(observed_at, overrides \\ %{}) do
+    Map.merge(
+      %{
+        quota_key: "account",
+        quota_scope: "account",
+        quota_family: "account",
+        window_kind: "primary",
+        window_minutes: 300,
+        used_percent: Decimal.new("47"),
+        reset_at: DateTime.add(DateTime.utc_now(), 3_600, :second),
+        source: "codex_usage_api",
+        source_precision: "observed",
+        freshness_state: "fresh",
+        observed_at: observed_at
+      },
+      overrides
+    )
+  end
+
+  defp persist_quota_windows!(identity, window_attrs) do
+    assert {:ok, windows} = QuotaWindows.upsert_quota_windows(identity, window_attrs)
+    windows
+  end
+
+  defp assert_scheduled_worker_quota_failure(pool, assignment, expected_code) do
+    assert {:ok, job} =
+             Jobs.enqueue_account_reconciliation(pool, assignment, trigger_kind: "scheduled")
+
+    assert %{discard: 1, success: 0} = Oban.drain_queue(queue: :jobs)
+
+    discarded_job = Repo.get!(Oban.Job, job.id)
+    assert discarded_job.state == "discarded"
+    assert discarded_job.max_attempts == 1
+    assert [%{"error" => error}] = discarded_job.errors
+    assert error =~ "account reconciliation partial: #{expected_code}"
+
+    assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+    assert assignment.metadata["last_reconciliation"]["status"] == "partial"
+    assert assignment.metadata["quota_priming"]["status"] == "failed"
+    assert assignment.metadata["quota_priming"]["reason"]["code"] == expected_code
+
+    assert [%{"code" => ^expected_code, "status" => "failed"}] =
+             Enum.filter(
+               assignment.metadata["last_reconciliation"]["steps"],
+               &(&1["status"] == "failed")
+             )
+
+    discarded_job
+  end
 
   defp active_assignment_fixture(metadata, opts \\ []) do
     pool = pool_fixture()

@@ -5,6 +5,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
   alias CodexPooler.Jobs
   alias CodexPooler.Pools.Pool
+  alias CodexPooler.Quotas.WindowClassifier
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Auth.TokenRefresh
   alias CodexPooler.Upstreams.EndpointMetadata
@@ -18,6 +19,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   @eligible PoolUpstreamAssignment.eligible_status()
   @health_active PoolUpstreamAssignment.active_health_status()
   @account_quota_key "account"
+  @fallback_denied_usage_statuses [401, 403, 429, :auth_rejected]
   @usage_auth_refresh_skew_seconds 5 * 60
   @codex_usage_paths [
     "/api/codex/usage",
@@ -131,6 +133,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
       :usage_unavailable ->
         step_result(:failed, "quota_refresh_unavailable", "quota windows were not available")
 
+      {:persisted_windows, windows} ->
+        step_result(:succeeded, "quota_reused_fresh", "fresh quota windows reused", %{
+          "window_count" => length(windows)
+        })
+
       {:windows, windows, identity_attrs} ->
         upsert_reconciliation_quota(identity, windows, identity_attrs, nil)
 
@@ -153,7 +160,9 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         {:windows, windows, %{}}
 
       true ->
-        codex_usage_quota_windows(identity, assignment, opts)
+        identity
+        |> codex_usage_quota_windows(assignment, opts)
+        |> maybe_reuse_persisted_quota_windows(identity)
     end
   end
 
@@ -208,8 +217,8 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         {:error, {:upstream_status, status}} when status in [401, 403] ->
           maybe_retry_codex_usage_after_token_refresh(identity, assignment, observed_at, opts)
 
-        _error ->
-          :usage_unavailable
+        {:error, reason} ->
+          {:usage_unavailable, reason}
       end
     else
       _unavailable -> :auth_unavailable
@@ -220,8 +229,37 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     if access_token_refresh_due_after_usage_auth_failure?(identity, observed_at) do
       retry_codex_usage_after_token_refresh(identity, assignment, opts)
     else
+      {:usage_unavailable, {:upstream_status, :auth_rejected}}
+    end
+  end
+
+  defp maybe_reuse_persisted_quota_windows(
+         {:usage_unavailable, {:upstream_status, status}},
+         _identity
+       )
+       when status in @fallback_denied_usage_statuses,
+       do: :usage_unavailable
+
+  defp maybe_reuse_persisted_quota_windows({:usage_unavailable, _reason}, identity) do
+    timestamp = now()
+
+    windows =
+      identity
+      |> Quota.Windows.list_quota_windows()
+      |> Enum.filter(&reusable_persisted_quota_window?(&1, timestamp))
+
+    if windows != [] do
+      {:persisted_windows, windows}
+    else
       :usage_unavailable
     end
+  end
+
+  defp maybe_reuse_persisted_quota_windows(result, _identity), do: result
+
+  defp reusable_persisted_quota_window?(window, timestamp) do
+    (WindowClassifier.primary_5h?(window) or WindowClassifier.monthly_primary?(window)) and
+      Quota.Windows.usable_window?(window, timestamp)
   end
 
   defp access_token_refresh_due_after_usage_auth_failure?(
