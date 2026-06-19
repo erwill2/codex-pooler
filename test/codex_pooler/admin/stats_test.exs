@@ -14,6 +14,7 @@ defmodule CodexPooler.Admin.StatsTest do
   alias CodexPooler.Jobs
   alias CodexPooler.Jobs.RuntimeStateCleanupWorker
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Assignments.PoolAssignments
 
   test "build_dashboard/2 returns pool-scoped KPI, table, chart, session, and quota aggregates" do
     scope = owner_scope()
@@ -185,6 +186,91 @@ defmodule CodexPooler.Admin.StatsTest do
              %{assignment_label: "High upstream", total_tokens: 90},
              %{assignment_label: "Low upstream", total_tokens: 10}
            ] = dashboard.tables.upstreams
+  end
+
+  test "build_dashboard/2 collapses repeated assignments for the same upstream identity" do
+    scope = owner_scope()
+    first_pool = pool_fixture(%{slug: "stats-shared-upstream-a", name: "Stats Shared A"})
+    second_pool = pool_fixture(%{slug: "stats-shared-upstream-b", name: "Stats Shared B"})
+    third_pool = pool_fixture(%{slug: "stats-shared-label", name: "Stats Shared Label"})
+    %{api_key: first_api_key} = active_api_key_fixture(first_pool)
+    %{api_key: second_api_key} = active_api_key_fixture(second_pool)
+    %{api_key: third_api_key} = active_api_key_fixture(third_pool)
+
+    %{identity: shared_identity, assignment: first_assignment} =
+      upstream_assignment_fixture(first_pool, %{
+        account_label: "Shared account",
+        assignment_label: "Pool A custom label"
+      })
+
+    assert {:ok, second_assignment} =
+             PoolAssignments.create_pool_assignment(second_pool, shared_identity, %{
+               assignment_label: "Pool B custom label",
+               status: "active",
+               health_status: "active",
+               eligibility_status: "eligible"
+             })
+
+    %{identity: same_label_identity, assignment: same_label_assignment} =
+      upstream_assignment_fixture(third_pool, %{
+        account_label: "Shared account",
+        assignment_label: "Pool A custom label"
+      })
+
+    as_of = ~U[2026-01-10 12:00:00.000000Z]
+    occurred_at = ~U[2026-01-10 11:30:00.000000Z]
+
+    insert_timed_usage!(
+      first_pool,
+      first_api_key,
+      first_assignment,
+      shared_identity,
+      occurred_at,
+      40
+    )
+
+    insert_timed_usage!(
+      second_pool,
+      second_api_key,
+      second_assignment,
+      shared_identity,
+      occurred_at,
+      60
+    )
+
+    insert_timed_usage!(
+      third_pool,
+      third_api_key,
+      same_label_assignment,
+      same_label_identity,
+      occurred_at,
+      25
+    )
+
+    assert {:ok, dashboard} = Stats.build_dashboard(scope, %{window: "1h", as_of: as_of})
+
+    assert [
+             %{
+               upstream_identity_id: shared_identity_id,
+               assignment_label: nil,
+               upstream_label: "Shared account",
+               status: "active",
+               assignment_count: 2,
+               requests: 2,
+               total_tokens: 100
+             },
+             %{
+               upstream_identity_id: same_label_identity_id,
+               assignment_label: "Pool A custom label",
+               upstream_label: "Shared account",
+               assignment_count: 1,
+               requests: 1,
+               total_tokens: 25
+             }
+           ] = dashboard.tables.upstreams
+
+    assert shared_identity_id == shared_identity.id
+    assert same_label_identity_id == same_label_identity.id
   end
 
   test "build_dashboard/2 returns hourly model usage top five plus Other for sub-day windows" do
