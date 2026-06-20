@@ -2438,7 +2438,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
             "input" => "sensitive transport body"
           })
 
-        assert %{"error" => %{"code" => "upstream_request_failed"}} = json_response(conn, 502)
+        public_payload = json_response(conn, 502)
+
+        assert %{"error" => %{"code" => "upstream_request_failed", "message" => message}} =
+                 public_payload
+
+        assert message == "upstream request failed"
+        refute inspect(public_payload) =~ "transport_failure"
+        refute inspect(public_payload) =~ "Req.TransportError"
       end)
 
     assert logs =~ "gateway upstream transport failed"
@@ -2465,6 +2472,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert attempt.network_error_code == "upstream_network_error"
     assert attempt.usage_status == "usage_unknown"
     assert attempt.response_metadata["error_code"] == "upstream_network_error"
+
+    assert_safe_transport_failure_metadata!(attempt, [
+      "sensitive transport body",
+      "upstream-token",
+      "authorization"
+    ])
+
     refute inspect(attempt.response_metadata) =~ "sensitive transport body"
   end
 
@@ -2501,7 +2515,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
             "input" => "sensitive protocol body"
           })
 
-        assert %{"error" => %{"code" => "upstream_request_failed"}} = json_response(conn, 502)
+        public_payload = json_response(conn, 502)
+
+        assert %{"error" => %{"code" => "upstream_request_failed", "message" => message}} =
+                 public_payload
+
+        assert message == "upstream request failed"
+        refute inspect(public_payload) =~ "transport_failure"
+        refute inspect(public_payload) =~ "Req.HTTPError"
+        refute inspect(public_payload) =~ "invalid_content_length_header"
       end)
 
     assert_receive {^served_ref, :served}, 1_000
@@ -2530,7 +2552,123 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert attempt.network_error_code == "upstream_network_error"
     assert attempt.usage_status == "usage_unknown"
     assert attempt.response_metadata["error_code"] == "upstream_network_error"
+
+    assert_transport_failure_metadata!(attempt, %{
+      "exception" => "Req.HTTPError",
+      "phase" => "request",
+      "reason" => "invalid_content_length_header",
+      "reason_class" => "Req.HTTPError"
+    })
+
+    assert_safe_transport_failure_metadata!(attempt, [
+      "sensitive protocol body",
+      "upstream-token",
+      "authorization"
+    ])
+
     refute inspect(attempt.response_metadata) =~ "sensitive protocol body"
+  end
+
+  test "POST /backend-api/codex/responses persists retryable transport diagnostics after fallback success",
+       %{conn: conn} do
+    first_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_transport_retry_should_not_run",
+          "object" => "response"
+        })
+      )
+
+    success_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_transport_retry_success",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(first_upstream)
+    {:ok, listen_socket} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+    {:ok, port} = :inet.port(listen_socket)
+    :ok = :gen_tcp.close(listen_socket)
+    closed_base_url = "http://127.0.0.1:#{port}"
+
+    assert {:ok, _identity} =
+             IdentityLifecycle.update_upstream_identity(setup.identity, %{
+               metadata: %{"base_url" => closed_base_url}
+             })
+
+    assert {:ok, _assignment} =
+             PoolAssignments.update_pool_assignment(setup.assignment, %{
+               metadata: %{"base_url" => closed_base_url}
+             })
+
+    success =
+      gateway_upstream(setup.pool, success_upstream, "upstream-token-transport-fallback",
+        compact?: false
+      )
+
+    prime_routing_quota!(success.identity)
+    use_routing_strategy!(setup.pool, "bridge_ring", 2)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, success.assignment])
+      )
+
+    request_id = seed_with_assignment_order([setup.assignment.id, success.assignment.id])
+
+    logs =
+      capture_log(fn ->
+        conn =
+          conn
+          |> put_req_header("x-request-id", request_id)
+          |> put_req_header("x-sensitive-header", "secret-header-value")
+          |> auth(setup)
+          |> post("/backend-api/codex/responses", %{
+            "model" => setup.model.exposed_model_id,
+            "input" => "retryable transport body token"
+          })
+
+        assert %{"id" => "resp_transport_retry_success"} = json_response(conn, 200)
+      end)
+
+    assert logs =~ "gateway upstream transport failed"
+    assert logs =~ "transport=http_json"
+    refute logs =~ "retryable transport body token"
+    refute logs =~ "secret-header-value"
+    assert FakeUpstream.count(first_upstream) == 0
+    assert FakeUpstream.count(success_upstream) == 1
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert first_attempt.status == "retryable_failed"
+    assert first_attempt.network_error_code == "upstream_network_error"
+    assert first_attempt.response_metadata["error_code"] == "upstream_network_error"
+
+    assert_safe_transport_failure_metadata!(first_attempt, [
+      "retryable transport body token",
+      "secret-header-value",
+      "upstream-token-transport-fallback",
+      "authorization"
+    ])
+
+    assert second_attempt.pool_upstream_assignment_id == success.assignment.id
+    assert second_attempt.status == "succeeded"
+    refute Map.has_key?(second_attempt.response_metadata, "transport_failure")
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.transport == "http_json"
+    assert request.retry_count == 1
+    assert request.last_error_code == nil
+    refute inspect(request.request_metadata) =~ "retryable transport body token"
+    refute inspect(request.request_metadata) =~ "secret-header-value"
   end
 
   test "POST /backend-api/codex/responses keeps pre-header receive timeout as network error" do
@@ -2575,6 +2713,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert attempt.status == "failed"
     assert attempt.network_error_code == "upstream_network_error"
     assert attempt.response_metadata["error_code"] == "upstream_network_error"
+    assert_safe_transport_failure_metadata!(attempt, ["pre-header timeout fixture"])
   end
 
   test "POST /backend-api/codex/responses keeps silent pre-first-event SSE stalls metadata-only" do
@@ -6095,6 +6234,27 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute logs =~ "authorization"
     assert FakeUpstream.count(first_upstream) == 1
     assert FakeUpstream.count(fallback_upstream) == 0
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.status == "retryable_failed"
+    assert first_attempt.network_error_code == "upstream_request_timeout"
+    refute Map.has_key?(first_attempt.response_metadata, "transport_failure")
+
+    assert second_attempt.status == "failed"
+    assert second_attempt.network_error_code == "upstream_network_error"
+
+    assert_safe_transport_failure_metadata!(second_attempt, [
+      "stream retry fallback dispatch error fixture",
+      "upstream-token",
+      "authorization"
+    ])
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "failed"
+    assert request.transport == "http_sse"
+    assert request.last_error_code == "upstream_network_error"
   end
 
   test "POST /backend-api/codex/responses finalizes reservation when all planned candidates reject at circuit begin",
@@ -7975,6 +8135,36 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert routing["bridge_candidate_id"] == assignment.id
     assert routing["bridge_candidate_rank"] == rank
     assert routing["upstream_identity_id"] == identity.id
+  end
+
+  defp assert_transport_failure_metadata!(attempt, expected) do
+    assert %{} = transport_failure = attempt.response_metadata["transport_failure"]
+
+    Enum.each(expected, fn {key, value} ->
+      assert transport_failure[key] == value
+    end)
+
+    transport_failure
+  end
+
+  defp assert_safe_transport_failure_metadata!(attempt, forbidden_values) do
+    transport_failure = assert_transport_failure_metadata!(attempt, %{"phase" => "request"})
+
+    assert is_binary(transport_failure["exception"])
+    assert is_binary(transport_failure["reason_class"])
+    assert Map.keys(transport_failure) -- transport_failure_metadata_keys() == []
+
+    metadata_text = inspect(transport_failure)
+
+    Enum.each(forbidden_values, fn forbidden ->
+      refute metadata_text =~ forbidden
+    end)
+
+    transport_failure
+  end
+
+  defp transport_failure_metadata_keys do
+    ~w(exception phase pre_visible_output reason reason_class terminal_seen text_frame_count)
   end
 
   defp assert_prompt_cache_locality_metadata_safe!(

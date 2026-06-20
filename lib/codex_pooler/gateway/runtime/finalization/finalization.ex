@@ -135,6 +135,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
         "error_code" => code,
         "message" => Metadata.safe_reason(reason)
       })
+      |> maybe_put_transport_failure_metadata(reason)
 
     with :ok <- record_dispatch_route_failure(code, context) do
       finalize_dispatch_error_after_route_failure(
@@ -416,6 +417,19 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   end
 
   defp compact_endpoint?(endpoint), do: endpoint == "/backend-api/codex/responses/compact"
+
+  @spec maybe_put_transport_failure_metadata(map(), term()) :: map()
+  defp maybe_put_transport_failure_metadata(metadata, %{transport_failure: transport_failure})
+       when is_map(transport_failure) and map_size(transport_failure) > 0 do
+    Map.put(metadata, "transport_failure", transport_failure)
+  end
+
+  defp maybe_put_transport_failure_metadata(metadata, %{"transport_failure" => transport_failure})
+       when is_map(transport_failure) and map_size(transport_failure) > 0 do
+    Map.put(metadata, "transport_failure", transport_failure)
+  end
+
+  defp maybe_put_transport_failure_metadata(metadata, _reason), do: metadata
 
   defp elapsed_ms(started), do: max(System.monotonic_time(:millisecond) - started, 0)
   defp dispatch_error_code(:invalid_upstream_base_url), do: "invalid_upstream_base_url"

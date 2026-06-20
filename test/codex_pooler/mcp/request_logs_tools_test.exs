@@ -165,7 +165,8 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
         codex_session_id: "session-example-1",
         codex_session_key: "session-key-example-1",
         request_error: "client_disconnected",
-        attempt_error: "owner_drained"
+        attempt_error: "owner_drained",
+        response_metadata: safe_transport_failure_metadata()
       })
 
     terminal_turn =
@@ -246,6 +247,9 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
            "expected request log item to include debug metadata"
 
     terminal_debug = terminal_item["debug"]
+    refute Map.has_key?(terminal_debug, "attempts")
+    refute inspect(terminal_debug) =~ "Mint.TransportError"
+    refute inspect(terminal_debug) =~ "closed"
 
     terminal_continuity = terminal_debug["continuity"]
     assert_ref_prefix(terminal_continuity["session_ref"], "session_")
@@ -793,7 +797,8 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
         codex_session_id: "session-example-1",
         codex_session_key: "session-key-example-1",
         request_error: "client_disconnected",
-        attempt_error: "owner_drained"
+        attempt_error: "owner_drained",
+        response_metadata: safe_transport_failure_metadata()
       })
 
     turn =
@@ -885,6 +890,15 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
              "upstream_status_code" => 499,
              "network_error_code" => "owner_drained",
              "latency_ms" => 321,
+             "transport_failure" => %{
+               "exception" => "Mint.TransportError",
+               "reason_class" => "Mint.TransportError",
+               "reason" => "closed",
+               "phase" => "request",
+               "pre_visible_output" => false,
+               "terminal_seen" => false,
+               "text_frame_count" => 0
+             },
              "final" => true
            }
 
@@ -894,6 +908,7 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert text =~ "terminal=terminal"
     assert text =~ "attempts=1"
     assert_no_debug_raw_session_values(result)
+    assert_output_omits_transport_failure_raw_values(result)
     assert :ok = Redaction.assert_mcp_output_safe!(result)
   end
 
@@ -917,7 +932,16 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
         request_error: "client_disconnected",
         attempt_error: "owner_drained",
         request_metadata: adversarial_debug_metadata(),
-        response_metadata: adversarial_debug_metadata(),
+        response_metadata:
+          Map.merge(adversarial_debug_metadata(), %{
+            "transport_failure" => %{
+              "exception" => "RuntimeError raw prompt: explain private data",
+              "reason_class" => "https://example.com/raw-debug-url",
+              "reason" => "Authorization: Bearer sk-example-secret",
+              "phase" => "request",
+              "stacktrace" => "raw stacktrace should stay hidden"
+            }
+          }),
         error_message: "raw prompt: explain private data"
       })
 
@@ -1830,6 +1854,23 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     }
   end
 
+  defp safe_transport_failure_metadata do
+    %{
+      "transport_failure" => %{
+        "exception" => "Mint.TransportError",
+        "reason_class" => "Mint.TransportError",
+        "reason" => "closed",
+        "phase" => "request",
+        "pre_visible_output" => false,
+        "terminal_seen" => false,
+        "text_frame_count" => 0,
+        "raw_detail" => "raw transport detail should stay hidden",
+        "raw_message" => "raw transport failure message should stay hidden",
+        "headers" => %{"authorization" => "Bearer sk-example-hidden"}
+      }
+    }
+  end
+
   defp assert_debug_fields_present(debug, :list) do
     assert is_map(debug)
     assert is_map(debug["continuity"])
@@ -1864,13 +1905,23 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     end
   end
 
+  defp assert_output_omits_transport_failure_raw_values(result) do
+    inspected = inspect(result)
+
+    refute inspected =~ "raw transport failure message should stay hidden"
+    refute inspected =~ "raw transport detail should stay hidden"
+    refute inspected =~ "Bearer sk-example-hidden"
+  end
+
   defp adversarial_forbidden_strings do
     [
       "Authorization: Bearer sk-example-secret",
       "Cookie: session=secret-cookie",
       "raw prompt: explain private data",
       "idempotency_key=idem-secret-123",
-      ~s({"type":"response.output_text.delta","delta":"secret frame"})
+      ~s({"type":"response.output_text.delta","delta":"secret frame"}),
+      "https://example.com/raw-debug-url",
+      "raw stacktrace should stay hidden"
     ]
   end
 

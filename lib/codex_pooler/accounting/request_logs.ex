@@ -24,6 +24,17 @@ defmodule CodexPooler.Accounting.RequestLogs do
 
   @proxy_control_route_class RouteClass.proxy_control()
   @bounded_detail_attempts 10
+  @transport_failure_phases ~w(
+    connect
+    decode
+    receive
+    receive_timeout
+    request
+    send_control
+    send_payload
+    unexpected_frame
+    upstream_close
+  )
 
   @spec list(term(), keyword()) :: map()
   def list(pool_or_id, opts \\ []) do
@@ -388,6 +399,119 @@ defmodule CodexPooler.Accounting.RequestLogs do
       latency_ms: attempt.latency_ms,
       final: maybe_field(turn, :final_attempt_id) == attempt.id
     }
+    |> maybe_put_transport_failure(attempt)
+  end
+
+  @spec maybe_put_transport_failure(map(), Attempt.t()) :: map()
+  defp maybe_put_transport_failure(projection, %Attempt{} = attempt) do
+    case transport_failure_projection(attempt.response_metadata) do
+      transport_failure when map_size(transport_failure) > 0 ->
+        Map.put(projection, :transport_failure, transport_failure)
+
+      _transport_failure ->
+        projection
+    end
+  end
+
+  @spec transport_failure_projection(term()) :: map()
+  defp transport_failure_projection(response_metadata) do
+    response_metadata
+    |> Accounting.sanitize_metadata()
+    |> case do
+      %{"transport_failure" => transport_failure} when is_map(transport_failure) ->
+        transport_failure
+
+      %{transport_failure: transport_failure} when is_map(transport_failure) ->
+        transport_failure
+
+      _metadata ->
+        %{}
+    end
+    |> safe_transport_failure()
+  end
+
+  @spec safe_transport_failure(map()) :: map()
+  defp safe_transport_failure(transport_failure) when is_map(transport_failure) do
+    %{}
+    |> put_transport_failure_text(
+      :exception,
+      transport_failure_value(transport_failure, "exception")
+    )
+    |> put_transport_failure_text(
+      :reason_class,
+      transport_failure_value(transport_failure, "reason_class")
+    )
+    |> put_transport_failure_text(:reason, transport_failure_value(transport_failure, "reason"))
+    |> put_transport_failure_phase(transport_failure_value(transport_failure, "phase"))
+    |> put_transport_failure_boolean(
+      :pre_visible_output,
+      transport_failure_value(transport_failure, "pre_visible_output")
+    )
+    |> put_transport_failure_boolean(
+      :terminal_seen,
+      transport_failure_value(transport_failure, "terminal_seen")
+    )
+    |> put_transport_failure_integer(
+      :text_frame_count,
+      transport_failure_value(transport_failure, "text_frame_count")
+    )
+  end
+
+  @spec transport_failure_value(map(), String.t()) :: term()
+  defp transport_failure_value(map, key) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> value
+      :error -> Map.get(map, transport_failure_atom_key(key))
+    end
+  end
+
+  defp transport_failure_atom_key("exception"), do: :exception
+  defp transport_failure_atom_key("reason_class"), do: :reason_class
+  defp transport_failure_atom_key("reason"), do: :reason
+  defp transport_failure_atom_key("phase"), do: :phase
+  defp transport_failure_atom_key("pre_visible_output"), do: :pre_visible_output
+  defp transport_failure_atom_key("terminal_seen"), do: :terminal_seen
+  defp transport_failure_atom_key("text_frame_count"), do: :text_frame_count
+
+  defp put_transport_failure_text(metadata, key, value) when is_binary(value) do
+    value = String.trim(value)
+
+    if safe_transport_failure_text?(value) do
+      Map.put(metadata, key, value)
+    else
+      metadata
+    end
+  end
+
+  defp put_transport_failure_text(metadata, _key, _value), do: metadata
+
+  defp put_transport_failure_phase(metadata, phase) when is_binary(phase) do
+    phase = String.trim(phase)
+
+    if phase in @transport_failure_phases do
+      Map.put(metadata, :phase, phase)
+    else
+      metadata
+    end
+  end
+
+  defp put_transport_failure_phase(metadata, _phase), do: metadata
+
+  defp put_transport_failure_boolean(metadata, key, value) when is_boolean(value),
+    do: Map.put(metadata, key, value)
+
+  defp put_transport_failure_boolean(metadata, _key, _value), do: metadata
+
+  defp put_transport_failure_integer(metadata, key, value) when is_integer(value) and value >= 0,
+    do: Map.put(metadata, key, value)
+
+  defp put_transport_failure_integer(metadata, _key, _value), do: metadata
+
+  defp safe_transport_failure_text?(value) do
+    value != "" and byte_size(value) <= 96 and
+      Regex.match?(~r/^[A-Za-z0-9_.:-]+$/, value) and
+      not Regex.match?(~r/(?i)\bBearer\b|https?:\/\/|sk-[A-Za-z0-9_-]{8,}/, value) and
+      not Regex.match?(~r/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/, value)
   end
 
   defp metadata_session_id(metadata) when is_map(metadata) do

@@ -1871,7 +1871,21 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
       |> Ecto.Changeset.change(%{
         latency_ms: 321,
         network_error_code: "owner_drained",
-        error_message: "raw attempt error must not enter debug"
+        error_message: "raw attempt error must not enter debug",
+        response_metadata: %{
+          "transport_failure" => %{
+            "exception" => "Mint.TransportError",
+            "reason_class" => "Mint.TransportError",
+            "reason" => "closed",
+            "phase" => "request",
+            "pre_visible_output" => false,
+            "terminal_seen" => false,
+            "text_frame_count" => 0,
+            "raw_detail" => "raw transport detail should stay hidden",
+            "raw_message" => "raw prompt should stay hidden",
+            "headers" => %{"authorization" => "Bearer sk-example-hidden"}
+          }
+        }
       })
       |> Repo.update!()
 
@@ -1933,12 +1947,24 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
              upstream_status_code: 499,
              network_error_code: "owner_drained",
              latency_ms: 321,
+             transport_failure: %{
+               exception: "Mint.TransportError",
+               reason_class: "Mint.TransportError",
+               reason: "closed",
+               phase: "request",
+               pre_visible_output: false,
+               terminal_seen: false,
+               text_frame_count: 0
+             },
              final: true
            }
 
     refute inspect(log.debug) =~ "session-example-1"
     refute inspect(log.debug) =~ "session-key-example-1"
     refute inspect(log.debug) =~ "raw attempt error"
+    refute inspect(log.debug) =~ "raw transport detail should stay hidden"
+    refute inspect(log.debug) =~ "raw prompt should stay hidden"
+    refute inspect(log.debug) =~ "Bearer sk-example-hidden"
   end
 
   test "request log debug projection reports failed request with linked open turn as mismatch" do

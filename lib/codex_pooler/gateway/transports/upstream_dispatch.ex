@@ -164,7 +164,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       Mint.HTTPError
     ] ->
       log_upstream_transport_exception(exception, identity, opts)
-      {:error, upstream_transport_error()}
+      {:error, upstream_transport_error(exception)}
   end
 
   def http_request(%DispatchRequest{
@@ -209,7 +209,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
       Mint.HTTPError
     ] ->
       log_upstream_transport_exception(exception, identity, opts)
-      {:error, upstream_transport_error()}
+      {:error, upstream_transport_error(exception)}
   end
 
   @spec websocket_request(DispatchRequest.t()) :: {:ok, map()} | {:error, map()}
@@ -504,7 +504,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
          opts
        ) do
     log_upstream_transport_exception(exception, identity, opts)
-    {:error, upstream_transport_error()}
+    {:error, upstream_transport_error(exception)}
   end
 
   defp normalize_upstream_transport_result(
@@ -513,7 +513,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
          opts
        ) do
     log_upstream_transport_exception(exception, identity, opts)
-    {:error, upstream_transport_error()}
+    {:error, upstream_transport_error(exception)}
   end
 
   defp normalize_upstream_transport_result(
@@ -522,7 +522,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
          opts
        ) do
     log_upstream_transport_exception(exception, identity, opts)
-    {:error, upstream_transport_error()}
+    {:error, upstream_transport_error(exception)}
   end
 
   defp normalize_upstream_transport_result(
@@ -531,7 +531,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
          opts
        ) do
     log_upstream_transport_exception(exception, identity, opts)
-    {:error, upstream_transport_error()}
+    {:error, upstream_transport_error(exception)}
   end
 
   defp normalize_upstream_transport_result(
@@ -540,7 +540,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
          opts
        ) do
     log_upstream_transport_exception(exception, identity, opts)
-    {:error, upstream_transport_error()}
+    {:error, upstream_transport_error(exception)}
   end
 
   defp normalize_upstream_transport_result(
@@ -549,13 +549,13 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
          opts
        ) do
     log_upstream_transport_exception(exception, identity, opts)
-    {:error, upstream_transport_error()}
+    {:error, upstream_transport_error(exception)}
   end
 
   defp normalize_upstream_transport_result(result, _identity, _opts), do: result
 
-  defp upstream_transport_error do
-    %{status: 502, code: "upstream_network_error", message: "upstream request failed", param: nil}
+  defp upstream_transport_error(reason) do
+    TransportFailureReason.upstream_transport_error(reason, %{phase: :request})
   end
 
   defp log_upstream_transport_exception(exception, identity, opts) do

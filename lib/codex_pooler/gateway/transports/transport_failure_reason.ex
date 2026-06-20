@@ -2,8 +2,26 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
   @moduledoc false
 
   @max_reason_length 96
+  @allowed_phases ~w(
+    connect
+    decode
+    receive
+    receive_timeout
+    request
+    send_control
+    send_payload
+    unexpected_frame
+    upstream_close
+  )
 
   @type transport_failure_metadata :: %{String.t() => String.t() | non_neg_integer() | boolean()}
+  @type upstream_transport_error :: %{
+          required(:status) => pos_integer(),
+          required(:code) => String.t(),
+          required(:message) => String.t(),
+          required(:param) => nil,
+          optional(:transport_failure) => transport_failure_metadata()
+        }
 
   @spec safe_reason(term()) :: String.t() | nil
   def safe_reason(%Finch.TransportError{source: %Mint.TransportError{} = source}),
@@ -52,6 +70,17 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
     |> compact_metadata()
   end
 
+  @spec upstream_transport_error(term(), map()) :: upstream_transport_error()
+  def upstream_transport_error(reason, attrs) when is_map(attrs) do
+    %{
+      status: 502,
+      code: "upstream_network_error",
+      message: "upstream request failed",
+      param: nil
+    }
+    |> maybe_put_transport_failure(transport_failure_metadata(reason, attrs))
+  end
+
   defp safe_tuple_reason(value) when is_atom(value), do: safe_reason(value)
   defp safe_tuple_reason(value) when is_tuple(value), do: safe_reason(value)
   defp safe_tuple_reason(value) when is_integer(value), do: Integer.to_string(value)
@@ -97,9 +126,13 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
     |> String.trim("_")
     |> truncate_reason()
     |> blank_to_nil()
+    |> allow_phase()
   end
 
   defp safe_phase(_phase), do: nil
+
+  defp allow_phase(phase) when phase in @allowed_phases, do: phase
+  defp allow_phase(_phase), do: nil
 
   defp safe_boolean(value) when is_boolean(value), do: value
   defp safe_boolean(_value), do: nil
@@ -120,4 +153,9 @@ defmodule CodexPooler.Gateway.Transports.TransportFailureReason do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
   end
+
+  defp maybe_put_transport_failure(error, metadata) when map_size(metadata) > 0,
+    do: Map.put(error, :transport_failure, metadata)
+
+  defp maybe_put_transport_failure(error, _metadata), do: error
 end

@@ -464,7 +464,16 @@ defmodule CodexPoolerWeb.McpControllerTest do
           request_error: "client_disconnected",
           attempt_error: "owner_drained",
           request_metadata: adversarial_debug_metadata(),
-          response_metadata: adversarial_debug_metadata(),
+          response_metadata:
+            Map.merge(adversarial_debug_metadata(), %{
+              "transport_failure" => %{
+                "exception" => "RuntimeError raw prompt: explain private data",
+                "reason_class" => "https://example.com/raw-debug-url",
+                "reason" => "Authorization: Bearer sk-example-secret",
+                "phase" => "request",
+                "stacktrace" => "raw stacktrace should stay hidden"
+              }
+            }),
           error_message: "raw prompt: explain private data"
         })
 
@@ -1108,7 +1117,9 @@ defmodule CodexPoolerWeb.McpControllerTest do
       "Cookie: session=secret-cookie",
       "raw prompt: explain private data",
       "idempotency_key=idem-secret-123",
-      ~s({"type":"response.output_text.delta","delta":"secret frame"})
+      ~s({"type":"response.output_text.delta","delta":"secret frame"}),
+      "https://example.com/raw-debug-url",
+      "raw stacktrace should stay hidden"
     ]
   end
 
