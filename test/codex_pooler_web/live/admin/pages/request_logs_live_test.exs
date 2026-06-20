@@ -2132,6 +2132,72 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     refute html =~ secret_value
   end
 
+  test "succeeded rows keep green final status while showing compact retryable attempt errors",
+       %{conn: conn, scope: scope} do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "retryable-transport-error-logs",
+        name: "Retryable Transport Error Logs"
+      })
+
+    raw_reason_detail = "tcp reset while reading host example.com/path?token=secret"
+
+    %{request: request, assignment: assignment} =
+      request_log_fixture(pool, %{
+        correlation_id: "req-recovered-upstream-network-error",
+        requested_model: "gpt-recovered-transport",
+        status: "succeeded",
+        retry_count: 1,
+        attempt_status: "failed",
+        attempt_network_error_code: "upstream_network_error",
+        attempt_response_metadata: %{
+          "transport_failure" => %{
+            "exception" => "Mint.TransportError",
+            "reason_class" => "transport",
+            "reason" => "closed",
+            "phase" => "request",
+            "raw_reason_detail" => raw_reason_detail
+          }
+        }
+      })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 2,
+      status: "succeeded",
+      retryable: false,
+      upstream_status_code: 200,
+      response_metadata: %{}
+    })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+
+    row_selector = "#request-log-row-#{request.id}"
+    errors_selector = "#request-log-#{request.id}-errors"
+
+    assert has_element?(
+             view,
+             "#{row_selector} [data-role='status-icon'][aria-label='Status: Succeeded']"
+           )
+
+    assert has_element?(view, "#{row_selector} [data-role='status-icon'] .text-success")
+    refute has_element?(view, "#{row_selector} [data-role='status-icon'] .text-error")
+    assert has_element?(view, errors_selector, "upstream_network_error")
+
+    errors_html = view |> element(errors_selector) |> render()
+    row_html = view |> element(row_selector) |> render()
+
+    assert errors_html =~ "upstream_network_error"
+    refute errors_html =~ "transport_failure"
+    refute errors_html =~ "Mint.TransportError"
+    refute errors_html =~ "transport"
+    refute errors_html =~ "closed"
+    refute errors_html =~ raw_reason_detail
+
+    refute row_html =~ "transport_failure"
+    refute row_html =~ "Mint.TransportError"
+    refute row_html =~ raw_reason_detail
+  end
+
   test "owner_drained rows keep persisted in-progress and failed statuses while showing sanitized attempt errors",
        %{conn: conn, scope: scope} do
     {:ok, pool} =

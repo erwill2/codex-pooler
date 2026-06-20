@@ -8,6 +8,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.Admin.PoolFilterComponents
+  alias CodexPoolerWeb.Admin.RequestLogDetailDrawer
   alias CodexPoolerWeb.Admin.RequestLogFilterForm
   alias CodexPoolerWeb.Admin.RequestLogsDisplay
   alias CodexPoolerWeb.DateTimeDisplay
@@ -20,6 +21,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   @page_size 50
   @request_logs_reload_debounce_ms 250
   @reload_telemetry_event [:codex_pooler, :admin, :request_logs, :reload]
+  @selected_request_id_param "selected_request_id"
 
   @impl true
   def mount(_params, _session, socket) do
@@ -43,7 +45,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
        request_logs_reload_timer: nil,
        request_logs_loaded?: false,
        visible_pool_ids: [],
-       request_log_filters: %{}
+       request_log_filters: %{},
+       selected_request_log: nil
      )}
   end
 
@@ -95,6 +98,22 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
      push_patch(socket, to: ~p"/admin/request-logs?#{RequestLogFilterForm.query_params(params)}")}
   end
 
+  def handle_event("open_request_log", %{"request-id" => request_id}, socket) do
+    {:noreply,
+     push_patch(socket,
+       to:
+         ~p"/admin/request-logs?#{open_request_log_query_params(socket.assigns.current_params, request_id)}"
+     )}
+  end
+
+  def handle_event("close_request_log", _params, socket) do
+    {:noreply,
+     push_patch(socket,
+       to:
+         ~p"/admin/request-logs?#{close_request_log_query_params(socket.assigns.current_params)}"
+     )}
+  end
+
   @impl true
   def handle_info({Events, %{pool_id: pool_id, topics: topics}}, socket) do
     if "request_logs" in topics and request_log_event_in_scope?(socket, pool_id) do
@@ -117,95 +136,117 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       active_nav={:request_logs}
       alert_notification_center={@alert_notification_center}
     >
-      <section id="admin-request-logs-live" class="grid gap-6">
-        <AdminComponents.page_header
-          id="request-log-page-header"
-          title="Request logs"
-          description="Audit recent gateway traffic, routing decisions, upstream outcomes, quota evidence, token usage, and cost settlement."
+      <div id="request-log-detail-drawer-root" class="drawer drawer-end">
+        <input
+          id="request-log-detail-drawer"
+          type="checkbox"
+          class="drawer-toggle"
+          checked={@selected_request_log != nil}
         />
 
-        <AdminComponents.filter_form
-          id="request-log-filter-form"
-          for={@filter_form}
-          phx-change="filter"
-          phx-submit="filter"
-          advanced_open={advanced_filters_open?(@filter_values)}
-          mobile_single_column
-        >
-          <PoolFilterComponents.pool_filter_dropdown
-            id="request-log-pool-filter"
-            label="Pool"
-            hidden_id="filters_pool_id"
-            selected_value={@filter_values["pool_id"] || ""}
-            options={@pool_filter_options}
-          />
-          <.request_log_filter_dropdown
-            id="request-log-status-filter"
-            label="Status"
-            field_name="status"
-            hidden_id="filters_status"
-            role="status-filter"
-            event="select_status_filter"
-            value_attr={:status}
-            selected_value={@filter_values["status"] || ""}
-            selected={RequestLogsDisplay.selected_status_filter_option(@filter_values["status"])}
-            options={RequestLogsDisplay.status_filter_options()}
-          />
-          <.request_log_filter_dropdown
-            id="request-log-upstream-filter"
-            label="Upstream account"
-            field_name="upstream_identity_id"
-            hidden_id="filters_upstream_identity_id"
-            role="upstream-filter"
-            event="select_upstream_filter"
-            value_attr={:upstream_id}
-            selected_value={@filter_values["upstream_identity_id"] || ""}
-            selected={
-              selected_upstream_filter_option(
-                @upstream_account_options,
-                @filter_values["upstream_identity_id"]
-              )
-            }
-            options={@upstream_account_options}
-          />
-          <.request_log_filter_dropdown
-            id="request-log-model-filter"
-            label="Model"
-            field_name="model"
-            hidden_id="filters_model"
-            role="model-filter"
-            event="select_model_filter"
-            value_attr={:model}
-            selected_value={@filter_values["model"] || ""}
-            selected={RequestLogsDisplay.selected_model_filter_option(@filter_values["model"])}
-            options={@model_filter_options}
-          />
-          <:advanced>
-            <.request_id_filter field={@filter_form[:request_id]} />
-            <AdminComponents.cally_date_filter field={@filter_form[:date_from]} label="Date from" />
-            <AdminComponents.cally_date_filter field={@filter_form[:date_to]} label="Date to" />
-          </:advanced>
-        </AdminComponents.filter_form>
+        <div class="drawer-content min-w-0">
+          <section id="admin-request-logs-live" class="grid gap-6">
+            <AdminComponents.page_header
+              id="request-log-page-header"
+              title="Request logs"
+              description="Audit recent gateway traffic, routing decisions, upstream outcomes, quota evidence, token usage, and cost settlement."
+            />
 
-        <div
-          :if={@filter_errors != []}
-          id="request-log-filter-errors"
-          class="alert alert-warning items-start"
-        >
-          <.icon name="hero-exclamation-triangle" class="size-5" />
-          <div>
-            <p class="font-semibold">Some filters were ignored</p>
-            <ul class="mt-1 list-disc space-y-1 pl-5 text-sm">
-              <li :for={error <- @filter_errors}>{error.message}</li>
-            </ul>
-          </div>
+            <AdminComponents.filter_form
+              id="request-log-filter-form"
+              for={@filter_form}
+              phx-change="filter"
+              phx-submit="filter"
+              advanced_open={advanced_filters_open?(@filter_values)}
+              mobile_single_column
+            >
+              <PoolFilterComponents.pool_filter_dropdown
+                id="request-log-pool-filter"
+                label="Pool"
+                hidden_id="filters_pool_id"
+                selected_value={@filter_values["pool_id"] || ""}
+                options={@pool_filter_options}
+              />
+              <.request_log_filter_dropdown
+                id="request-log-status-filter"
+                label="Status"
+                field_name="status"
+                hidden_id="filters_status"
+                role="status-filter"
+                event="select_status_filter"
+                value_attr={:status}
+                selected_value={@filter_values["status"] || ""}
+                selected={RequestLogsDisplay.selected_status_filter_option(@filter_values["status"])}
+                options={RequestLogsDisplay.status_filter_options()}
+              />
+              <.request_log_filter_dropdown
+                id="request-log-upstream-filter"
+                label="Upstream account"
+                field_name="upstream_identity_id"
+                hidden_id="filters_upstream_identity_id"
+                role="upstream-filter"
+                event="select_upstream_filter"
+                value_attr={:upstream_id}
+                selected_value={@filter_values["upstream_identity_id"] || ""}
+                selected={
+                  selected_upstream_filter_option(
+                    @upstream_account_options,
+                    @filter_values["upstream_identity_id"]
+                  )
+                }
+                options={@upstream_account_options}
+              />
+              <.request_log_filter_dropdown
+                id="request-log-model-filter"
+                label="Model"
+                field_name="model"
+                hidden_id="filters_model"
+                role="model-filter"
+                event="select_model_filter"
+                value_attr={:model}
+                selected_value={@filter_values["model"] || ""}
+                selected={RequestLogsDisplay.selected_model_filter_option(@filter_values["model"])}
+                options={@model_filter_options}
+              />
+              <:advanced>
+                <.request_id_filter field={@filter_form[:request_id]} />
+                <AdminComponents.cally_date_filter
+                  field={@filter_form[:date_from]}
+                  label="Date from"
+                />
+                <AdminComponents.cally_date_filter
+                  field={@filter_form[:date_to]}
+                  label="Date to"
+                />
+              </:advanced>
+            </AdminComponents.filter_form>
+
+            <div
+              :if={@filter_errors != []}
+              id="request-log-filter-errors"
+              class="alert alert-warning items-start"
+            >
+              <.icon name="hero-exclamation-triangle" class="size-5" />
+              <div>
+                <p class="font-semibold">Some filters were ignored</p>
+                <ul class="mt-1 list-disc space-y-1 pl-5 text-sm">
+                  <li :for={error <- @filter_errors}>{error.message}</li>
+                </ul>
+              </div>
+            </div>
+
+            <.request_logs_table
+              request_logs={@request_logs}
+              datetime_preferences={@datetime_preferences}
+            />
+          </section>
         </div>
 
-        <.request_logs_table
-          request_logs={@request_logs}
+        <RequestLogDetailDrawer.request_log_detail_drawer
+          selected_request_log={@selected_request_log}
           datetime_preferences={@datetime_preferences}
         />
-      </section>
+      </div>
     </AdminComponents.admin_shell>
     """
   end
@@ -302,6 +343,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       request_log_filters: filters,
       request_logs_loaded?: true
     )
+    |> assign_selected_request_log(params)
+    |> maybe_clear_missing_selected_request_log()
     |> notify_request_logs_reload(reload_stage, started_at)
   end
 
@@ -320,7 +363,66 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
       model_filter_options:
         model_filter_options(model_filter_models, socket.assigns.filter_values["model"])
     )
+    |> assign_selected_request_log(socket.assigns.current_params)
+    |> maybe_clear_missing_selected_request_log()
     |> notify_request_logs_reload(:event_refresh, started_at)
+  end
+
+  defp assign_selected_request_log(socket, params) do
+    case selected_request_id(params) do
+      nil ->
+        assign(socket, :selected_request_log, nil)
+
+      request_id ->
+        assign(
+          socket,
+          :selected_request_log,
+          Accounting.RequestLogs.get_for_scope(socket.assigns.current_scope, request_id)
+        )
+    end
+  end
+
+  defp maybe_clear_missing_selected_request_log(socket) do
+    if selected_request_id(socket.assigns.current_params) &&
+         is_nil(socket.assigns.selected_request_log) do
+      push_patch(socket,
+        to:
+          ~p"/admin/request-logs?#{close_request_log_query_params(socket.assigns.current_params)}"
+      )
+    else
+      socket
+    end
+  end
+
+  defp selected_request_id(params) do
+    params
+    |> Map.get(@selected_request_id_param)
+    |> case do
+      value when is_binary(value) ->
+        value = String.trim(value)
+        if Ecto.UUID.cast(value) == {:ok, value}, do: value
+
+      _value ->
+        nil
+    end
+  end
+
+  defp open_request_log_query_params(params, request_id) do
+    params
+    |> Map.put(@selected_request_id_param, request_id)
+    |> normalize_request_log_query_params()
+  end
+
+  defp close_request_log_query_params(params) do
+    params
+    |> Map.delete(@selected_request_id_param)
+    |> normalize_request_log_query_params()
+  end
+
+  defp normalize_request_log_query_params(params) do
+    params
+    |> Enum.reject(fn {_key, value} -> is_nil(value) or value == "" end)
+    |> Map.new()
   end
 
   defp request_logs(selected_pool, filters, _visible_pool_ids) when not is_nil(selected_pool) do

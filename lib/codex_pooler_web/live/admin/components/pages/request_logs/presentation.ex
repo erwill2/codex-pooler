@@ -108,6 +108,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
                 <.request_log_timestamp_cell
                   request_log={request_log}
                   datetime_preferences={@datetime_preferences}
+                  prefix="request-log"
                 />
               </td>
               <td class="align-middle">
@@ -216,6 +217,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
                 <.request_log_timestamp_cell
                   request_log={request_log}
                   datetime_preferences={@datetime_preferences}
+                  prefix="mobile-request-log"
                 />
               </td>
               <td class="align-middle">
@@ -325,22 +327,34 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
 
   attr :request_log, :map, required: true
   attr :datetime_preferences, :map, required: true
+  attr :prefix, :string, required: true
 
   def request_log_timestamp_cell(assigns) do
     ~H"""
-    <span data-role="timestamp" class="grid gap-0.5 leading-tight">
+    <button
+      id={"#{@prefix}-#{@request_log.id}-open-details"}
+      type="button"
+      data-role="open-request-log-details"
+      phx-click="open_request_log"
+      phx-value-request-id={@request_log.id}
+      class="group grid max-w-full gap-0.5 rounded-field text-left leading-tight transition-colors hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+      aria-label={"Inspect request #{format_record_id(@request_log.id) || @request_log.id}"}
+    >
       <span data-role="timestamp-datetime" class="block whitespace-nowrap">
         {format_datetime(@request_log.admitted_at, @datetime_preferences)}
       </span>
-      <span
-        :if={record_id = format_record_id(@request_log.id)}
-        data-role="record-id"
-        class="block text-base-content/45"
-        title={@request_log.id}
-      >
-        {record_id}
+      <span class="inline-flex min-w-0 items-center gap-1 text-base-content/45 group-hover:text-primary/80">
+        <span
+          :if={record_id = format_record_id(@request_log.id)}
+          data-role="record-id"
+          class="block truncate"
+          title={@request_log.id}
+        >
+          {record_id}
+        </span>
+        <.icon name="hero-magnifying-glass" class="size-3 shrink-0" />
       </span>
-    </span>
+    </button>
     """
   end
 
