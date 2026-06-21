@@ -153,9 +153,9 @@ OpenAI Realtime SDK compatibility.
             "output": ["text"]
           },
           "limit": {
-            "context": 400000,
-            "input": 256000,
-            "output": 128000
+            "context": 272000,
+            "input": 240000,
+            "output": 64000
           }
         }
       }
@@ -367,9 +367,9 @@ point the OpenAI provider at Codex Pooler and use the current OpenClaw runtime i
             name: "GPT-5.5 via Codex Pooler",
             reasoning: true,
             input: ["text", "image"],
-            contextWindow: 400000,
-            contextTokens: 256000,
-            maxTokens: 128000,
+            contextWindow: 272000,
+            contextTokens: 208000,
+            maxTokens: 64000,
           },
         ],
       },
@@ -427,7 +427,7 @@ model:
   provider: openai-api
   base_url: http://localhost:4000/v1
   api_mode: codex_responses
-  context_length: 400000
+  context_length: 272000
   supports_vision: true
 
 agent:
@@ -479,7 +479,7 @@ model:
   default: gpt-5.5
   provider: openai-codex
   base_url: http://localhost:4000/v1
-  context_length: 400000
+  context_length: 272000
   supports_vision: true
 
 agent:
@@ -556,8 +556,8 @@ Then add a provider to `~/.pi/agent/models.json`:
             "xhigh": "xhigh"
           },
           "input": ["text", "image"],
-          "contextWindow": 400000,
-          "maxTokens": 128000
+          "contextWindow": 272000,
+          "maxTokens": 64000
         }
       ]
     }
@@ -639,8 +639,8 @@ providers:
         input:
           - text
           - image
-        contextWindow: 400000
-        maxTokens: 128000
+        contextWindow: 272000
+        maxTokens: 64000
 ```
 
 `apiKey: CODEX_POOLER_API_KEY` makes OMP resolve that environment variable at
@@ -667,6 +667,8 @@ modelRoles:
   plan: codex-pooler/gpt-5.5:xhigh
   task: codex-pooler/gpt-5.5:xhigh
   vision: codex-pooler/gpt-5.5:xhigh
+compaction:
+  reserveTokens: 64000
 ```
 
 Check the non-interactive path from a repository:
@@ -721,9 +723,9 @@ Then configure the provider in `~/.config/kilo/kilo.jsonc`:
             "output": ["text"]
           },
           "limit": {
-            "context": 400000,
-            "input": 256000,
-            "output": 128000
+            "context": 272000,
+            "input": 208000,
+            "output": 64000
           }
         }
       }
