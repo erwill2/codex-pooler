@@ -32,6 +32,9 @@ models:
     model: gpt-5.5
     apiBase: https://codex-pooler.example.com/v1
     apiKey: "${{ secrets.CODEX_POOLER_API_KEY }}"
+    contextLength: 272000
+    defaultCompletionOptions:
+      maxTokens: 128000
     roles:
       - chat
       - edit
@@ -53,6 +56,8 @@ mcpServers:
 ```
 
 For local setup, change `apiBase` to `http://localhost:4000/v1`. If you keep the optional operator MCP add-on locally, change the MCP `url` to `http://localhost:4000/mcp`.
+
+Continue uses `contextLength` for request pruning and `defaultCompletionOptions.maxTokens` for the completion budget. It prunes request messages before sending instead of doing Codex-style local compaction, so keep the context length at Codex Pooler's exposed model window.
 
 Check the headless CLI path after saving the config:
 

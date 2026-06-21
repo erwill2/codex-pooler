@@ -128,10 +128,12 @@ curl -sS -X POST \
       { "role": "user", "content": "Reply with only: ok" }
     ],
     "stream": false,
-    "max_tokens": 16
+    "max_completion_tokens": 16
   }' \
   "$WINDMILL_URL/api/w/<workspace>/ai/proxy/chat/completions"
 ```
+
+Windmill's agent request field is `max_completion_tokens`; provider adapters map it to OpenAI Responses `max_output_tokens` or chat `max_completion_tokens` as needed. Do not use `max_tokens` for GPT-5/O-series Windmill AI requests.
 
 A working setup returns an OpenAI-shaped chat completion. If the response says
 the URL resolves to a private or internal IP address, set

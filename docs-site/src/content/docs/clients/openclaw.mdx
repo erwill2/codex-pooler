@@ -28,6 +28,7 @@ OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surfac
   agents: {
     defaults: {
       model: { primary: "openai/gpt-5.5" },
+      compaction: { reserveTokens: 128000 },
     },
   },
   models: {
@@ -45,9 +46,9 @@ OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surfac
             name: "GPT-5.5 via Codex Pooler",
             reasoning: true,
             input: ["text", "image"],
-            contextWindow: 272000,
-            contextTokens: 208000,
-            maxTokens: 64000,
+            contextWindow: 1000000,
+            contextTokens: 272000,
+            maxTokens: 128000,
           },
         ],
       },
@@ -57,6 +58,8 @@ OpenClaw's OpenAI provider should point `baseUrl` at Codex Pooler's `/v1` surfac
 ```
 
 Define only model ids your assigned Pool can serve. If you run Codex Pooler locally, set `baseUrl` to `http://localhost:4000/v1`.
+
+OpenClaw separates the provider/native `contextWindow` from the effective runtime `contextTokens` budget. Its OpenAI `gpt-5.5` catalog publishes a 1M native window, a 272k effective cap, and a 128k output budget. The explicit compaction reserve keeps local prompt history under the remaining 144k budget before a long completion.
 
 ## Operator MCP server
 

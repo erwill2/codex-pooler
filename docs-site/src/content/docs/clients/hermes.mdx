@@ -63,6 +63,8 @@ mcp_servers:
 
 Use `http://localhost:4000/v1` and `http://localhost:4000/mcp` for a local Codex Pooler instance.
 
+Hermes' direct `openai-api` fallback metadata treats `gpt-5.5` as a 1.05M-token API model when no override is present. Keep `context_length: 272000` in Codex Pooler configs so Hermes compacts against Codex Pooler's exposed model window instead of overfilling `/v1`.
+
 Remote HTTP MCP servers require Hermes' `mcp` extra. If `hermes mcp test codex_pooler` reports `mcp.client.streamable_http is not available`, install MCP support into the Hermes environment, following the [Hermes MCP Integration docs](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp), and rerun the test.
 
 Test the model path with a one-shot prompt:

@@ -154,7 +154,7 @@ OpenAI Realtime SDK compatibility.
           },
           "limit": {
             "context": 272000,
-            "input": 240000,
+            "input": 228000,
             "output": 64000
           }
         }
@@ -180,6 +180,13 @@ OpenAI Realtime SDK compatibility.
 Define only models that your assigned Pool can serve. For deployed instances,
 change `baseURL` to `https://codex-pooler.example.com/v1`; if you keep the optional
 operator MCP entry, change its `url` to `https://codex-pooler.example.com/mcp`.
+
+OpenCode subtracts its compaction reserve from `limit.input` before deciding a
+conversation is full. The `228000` value leaves 208k usable input tokens after
+OpenCode's default 20k reserve, so 208k input plus a 64k output cap stays inside
+Codex Pooler's 272k `gpt-5.5` window. OpenCode's request layer caps output at
+32k by default; set `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=64000` only if you
+want OpenCode to request the full 64k cap.
 
 </details>
 
@@ -245,6 +252,13 @@ requires_openai_auth = true
 
 For deployed instances, change `base_url` to
 `https://codex-pooler.example.com/backend-api/codex`.
+
+When Codex Pooler serves current model metadata, Codex does not need explicit
+client-side context overrides. If you must pin `gpt-5.5` for an older model
+catalog, use Codex's own fields: `model_context_window = 272000` and
+`model_auto_compact_token_limit = 244800`. Codex computes an effective 95%
+window for turn budgeting and does not send an OpenAI SDK-style output cap on
+normal `/responses` turns.
 
 Optional operator-only MCP metadata add-on. Omit for normal Codex runtime use:
 
@@ -350,6 +364,7 @@ point the OpenAI provider at Codex Pooler and use the current OpenClaw runtime i
   agents: {
     defaults: {
       model: { primary: "openai/gpt-5.5" },
+      compaction: { reserveTokens: 128000 },
     },
   },
   models: {
@@ -367,9 +382,9 @@ point the OpenAI provider at Codex Pooler and use the current OpenClaw runtime i
             name: "GPT-5.5 via Codex Pooler",
             reasoning: true,
             input: ["text", "image"],
-            contextWindow: 272000,
-            contextTokens: 208000,
-            maxTokens: 64000,
+            contextWindow: 1000000,
+            contextTokens: 272000,
+            maxTokens: 128000,
           },
         ],
       },
@@ -393,6 +408,13 @@ point the OpenAI provider at Codex Pooler and use the current OpenClaw runtime i
 Define only models that your assigned Pool can serve. For deployed instances,
 change `baseUrl` to `https://codex-pooler.example.com/v1`; if you keep the optional
 operator MCP add-on, change its `url` to `https://codex-pooler.example.com/mcp`.
+
+OpenClaw keeps `contextWindow` as the provider/native window and uses
+`contextTokens` as the effective runtime budget. The `gpt-5.5` OpenAI source
+catalog publishes a 1M native window, a 272k effective cap, and a 128k output
+budget; the explicit compaction reserve keeps local history under the remaining
+144k prompt budget before a long completion.
+
 If you prefer to keep Codex Pooler separate from OpenClaw's built-in OpenAI
 provider behavior, use a custom provider id such as `codex-pooler/gpt-5.5`
 instead. That follows OpenClaw's generic custom-provider shape, but tools that
@@ -447,6 +469,11 @@ mcp_servers:
     timeout: 120
     connect_timeout: 15
 ```
+
+Hermes' direct `openai-api` fallback metadata treats `gpt-5.5` as a 1.05M-token
+API model when no override is present. Keep `context_length: 272000` in Codex
+Pooler configs so Hermes compacts against Codex Pooler's exposed model window
+instead of overfilling the `/v1` route.
 
 Remote HTTP MCP servers require Hermes' `mcp` extra. If
 `hermes mcp test codex_pooler` reports `mcp.client.streamable_http is not
@@ -557,7 +584,7 @@ Then add a provider to `~/.pi/agent/models.json`:
           },
           "input": ["text", "image"],
           "contextWindow": 272000,
-          "maxTokens": 64000
+          "maxTokens": 128000
         }
       ]
     }
@@ -575,6 +602,13 @@ the model picker and footer. Without it, Pi treats `xhigh` as unsupported for a
 custom model and clamps `--thinking xhigh` or `defaultThinkingLevel: "xhigh"` to
 `high`.
 
+Pi accepts `contextWindow` and `maxTokens` for custom models; it has no
+`contextTokens` field. The bundled Pi `gpt-5.5` entries use a 272k context
+window and 128k output budget, so matching those values keeps Codex Pooler
+custom-provider behavior aligned with Pi's built-in metadata. The explicit
+compaction reserve makes Pi compact before a prompt plus a long completion can
+exceed that 272k window.
+
 Optionally set Codex Pooler as the default Pi model in
 `~/.pi/agent/settings.json`:
 
@@ -583,7 +617,10 @@ Optionally set Codex Pooler as the default Pi model in
   "defaultProvider": "codex-pooler",
   "defaultModel": "gpt-5.5",
   "defaultThinkingLevel": "xhigh",
-  "enabledModels": ["codex-pooler/gpt-5.5"]
+  "enabledModels": ["codex-pooler/gpt-5.5"],
+  "compaction": {
+    "reserveTokens": 128000
+  }
 }
 ```
 
@@ -640,7 +677,7 @@ providers:
           - text
           - image
         contextWindow: 272000
-        maxTokens: 64000
+        maxTokens: 128000
 ```
 
 `apiKey: CODEX_POOLER_API_KEY` makes OMP resolve that environment variable at
@@ -648,6 +685,11 @@ runtime. `authHeader: true` makes OMP send the Pool API key as
 `Authorization: Bearer ...`. Define only model ids your assigned Pool can
 serve. For deployed instances, change `baseUrl` to
 `https://codex-pooler.example.com/v1`.
+
+OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept
+`contextTokens`. Its Codex `gpt-5.5` catalog uses a 272k context window and 128k
+output budget. `compaction.reserveTokens: 128000` makes OMP compact before a
+prompt plus a long completion can exceed that 272k window.
 
 Optionally set Codex Pooler as the default OMP model roles in
 `~/.omp/agent/config.yml`:
@@ -668,7 +710,7 @@ modelRoles:
   task: codex-pooler/gpt-5.5:xhigh
   vision: codex-pooler/gpt-5.5:xhigh
 compaction:
-  reserveTokens: 64000
+  reserveTokens: 128000
 ```
 
 Check the non-interactive path from a repository:
@@ -724,15 +766,26 @@ Then configure the provider in `~/.config/kilo/kilo.jsonc`:
           },
           "limit": {
             "context": 272000,
-            "input": 208000,
+            "input": 228000,
             "output": 64000
           }
         }
       }
     }
+  },
+  "compaction": {
+    "threshold_percent": 75
   }
 }
 ```
+
+Kilo uses OpenCode-style `limit.{context,input,output}` fields, but it includes
+reasoning tokens in overflow accounting and uses `compaction.threshold_percent`
+for preflight compaction. `limit.input: 228000` leaves 208k usable input tokens
+after the default 20k reserve; the 75% threshold asks Kilo to compact earlier.
+For GPT-5 OpenAI-compatible models, Kilo suppresses the outgoing max-token
+request field to avoid incompatible `max_tokens`, so `limit.output` is still
+important for local context math and UI even when it is not forwarded.
 
 Define only model ids your assigned Pool can serve. For deployed instances,
 change `baseURL` to `https://codex-pooler.example.com/v1`. If you add Kilo
@@ -775,6 +828,12 @@ taking priority.
 model: openai/gpt-5.5
 openai-api-base: http://localhost:4000/v1
 ```
+
+Aider's bundled `gpt-5.5` settings define behavior flags such as diff editing,
+repo-map use, and `reasoning_effort`; they do not bundle context/output limits
+in `.aider.conf.yml`. If you need explicit unknown-model limits, use Aider's
+separate model metadata JSON file instead of adding unsupported context fields to
+the main config.
 
 Keep the Pool API key out of the YAML file. Export it in the shell, or put it in
 a gitignored `.env` file that Aider can load:
@@ -831,6 +890,9 @@ models:
     model: gpt-5.5
     apiBase: http://localhost:4000/v1
     apiKey: "${{ secrets.CODEX_POOLER_API_KEY }}"
+    contextLength: 272000
+    defaultCompletionOptions:
+      maxTokens: 128000
     roles:
       - chat
       - edit
@@ -854,6 +916,11 @@ mcpServers:
 For deployed instances, change `apiBase` to `https://codex-pooler.example.com/v1`;
 if you keep the optional operator MCP add-on, change the MCP `url` to
 `https://codex-pooler.example.com/mcp`.
+
+Continue uses `contextLength` for request pruning and
+`defaultCompletionOptions.maxTokens` for the completion budget. It prunes rather
+than summarizing/compacting locally, so keep the context length at Codex Pooler's
+272k `gpt-5.5` window instead of using direct-OpenAI 1M metadata.
 
 Check the headless CLI path after saving the config:
 
@@ -884,6 +951,12 @@ cline auth \
   --baseurl http://localhost:4000/v1 \
   --modelid gpt-5.5
 ```
+
+Cline's model metadata names are `contextWindow`, `maxInputTokens`, and
+`maxTokens`. If you add a manual Codex Pooler model entry in Cline settings, use
+`contextWindow: 272000`, `maxInputTokens: 144000`, and `maxTokens: 128000` so
+Cline's compaction trigger leaves room for a long completion inside the 272k
+Pooler window.
 
 Check the headless CLI path after saving auth:
 
@@ -946,7 +1019,15 @@ GOOSE_PROVIDER: openai
 GOOSE_MODEL: gpt-5.5
 OPENAI_HOST: http://localhost:4000
 OPENAI_BASE_PATH: v1/chat/completions
+GOOSE_CONTEXT_LIMIT: 272000
+GOOSE_MAX_TOKENS: 128000
+GOOSE_AUTO_COMPACT_THRESHOLD: 0.52
 ```
+
+Goose reads `GOOSE_CONTEXT_LIMIT` and `GOOSE_MAX_TOKENS` into its model config.
+Its auto-compaction threshold is a ratio of the context limit, not an output
+reserve, so `0.52` compacts before prompt history can crowd out a 128k
+completion in Codex Pooler's 272k `gpt-5.5` window.
 
 Check the headless CLI path with tool access enabled:
 
@@ -1031,6 +1112,10 @@ metadata_model:
   model: gpt-5.5
 ```
 
+Windmill's agent request field is `max_completion_tokens`; provider adapters map
+that to OpenAI Responses `max_output_tokens` or chat `max_completion_tokens` as
+needed. Do not use `max_tokens` for GPT-5/O-series Windmill AI requests.
+
 For deployed Codex Pooler instances, change `base_url` to
 `https://codex-pooler.example.com/v1`. If Windmill is self-hosted and that URL
 resolves to a private or internal address from the Windmill app pod or server,
@@ -1075,6 +1160,11 @@ For deployed instances, change `LLM_BASE_URL` to
 `https://codex-pooler.example.com/v1`. The model name should stay
 `openai/gpt-5.5` so OpenHands selects its OpenAI-compatible provider path while
 Codex Pooler routes the request through the assigned Pool.
+
+The audited OpenHands app source delegates authoritative LLM limit parsing to
+`openhands-sdk`; the local app checkout does not expose source-verifiable
+`gpt-5.5` context or output limit fields. Keep this example to model/base URL
+environment overrides unless the SDK source is audited too.
 
 </details>
 
@@ -1134,6 +1224,7 @@ For deployed instances, change `baseURL` to `https://codex-pooler.example.com/v1
 
 </details>
 
+
 <details>
 <summary><img src=".github/assets/vercel-favicon.png" alt="Vercel logo" width="16" height="16"> Vercel AI SDK</summary>
 
@@ -1161,6 +1252,14 @@ console.log(text);
 For deployed instances, change `baseURL` to `https://codex-pooler.example.com/v1`.
 
 </details>
+
+The official OpenAI SDKs and Vercel AI SDK do not expose Codex model-catalog
+context fields. Use their output-budget fields only when your application needs
+one: `max_output_tokens` in OpenAI Responses, `max_completion_tokens` in Chat
+Completions, and `maxOutputTokens` at the Vercel AI SDK layer. Codex Pooler's
+public `/v1/responses` currently rejects `context_management`, and public
+`/v1/responses/compact` is routed but unsupported, so do not document SDK-side
+compaction as a Codex Pooler feature.
 
 <details>
 <summary><img src=".github/assets/claude-code-favicon.png" alt="Claude Code logo" width="16" height="16"> Claude Code</summary>
