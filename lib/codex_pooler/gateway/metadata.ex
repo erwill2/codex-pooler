@@ -42,7 +42,9 @@ defmodule CodexPooler.Gateway.Metadata do
 
     with {:ok, visibility} <- policy_visible_models(auth, "/v1/models", request_options),
          :ok <- record_metadata_request(auth, "/v1/models", request_options, visibility) do
-      models = Enum.map(visibility.visible_models, &openai_model_payload/1)
+      pricing_buckets = Catalog.pricing_buckets_by_identifier(visibility.visible_models)
+
+      models = Enum.map(visibility.visible_models, &openai_model_payload(&1, pricing_buckets))
 
       {:ok,
        %{
@@ -117,20 +119,33 @@ defmodule CodexPooler.Gateway.Metadata do
     }
   end
 
-  defp openai_model_payload(%Model{} = model) do
+  defp openai_model_payload(%Model{} = model, pricing_buckets) do
+    metadata =
+      model
+      |> ModelMetadata.metadata()
+      |> ModelMetadata.apply_context_window_policy(model, pricing_buckets)
+
     %{
       "id" => model.exposed_model_id,
       "object" => "model",
       "created" => openai_model_created_at(model),
       "owned_by" => "codex-pooler",
       "permission" => [],
-      "input_modalities" => ModelMetadata.input_modalities(ModelMetadata.metadata(model)),
+      "input_modalities" => ModelMetadata.input_modalities(metadata),
       "display_name" => model.display_name,
       "supports_streaming" => model.supports_streaming,
       "supports_tools" => model.supports_tools,
       "supports_reasoning" => model.supports_reasoning
     }
+    |> maybe_put_context_length(metadata)
   end
+
+  defp maybe_put_context_length(payload, %{"context_window" => context_length})
+       when is_integer(context_length) and context_length > 0 do
+    Map.put(payload, "context_length", context_length)
+  end
+
+  defp maybe_put_context_length(payload, _metadata), do: payload
 
   defp openai_model_created_at(%Model{} = model) do
     model.first_seen_at

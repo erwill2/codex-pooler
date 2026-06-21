@@ -470,10 +470,11 @@ mcp_servers:
     connect_timeout: 15
 ```
 
-Hermes' direct `openai-api` fallback metadata treats `gpt-5.5` as a 1.05M-token
-API model when no override is present. Keep `context_length: 272000` in Codex
-Pooler configs so Hermes compacts against Codex Pooler's exposed model window
-instead of overfilling the `/v1` route.
+Current Codex Pooler releases also expose an SDK-readable `context_length` value
+on `/v1/models`, derived from the Codex `context_window` metadata, so Hermes'
+automatic probes can resolve the 272k Pooler window. Keep `context_length: 272000`
+in Hermes config as a safe explicit override for older Pooler deployments or stale
+model metadata.
 
 Remote HTTP MCP servers require Hermes' `mcp` extra. If
 `hermes mcp test codex_pooler` reports `mcp.client.streamable_http is not
@@ -1252,9 +1253,11 @@ console.log(text);
 For deployed instances, change `baseURL` to `https://codex-pooler.example.com/v1`.
 
 
-The official OpenAI SDKs and Vercel AI SDK do not expose Codex model-catalog
-context fields. Use their output-budget fields only when your application needs
-one: `max_output_tokens` in OpenAI Responses, `max_completion_tokens` in Chat
+`GET /v1/models` may include `context_length` for clients that probe
+OpenAI-compatible model lists, such as Hermes. The official OpenAI SDK request
+APIs and Vercel AI SDK generation APIs do not expose Codex model-catalog context
+controls. Use their output-budget fields only when your application needs one:
+`max_output_tokens` in OpenAI Responses, `max_completion_tokens` in Chat
 Completions, and `maxOutputTokens` at the Vercel AI SDK layer. Codex Pooler's
 public `/v1/responses` currently rejects `context_management`, and public
 `/v1/responses/compact` is routed but unsupported, so do not document SDK-side

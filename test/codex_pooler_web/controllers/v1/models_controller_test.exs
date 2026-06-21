@@ -127,7 +127,9 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
     assert request.request_metadata["operation"] == "models"
   end
 
-  test "GET /v1/models strips Codex-native context metadata", %{conn: conn} do
+  test "GET /v1/models exposes SDK-readable context length without backend metadata", %{
+    conn: conn
+  } do
     upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
 
     setup =
@@ -155,6 +157,7 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
     assert model["supports_reasoning"] == true
     assert model["input_modalities"] == ["text"]
     assert is_integer(model["created"])
+    assert model["context_length"] == 272_000
 
     refute Map.has_key?(model, "upstream_model_id")
     refute Map.has_key?(model, "source_assignment_ids")
@@ -167,7 +170,6 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
     refute Map.has_key?(model, "secret")
     refute Map.has_key?(model, "input_context_window")
     refute Map.has_key?(model, "metadata")
-    refute Map.has_key?(model, "context_window")
     refute Map.has_key?(model, "max_context_window")
     refute Map.has_key?(model, "auto_compact_token_limit")
     refute Map.has_key?(model, "comp_hash")
