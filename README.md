@@ -1251,7 +1251,6 @@ console.log(text);
 
 For deployed instances, change `baseURL` to `https://codex-pooler.example.com/v1`.
 
-</details>
 
 The official OpenAI SDKs and Vercel AI SDK do not expose Codex model-catalog
 context fields. Use their output-budget fields only when your application needs
@@ -1260,6 +1259,7 @@ Completions, and `maxOutputTokens` at the Vercel AI SDK layer. Codex Pooler's
 public `/v1/responses` currently rejects `context_management`, and public
 `/v1/responses/compact` is routed but unsupported, so do not document SDK-side
 compaction as a Codex Pooler feature.
+</details>
 
 <details>
 <summary><img src=".github/assets/claude-code-favicon.png" alt="Claude Code logo" width="16" height="16"> Claude Code</summary>
