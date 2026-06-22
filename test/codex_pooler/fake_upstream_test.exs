@@ -102,24 +102,19 @@ defmodule CodexPooler.FakeUpstreamTest do
           )
         )
 
-      response =
-        Req.get!(FakeUpstream.url(upstream) <> "/stream-timeout",
-          into: :self,
-          receive_timeout: 100,
-          retry: false
-        )
-
-      assert response.status == 200
+      task = stream_timeout_request(FakeUpstream.url(upstream) <> "/stream-timeout", self())
 
       assert_receive {:fake_upstream_timeout_barrier, :mid_stream, upstream_pid, ^release_ref},
                      1_000
 
-      assert {:ok, data: "data: partial\n\n"} = receive_stream_message(response)
-      assert {:error, error} = receive_stream_message(response)
+      try do
+        assert_receive {:fake_upstream_stream_data, "data: partial\n\n"}, 1_000
+        assert {:error, error} = Task.await(task, 1_000)
 
-      send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
-
-      assert transport_timeout?(error)
+        assert transport_timeout?(error)
+      after
+        send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+      end
     end
   end
 
@@ -181,6 +176,19 @@ defmodule CodexPooler.FakeUpstreamTest do
         message -> message
       end
     )
+  end
+
+  defp stream_timeout_request(url, parent) do
+    Task.async(fn ->
+      Req.get(url,
+        into: fn {:data, data}, {request, response} ->
+          send(parent, {:fake_upstream_stream_data, data})
+          {:cont, {request, response}}
+        end,
+        receive_timeout: 100,
+        retry: false
+      )
+    end)
   end
 
   defp transport_timeout?(%Finch.TransportError{

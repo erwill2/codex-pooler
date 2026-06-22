@@ -61,6 +61,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
   @sentinel "SECRET_SENTINEL_DO_NOT_STORE_123"
   @supported_compression_model "gpt-4o"
+  @blocking_owner_receive_timeout_ms 1_000
+  @response_task_stop_timeout_ms 1_000
 
   @websocket_lifecycle_metadata_keys ~w(
     codex_session_id
@@ -3684,34 +3686,39 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
     assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
     assert state.request_response_work_started?
-    assert_receive {:blocking_owner_upstream_received, owner_worker_pid, ^release_ref}
+    owner_worker_pid = assert_blocking_owner_upstream_received!(release_ref)
 
-    logs =
-      capture_websocket_lifecycle_log(fn ->
-        assert :ok = CodexResponsesSocket.terminate(:closed, state)
-      end)
+    try do
+      logs =
+        capture_websocket_lifecycle_log(fn ->
+          assert :ok = CodexResponsesSocket.terminate(:closed, state)
+        end)
 
-    refute logs =~ WebsocketConnectionLogger.closed_message()
-    refute logs =~ WebsocketConnectionLogger.init_failed_message()
-    refute logs =~ "websocket owner detach failed"
-    assert_no_websocket_lifecycle_leaks!(logs)
+      refute logs =~ WebsocketConnectionLogger.closed_message()
+      refute logs =~ WebsocketConnectionLogger.init_failed_message()
+      refute logs =~ "websocket owner detach failed"
+      assert_no_websocket_lifecycle_leaks!(logs)
 
-    send(owner_worker_pid, {:blocking_owner_upstream_release, release_ref})
+      send(owner_worker_pid, {:blocking_owner_upstream_release, release_ref})
+      assert_response_task_stopped!(state)
 
-    session =
-      Repo.get_by!(CodexSession, session_key: turn_state_session_key("close-during-request"))
+      session =
+        Repo.get_by!(CodexSession, session_key: turn_state_session_key("close-during-request"))
 
-    assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
-    request = Repo.get!(Request, turn.request_id)
-    attempt = Repo.one!(from(a in Attempt, where: a.request_id == ^request.id))
+      assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
+      request = Repo.get!(Request, turn.request_id)
+      attempt = Repo.one!(from(a in Attempt, where: a.request_id == ^request.id))
 
-    assert request.status == "failed"
-    assert request.response_status_code == 499
-    assert request.last_error_code == "client_disconnected"
-    assert attempt.status == "failed"
-    assert attempt.network_error_code == "client_disconnected"
-    assert turn.status == "interrupted"
-    assert turn.error_code == "client_disconnected"
+      assert request.status == "failed"
+      assert request.response_status_code == 499
+      assert request.last_error_code == "client_disconnected"
+      assert attempt.status == "failed"
+      assert attempt.network_error_code == "client_disconnected"
+      assert turn.status == "interrupted"
+      assert turn.error_code == "client_disconnected"
+    after
+      send(owner_worker_pid, {:blocking_owner_upstream_release, release_ref})
+    end
   end
 
   test "owner rollout timeline preserves interrupted and recovered websocket rows" do
@@ -4670,6 +4677,23 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
         Agent.stop(upstream_pid)
       end
     }
+  end
+
+  defp assert_blocking_owner_upstream_received!(release_ref) do
+    receive do
+      {:blocking_owner_upstream_received, owner_worker_pid, ^release_ref} -> owner_worker_pid
+    after
+      @blocking_owner_receive_timeout_ms ->
+        flunk("expected blocking owner upstream to receive the websocket request")
+    end
+  end
+
+  defp assert_response_task_stopped!(state) do
+    [response_task_pid] = MapSet.to_list(state.tasks)
+    monitor = Process.monitor(response_task_pid)
+
+    assert_receive {:DOWN, ^monitor, :process, ^response_task_pid, _reason},
+                   @response_task_stop_timeout_ms
   end
 
   defp crashing_owner_safe_state(upstream_pid) do
