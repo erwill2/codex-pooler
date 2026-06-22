@@ -385,7 +385,9 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
         put_context_window(metadata, context_window)
 
       _value ->
-        maybe_apply_pricing_context_window(metadata, model, pricing_buckets)
+        metadata
+        |> maybe_apply_pricing_context_window(model, pricing_buckets)
+        |> apply_effective_context_window()
     end
   end
 
@@ -478,6 +480,29 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
       value when is_integer(value) and value > 0 -> min(value, auto_compact_limit)
       _value -> auto_compact_limit
     end)
+  end
+
+  defp apply_effective_context_window(metadata) do
+    context_window = metadata["context_window"]
+    percent = int_metadata(metadata, "effective_context_window_percent", 95)
+
+    if is_integer(context_window) and context_window > 0 and percent in 1..99 do
+      effective_context_window = max(1, div(context_window * percent, 100))
+      auto_compact_limit = div(effective_context_window * 9, 10)
+
+      metadata
+      |> Map.put("context_window", effective_context_window)
+      |> Map.update("max_context_window", context_window, fn
+        value when is_integer(value) and value > 0 -> max(value, context_window)
+        _value -> context_window
+      end)
+      |> Map.update("auto_compact_token_limit", auto_compact_limit, fn
+        value when is_integer(value) and value > 0 -> min(value, auto_compact_limit)
+        _value -> auto_compact_limit
+      end)
+    else
+      metadata
+    end
   end
 
   defp metadata_includes?(metadata, keys, expected) do

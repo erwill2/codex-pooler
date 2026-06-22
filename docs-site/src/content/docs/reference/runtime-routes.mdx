@@ -303,7 +303,7 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td>OpenAI-shaped model metadata from Pool/catalog state</td>
       <td>No upstream Codex request</td>
       <td>Supported</td>
-      <td>Returns an OpenAI-shaped model list for the authenticated Pool. Includes <code>context_length</code> when Codex context metadata is available; backend-only fields such as <code>context_window</code>, <code>auto_compact_token_limit</code>, and <code>comp_hash</code> are omitted.</td>
+      <td>Returns an OpenAI-shaped model list for the authenticated Pool. Includes effective <code>context_length</code> when Codex context metadata is available; backend-only fields such as <code>context_window</code>, <code>max_context_window</code>, <code>auto_compact_token_limit</code>, and <code>comp_hash</code> are omitted.</td>
     </tr>
     <tr>
       <td><code>POST /v1/responses</code></td>

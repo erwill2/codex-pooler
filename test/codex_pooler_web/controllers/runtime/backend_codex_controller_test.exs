@@ -650,9 +650,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     conn = conn |> auth(setup) |> get("/backend-api/codex/models")
 
     assert %{"models" => [model]} = json_response(conn, 200)
-    assert model["context_window"] == 128_000
+    assert model["context_window"] == 121_600
     assert model["max_context_window"] == 128_000
-    assert model["auto_compact_token_limit"] == 115_200
+    assert model["auto_compact_token_limit"] == 109_440
   end
 
   test "GET /backend-api/codex/models promotes long context window from pricing", %{conn: conn} do
@@ -686,9 +686,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     conn = conn |> auth(setup) |> get("/backend-api/codex/models")
 
     assert %{"models" => [model]} = json_response(conn, 200)
-    assert model["context_window"] == 1_000_000
+    assert model["context_window"] == 950_000
     assert model["max_context_window"] == 1_000_000
-    assert model["auto_compact_token_limit"] == 900_000
+    assert model["auto_compact_token_limit"] == 855_000
   end
 
   test "GET /backend-api/codex/models exposes service tiers for fast mode", %{conn: conn} do

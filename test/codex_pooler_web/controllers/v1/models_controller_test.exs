@@ -157,7 +157,7 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
     assert model["supports_reasoning"] == true
     assert model["input_modalities"] == ["text"]
     assert is_integer(model["created"])
-    assert model["context_length"] == 272_000
+    assert model["context_length"] == 258_400
 
     refute Map.has_key?(model, "upstream_model_id")
     refute Map.has_key?(model, "source_assignment_ids")
