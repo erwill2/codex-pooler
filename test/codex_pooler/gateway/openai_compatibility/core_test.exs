@@ -1315,6 +1315,54 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       refute inspect(coerced["input"]) =~ "synthetic-encrypted-reasoning"
     end
 
+    test "OMP stateless replay drops known function call status metadata" do
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "store" => false,
+        "stream" => true,
+        "input" => [
+          %{
+            "type" => "function_call",
+            "call_id" => "call_fixture_completed",
+            "name" => "lookup_fixture",
+            "arguments" => "{\"value\":\"completed\"}",
+            "status" => "completed"
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_fixture_completed",
+            "output" => "synthetic completed tool output"
+          },
+          %{
+            "type" => "function_call",
+            "call_id" => "call_fixture_incomplete",
+            "name" => "lookup_fixture",
+            "arguments" => "{\"value\":\"incomplete\"}",
+            "status" => "incomplete"
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_fixture_incomplete",
+            "output" => "synthetic incomplete tool output"
+          },
+          %{"role" => "user", "content" => "synthetic follow-up"}
+        ]
+      }
+
+      assert {:ok, %{payload: coerced}} = Responses.coerce(payload)
+
+      assert [
+               %{"type" => "function_call"} = completed_call,
+               %{"type" => "function_call_output"},
+               %{"type" => "function_call"} = incomplete_call,
+               %{"type" => "function_call_output"},
+               %{"type" => "message", "role" => "user"}
+             ] = coerced["input"]
+
+      refute Map.has_key?(completed_call, "status")
+      refute Map.has_key?(incomplete_call, "status")
+    end
+
     test "Hermes ordinary replay drops reasoning and preserves completed assistant metadata" do
       payload = %{
         "model" => "gpt-fixture-text",

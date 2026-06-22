@@ -442,6 +442,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert feature.contract =~ "lift Responses system/developer input-message text"
       assert feature.contract =~ "early public streaming terminal errors"
       assert feature.contract =~ "accept safe Hermes assistant replay status values"
+      assert feature.contract =~ "drop known OMP function_call replay status fields"
       assert feature.contract =~ "translate OpenClaw assistant thinking replays before validation"
       assert feature.contract =~ "chat input fallback"
       assert feature.contract =~ "Responses additional_tools support narrow and non-executable"

@@ -317,6 +317,72 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     end
 
     @tag :tool_result_previous_response
+    test "v1 Responses drops OMP function-call replay status before dispatch", %{conn: conn} do
+      upstream =
+        start_upstream(
+          FakeUpstream.json_response(%{
+            "id" => "resp_v1_omp_replay_status",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          })
+        )
+
+      setup = gateway_setup(upstream)
+
+      response_conn =
+        conn
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "store" => false,
+          "stream" => true,
+          "input" => [
+            %{
+              "type" => "function_call",
+              "call_id" => "call_v1_omp_incomplete",
+              "name" => "lookup_fixture",
+              "arguments" => "{\"value\":\"sample\"}",
+              "status" => "incomplete"
+            },
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_v1_omp_incomplete",
+              "output" => "synthetic omp tool text"
+            },
+            %{"role" => "user", "content" => "synthetic follow-up"}
+          ]
+        })
+
+      assert [content_type] = get_resp_header(response_conn, "content-type")
+      assert content_type =~ "text/event-stream"
+      assert response_conn.status == 200
+
+      assert [captured] = FakeUpstream.requests(upstream)
+
+      assert [
+               %{
+                 "type" => "function_call",
+                 "call_id" => "call_v1_omp_incomplete",
+                 "name" => "lookup_fixture",
+                 "arguments" => "{\"value\":\"sample\"}"
+               } = function_call,
+               %{
+                 "type" => "function_call_output",
+                 "call_id" => "call_v1_omp_incomplete",
+                 "output" => "synthetic omp tool text"
+               },
+               %{"type" => "message", "role" => "user"}
+             ] = captured.json["input"]
+
+      refute Map.has_key?(function_call, "status")
+
+      metadata = persisted_gateway_metadata(setup.pool.id)
+      refute metadata =~ "synthetic omp tool text"
+      refute metadata =~ "call_v1_omp_incomplete"
+      refute metadata =~ "raw_request"
+    end
+
+    @tag :tool_result_previous_response
     test "v1 Responses translates Hermes chat-style tool continuations before dispatch", %{
       conn: conn
     } do
