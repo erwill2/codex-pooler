@@ -310,7 +310,7 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td><code>/backend-api/codex/responses</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>OpenAI Responses payloads are coerced to Codex-compatible work. System/developer input-message text is lifted into top-level instructions. Remote MCP tool definitions are rejected before dispatch. Streaming responses use the public Responses stream adapter, and early terminal errors emit first without synthetic success prefixes.</td>
+      <td>OpenAI Responses payloads are coerced to Codex-compatible work. System/developer input-message text is lifted into top-level instructions. Remote MCP tool definitions are rejected before dispatch. Streaming responses use the public Responses stream adapter, and early terminal errors emit first without synthetic success prefixes. For public HTTP SSE only, if upstream has already emitted public Responses-visible data and ends before a terminal Responses event, Codex Pooler emits a sanitized <code>response.failed</code> terminal with <code>upstream_stream_error</code>; backend raw streams and websocket surfaces are not rewritten.</td>
     </tr>
     <tr>
       <td><code>GET /v1/responses</code></td>

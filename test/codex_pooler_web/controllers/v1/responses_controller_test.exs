@@ -3095,6 +3095,76 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :streaming_sequence
+  test "POST /v1/responses streaming emits terminal response.failed when upstream closes after visible output",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.output_text.delta",
+             %{
+               "type" => "response.output_text.delta",
+               "delta" => "visible-before-upstream-close",
+               "response" => %{"id" => "resp_visible_before_close"}
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic interrupted stream request",
+        "stream" => true
+      })
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+
+    body = conn.resp_body
+    assert body =~ "visible-before-upstream-close"
+    refute body =~ "event: response.completed\n"
+    refute body =~ "event: response.incomplete\n"
+
+    assert body =~ "event: response.failed"
+    assert body =~ ~s("type":"response.failed")
+    assert body =~ ~s("status":"failed")
+    assert body =~ ~s("code":"upstream_stream_error")
+
+    assert [%{"event" => "response.failed", "data" => data}] =
+             public_sse_events(body)
+             |> Enum.filter(&(&1["event"] == "response.failed"))
+
+    assert data["type"] == "response.failed"
+    assert data["response"]["status"] == "failed"
+    assert data["response"]["id"] == "resp_visible_before_close"
+    assert data["error"]["code"] == "upstream_stream_error"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "http_sse"
+    assert request.status == "failed"
+    assert request.last_error_code == "upstream_stream_error"
+
+    assert get_in(request.request_metadata, ["openai_compatibility", "source_endpoint"]) ==
+             "/v1/responses"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == "upstream_stream_error"
+    assert attempt.response_metadata["error_kind"] == "stream_interrupted"
+
+    persistence_text = inspect({request.request_metadata, attempt.response_metadata})
+    refute persistence_text =~ "synthetic interrupted stream request"
+    refute persistence_text =~ "visible-before-upstream-close"
+  end
+
+  @tag :streaming_sequence
   test "POST /v1/responses streaming preserves ordinary response.incomplete", %{conn: conn} do
     upstream =
       start_upstream(

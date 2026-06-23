@@ -108,6 +108,8 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
     |> Map.merge(%{
       write_chunk: http_stream_writer(response_context),
       write_keepalive: http_sse_keepalive_writer(response_context.response),
+      before_finalize_failure: http_stream_terminal_failure_writer(),
+      before_finalize_success: http_stream_terminal_success_hook(),
       keepalive_interval_ms: sse_keepalive_interval_ms(response_context.response)
     })
   end
@@ -211,6 +213,35 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
       else
         write_stream_data(response_context, conn, data)
       end
+    end
+  end
+
+  defp http_stream_terminal_failure_writer do
+    fn state, reason ->
+      write_public_openai_responses_terminal_failure(state, reason)
+    end
+  end
+
+  defp http_stream_terminal_success_hook do
+    fn state ->
+      case write_public_openai_responses_terminal_failure(state, :upstream_stream_interrupted) do
+        {:ok, state, ""} -> {:ok, state, ""}
+        {:ok, state, data} -> {:failure, state, data, :upstream_stream_interrupted}
+        {:error, _reason} -> {:failure, state, "", :upstream_stream_interrupted}
+      end
+    end
+  end
+
+  defp write_public_openai_responses_terminal_failure(state, reason) do
+    case DownstreamStream.synthetic_terminal_failure(state, reason) do
+      {nil, state} ->
+        {:ok, state, ""}
+
+      {data, state} ->
+        case update_relay_target(state, &Plug.Conn.chunk(&1, data)) do
+          {:ok, state} -> {:ok, state, data}
+          {:error, _reason} = error -> error
+        end
     end
   end
 

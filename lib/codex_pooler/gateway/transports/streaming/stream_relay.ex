@@ -14,6 +14,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelay do
           | {:terminal_stream_failure, StreamProtocol.terminal_failure()}
           | {:terminal_stream_failure, relay_state(), StreamProtocol.terminal_failure()}
   @type stream_finalization_result :: {:ok, term()} | {:error, term()}
+  @type before_finalize_failure_result :: {:ok, relay_state(), iodata()} | {:error, term()}
+  @type before_finalize_success_result ::
+          {:ok, relay_state(), iodata()} | {:failure, relay_state(), iodata(), term()}
   @type first_event_retry_result :: {:ok, relay_state()} | {:error, term()}
   @type stream_relay_result :: {:ok, relay_state()} | {:error, term()}
   @type handler_map :: %{
@@ -25,6 +28,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelay do
                                              first_event_retry_result()),
           required(:write_chunk) => (relay_state(), binary() -> stream_write_result()),
           required(:write_keepalive) => (relay_state() -> {:ok, relay_state()} | {:error, term()}),
+          optional(:before_finalize_failure) => (relay_state(), term() ->
+                                                   before_finalize_failure_result()),
+          optional(:before_finalize_success) => (relay_state() ->
+                                                   before_finalize_success_result()),
           optional(:keepalive_interval_ms) => non_neg_integer()
         }
 
@@ -86,10 +93,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelay do
   end
 
   defp finalize_stream_parse_error(state, chunks, reason, handlers) do
-    stream_finalization_result(
-      handlers.finalize_failure.(chunks, stream_parse_error_reason(reason)),
-      state
-    )
+    reason = stream_parse_error_reason(reason)
+    {state, chunks} = run_before_finalize_failure_hook(state, chunks, reason, handlers)
+
+    stream_finalization_result(handlers.finalize_failure.(chunks, reason), state)
   end
 
   defp stream_parse_error_reason(%Req.TransportError{reason: :timeout} = reason),
@@ -166,7 +173,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelay do
     do: stream_upstream(state, response, chunks, handlers)
 
   defp finish_stream_parts({:done, state, chunks}, _response, handlers) do
-    stream_finalization_result(handlers.finalize_success.(chunks), state)
+    case run_before_finalize_success_hook(state, chunks, handlers) do
+      {:ok, state, chunks} ->
+        stream_finalization_result(handlers.finalize_success.(chunks), state)
+
+      {:failure, state, chunks, reason} ->
+        stream_finalization_result(handlers.finalize_failure.(chunks, reason), state)
+    end
   end
 
   defp finish_stream_parts({:retry_first_event, state, chunks, failure}, _response, handlers) do
@@ -174,7 +187,42 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelay do
   end
 
   defp finish_stream_parts({:error, state, chunks, reason}, _response, handlers) do
+    {state, chunks} = run_before_finalize_failure_hook(state, chunks, reason, handlers)
+
     stream_finalization_result(handlers.finalize_failure.(chunks, reason), state)
+  end
+
+  defp run_before_finalize_success_hook(state, chunks, handlers) do
+    case Map.get(handlers, :before_finalize_success) do
+      callback when is_function(callback, 1) ->
+        case callback.(state) do
+          {:ok, state, data} ->
+            {:ok, state, append_stream_chunk(chunks, data)}
+
+          {:failure, state, data, reason} ->
+            {:failure, state, append_stream_chunk(chunks, data), reason}
+
+          _other ->
+            {:ok, state, chunks}
+        end
+
+      _callback ->
+        {:ok, state, chunks}
+    end
+  end
+
+  defp run_before_finalize_failure_hook(state, chunks, reason, handlers) do
+    case Map.get(handlers, :before_finalize_failure) do
+      callback when is_function(callback, 2) ->
+        case callback.(state, reason) do
+          {:ok, state, data} -> {state, append_stream_chunk(chunks, data)}
+          {:error, _write_reason} -> {state, chunks}
+          _other -> {state, chunks}
+        end
+
+      _callback ->
+        {state, chunks}
+    end
   end
 
   defp stream_finalization_result({:ok, _finalized}, state), do: {:ok, state}

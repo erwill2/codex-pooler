@@ -62,6 +62,129 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelayTest do
     assert_process_down(monitor, pid)
   end
 
+  test "runs failure hook before failure finalization and preserves the original reason" do
+    parent = self()
+    ref = make_ref()
+    response = async_response(ref)
+    reason = :upstream_closed
+
+    pid =
+      spawn(fn ->
+        send(self(), {ref, {:data, "visible"}})
+        send(self(), {ref, {:error, reason}})
+
+        result =
+          StreamRelay.run(
+            :stream_state,
+            response,
+            Map.merge(handlers(), %{
+              before_finalize_failure: fn _state, ^reason ->
+                send(parent, :before_finalize_failure)
+                {:ok, :terminal_written, ["synthetic-terminal"]}
+              end,
+              finalize_failure: fn body, ^reason ->
+                send(parent, {:finalize_failure, body})
+                {:ok, :finalized}
+              end
+            })
+          )
+
+        send(parent, {:stream_relay_result, result})
+      end)
+
+    monitor = Process.monitor(pid)
+
+    assert_receive :before_finalize_failure, 1_000
+    assert_receive {:finalize_failure, "visiblesynthetic-terminal"}, 1_000
+    assert_receive {:stream_relay_result, {:ok, :terminal_written}}, 1_000
+    assert_process_down(monitor, pid)
+  end
+
+  test "failure hook write errors preserve the original failure reason" do
+    parent = self()
+    ref = make_ref()
+    response = async_response(ref)
+    reason = :upstream_closed
+
+    pid =
+      spawn(fn ->
+        send(self(), {ref, {:data, "visible"}})
+        send(self(), {ref, {:error, reason}})
+
+        result =
+          StreamRelay.run(
+            :stream_state,
+            response,
+            Map.merge(handlers(), %{
+              before_finalize_failure: fn _state, ^reason ->
+                send(parent, :before_finalize_failure)
+                {:error, :client_closed}
+              end,
+              finalize_failure: fn body, ^reason ->
+                send(parent, {:finalize_failure, body})
+                {:ok, :finalized}
+              end
+            })
+          )
+
+        send(parent, {:stream_relay_result, result})
+      end)
+
+    monitor = Process.monitor(pid)
+
+    assert_receive :before_finalize_failure, 1_000
+    assert_receive {:finalize_failure, "visible"}, 1_000
+    assert_receive {:stream_relay_result, {:ok, :stream_state}}, 1_000
+    assert_process_down(monitor, pid)
+  end
+
+  test "success hook can convert terminal-missing stream completion into failure finalization" do
+    parent = self()
+    ref = make_ref()
+    response = async_response(ref)
+
+    pid =
+      spawn(fn ->
+        send(self(), {ref, {:data, "visible"}})
+        send(self(), {ref, :done})
+
+        result =
+          StreamRelay.run(
+            :stream_state,
+            response,
+            Map.merge(handlers(), %{
+              before_finalize_failure: fn _state, _reason ->
+                send(parent, :unexpected_before_finalize_failure)
+                {:error, :unexpected_before_finalize_failure}
+              end,
+              before_finalize_success: fn _state ->
+                send(parent, :before_finalize_success)
+                {:failure, :terminal_written, "synthetic-terminal", :upstream_stream_interrupted}
+              end,
+              finalize_success: fn _body ->
+                send(parent, :unexpected_finalize_success)
+                {:ok, :unexpected_success}
+              end,
+              finalize_failure: fn body, :upstream_stream_interrupted ->
+                send(parent, {:finalize_failure, body})
+                {:ok, :finalized}
+              end
+            })
+          )
+
+        send(parent, {:stream_relay_result, result})
+      end)
+
+    monitor = Process.monitor(pid)
+
+    assert_receive :before_finalize_success, 1_000
+    assert_receive {:finalize_failure, "visiblesynthetic-terminal"}, 1_000
+    assert_receive {:stream_relay_result, {:ok, :terminal_written}}, 1_000
+    refute_received :unexpected_before_finalize_failure
+    refute_received :unexpected_finalize_success
+    assert_process_down(monitor, pid)
+  end
+
   test "success finalization keeps only a bounded retained body while writing all chunks" do
     parent = self()
     ref = make_ref()

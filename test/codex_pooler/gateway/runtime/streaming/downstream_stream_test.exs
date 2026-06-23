@@ -273,6 +273,152 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
 
       assert DownstreamStream.keepalive_allowed?(state)
     end
+
+    test "synthesizes a sanitized terminal failure with the observed public response id" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      created =
+        sse_event("response.created", %{
+          "type" => "response.created",
+          "response" => %{"id" => "resp_public_interrupted", "status" => "in_progress"}
+        })
+
+      assert {created_chunk, state} =
+               DownstreamStream.normalize_data(created, "/v1/responses", opts, state)
+
+      assert created_chunk =~ "event: response.created\n"
+
+      assert {failure, state} =
+               DownstreamStream.synthetic_terminal_failure(
+                 state,
+                 "cookie=raw-upstream-reason"
+               )
+
+      assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(failure)
+      assert data["type"] == "response.failed"
+      assert data["response"]["id"] == "resp_public_interrupted"
+      assert data["response"]["status"] == "failed"
+      assert data["error"]["code"] == "upstream_stream_error"
+      refute Jason.encode!(data) =~ "raw-upstream-reason"
+
+      assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
+    end
+
+    test "reuses a response id observed on a response-bearing nonterminal event" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      delta =
+        sse_event("response.output_text.delta", %{
+          "type" => "response.output_text.delta",
+          "delta" => "partial public text",
+          "response" => %{"id" => "resp_from_delta"}
+        })
+
+      assert {_chunk, state} =
+               DownstreamStream.normalize_data(delta, "/v1/responses", opts, state)
+
+      assert {failure, _state} =
+               DownstreamStream.synthetic_terminal_failure(state, :upstream_interrupted)
+
+      assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(failure)
+      assert data["response"]["id"] == "resp_from_delta"
+      assert data["error"]["code"] == "upstream_stream_error"
+    end
+
+    test "does not synthesize after an upstream terminal has already been observed" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      failed =
+        sse_event("response.failed", %{
+          "type" => "response.failed",
+          "response" => %{
+            "id" => "resp_already_failed",
+            "status" => "failed",
+            "error" => %{"code" => "server_error", "message" => "synthetic terminal"}
+          },
+          "error" => %{"code" => "server_error", "message" => "synthetic terminal"}
+        })
+
+      assert {_chunk, state} =
+               DownstreamStream.normalize_data(failed, "/v1/responses", opts, state)
+
+      assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
+    end
+
+    test "does not synthesize for keepalive comments or malformed non-response data" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      assert {"", state} =
+               DownstreamStream.normalize_data(": keepalive\n\n", "/v1/responses", opts, state)
+
+      assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
+
+      assert {"", state} =
+               DownstreamStream.normalize_data(
+                 "not-json-and-not-sse\n\n",
+                 "/v1/responses",
+                 opts,
+                 state
+               )
+
+      assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
+    end
+  end
+
+  defp public_sse_events(body) do
+    body
+    |> String.split("\n\n", trim: true)
+    |> Enum.flat_map(fn block ->
+      case public_sse_event(block) do
+        nil -> []
+        event -> [event]
+      end
+    end)
+  end
+
+  defp public_sse_event(block) do
+    lines = String.split(block, "\n")
+    event = lines |> Enum.find(&String.starts_with?(&1, "event: ")) |> strip_sse_prefix("event: ")
+    data = lines |> Enum.find(&String.starts_with?(&1, "data: ")) |> strip_sse_prefix("data: ")
+
+    if is_binary(event) and is_binary(data) and data != "[DONE]" do
+      %{"event" => event, "data" => Jason.decode!(data)}
+    end
+  end
+
+  defp strip_sse_prefix(nil, _prefix), do: nil
+  defp strip_sse_prefix(line, prefix), do: String.replace_prefix(line, prefix, "")
+
+  defp sse_event(event, payload) do
+    "event: " <> event <> "\n" <> "data: " <> Jason.encode!(payload) <> "\n\n"
   end
 
   defp attach_stream_buffer_telemetry do

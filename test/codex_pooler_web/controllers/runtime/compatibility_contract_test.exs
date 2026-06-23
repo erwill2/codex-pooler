@@ -427,6 +427,17 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert feature.contract =~ "accept Responses truncation auto and disabled locally"
       assert feature.contract =~ "accept Codex-native Responses web_search hosted tool shapes"
       assert feature.contract =~ "keeping web_search_preview type-only"
+      assert feature.contract =~ "emit sanitized response.failed upstream_stream_error"
+      assert feature.contract =~ "preserve backend raw/websocket stream behavior"
+
+      assert fixture.stream_interruption_contract == %{
+               applies_to: "POST /v1/responses HTTP SSE after public Responses data",
+               terminal_event: "response.failed",
+               error_code: "upstream_stream_error",
+               backend_raw_streams: "unchanged",
+               websocket_streams: "unchanged",
+               raw_error_details: false
+             }
 
       assert get_in(CompatibilityMatrix.fixture!(:v1_supported_surface), [
                :responses_builtin_tools,

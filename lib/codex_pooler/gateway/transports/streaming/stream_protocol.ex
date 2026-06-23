@@ -16,6 +16,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
     "websocket_connection_limit_reached"
   ]
   @websocket_auth_refresh_event_codes ["invalid_api_key", "invalid_authentication"]
+  @synthetic_public_openai_responses_failure_code "upstream_stream_error"
+  @synthetic_public_openai_responses_failure_message "upstream stream interrupted before terminal response event"
   @incomplete_failure_reason_codes @retryable_first_event_codes ++
                                      @websocket_auth_refresh_event_codes ++
                                      [
@@ -118,6 +120,30 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
           {binary(), public_openai_responses_stream_state()}
   def normalize_public_openai_responses_sse_data(data, state),
     do: PublicResponses.normalize_data(data, state)
+
+  @spec synthetic_public_openai_responses_failure_sse(String.t() | nil, term()) :: binary()
+  def synthetic_public_openai_responses_failure_sse(response_id, _reason) do
+    error = %{
+      "code" => @synthetic_public_openai_responses_failure_code,
+      "message" => @synthetic_public_openai_responses_failure_message
+    }
+
+    response =
+      %{"status" => "failed", "error" => error}
+      |> put_synthetic_response_id(response_id)
+
+    [
+      "event: response.failed\n",
+      "data: ",
+      Jason.encode!(%{
+        "type" => "response.failed",
+        "error" => error,
+        "response" => response
+      }),
+      "\n\n"
+    ]
+    |> IO.iodata_to_binary()
+  end
 
   @spec canonicalize_codex_responses_json_message(binary()) :: binary()
   def canonicalize_codex_responses_json_message(data) when is_binary(data) do
@@ -404,6 +430,18 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
     {event_type, decoded}
   end
 
+  defp put_synthetic_response_id(response, response_id) when is_binary(response_id) do
+    response_id = String.trim(response_id)
+
+    if response_id == "" do
+      response
+    else
+      Map.put(response, "id", response_id)
+    end
+  end
+
+  defp put_synthetic_response_id(response, _response_id), do: response
+
   defp codex_responses_error_needs_canonical_response?("error", decoded),
     do: not is_nil(sse_error_code(decoded))
 
@@ -616,7 +654,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
   end
 
   defp incomplete_failure_event?(event) do
-    Map.get(event, :explicit_error?) or
+    Map.get(event, :explicit_error?) == true or
       incomplete_failure_reason?(Map.get(event, :incomplete_reason)) or
       incomplete_failure_reason?(Map.get(event, :upstream_error_code))
   end

@@ -21,11 +21,14 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
         )
 
       public_openai_responses_stream?(opts) ->
-        Map.put(
-          state,
+        state
+        |> Map.put(
           :public_openai_responses,
           StreamProtocol.public_openai_responses_stream_state()
         )
+        |> Map.put(:public_openai_responses_data_seen?, false)
+        |> Map.put(:public_openai_responses_terminal_seen?, false)
+        |> Map.put(:public_openai_responses_response_id, nil)
 
       true ->
         state
@@ -76,6 +79,25 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
 
   def keepalive_allowed?(_state), do: true
 
+  @spec synthetic_terminal_failure(state(), term()) :: {binary() | nil, state()}
+  def synthetic_terminal_failure(
+        %{
+          public_openai_responses_data_seen?: true,
+          public_openai_responses_terminal_seen?: false
+        } = state,
+        reason
+      ) do
+    data =
+      StreamProtocol.synthetic_public_openai_responses_failure_sse(
+        Map.get(state, :public_openai_responses_response_id),
+        reason
+      )
+
+    {data, %{state | public_openai_responses_terminal_seen?: true}}
+  end
+
+  def synthetic_terminal_failure(state, _reason), do: {nil, state}
+
   defp normalize_public_openai_chat_stream_data(
          data,
          %{public_openai_chat: stream_state} = state
@@ -93,10 +115,40 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
     {data, stream_state} =
       StreamProtocol.normalize_public_openai_responses_sse_data(data, stream_state)
 
-    {data, %{state | public_openai_responses: stream_state}}
+    state =
+      state
+      |> Map.put(:public_openai_responses, stream_state)
+      |> track_public_openai_responses_output(data)
+
+    {data, state}
   end
 
   defp normalize_public_openai_responses_stream_data(data, state), do: {data, state}
+
+  defp track_public_openai_responses_output(state, data) when is_binary(data) do
+    {blocks, _buffer} = StreamProtocol.complete_sse_blocks(data, bounded?: false)
+
+    Enum.reduce(blocks, state, fn block, acc ->
+      track_public_openai_responses_block(acc, block)
+    end)
+  end
+
+  defp track_public_openai_responses_block(state, "data: [DONE]") do
+    %{state | public_openai_responses_terminal_seen?: true}
+  end
+
+  defp track_public_openai_responses_block(state, block) do
+    data = StreamProtocol.sse_field(block, "data")
+    decoded = StreamProtocol.decode_sse_data(data)
+    data_type = decoded_string(decoded, "type")
+    event_type = StreamProtocol.sse_field(block, "event") || data_type
+    event = %{event_type: event_type, data_type: data_type}
+
+    state
+    |> maybe_put_public_openai_responses_response_id(decoded)
+    |> maybe_mark_public_openai_responses_data_seen(event)
+    |> maybe_mark_public_openai_responses_terminal_seen(event)
+  end
 
   defp normalize_codex_responses_stream_data(data, endpoint, opts, state) when is_binary(data) do
     buffer = Map.get(state, :codex_responses_sse_buffer, "")
@@ -176,4 +228,55 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
        do: payload
 
   defp openai_chat_payload(_opts), do: %{}
+
+  defp maybe_put_public_openai_responses_response_id(state, decoded) do
+    case response_id(decoded) do
+      response_id when is_binary(response_id) ->
+        %{state | public_openai_responses_response_id: response_id}
+
+      nil ->
+        state
+    end
+  end
+
+  defp maybe_mark_public_openai_responses_data_seen(state, event) do
+    if StreamProtocol.downstream_visible_event?(event) and
+         is_nil(StreamProtocol.terminal_outcome_event(event)) do
+      %{state | public_openai_responses_data_seen?: true}
+    else
+      state
+    end
+  end
+
+  defp maybe_mark_public_openai_responses_terminal_seen(state, event) do
+    if StreamProtocol.terminal_outcome_event(event) do
+      %{state | public_openai_responses_terminal_seen?: true}
+    else
+      state
+    end
+  end
+
+  defp response_id(decoded) when is_map(decoded) do
+    nested_string(decoded, ["response", "id"]) || decoded_string(decoded, "id")
+  end
+
+  defp decoded_string(decoded, key) when is_map(decoded) do
+    case Map.get(decoded, key) do
+      value when is_binary(value) and value != "" -> value
+      _value -> nil
+    end
+  end
+
+  defp nested_string(map, keys) do
+    Enum.reduce_while(keys, map, fn key, acc ->
+      case acc do
+        %{^key => value} -> {:cont, value}
+        _other -> {:halt, nil}
+      end
+    end)
+    |> case do
+      value when is_binary(value) and value != "" -> value
+      _value -> nil
+    end
+  end
 end

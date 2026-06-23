@@ -253,6 +253,31 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
     end
   end
 
+  describe "synthetic_public_openai_responses_failure_sse/2" do
+    test "generates a sanitized response.failed SSE body with a reused response id" do
+      raw_reason = "Bearer synthetic-token raw upstream exception should not leak"
+
+      body =
+        StreamProtocol.synthetic_public_openai_responses_failure_sse(
+          "resp_known_interrupted",
+          raw_reason
+        )
+
+      assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(body)
+      assert data["type"] == "response.failed"
+      assert data["response"]["id"] == "resp_known_interrupted"
+      assert data["response"]["status"] == "failed"
+      assert data["error"]["code"] == "upstream_stream_error"
+      assert data["response"]["error"]["code"] == "upstream_stream_error"
+
+      serialized = Jason.encode!(data)
+      assert serialized =~ "upstream stream interrupted before terminal response event"
+      refute serialized =~ "Bearer"
+      refute serialized =~ "synthetic-token"
+      refute serialized =~ "raw upstream exception"
+    end
+  end
+
   describe "wrapped websocket/direct JSON terminal error frames" do
     test "canonicalizes typeless detail-only websocket frames as terminal failures" do
       frame = Jason.encode!(%{"detail" => "synthetic upstream detail must stay out of metadata"})

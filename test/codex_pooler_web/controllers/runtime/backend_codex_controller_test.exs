@@ -6615,6 +6615,44 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert_turn_state_not_persisted!(setup, response_turn_state)
   end
 
+  test "POST /backend-api/codex/responses does not synthesize public terminal events for raw backend stream closes",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.output_text.delta",
+             %{"type" => "response.output_text.delta", "delta" => "backend-visible-before-close"}}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic backend interrupted stream request",
+        "stream" => true
+      })
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "backend-visible-before-close"
+    refute conn.resp_body =~ "event: response.failed"
+    refute conn.resp_body =~ "upstream_stream_error"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "http_sse"
+    assert request.status == "succeeded"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+  end
+
   test "POST /backend-api/codex/responses relays stream safety-buffering metadata without persisting it",
        %{conn: conn} do
     safety_buffering = %{
