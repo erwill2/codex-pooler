@@ -199,6 +199,15 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     record_health_failure(code, code, context)
   end
 
+  defp record_stream_failure_health(
+         :upstream_stream_interrupted,
+         "upstream_stream_error",
+         nil,
+         _headers,
+         _context
+       ),
+       do: :ok
+
   defp record_stream_failure_health(reason, code, nil, _headers, context) do
     record_health_failure(reason, code, context)
   end

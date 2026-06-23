@@ -12,8 +12,10 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Persistence.{BridgeDemotion, RoutingCircuitState}
   alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
   alias CodexPooler.Gateway.Runtime.Dispatch.{Context, ResponseContext}
+  alias CodexPooler.Gateway.Runtime.Finalization.Streaming
   alias CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector
   alias CodexPooler.Gateway.Runtime.Streaming.StreamLifecycle
   alias CodexPooler.Gateway.Service
@@ -246,6 +248,56 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
     assert FakeUpstream.count(stalled_upstream) == 1
     assert FakeUpstream.count(fallback_upstream) == 0
     assert_pre_first_stall_finalized!(setup, "partial frame stall")
+  end
+
+  test "terminal-missing upstream SSE close fails request without poisoning route health" do
+    {setup, _first_upstream, _second_upstream} =
+      stream_retry_setup(
+        FakeUpstream.sse_stream([]),
+        FakeUpstream.sse_stream([])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    payload = payload(setup)
+    request_options = request_options(auth, payload, setup)
+
+    assert {:ok, reserved} =
+             Accounting.reserve(auth, setup.model, payload, %{
+               endpoint: @endpoint_path,
+               transport: "http_sse",
+               correlation_id:
+                 "upstream-stream-interrupted-#{System.unique_integer([:positive])}",
+               request_metadata: %{}
+             })
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+    context =
+      retry_context(setup, auth, request_options, reserved.request,
+        candidates: [{setup.assignment, setup.identity}],
+        attempt: attempt
+      )
+
+    response_context = %ResponseContext{context: context, response: %Req.Response{status: 200}}
+
+    assert {:ok, _finalized} =
+             Streaming.finalize_failure(
+               "event: response.created\n\n",
+               :upstream_stream_interrupted,
+               response_context
+             )
+
+    assert [request] = Repo.all(from(r in Request, where: r.id == ^reserved.request.id))
+    assert request.status == "failed"
+    assert request.last_error_code == "upstream_stream_error"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == "upstream_stream_error"
+    assert attempt.response_metadata["error_kind"] == "stream_interrupted"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
   end
 
   defp retry_context(setup, auth, request_options, request, opts \\ []) do

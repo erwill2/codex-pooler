@@ -1272,6 +1272,53 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert_turn_state_not_persisted!(setup, response_turn_state)
   end
 
+  test "POST /v1/responses terminal-missing SSE close does not poison route health",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.created",
+             %{
+               "type" => "response.created",
+               "response" => %{"id" => "resp_public_terminal_missing"}
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic public terminal-missing stream request",
+        "stream" => true
+      })
+
+    assert conn.status == 200
+    assert conn.resp_body =~ "event: response.failed\n"
+    assert conn.resp_body =~ ~s("code":"upstream_stream_error")
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "http_sse"
+    assert request.status == "failed"
+    assert request.last_error_code == "upstream_stream_error"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.upstream_status_code == 200
+    assert attempt.network_error_code == "upstream_stream_error"
+    assert attempt.response_metadata["error_kind"] == "stream_interrupted"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+  end
+
   test "POST /backend-api/codex/responses sends trusted Responses Lite marker from selected model metadata",
        %{conn: conn} do
     upstream =
