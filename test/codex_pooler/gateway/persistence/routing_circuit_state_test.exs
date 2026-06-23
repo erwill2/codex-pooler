@@ -175,6 +175,22 @@ defmodule CodexPooler.Gateway.Persistence.RoutingCircuitStateTest do
     assert DateTime.compare(resumed.updated_at, state.updated_at) == :gt
   end
 
+  test "neutral completions release half-open probes without counting success or failure" do
+    {auth, model, assignment} = routing_fixture()
+    state = half_open_circuit!(auth, model, assignment, updated_at: now(), probe_count: 1)
+
+    assert {:ok, %RoutingCircuitState{} = updated} =
+             CircuitState.record_neutral_completion(auth, model, assignment, "proxy_websocket")
+
+    assert updated.id == state.id
+    assert updated.status == "half_open"
+    assert updated.reason_code == "test_probe"
+    assert updated.failure_count == state.failure_count
+    assert updated.success_count == state.success_count
+    assert updated.metadata["probe_in_flight_count"] == 0
+    assert CircuitState.eligible?(auth, model, assignment, "proxy_websocket")
+  end
+
   defp open_circuit!(auth, model, assignment, attrs) do
     now = now()
     next_probe_at = Keyword.fetch!(attrs, :next_probe_at)

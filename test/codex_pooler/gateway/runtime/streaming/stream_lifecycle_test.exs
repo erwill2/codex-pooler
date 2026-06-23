@@ -300,6 +300,83 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
     assert Repo.all(from(c in RoutingCircuitState)) == []
   end
 
+  test "terminal-missing upstream SSE close releases half-open route probe" do
+    {setup, _first_upstream, _second_upstream} =
+      stream_retry_setup(
+        FakeUpstream.sse_stream([]),
+        FakeUpstream.sse_stream([])
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    payload = payload(setup)
+    request_options = request_options(auth, payload, setup)
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    circuit =
+      %RoutingCircuitState{
+        pool_id: auth.pool.id,
+        pool_upstream_assignment_id: setup.assignment.id,
+        upstream_identity_id: setup.identity.id,
+        model_identifier: setup.model.exposed_model_id,
+        route_class: request_options.transport.route_class,
+        status: "half_open",
+        reason_code: "upstream_5xx",
+        failure_count: 3,
+        success_count: 0,
+        opened_at: DateTime.add(now, -120, :second),
+        half_opened_at: now,
+        metadata: %{"probe_in_flight_count" => 1},
+        created_at: DateTime.add(now, -120, :second),
+        updated_at: now
+      }
+      |> Repo.insert!()
+
+    assert {:ok, reserved} =
+             Accounting.reserve(auth, setup.model, payload, %{
+               endpoint: @endpoint_path,
+               transport: "http_sse",
+               correlation_id:
+                 "upstream-stream-neutral-probe-#{System.unique_integer([:positive])}",
+               request_metadata: %{}
+             })
+
+    assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+    context =
+      retry_context(setup, auth, request_options, reserved.request,
+        candidates: [{setup.assignment, setup.identity}],
+        attempt: attempt,
+        routing_circuit_state: circuit
+      )
+
+    response_context = %ResponseContext{context: context, response: %Req.Response{status: 200}}
+
+    assert {:ok, _finalized} =
+             Streaming.finalize_failure(
+               "event: response.created\n\n",
+               :upstream_stream_interrupted,
+               response_context
+             )
+
+    assert [request] = Repo.all(from(r in Request, where: r.id == ^reserved.request.id))
+    assert request.status == "failed"
+    assert request.last_error_code == "upstream_stream_error"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == "upstream_stream_error"
+
+    assert Repo.all(from(d in BridgeDemotion)) == []
+
+    assert %RoutingCircuitState{} = updated = Repo.get!(RoutingCircuitState, circuit.id)
+    assert updated.status == "half_open"
+    assert updated.reason_code == "upstream_5xx"
+    assert updated.failure_count == 3
+    assert updated.success_count == 0
+    assert updated.metadata["probe_in_flight_count"] == 0
+  end
+
   defp retry_context(setup, auth, request_options, request, opts \\ []) do
     candidates =
       Keyword.get(opts, :candidates, [
@@ -330,6 +407,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
       allow_retry?: true,
       routing_attempt_metadata: %{},
       route_class: request_options.transport.route_class,
+      routing_circuit_state: Keyword.get(opts, :routing_circuit_state),
       attempt: Keyword.get(opts, :attempt),
       started: System.monotonic_time(:millisecond)
     }

@@ -49,6 +49,28 @@ defmodule CodexPooler.Gateway.Routing.RouteLifecycle do
     end
   end
 
+  @spec selection_neutral_completion(map(), CodexPooler.Catalog.Model.t(), RoutingSelection.t()) ::
+          success_result()
+  def selection_neutral_completion(
+        auth,
+        model,
+        %RoutingSelection{
+          circuit_state: %RoutingCircuitState{}
+        } = selection
+      ) do
+    case CircuitState.record_neutral_completion(
+           auth,
+           model,
+           selection.assignment,
+           selection.route_class
+         ) do
+      {:ok, _state} -> :ok
+      {:error, reason} -> lifecycle_failure(:record_route_circuit_neutral_completion, reason)
+    end
+  end
+
+  def selection_neutral_completion(_auth, _model, %RoutingSelection{}), do: :ok
+
   @spec log_optional_result(String.t(), keyword(), success_result() | failure_result()) :: :ok
   def log_optional_result(_operation, _metadata, :ok), do: :ok
   def log_optional_result(_operation, _metadata, {:ok, _value}), do: :ok

@@ -233,6 +233,45 @@ defmodule CodexPooler.Gateway.Routing.CircuitState do
       ),
       do: {:error, :invalid_route_class}
 
+  @spec record_neutral_completion(auth(), Model.t(), PoolUpstreamAssignment.t(), String.t()) ::
+          {:ok, :ok | RoutingCircuitState.t()} | {:error, term()}
+  def record_neutral_completion(
+        %{pool: %Pool{}, api_key: %APIKey{}} = auth,
+        %Model{} = model,
+        %PoolUpstreamAssignment{} = assignment,
+        route_class
+      )
+      when is_binary(route_class) and route_class != "" do
+    now = now()
+
+    Repo.transaction(fn ->
+      case latest_for_update(auth, model, assignment, route_class) do
+        %RoutingCircuitState{status: @half_open_status} = state ->
+          state
+          |> RoutingCircuitState.changeset(%{
+            metadata: probe_metadata(state, max(probe_in_flight_count(state) - 1, 0)),
+            updated_at: now
+          })
+          |> persist_or_rollback(:update)
+
+        %RoutingCircuitState{} = state ->
+          state
+
+        nil ->
+          :ok
+      end
+    end)
+    |> unwrap_transaction()
+  end
+
+  def record_neutral_completion(
+        %{pool: %Pool{}, api_key: %APIKey{}},
+        %Model{},
+        %PoolUpstreamAssignment{},
+        _route_class
+      ),
+      do: {:error, :invalid_route_class}
+
   defp begin_attempt_with_snapshot(
          _auth,
          _model,

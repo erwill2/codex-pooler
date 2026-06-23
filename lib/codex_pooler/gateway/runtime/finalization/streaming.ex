@@ -204,9 +204,9 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
          "upstream_stream_error",
          nil,
          _headers,
-         _context
+         context
        ),
-       do: :ok
+       do: RouteLifecycle.neutral_completion(context)
 
   defp record_stream_failure_health(reason, code, nil, _headers, context) do
     record_health_failure(reason, code, context)

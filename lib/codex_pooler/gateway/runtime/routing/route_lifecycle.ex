@@ -38,6 +38,15 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycle do
     end
   end
 
+  @spec neutral_completion(DispatchContext.t()) :: success_result()
+  def neutral_completion(%DispatchContext{} = context) do
+    RoutingRouteLifecycle.selection_neutral_completion(
+      context.auth,
+      context.model,
+      routing_selection(context)
+    )
+  end
+
   defp merge_failure_metadata(%DispatchContext{} = context, demotion_reason) do
     case Accounting.merge_request_metadata(
            context.reserved.request,
