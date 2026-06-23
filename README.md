@@ -677,6 +677,8 @@ providers:
         input:
           - text
           - image
+        compat:
+          streamIdleTimeoutMs: 300000
         contextWindow: 272000
         maxTokens: 128000
 ```
@@ -691,6 +693,12 @@ OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept
 `contextTokens`. Its Codex `gpt-5.5` catalog uses a 272k context window and 128k
 output budget. `compaction.reserveTokens: 128000` makes OMP compact before a
 prompt plus a long completion can exceed that 272k window.
+
+`compat.streamIdleTimeoutMs: 300000` keeps long OpenAI Responses reasoning turns
+from being aborted by OMP's semantic-progress idle watchdog while Codex Pooler
+and the upstream account are still working. Existing OMP sessions need to be
+restarted or resumed after this config change. As an environment-only override,
+set `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS=300000` before launching `omp`.
 
 Optionally set Codex Pooler as the default OMP model roles in
 `~/.omp/agent/config.yml`:
