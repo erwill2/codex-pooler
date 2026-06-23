@@ -13,8 +13,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   alias CodexPooler.Events.Event
   alias CodexPooler.Events.PostgresBridge
   alias CodexPooler.FakeOpenAIAuthProvider
-  alias CodexPooler.Jobs.TokenRefreshWorker
   alias CodexPooler.Jobs.SavedResetRedemptionWorker
+  alias CodexPooler.Jobs.TokenRefreshWorker
   alias CodexPooler.Mailer
   alias CodexPooler.Pools
   alias CodexPooler.Repo
@@ -751,7 +751,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
             "source" => "codex_usage_api",
             "path_style" => "codex",
             "usage_path" => "/api/codex/usage",
-            "observed_at" => DateTime.to_iso8601(observed_at)
+            "observed_at" => DateTime.to_iso8601(observed_at),
+            "available_expires_at" => [
+              "2026-07-18T00:40:11.968726Z",
+              "2026-07-20T00:40:11.968726Z"
+            ],
+            "next_expires_at" => "2026-07-18T00:40:11.968726Z"
           }
         }
       })
@@ -810,7 +815,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     active_badge_id = "upstream-account-#{active_identity.id}-saved-reset-count"
 
     active_badge_selector =
-      "##{active_badge_id}[data-role='upstream-saved-reset-count-badge'][aria-label='Saved resets: 2; auto redeem active']"
+      "##{active_badge_id}[data-role='upstream-saved-reset-count-badge'][aria-label='Saved resets: 2; auto redeem active; Next expires 2026-07-18 00:40:11 UTC']"
 
     assert has_element?(view, active_badge_selector, "2")
     assert has_element?(view, "#{active_badge_selector} .hero-battery-100.size-3.text-current")
@@ -865,6 +870,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     view |> element(active_badge_selector) |> render_click()
 
     assert has_element?(view, "#saved-reset-policy-dialog", "Manage saved reset bank")
+
+    assert has_element?(
+             view,
+             "#saved-reset-next-expiration",
+             "Next saved reset expires at 2026-07-18 00:40:11 UTC · 2 expiration dates reported"
+           )
   end
 
   test "edits saved reset policy from the upstream account dropdown without redeeming resets", %{

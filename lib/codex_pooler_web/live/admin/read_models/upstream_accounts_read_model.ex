@@ -310,7 +310,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       reauth_required?: reauth_required?(identity),
       reauth_reason_code: reauth_reason_code(identity),
       reauth_reason_message: reauth_reason_message(identity),
-      saved_resets: SavedResets.snapshot(identity),
+      saved_resets: saved_reset_snapshot(identity, datetime_preferences),
       saved_reset_policy: SavedResets.auto_policy(identity),
       token_burn: Map.fetch!(token_burns, identity.id),
       assignments: identity_assignments,
@@ -321,6 +321,41 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
     Map.put(account, :saved_reset_redemption_action, saved_reset_redemption_action(account))
   end
+
+  defp saved_reset_snapshot(identity, datetime_preferences) do
+    snapshot = SavedResets.snapshot(identity)
+
+    Map.merge(snapshot, %{
+      next_expires_label: saved_reset_next_expires_label(snapshot, datetime_preferences),
+      next_expires_title: saved_reset_next_expires_title(snapshot, datetime_preferences)
+    })
+  end
+
+  defp saved_reset_next_expires_label(%{next_expires_at: expires_at}, datetime_preferences) do
+    case parse_datetime(expires_at) do
+      %DateTime{} = datetime ->
+        "Next expires " <> DateTimeDisplay.format_datetime(datetime, datetime_preferences)
+
+      nil ->
+        nil
+    end
+  end
+
+  defp saved_reset_next_expires_title(%{next_expires_at: expires_at}, datetime_preferences) do
+    case parse_datetime(expires_at) do
+      %DateTime{} = datetime -> DateTimeDisplay.format_datetime(datetime, datetime_preferences)
+      nil -> nil
+    end
+  end
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> DateTime.truncate(datetime, :microsecond)
+      _invalid -> nil
+    end
+  end
+
+  defp parse_datetime(_value), do: nil
 
   defp saved_reset_redemption_action(account) do
     cond do
@@ -366,8 +401,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
   defp expired_access_token_label?(label) when is_binary(label),
     do: String.starts_with?(label, "access token expired")
-
-  defp expired_access_token_label?(_label), do: false
 
   defp identity_assignments(identity, assignments, quota_readiness) do
     assignments

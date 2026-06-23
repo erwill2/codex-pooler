@@ -29,6 +29,9 @@ defmodule CodexPooler.Upstreams.SavedResets do
           required(:path_style) => String.t() | nil,
           required(:usage_path) => String.t() | nil,
           required(:observed_at) => String.t() | nil,
+          required(:available_expires_at) => [String.t()],
+          required(:next_expires_at) => String.t() | nil,
+          required(:expires_reported?) => boolean(),
           required(:in_progress?) => boolean(),
           required(:last_redemption) => map() | nil
         }
@@ -68,6 +71,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
           "usage_path" => usage_path,
           "reason" => nil
         }
+        |> Map.merge(expiration_metadata_from_payload(payload))
 
       :unreported ->
         %{
@@ -77,9 +81,27 @@ defmodule CodexPooler.Upstreams.SavedResets do
           "path_style" => path_style,
           "observed_at" => DateTime.to_iso8601(observed_at),
           "usage_path" => usage_path,
+          "available_expires_at" => [],
+          "next_expires_at" => nil,
           "reason" => %{"code" => "saved_resets_unreported"}
         }
     end
+  end
+
+  @spec credit_list_snapshot(term(), DateTime.t(), String.t() | nil) :: map()
+  def credit_list_snapshot(payload, %DateTime{} = observed_at, usage_url) do
+    {usage_path, path_style} = usage_path_style(usage_url)
+
+    %{
+      "status" => @reported,
+      "available_count" => available_count_from_credit_list(payload),
+      "source" => @reset_credits_source,
+      "path_style" => path_style,
+      "observed_at" => DateTime.to_iso8601(observed_at),
+      "usage_path" => usage_path,
+      "reason" => nil
+    }
+    |> Map.merge(expiration_metadata_from_payload(payload))
   end
 
   @spec unavailable_snapshot(DateTime.t(), String.t()) :: map()
@@ -91,6 +113,8 @@ defmodule CodexPooler.Upstreams.SavedResets do
       "path_style" => @unknown_path_style,
       "observed_at" => DateTime.to_iso8601(observed_at),
       "usage_path" => nil,
+      "available_expires_at" => [],
+      "next_expires_at" => nil,
       "reason" => %{"code" => code}
     }
   end
@@ -103,6 +127,8 @@ defmodule CodexPooler.Upstreams.SavedResets do
     redemption = Map.get(metadata, "saved_reset_redemption")
     status = snapshot_status(snapshot)
     available_count = snapshot_available_count(snapshot, status)
+    available_expires_at = snapshot_available_expires_at(snapshot)
+    next_expires_at = snapshot_next_expires_at(snapshot, available_expires_at)
     reported? = status == @reported
     available? = reported? and is_integer(available_count) and available_count > 0
 
@@ -116,6 +142,9 @@ defmodule CodexPooler.Upstreams.SavedResets do
       path_style: string_or_nil(snapshot["path_style"]),
       usage_path: string_or_nil(snapshot["usage_path"]),
       observed_at: string_or_nil(snapshot["observed_at"]),
+      available_expires_at: available_expires_at,
+      next_expires_at: next_expires_at,
+      expires_reported?: next_expires_at != nil,
       in_progress?: redemption_in_progress?(redemption),
       last_redemption: redemption_or_nil(redemption)
     }
@@ -153,8 +182,14 @@ defmodule CodexPooler.Upstreams.SavedResets do
       path when path in ["/api/codex/usage", "/backend-api/codex/usage"] ->
         {path, @codex_path_style}
 
-      path when path in ["/wham/usage", "/backend-api/wham/usage"] ->
-        {path, @chatgpt_path_style}
+      path
+      when path in [
+             "/wham/usage",
+             "/backend-api/wham/usage",
+             "/wham/rate-limit-reset-credits",
+             "/backend-api/wham/rate-limit-reset-credits"
+           ] ->
+        {chatgpt_usage_path(path), @chatgpt_path_style}
 
       _path ->
         {nil, @unknown_path_style}
@@ -162,6 +197,13 @@ defmodule CodexPooler.Upstreams.SavedResets do
   end
 
   defp usage_path_style(_usage_url), do: {nil, @unknown_path_style}
+
+  defp chatgpt_usage_path("/wham/rate-limit-reset-credits"), do: "/wham/usage"
+
+  defp chatgpt_usage_path("/backend-api/wham/rate-limit-reset-credits"),
+    do: "/backend-api/wham/usage"
+
+  defp chatgpt_usage_path(path), do: path
 
   defp non_negative_truncated_integer(value) when is_integer(value), do: {:ok, max(value, 0)}
 
@@ -205,6 +247,81 @@ defmodule CodexPooler.Upstreams.SavedResets do
   end
 
   defp snapshot_available_count(_snapshot, _status), do: nil
+
+  defp snapshot_available_expires_at(%{"available_expires_at" => values}) when is_list(values) do
+    values
+    |> Enum.map(&safe_iso8601/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.sort_by(&datetime_sort_key/1)
+  end
+
+  defp snapshot_available_expires_at(_snapshot), do: []
+
+  defp snapshot_next_expires_at(%{"next_expires_at" => value}, fallback_values) do
+    safe_iso8601(value) || List.first(fallback_values)
+  end
+
+  defp snapshot_next_expires_at(_snapshot, fallback_values), do: List.first(fallback_values)
+
+  defp expiration_metadata_from_payload(payload) do
+    expires_at =
+      payload
+      |> credit_list_from_payload()
+      |> available_expiration_iso8601s()
+
+    %{
+      "available_expires_at" => expires_at,
+      "next_expires_at" => List.first(expires_at)
+    }
+  end
+
+  defp available_count_from_credit_list(%{} = payload) do
+    case non_negative_truncated_integer(Map.get(payload, "available_count")) do
+      {:ok, count} -> count
+      :error -> payload |> credit_list_from_payload() |> Enum.count(&available_credit?/1)
+    end
+  end
+
+  defp available_count_from_credit_list(_payload), do: 0
+
+  defp credit_list_from_payload(%{"rate_limit_reset_credits" => %{"credits" => credits}})
+       when is_list(credits),
+       do: credits
+
+  defp credit_list_from_payload(%{"credits" => credits}) when is_list(credits), do: credits
+  defp credit_list_from_payload(_payload), do: []
+
+  defp available_expiration_iso8601s(credits) when is_list(credits) do
+    credits
+    |> Enum.filter(&available_credit?/1)
+    |> Enum.map(fn credit -> safe_iso8601(credit["expires_at"]) end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.sort_by(&datetime_sort_key/1)
+  end
+
+  defp available_credit?(%{"status" => status}) when is_binary(status), do: status == "available"
+  defp available_credit?(%{}), do: true
+  defp available_credit?(_credit), do: false
+
+  defp safe_iso8601(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> DateTime.to_iso8601(datetime)
+      _invalid -> nil
+    end
+  end
+
+  defp safe_iso8601(_value), do: nil
+
+  defp datetime_sort_key(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> DateTime.to_unix(datetime, :microsecond)
+      _invalid -> 0
+    end
+  end
+
+  defp datetime_sort_key(_value), do: 0
 
   defp label(@reported, 1), do: "1 saved reset"
   defp label(@reported, count) when is_integer(count) and count > 1, do: "#{count} saved resets"

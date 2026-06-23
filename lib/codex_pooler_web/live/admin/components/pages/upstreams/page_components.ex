@@ -8,6 +8,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   alias CodexPoolerWeb.Admin.UpstreamAccountCard
   alias CodexPoolerWeb.Admin.UpstreamAuthJsonDialog
   alias CodexPoolerWeb.Admin.UpstreamFilterForm
+  alias CodexPoolerWeb.DateTimeDisplay
 
   @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"
   @saved_reset_docs_url "https://docs.codex-pooler.com/operators/upstreams/#saved-resets"
@@ -86,6 +87,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
         account={@editing_saved_reset_policy}
         form={@saved_reset_policy_form}
         confirming_saved_reset_redemption={@confirming_saved_reset_redemption}
+        datetime_preferences={@datetime_preferences}
       />
 
       <section id="upstream-account-surface" class="grid min-w-0 gap-4">
@@ -552,6 +554,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :account, :map, default: nil
   attr :form, :any, default: nil
   attr :confirming_saved_reset_redemption, :map, default: nil
+  attr :datetime_preferences, :map, required: true
 
   defp saved_reset_policy_dialog(assigns) do
     assigns = assign(assigns, :saved_reset_docs_url, @saved_reset_docs_url)
@@ -569,6 +572,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           <h2 class="mt-1 text-2xl font-bold text-base-content">Manage saved reset bank</h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
             A saved reset is a banked reset credit for this account. Choose when the account may spend saved resets and redeem one manually when needed.
+          </p>
+        </div>
+
+        <div
+          :if={@account.saved_resets.expires_reported?}
+          id="saved-reset-expiration-summary"
+          class="border-b border-base-300 bg-base-200/30 px-6 py-4"
+        >
+          <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
+            Reset expiration
+          </p>
+          <p id="saved-reset-next-expiration" class="mt-1 text-sm text-base-content">
+            {saved_reset_expiration_summary(@account.saved_resets, @datetime_preferences)}
           </p>
         </div>
 
@@ -662,6 +678,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
             id="saved-reset-manual-redemption"
             class="grid gap-3 rounded-lg border border-base-300 bg-base-200/30 p-4"
           >
+            <div
+              :if={@account.saved_resets.expires_reported?}
+              id="saved-reset-manual-redemption-expiration"
+              class="rounded-lg bg-base-100 p-3 text-xs leading-5 text-base-content/70"
+            >
+              {saved_reset_expiration_summary(@account.saved_resets, @datetime_preferences)}
+            </div>
+
             <div class="grid gap-1">
               <h3 class="text-sm font-semibold text-base-content">Redeem one banked reset now</h3>
               <p class="text-sm leading-6 text-base-content/70">
@@ -747,6 +771,30 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
     </dialog>
     """
   end
+
+  defp saved_reset_expiration_summary(saved_resets, datetime_preferences) do
+    count = length(saved_resets.available_expires_at)
+    next_expires_at = saved_resets.next_expires_at
+
+    suffix =
+      case count do
+        0 -> ""
+        1 -> ""
+        value -> " · #{value} expiration dates reported"
+      end
+
+    "Next saved reset expires at " <>
+      format_saved_reset_expiration(next_expires_at, datetime_preferences) <> suffix
+  end
+
+  defp format_saved_reset_expiration(value, datetime_preferences) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> DateTimeDisplay.format_datetime(datetime, datetime_preferences)
+      _invalid -> "unknown time"
+    end
+  end
+
+  defp format_saved_reset_expiration(_value, _datetime_preferences), do: "unknown time"
 
   attr :accounts, :list, required: true
   attr :datetime_preferences, :map, required: true

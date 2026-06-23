@@ -22,6 +22,50 @@ defmodule CodexPooler.Upstreams.SavedResetsTest do
                |> SavedResets.snapshot()
     end
 
+    test "projects sanitized reset credit expirations" do
+      observed_at = ~U[2026-06-23 10:00:00Z]
+
+      snapshot =
+        %{
+          "saved_resets" =>
+            SavedResets.usage_snapshot(
+              %{
+                "rate_limit_reset_credits" => %{
+                  "available_count" => 2,
+                  "credits" => [
+                    %{
+                      "id" => "ignored-late",
+                      "status" => "available",
+                      "expires_at" => "2026-07-20T00:40:11.968726Z"
+                    },
+                    %{
+                      "id" => "ignored-redeemed",
+                      "status" => "redeemed",
+                      "expires_at" => "2026-07-18T00:40:11.968726Z"
+                    },
+                    %{
+                      "id" => "ignored-early",
+                      "status" => "available",
+                      "expires_at" => "2026-07-18T00:40:11.968726Z"
+                    }
+                  ]
+                }
+              },
+              observed_at,
+              "https://chatgpt.com/backend-api/wham/usage"
+            )
+        }
+        |> SavedResets.snapshot()
+
+      assert snapshot.available_expires_at == [
+               "2026-07-18T00:40:11.968726Z",
+               "2026-07-20T00:40:11.968726Z"
+             ]
+
+      assert snapshot.next_expires_at == "2026-07-18T00:40:11.968726Z"
+      assert snapshot.expires_reported? == true
+    end
+
     test "clamps negative counts to zero" do
       assert {:reported, 0} =
                SavedResets.count_from_usage_payload(%{

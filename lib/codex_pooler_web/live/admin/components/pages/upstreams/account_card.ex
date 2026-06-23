@@ -345,6 +345,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
       |> assign(:badge_class, saved_reset_count_badge_class(assigns.saved_reset_policy))
       |> assign(:badge_icon_class, saved_reset_count_badge_icon_class(assigns.saved_reset_policy))
       |> assign(:policy_state_label, saved_reset_policy_state_label(assigns.saved_reset_policy))
+      |> assign(:expiry_label, saved_reset_expiry_label(assigns.saved_resets))
 
     ~H"""
     <button
@@ -352,8 +353,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
       type="button"
       data-role="upstream-saved-reset-count-badge"
       class={@badge_class}
-      aria-label={"Saved resets: #{@saved_resets.available_count}; #{@policy_state_label}"}
-      title={"#{@saved_resets.label}; #{@policy_state_label}"}
+      aria-label={"Saved resets: #{@saved_resets.available_count}; #{@policy_state_label}#{@expiry_label}"}
+      title={"#{@saved_resets.label}; #{@policy_state_label}#{@expiry_label}"}
       phx-click="open_saved_reset_policy"
       phx-value-id={@identity_id}
       disabled={@disabled}
@@ -371,6 +372,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
     ~H"""
     """
   end
+
+  defp saved_reset_expiry_label(%{next_expires_label: label}) when is_binary(label),
+    do: "; " <> label
+
+  defp saved_reset_expiry_label(_saved_resets), do: ""
 
   defp saved_reset_count_badge_class(%{enabled?: true}) do
     [

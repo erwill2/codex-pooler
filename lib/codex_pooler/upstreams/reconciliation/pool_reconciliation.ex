@@ -436,6 +436,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         {:ok, %{status: status, body: body}} when status in 200..299 ->
           case Quota.Windows.codex_usage_quota_windows_from_payload(body, observed_at) do
             {:ok, windows} ->
+              body = maybe_enrich_saved_reset_payload(identity, access_token, body, url, timeout)
               result = {:ok, body, url, windows}
 
               # Reason: successful usage probes prefer account-primary quota evidence immediately.
@@ -464,6 +465,72 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
       end
     end)
   end
+
+  defp maybe_enrich_saved_reset_payload(identity, access_token, payload, usage_url, timeout)
+       when is_map(payload) do
+    case SavedResets.count_from_usage_payload(payload) do
+      {:reported, count} when count > 0 ->
+        case fetch_reset_credits_payload(identity, access_token, usage_url, timeout) do
+          {:ok, reset_credits} -> merge_reset_credit_snapshot(payload, reset_credits)
+          :error -> payload
+        end
+
+      _unreported_or_empty ->
+        payload
+    end
+  end
+
+  defp maybe_enrich_saved_reset_payload(_identity, _access_token, payload, _usage_url, _timeout),
+    do: payload
+
+  defp fetch_reset_credits_payload(identity, access_token, usage_url, timeout) do
+    with {:ok, url} <- reset_credits_url(usage_url),
+         {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) <-
+           Req.get(url,
+             headers: codex_usage_headers(access_token, identity.chatgpt_account_id),
+             retry: false,
+             receive_timeout: timeout
+           ) do
+      {:ok, body}
+    else
+      _unavailable -> :error
+    end
+  end
+
+  defp reset_credits_url(usage_url) do
+    case URI.parse(usage_url).path do
+      "/backend-api/wham/usage" ->
+        {:ok,
+         %{URI.parse(usage_url) | path: "/backend-api/wham/rate-limit-reset-credits"}
+         |> URI.to_string()}
+
+      "/wham/usage" ->
+        {:ok, %{URI.parse(usage_url) | path: "/wham/rate-limit-reset-credits"} |> URI.to_string()}
+
+      _path ->
+        :error
+    end
+  end
+
+  defp merge_reset_credit_snapshot(payload, reset_credits) do
+    reset_credit_summary = Map.get(payload, "rate_limit_reset_credits") || %{}
+
+    reset_credit_summary =
+      reset_credit_summary
+      |> put_if_present("available_count", Map.get(reset_credits, "available_count"))
+      |> put_if_present("total_earned_count", Map.get(reset_credits, "total_earned_count"))
+      |> put_reset_credit_list(reset_credits)
+
+    Map.put(payload, "rate_limit_reset_credits", reset_credit_summary)
+  end
+
+  defp put_if_present(map, _key, nil), do: map
+  defp put_if_present(map, key, value), do: Map.put(map, key, value)
+
+  defp put_reset_credit_list(map, %{"credits" => credits}) when is_list(credits),
+    do: Map.put(map, "credits", credits)
+
+  defp put_reset_credit_list(map, _reset_credits), do: map
 
   defp prefer_current_usage_result(
          {:ok, _body, _url, previous_windows},

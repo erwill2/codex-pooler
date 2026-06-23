@@ -91,9 +91,6 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
           quota_mode
         )
         |> maybe_allow_missing_quota(filter_input, quota_mode)
-
-      result ->
-        maybe_allow_missing_quota(result, filter_input, quota_mode)
     end
   end
 

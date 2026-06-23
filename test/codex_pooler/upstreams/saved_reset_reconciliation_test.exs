@@ -16,7 +16,8 @@ defmodule CodexPooler.Upstreams.SavedResetReconciliationTest do
            "/api/codex/usage" => {404, %{}},
            "/backend-api/codex/usage" => {404, %{}},
            "/wham/usage" => {404, %{}},
-           "/backend-api/wham/usage" => {200, usage_payload(3)}
+           "/backend-api/wham/usage" => {200, usage_payload(3)},
+           "/backend-api/wham/rate-limit-reset-credits" => {200, reset_credits_payload()}
          }}
       )
 
@@ -35,17 +36,26 @@ defmodule CodexPooler.Upstreams.SavedResetReconciliationTest do
              available_count: 3,
              available?: true,
              reported?: true,
+             expires_reported?: true,
+             available_expires_at: [
+               "2026-07-18T00:40:11.968726Z",
+               "2026-07-20T00:40:11.968726Z"
+             ],
+             next_expires_at: "2026-07-18T00:40:11.968726Z",
              path_style: "chatgpt_api",
              usage_path: "/backend-api/wham/usage"
            } = SavedResets.snapshot(updated_identity)
 
     assert get_in(updated_identity.metadata, ["saved_resets", "source"]) == "codex_usage_api"
     assert is_binary(get_in(updated_identity.metadata, ["saved_resets", "observed_at"]))
-
     metadata_json = Jason.encode!(updated_identity.metadata)
-    refute metadata_json =~ "credits"
+    assert metadata_json =~ "available_expires_at"
+    assert metadata_json =~ "next_expires_at"
+    refute metadata_json =~ "RateLimitResetCredit_"
     refute metadata_json =~ "credit_id"
     refute metadata_json =~ "redeem_request_id"
+    refute metadata_json =~ "One free rate limit reset"
+    refute metadata_json =~ "Referral reward"
   end
 
   test "refresh_quota_from_usage stores unreported snapshot when usage omits reset credits" do
@@ -85,6 +95,37 @@ defmodule CodexPooler.Upstreams.SavedResetReconciliationTest do
           "reset_after_seconds" => 900
         }
       }
+    }
+  end
+
+  defp reset_credits_payload do
+    %{
+      "available_count" => 3,
+      "total_earned_count" => 4,
+      "credits" => [
+        %{
+          "id" => "RateLimitResetCredit_early",
+          "reset_type" => "codex_rate_limits",
+          "status" => "available",
+          "granted_at" => "2026-06-18T00:40:11.968726Z",
+          "expires_at" => "2026-07-18T00:40:11.968726Z",
+          "title" => "One free rate limit reset"
+        },
+        %{
+          "id" => "RateLimitResetCredit_late",
+          "reset_type" => "codex_rate_limits",
+          "status" => "available",
+          "granted_at" => "2026-06-20T00:40:11.968726Z",
+          "expires_at" => "2026-07-20T00:40:11.968726Z",
+          "description" => "Referral reward"
+        },
+        %{
+          "id" => "RateLimitResetCredit_redeemed",
+          "reset_type" => "codex_rate_limits",
+          "status" => "redeemed",
+          "expires_at" => "2026-07-10T00:40:11.968726Z"
+        }
+      ]
     }
   end
 end

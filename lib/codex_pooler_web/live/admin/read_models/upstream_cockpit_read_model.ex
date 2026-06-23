@@ -246,7 +246,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     pools = Pools.list_visible_pools(scope)
 
     scope
-    |> UpstreamAccountsReadModel.list_visible_accounts(pools)
+    |> UpstreamAccountsReadModel.list_visible_accounts(
+      pools,
+      %{},
+      DateTimeDisplay.preferences_for_user(scope.user)
+    )
     |> Enum.find(&(&1.identity.id == identity_id))
     |> case do
       nil -> :error

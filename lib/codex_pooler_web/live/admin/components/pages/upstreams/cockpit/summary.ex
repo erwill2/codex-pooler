@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
+  alias CodexPoolerWeb.DateTimeDisplay
 
   def cockpit_navigation(assigns) do
     ~H"""
@@ -137,8 +138,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
   end
 
   attr :cockpit, :map, required: true
+  attr :datetime_preferences, :map, required: true
 
   def status_summary(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :cockpit,
+        with_saved_reset_expiration_label(assigns.cockpit, assigns.datetime_preferences)
+      )
+
     ~H"""
     <AdminComponents.metric_strip id="upstream-status-summary" compact_mobile={true}>
       <AdminComponents.metric_card
@@ -164,7 +173,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
         icon="hero-arrow-path"
         label="Saved resets"
         value={@cockpit.saved_resets.label}
-        description={saved_reset_summary_description(@cockpit.saved_reset_policy)}
+        description={
+          saved_reset_summary_description(@cockpit.saved_resets, @cockpit.saved_reset_policy)
+        }
         tone={saved_reset_summary_tone(@cockpit.saved_resets)}
         compact_mobile={true}
       />
@@ -224,6 +235,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
         quota_status_detail_label(cockpit.charts.quota_health),
         cockpit.charts.quota_health.state
       ),
+      optional_detail(
+        "saved-reset-expiration",
+        Map.get(cockpit.saved_resets, :next_expires_label),
+        "active"
+      ),
       optional_detail("reauth-code", cockpit.header.reauth_reason_code, "reauth_required"),
       optional_detail("reauth-message", cockpit.header.reauth_reason_message, "reauth_required")
     ]
@@ -241,6 +257,36 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
   defp optional_detail(_id, nil, _status), do: nil
   defp optional_detail(_id, "", _status), do: nil
   defp optional_detail(id, label, status), do: detail(id, label, status)
+
+  defp with_saved_reset_expiration_label(cockpit, datetime_preferences) do
+    saved_resets =
+      Map.put_new(
+        cockpit.saved_resets,
+        :next_expires_label,
+        saved_reset_next_expires_label(cockpit.saved_resets, datetime_preferences)
+      )
+
+    Map.put(cockpit, :saved_resets, saved_resets)
+  end
+
+  defp saved_reset_next_expires_label(%{next_expires_at: expires_at}, datetime_preferences) do
+    case parse_datetime(expires_at) do
+      %DateTime{} = datetime ->
+        "Next expires " <> DateTimeDisplay.format_datetime(datetime, datetime_preferences)
+
+      nil ->
+        nil
+    end
+  end
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> DateTime.truncate(datetime, :microsecond)
+      _invalid -> nil
+    end
+  end
+
+  defp parse_datetime(_value), do: nil
 
   defp plan_status_label(%{header: %{plan_reported?: true, plan_label: plan_label}}),
     do: "Plan #{plan_label}"
@@ -278,7 +324,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
   defp quota_summary_tone(%{degraded?: true}), do: :warning
   defp quota_summary_tone(_quota), do: :success
 
-  defp saved_reset_summary_description(%{
+  defp saved_reset_summary_description(saved_resets, policy) do
+    [
+      saved_reset_policy_description(policy),
+      saved_reset_next_expires_description(saved_resets)
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(" · ")
+  end
+
+  defp saved_reset_policy_description(%{
          enabled?: true,
          trigger_mode: "threshold",
          keep_credits: keep_credits,
@@ -286,10 +341,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
        }),
        do: "Auto redeem on · near #{threshold}% · keep #{keep_credits}"
 
-  defp saved_reset_summary_description(%{enabled?: true, keep_credits: keep_credits}),
+  defp saved_reset_policy_description(%{enabled?: true, keep_credits: keep_credits}),
     do: "Auto redeem on · blocked · keep #{keep_credits}"
 
-  defp saved_reset_summary_description(_policy), do: "Auto redeem off"
+  defp saved_reset_policy_description(_policy), do: "Auto redeem off"
+
+  defp saved_reset_next_expires_description(%{next_expires_label: label}) when is_binary(label),
+    do: label
+
+  defp saved_reset_next_expires_description(_saved_resets), do: nil
 
   defp saved_reset_summary_tone(%{available?: true}), do: :success
   defp saved_reset_summary_tone(%{reported?: true}), do: :neutral

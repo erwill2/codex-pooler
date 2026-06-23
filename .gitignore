@@ -44,6 +44,7 @@ RUNBOOK.md
 /.elixir_ls/
 /.impeccable/
 /.omo/
+/.omp/
 /references/*
 !/references/.gitkeep
 !/references/README.md

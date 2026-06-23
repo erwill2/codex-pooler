@@ -944,7 +944,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
             "source" => "codex_usage_api",
             "path_style" => "codex",
             "usage_path" => "/api/codex/usage",
-            "observed_at" => DateTime.to_iso8601(now)
+            "observed_at" => DateTime.to_iso8601(now),
+            "available_expires_at" => ["2026-07-18T00:40:11.968726Z"],
+            "next_expires_at" => "2026-07-18T00:40:11.968726Z"
           }
         }
       })
@@ -953,6 +955,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert cockpit.saved_resets.label == "1 saved reset"
     assert cockpit.saved_resets.available? == true
     assert cockpit.saved_reset_policy.enabled? == false
+    assert cockpit.saved_resets.next_expires_label == "Next expires 2026-07-18 00:40:11 UTC"
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
     metric_selector = "#upstream-status-summary-saved-resets"
@@ -964,6 +967,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
            )
 
     assert has_element?(view, metric_selector, "Auto redeem off")
+    assert has_element?(view, metric_selector, "Next expires 2026-07-18 00:40:11 UTC")
 
     assert has_element?(view, "#saved-reset-policy-auto-redeem-enabled")
     assert has_element?(view, "#saved-reset-policy-min-blocked-minutes")

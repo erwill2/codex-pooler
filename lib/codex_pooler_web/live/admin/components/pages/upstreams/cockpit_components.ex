@@ -53,7 +53,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
       <Dialogs.delete_account_dialog account={@deleting_account} form={@delete_account_form} />
 
       <Summary.identity_summary cockpit={@cockpit} />
-      <Summary.status_summary cockpit={@cockpit} />
+      <Summary.status_summary cockpit={@cockpit} datetime_preferences={@datetime_preferences} />
       <Summary.oauth_flow_state cockpit={@cockpit} datetime_preferences={@datetime_preferences} />
       <Sections.assignments_section cockpit={@cockpit} />
       <Charts.quota_section cockpit={@cockpit} datetime_preferences={@datetime_preferences} />

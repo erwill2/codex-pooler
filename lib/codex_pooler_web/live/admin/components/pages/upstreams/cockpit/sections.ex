@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
+  alias Phoenix.HTML.Form
 
   def assignments_section(assigns) do
     ~H"""
@@ -542,7 +543,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
   end
 
   defp form_checkbox_checked?(field) do
-    Phoenix.HTML.Form.normalize_value("checkbox", field.value)
+    Form.normalize_value("checkbox", field.value)
   end
 
   defp default_pool_id(%{assignments: %{items: [%{pool_id: pool_id} | _items]}}), do: pool_id

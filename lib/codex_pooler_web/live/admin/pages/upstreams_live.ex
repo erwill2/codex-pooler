@@ -443,41 +443,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
           saved_reset_policy_changeset(current_saved_reset_policy(socket), params, :validate)
 
         if changeset.valid? do
-          attrs =
-            changeset
-            |> Ecto.Changeset.apply_changes()
-            |> Map.put(:trigger_kind, "admin_upstreams_live")
-
-          case Upstreams.update_saved_reset_policy_for_scope(
-                 socket.assigns.current_scope,
-                 identity_id,
-                 attrs
-               ) do
-            {:ok, _result} ->
-              {:noreply,
-               socket
-               |> put_flash(:info, "Saved reset policy updated")
-               |> close_saved_reset_policy_dialog()
-               |> reload_upstreams()}
-
-            {:error, %Ecto.Changeset{} = changeset} ->
-              {:noreply,
-               assign(
-                 socket,
-                 :saved_reset_policy_form,
-                 Phoenix.Component.to_form(changeset, as: :saved_reset_policy)
-               )}
-
-            {:error, reason} ->
-              {:noreply, put_flash(socket, :error, error_message(reason))}
-          end
+          save_saved_reset_policy(socket, identity_id, changeset)
         else
-          {:noreply,
-           assign(
-             socket,
-             :saved_reset_policy_form,
-             Phoenix.Component.to_form(changeset, as: :saved_reset_policy)
-           )}
+          {:noreply, assign_saved_reset_policy_form(socket, changeset)}
         end
 
       nil ->
@@ -547,6 +515,40 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
       {:error, reason} ->
         {:noreply, put_flash(socket, :error, error_message(reason))}
     end
+  end
+
+  defp save_saved_reset_policy(socket, identity_id, changeset) do
+    attrs =
+      changeset
+      |> Ecto.Changeset.apply_changes()
+      |> Map.put(:trigger_kind, "admin_upstreams_live")
+
+    case Upstreams.update_saved_reset_policy_for_scope(
+           socket.assigns.current_scope,
+           identity_id,
+           attrs
+         ) do
+      {:ok, _result} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Saved reset policy updated")
+         |> close_saved_reset_policy_dialog()
+         |> reload_upstreams()}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:noreply, assign_saved_reset_policy_form(socket, changeset)}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, error_message(reason))}
+    end
+  end
+
+  defp assign_saved_reset_policy_form(socket, changeset) do
+    assign(
+      socket,
+      :saved_reset_policy_form,
+      Phoenix.Component.to_form(changeset, as: :saved_reset_policy)
+    )
   end
 
   defp enqueue_saved_reset_redemption(socket, account) do
