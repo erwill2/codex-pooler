@@ -1170,11 +1170,6 @@ For deployed instances, change `LLM_BASE_URL` to
 `openai/gpt-5.5` so OpenHands selects its OpenAI-compatible provider path while
 Codex Pooler routes the request through the assigned Pool.
 
-The audited OpenHands app source delegates authoritative LLM limit parsing to
-`openhands-sdk`; the local app checkout does not expose source-verifiable
-`gpt-5.5` context or output limit fields. Keep this example to model/base URL
-environment overrides unless the SDK source is audited too.
-
 </details>
 
 <details>
