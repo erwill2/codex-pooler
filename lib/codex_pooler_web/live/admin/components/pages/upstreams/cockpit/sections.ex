@@ -311,7 +311,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
             <div class="grid max-w-3xl gap-1">
               <p class="text-sm font-semibold text-base-content">Auto redeem policy</p>
               <p class="text-xs leading-5 text-base-content/60">
-                Automatic redemption can wait until weekly quota is blocked, start earlier near the quota limit when every eligible account is under pressure, or spend a soon-expiring reset when this account already has weekly usage. The reset buffer prevents spending when the weekly reset is close.
+                Automatic redemption can wait until weekly quota is blocked, start earlier near the quota limit when every eligible account is under pressure, or rescue a soon-expiring reset when this account already has weekly usage. The reset buffer prevents spending when the weekly reset is close.
               </p>
             </div>
             <label
@@ -341,7 +341,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
               label="Auto trigger"
               class="select select-bordered w-full"
               options={[
-                {"Blocked", "blocked"},
+                {"Blocked or expiring", "blocked"},
                 {"Near limit", "threshold"}
               ]}
             />

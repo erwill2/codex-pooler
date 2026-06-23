@@ -19,6 +19,8 @@ defmodule CodexPooler.Upstreams.SavedResets do
   @default_quota_threshold_percent 95
   @expiration_refresh_ttl_seconds 6 * 60 * 60
   @expiring_soon_seconds 24 * 60 * 60
+  @redemption_projection_receive_timeout_ms 15_000
+  @redemption_projection_stale_grace_ms 60_000
 
   @type count_parse_result :: {:reported, non_neg_integer()} | :unreported
   @type snapshot_projection :: %{
@@ -37,6 +39,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
           required(:expires_refresh_attempted_at) => String.t() | nil,
           required(:expires_reported?) => boolean(),
           required(:in_progress?) => boolean(),
+          required(:redemption_stale?) => boolean(),
           required(:last_redemption) => map() | nil
         }
   @type auto_policy_projection :: %{
@@ -128,11 +131,16 @@ defmodule CodexPooler.Upstreams.SavedResets do
   end
 
   @spec snapshot(UpstreamIdentity.t() | map() | nil) :: snapshot_projection()
-  def snapshot(%UpstreamIdentity{} = identity), do: snapshot(identity.metadata)
+  def snapshot(identity_or_metadata), do: snapshot(identity_or_metadata, now())
 
-  def snapshot(%{} = metadata) do
+  @spec snapshot(UpstreamIdentity.t() | map() | nil, DateTime.t()) :: snapshot_projection()
+  def snapshot(%UpstreamIdentity{} = identity, %DateTime{} = timestamp),
+    do: snapshot(identity.metadata, timestamp)
+
+  def snapshot(%{} = metadata, %DateTime{} = timestamp) do
     snapshot = Map.get(metadata, "saved_resets", metadata)
     redemption = Map.get(metadata, "saved_reset_redemption")
+    redemption_state = redemption_state(redemption, timestamp)
     status = snapshot_status(snapshot)
     available_count = snapshot_available_count(snapshot, status)
     available_expires_at = snapshot_available_expires_at(snapshot)
@@ -157,13 +165,14 @@ defmodule CodexPooler.Upstreams.SavedResets do
       expires_observed_at: expires_observed_at,
       expires_refresh_attempted_at: expires_refresh_attempted_at,
       expires_reported?: next_expires_at != nil,
-      in_progress?: redemption_in_progress?(redemption),
+      in_progress?: redemption_state == :in_progress,
+      redemption_stale?: redemption_state == :stale,
       last_redemption: redemption_or_nil(redemption)
     }
   end
 
-  def snapshot(_identity_or_metadata) do
-    snapshot(%{"saved_resets" => %{}})
+  def snapshot(_identity_or_metadata, %DateTime{} = timestamp) do
+    snapshot(%{"saved_resets" => %{}}, timestamp)
   end
 
   @spec reset_credit_list_refresh_due?(
@@ -514,8 +523,32 @@ defmodule CodexPooler.Upstreams.SavedResets do
   defp label(@unavailable, _count), do: "Saved resets unavailable"
   defp label(_status, _count), do: "Saved resets not reported"
 
-  defp redemption_in_progress?(%{"status" => "redeeming"}), do: true
-  defp redemption_in_progress?(_redemption), do: false
+  @spec redemption_state(map() | term(), DateTime.t()) :: :in_progress | :stale | :complete
+  defp redemption_state(
+         %{"status" => "redeeming", "started_at" => started_at},
+         %DateTime{} = timestamp
+       )
+       when is_binary(started_at) do
+    case DateTime.from_iso8601(started_at) do
+      {:ok, started_at, _offset} ->
+        if fresh_redemption?(started_at, timestamp), do: :in_progress, else: :stale
+
+      _invalid ->
+        :stale
+    end
+  end
+
+  defp redemption_state(%{"status" => "redeeming"}, _timestamp), do: :stale
+  defp redemption_state(_redemption, _timestamp), do: :complete
+
+  @spec fresh_redemption?(DateTime.t(), DateTime.t()) :: boolean()
+  defp fresh_redemption?(%DateTime{} = started_at, %DateTime{} = timestamp) do
+    DateTime.diff(timestamp, started_at, :millisecond) <
+      @redemption_projection_receive_timeout_ms + @redemption_projection_stale_grace_ms
+  end
+
+  @spec now() :: DateTime.t()
+  defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
   defp redemption_or_nil(%{} = redemption), do: redemption
   defp redemption_or_nil(_redemption), do: nil

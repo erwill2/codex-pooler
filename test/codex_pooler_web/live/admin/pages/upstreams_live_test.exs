@@ -989,6 +989,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       })
 
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    stale_started_at = now |> DateTime.add(-5, :minute) |> DateTime.to_iso8601()
 
     %{identity: identity, assignment: assignment} =
       active_upstream_assignment_fixture(pool, %{
@@ -1006,9 +1007,27 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
             "path_style" => "codex_api",
             "usage_path" => "/api/codex/usage",
             "observed_at" => DateTime.to_iso8601(now)
+          },
+          "saved_reset_redemption" => %{
+            "status" => "redeeming",
+            "attempt_id" => Ecto.UUID.generate(),
+            "generation" => 1,
+            "trigger_kind" => "admin_manual",
+            "started_at" => stale_started_at,
+            "finished_at" => nil,
+            "result" => nil
           }
         }
       })
+
+    [account] =
+      scope
+      |> UpstreamAccountsReadModel.list_visible_accounts([pool])
+      |> Enum.filter(&(&1.identity.id == identity.id))
+
+    assert account.saved_resets.redemption_stale? == true
+    assert account.saved_resets.in_progress? == false
+    assert account.saved_reset_redemption_action.available? == true
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 

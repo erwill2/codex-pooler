@@ -132,6 +132,47 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       assert {:error, :redemption_in_progress} = SavedResetRedemption.redeem(assignment)
       assert [] = FakeUpstream.requests(fake)
     end
+
+    test "stale admin in-progress redemption is recovered by manual attempt" do
+      {:ok, fake} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      stale_started_at =
+        DateTime.utc_now()
+        |> DateTime.add(-5, :minute)
+        |> DateTime.truncate(:microsecond)
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
+          redemption: %{
+            "status" => "redeeming",
+            "attempt_id" => Ecto.UUID.generate(),
+            "generation" => 1,
+            "trigger_kind" => "admin_manual",
+            "started_at" => DateTime.to_iso8601(stale_started_at),
+            "finished_at" => nil,
+            "result" => nil
+          }
+        )
+
+      assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} =
+               SavedResetRedemption.redeem(assignment)
+
+      assert [consume_request, usage_request] = FakeUpstream.requests(fake)
+      assert consume_request.path == "/api/codex/rate-limit-reset-credits/consume"
+      assert usage_request.path == "/api/codex/usage"
+
+      persisted = Repo.reload!(identity)
+      assert get_in(persisted.metadata, ["saved_reset_redemption", "status"]) == "succeeded"
+      assert get_in(persisted.metadata, ["saved_reset_redemption", "generation"]) == 3
+      assert get_in(persisted.metadata, ["saved_reset_redemption", "result", "code"]) == "reset"
+    end
   end
 
   defp assignment_with_fake(fake, usage_path, path_style, opts \\ []) do

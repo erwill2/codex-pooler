@@ -92,20 +92,46 @@ defmodule CodexPooler.Upstreams.SavedResetsTest do
                |> SavedResets.snapshot()
     end
 
-    test "projects in-progress redemption metadata" do
-      assert %{in_progress?: true} =
-               SavedResets.snapshot(%{
-                 "saved_resets" => %{
-                   "status" => "reported",
-                   "available_count" => 1,
-                   "source" => "codex_usage_api",
-                   "path_style" => "chatgpt_api",
-                   "observed_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
-                   "usage_path" => "/wham/usage",
-                   "reason" => nil
-                 },
-                 "saved_reset_redemption" => %{"status" => "redeeming"}
-               })
+    test "projects fresh in-progress redemption metadata" do
+      started_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert %{in_progress?: true, redemption_stale?: false} =
+               started_at
+               |> saved_reset_snapshot_metadata()
+               |> SavedResets.snapshot()
     end
+
+    test "projects stale redemption metadata as retryable" do
+      started_at =
+        DateTime.utc_now() |> DateTime.add(-5, :minute) |> DateTime.truncate(:microsecond)
+
+      assert %{in_progress?: false, redemption_stale?: true} =
+               started_at
+               |> saved_reset_snapshot_metadata()
+               |> SavedResets.snapshot()
+    end
+  end
+
+  defp saved_reset_snapshot_metadata(started_at) do
+    %{
+      "saved_resets" => %{
+        "status" => "reported",
+        "available_count" => 1,
+        "source" => "codex_usage_api",
+        "path_style" => "chatgpt_api",
+        "observed_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+        "usage_path" => "/wham/usage",
+        "reason" => nil
+      },
+      "saved_reset_redemption" => %{
+        "status" => "redeeming",
+        "attempt_id" => Ecto.UUID.generate(),
+        "generation" => 1,
+        "trigger_kind" => "admin_manual",
+        "started_at" => DateTime.to_iso8601(started_at),
+        "finished_at" => nil,
+        "result" => nil
+      }
+    }
   end
 end

@@ -605,9 +605,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                 name="saved_reset_policy[auto_redeem_enabled]"
                 label="Auto redeem saved resets"
               />
-              <p class="text-xs leading-5 text-base-content/65">
-                Let Codex Pooler spend a banked reset automatically when the Pool is at risk and this account has more resets than the reserve below.
-              </p>
             </div>
 
             <div class="grid gap-4 md:grid-cols-[minmax(0,1.1fr)_minmax(9rem,0.9fr)]">
@@ -619,12 +616,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                   name="saved_reset_policy[trigger_mode]"
                   label="When automatic redemption can start"
                   options={[
-                    {"Only after work is blocked", "blocked"},
+                    {"After block or near expiry", "blocked"},
                     {"Before work stops near the quota limit", "threshold"}
                   ]}
                 />
                 <p class="text-xs leading-5 text-base-content/65">
-                  Early mode waits until every eligible account in the Pool is also near the configured weekly quota limit. Expiring saved resets may also redeem early when this account already has weekly usage.
+                  Blocked mode waits for weekly quota exhaustion, except a known reset expiring within 24 hours may be rescued early after this account has weekly usage. Near-limit mode waits until every eligible account in the Pool is also near the configured weekly quota limit.
                 </p>
               </div>
 
@@ -640,7 +637,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                   step="1"
                 />
                 <p class="text-xs leading-5 text-base-content/65">
-                  Used only by early mode. 95 means redeem when fresh weekly quota evidence shows at least 95% used.
+                  Used only by near-limit mode. 95 means redeem when every eligible account has fresh weekly quota evidence at or above 95% used.
                 </p>
               </div>
             </div>
@@ -655,7 +652,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                 min="0"
               />
               <p class="text-xs leading-5 text-base-content/65">
-                Do not spend a saved reset when the weekly quota will reset naturally within this many minutes. Use 0 only when operators accept aggressive fail-open routing.
+                Do not spend a saved reset when the weekly quota will reset naturally within this many minutes. Set 0 to allow automatic redemption even when the natural reset is close.
               </p>
             </div>
 
@@ -669,7 +666,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                 min="0"
               />
               <p class="text-xs leading-5 text-base-content/65">
-                Automatic redemption stops when the available reset count is at or below this reserve. Manual redemption below remains an explicit operator action.
+                Automatic redemption stops when the available reset count is at or below this reserve.
               </p>
             </div>
           </.form>

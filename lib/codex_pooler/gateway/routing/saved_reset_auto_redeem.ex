@@ -261,7 +261,8 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
     snapshot = SavedResets.snapshot(identity)
 
     policy.enabled? and snapshot.available_count != nil and
-      snapshot.available_count > policy.keep_credits and not snapshot.in_progress?
+      snapshot.available_count > policy.keep_credits and not snapshot.in_progress? and
+      not snapshot.redemption_stale?
   end
 
   defp redeemable_weekly_window?(

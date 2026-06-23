@@ -342,7 +342,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
        do: "Auto redeem on · near #{threshold}% · keep #{keep_credits}"
 
   defp saved_reset_policy_description(%{enabled?: true, keep_credits: keep_credits}),
-    do: "Auto redeem on · blocked · keep #{keep_credits}"
+    do: "Auto redeem on · blocked/expiring · keep #{keep_credits}"
 
   defp saved_reset_policy_description(_policy), do: "Auto redeem off"
 

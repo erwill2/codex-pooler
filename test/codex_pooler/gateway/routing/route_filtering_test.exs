@@ -96,6 +96,43 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
       assert [] = FakeUpstream.requests(upstream)
     end
 
+    test "auto redemption ignores stale in-progress redemption until manual recovery" do
+      {:ok, upstream} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      started_at = DateTime.utc_now() |> DateTime.add(-5, :minute) |> DateTime.to_iso8601()
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      %{identity: identity, assignment: assignment} =
+        active_upstream_assignment_fixture(pool, %{
+          metadata:
+            upstream
+            |> saved_reset_metadata(1)
+            |> Map.put("saved_reset_redemption", %{
+              "status" => "redeeming",
+              "attempt_id" => Ecto.UUID.generate(),
+              "generation" => 1,
+              "trigger_kind" => "gateway_auto",
+              "started_at" => started_at,
+              "finished_at" => nil,
+              "result" => nil
+            })
+        })
+
+      identity = enable_saved_reset_auto_redeem!(identity)
+      upsert_weekly_exhausted_quota!(identity)
+      filter_input = filter_input(pool, api_key, assignment, identity, "auto-stale-redemption")
+
+      assert {:error, %{code: "quota_exhausted"}} = RouteFiltering.filter_candidates(filter_input)
+      assert [] = FakeUpstream.requests(upstream)
+    end
+
     test "auto redeems saved reset and refilters when weekly account quota is exhausted" do
       {:ok, upstream} =
         FakeUpstream.start_link(
