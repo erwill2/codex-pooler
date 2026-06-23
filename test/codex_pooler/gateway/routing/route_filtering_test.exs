@@ -183,6 +183,66 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
       assert usage_request.path == "/api/codex/usage"
     end
 
+    test "auto redeems saved reset before exhaustion when a usable reset expires soon" do
+      {:ok, upstream} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      %{identity: identity, assignment: assignment} =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: saved_reset_metadata(upstream, 1, expiring_saved_reset_attrs())
+        })
+
+      identity = enable_saved_reset_auto_redeem!(identity)
+      upsert_weekly_pressure_quota!(identity, Decimal.new("25"))
+      filter_input = filter_input(pool, api_key, assignment, identity, "expiring-reset")
+
+      assert {:ok, [{%{id: assignment_id}, %{id: identity_id}}], _filtered_options} =
+               RouteFiltering.filter_candidates(filter_input)
+
+      assert assignment_id == assignment.id
+      assert identity_id == identity.id
+
+      assert [consume_request, usage_request] = FakeUpstream.requests(upstream)
+      assert consume_request.method == "POST"
+      assert consume_request.path == "/api/codex/rate-limit-reset-credits/consume"
+      assert usage_request.path == "/api/codex/usage"
+    end
+
+    test "expiring saved reset auto redemption waits when no weekly usage would be recovered" do
+      {:ok, upstream} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(1)}
+           }}
+        )
+
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      %{identity: identity, assignment: assignment} =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: saved_reset_metadata(upstream, 1, expiring_saved_reset_attrs())
+        })
+
+      identity = enable_saved_reset_auto_redeem!(identity)
+      upsert_weekly_pressure_quota!(identity, Decimal.new("0"))
+      filter_input = filter_input(pool, api_key, assignment, identity, "expiring-unused")
+
+      assert {:ok, _filtered_candidates, _filtered_options} =
+               RouteFiltering.filter_candidates(filter_input)
+
+      assert [] = FakeUpstream.requests(upstream)
+    end
+
     test "early auto redemption waits when another candidate is not near the weekly limit" do
       {:ok, upstream} =
         FakeUpstream.start_link(
@@ -332,19 +392,39 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
     })
   end
 
-  defp saved_reset_metadata(upstream, available_count) do
+  defp saved_reset_metadata(upstream, available_count, saved_reset_attrs \\ %{}) do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601()
+
+    saved_resets =
+      Map.merge(
+        %{
+          "status" => "reported",
+          "available_count" => available_count,
+          "source" => "codex_usage_api",
+          "path_style" => "codex_api",
+          "observed_at" => observed_at,
+          "usage_path" => "/api/codex/usage",
+          "reason" => nil
+        },
+        saved_reset_attrs
+      )
+
     %{
       "usage_base_url" => FakeUpstream.url(upstream),
-      "saved_resets" => %{
-        "status" => "reported",
-        "available_count" => available_count,
-        "source" => "codex_usage_api",
-        "path_style" => "codex_api",
-        "observed_at" =>
-          DateTime.utc_now() |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601(),
-        "usage_path" => "/api/codex/usage",
-        "reason" => nil
-      }
+      "saved_resets" => saved_resets
+    }
+  end
+
+  defp expiring_saved_reset_attrs do
+    timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    expires_at = timestamp |> DateTime.add(1, :hour) |> DateTime.to_iso8601()
+    observed_at = DateTime.to_iso8601(timestamp)
+
+    %{
+      "available_expires_at" => [expires_at],
+      "next_expires_at" => expires_at,
+      "expires_observed_at" => observed_at,
+      "expires_refresh_attempted_at" => observed_at
     }
   end
 

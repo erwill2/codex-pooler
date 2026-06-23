@@ -17,6 +17,8 @@ defmodule CodexPooler.Upstreams.SavedResets do
   @default_keep_credits 0
   @default_trigger_mode "blocked"
   @default_quota_threshold_percent 95
+  @expiration_refresh_ttl_seconds 6 * 60 * 60
+  @expiring_soon_seconds 24 * 60 * 60
 
   @type count_parse_result :: {:reported, non_neg_integer()} | :unreported
   @type snapshot_projection :: %{
@@ -31,6 +33,8 @@ defmodule CodexPooler.Upstreams.SavedResets do
           required(:observed_at) => String.t() | nil,
           required(:available_expires_at) => [String.t()],
           required(:next_expires_at) => String.t() | nil,
+          required(:expires_observed_at) => String.t() | nil,
+          required(:expires_refresh_attempted_at) => String.t() | nil,
           required(:expires_reported?) => boolean(),
           required(:in_progress?) => boolean(),
           required(:last_redemption) => map() | nil
@@ -71,7 +75,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
           "usage_path" => usage_path,
           "reason" => nil
         }
-        |> Map.merge(expiration_metadata_from_payload(payload))
+        |> Map.merge(expiration_metadata_from_payload(payload, observed_at))
 
       :unreported ->
         %{
@@ -83,6 +87,8 @@ defmodule CodexPooler.Upstreams.SavedResets do
           "usage_path" => usage_path,
           "available_expires_at" => [],
           "next_expires_at" => nil,
+          "expires_observed_at" => nil,
+          "expires_refresh_attempted_at" => nil,
           "reason" => %{"code" => "saved_resets_unreported"}
         }
     end
@@ -101,7 +107,7 @@ defmodule CodexPooler.Upstreams.SavedResets do
       "usage_path" => usage_path,
       "reason" => nil
     }
-    |> Map.merge(expiration_metadata_from_payload(payload))
+    |> Map.merge(expiration_metadata_from_payload(payload, observed_at))
   end
 
   @spec unavailable_snapshot(DateTime.t(), String.t()) :: map()
@@ -115,6 +121,8 @@ defmodule CodexPooler.Upstreams.SavedResets do
       "usage_path" => nil,
       "available_expires_at" => [],
       "next_expires_at" => nil,
+      "expires_observed_at" => nil,
+      "expires_refresh_attempted_at" => nil,
       "reason" => %{"code" => code}
     }
   end
@@ -129,6 +137,8 @@ defmodule CodexPooler.Upstreams.SavedResets do
     available_count = snapshot_available_count(snapshot, status)
     available_expires_at = snapshot_available_expires_at(snapshot)
     next_expires_at = snapshot_next_expires_at(snapshot, available_expires_at)
+    expires_observed_at = snapshot_expires_observed_at(snapshot)
+    expires_refresh_attempted_at = snapshot_expires_refresh_attempted_at(snapshot)
     reported? = status == @reported
     available? = reported? and is_integer(available_count) and available_count > 0
 
@@ -144,6 +154,8 @@ defmodule CodexPooler.Upstreams.SavedResets do
       observed_at: string_or_nil(snapshot["observed_at"]),
       available_expires_at: available_expires_at,
       next_expires_at: next_expires_at,
+      expires_observed_at: expires_observed_at,
+      expires_refresh_attempted_at: expires_refresh_attempted_at,
       expires_reported?: next_expires_at != nil,
       in_progress?: redemption_in_progress?(redemption),
       last_redemption: redemption_or_nil(redemption)
@@ -152,6 +164,84 @@ defmodule CodexPooler.Upstreams.SavedResets do
 
   def snapshot(_identity_or_metadata) do
     snapshot(%{"saved_resets" => %{}})
+  end
+
+  @spec reset_credit_list_refresh_due?(
+          UpstreamIdentity.t() | map(),
+          non_neg_integer(),
+          DateTime.t()
+        ) ::
+          boolean()
+  def reset_credit_list_refresh_due?(
+        identity_or_metadata,
+        available_count,
+        %DateTime{} = timestamp
+      )
+      when is_integer(available_count) do
+    snapshot = snapshot(identity_or_metadata)
+
+    cond do
+      available_count <= 0 ->
+        false
+
+      snapshot.available_count != available_count ->
+        true
+
+      expiration_refresh_recent?(snapshot.expires_refresh_attempted_at, timestamp) ->
+        false
+
+      snapshot.expires_observed_at == nil ->
+        true
+
+      expiration_observation_stale?(snapshot.expires_observed_at, timestamp) ->
+        true
+
+      not next_expiration_future?(snapshot.next_expires_at, timestamp) ->
+        true
+
+      true ->
+        false
+    end
+  end
+
+  def reset_credit_list_refresh_due?(_identity_or_metadata, _available_count, _timestamp),
+    do: false
+
+  @spec reuse_expiration_metadata(term(), UpstreamIdentity.t() | map()) :: term()
+  @spec reuse_expiration_metadata(term(), UpstreamIdentity.t() | map(), DateTime.t() | nil) ::
+          term()
+  def reuse_expiration_metadata(payload, identity_or_metadata, attempted_at \\ nil)
+
+  def reuse_expiration_metadata(payload, identity_or_metadata, attempted_at)
+      when is_map(payload) do
+    snapshot = snapshot(identity_or_metadata)
+
+    Map.update(payload, "rate_limit_reset_credits", %{}, fn
+      %{} = reset_credits -> put_expiration_summary(reset_credits, snapshot, attempted_at)
+      other -> other
+    end)
+  end
+
+  def reuse_expiration_metadata(payload, _identity_or_metadata, _attempted_at), do: payload
+
+  @spec expires_soon?(UpstreamIdentity.t() | map(), DateTime.t()) :: boolean()
+  @spec expires_soon?(UpstreamIdentity.t() | map(), DateTime.t(), non_neg_integer()) :: boolean()
+  def expires_soon?(
+        identity_or_metadata,
+        %DateTime{} = timestamp,
+        within_seconds \\ @expiring_soon_seconds
+      )
+      when is_integer(within_seconds) and within_seconds >= 0 do
+    snapshot = snapshot(identity_or_metadata)
+
+    with next_expires_at when is_binary(next_expires_at) <- snapshot.next_expires_at,
+         {:ok, expires_at, _offset} <- DateTime.from_iso8601(next_expires_at) do
+      seconds_until_expiration = DateTime.diff(expires_at, timestamp, :second)
+
+      seconds_until_expiration >= 0 and seconds_until_expiration <= within_seconds
+    else
+      _invalid -> false
+    end
   end
 
   @spec auto_policy(UpstreamIdentity.t()) :: auto_policy_projection()
@@ -264,15 +354,44 @@ defmodule CodexPooler.Upstreams.SavedResets do
 
   defp snapshot_next_expires_at(_snapshot, fallback_values), do: List.first(fallback_values)
 
-  defp expiration_metadata_from_payload(payload) do
-    expires_at =
-      payload
-      |> credit_list_from_payload()
-      |> available_expiration_iso8601s()
+  defp snapshot_expires_observed_at(%{"expires_observed_at" => value}), do: safe_iso8601(value)
+  defp snapshot_expires_observed_at(_snapshot), do: nil
+
+  defp snapshot_expires_refresh_attempted_at(%{"expires_refresh_attempted_at" => value}),
+    do: safe_iso8601(value)
+
+  defp snapshot_expires_refresh_attempted_at(%{"expires_observed_at" => value}),
+    do: safe_iso8601(value)
+
+  defp snapshot_expires_refresh_attempted_at(_snapshot), do: nil
+
+  defp expiration_metadata_from_payload(payload, observed_at) do
+    case credit_list_payload(payload) do
+      {:ok, credits} -> expiration_metadata_from_credits(credits, observed_at)
+      :error -> expiration_metadata_from_summary(payload)
+    end
+  end
+
+  defp expiration_metadata_from_credits(credits, observed_at) do
+    expires_at = available_expiration_iso8601s(credits)
 
     %{
       "available_expires_at" => expires_at,
-      "next_expires_at" => List.first(expires_at)
+      "next_expires_at" => List.first(expires_at),
+      "expires_observed_at" => DateTime.to_iso8601(observed_at),
+      "expires_refresh_attempted_at" => DateTime.to_iso8601(observed_at)
+    }
+  end
+
+  defp expiration_metadata_from_summary(payload) do
+    summary = reset_credit_summary(payload)
+    expires_at = snapshot_available_expires_at(summary)
+
+    %{
+      "available_expires_at" => expires_at,
+      "next_expires_at" => snapshot_next_expires_at(summary, expires_at),
+      "expires_observed_at" => snapshot_expires_observed_at(summary),
+      "expires_refresh_attempted_at" => snapshot_expires_refresh_attempted_at(summary)
     }
   end
 
@@ -285,12 +404,78 @@ defmodule CodexPooler.Upstreams.SavedResets do
 
   defp available_count_from_credit_list(_payload), do: 0
 
-  defp credit_list_from_payload(%{"rate_limit_reset_credits" => %{"credits" => credits}})
-       when is_list(credits),
-       do: credits
+  defp put_expiration_summary(reset_credits, snapshot, attempted_at) do
+    reset_credits
+    |> Map.put("available_expires_at", snapshot.available_expires_at)
+    |> Map.put("next_expires_at", snapshot.next_expires_at)
+    |> Map.put("expires_observed_at", snapshot.expires_observed_at)
+    |> Map.put(
+      "expires_refresh_attempted_at",
+      expiration_refresh_attempted_at(snapshot, attempted_at)
+    )
+  end
 
-  defp credit_list_from_payload(%{"credits" => credits}) when is_list(credits), do: credits
-  defp credit_list_from_payload(_payload), do: []
+  defp expiration_refresh_attempted_at(_snapshot, %DateTime{} = attempted_at),
+    do: DateTime.to_iso8601(attempted_at)
+
+  defp expiration_refresh_attempted_at(snapshot, _attempted_at),
+    do: snapshot.expires_refresh_attempted_at
+
+  defp expiration_refresh_recent?(attempted_at, timestamp) when is_binary(attempted_at) do
+    case DateTime.from_iso8601(attempted_at) do
+      {:ok, attempted_at, _offset} ->
+        DateTime.diff(timestamp, attempted_at, :second) < @expiration_refresh_ttl_seconds
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp expiration_refresh_recent?(_attempted_at, _timestamp), do: false
+
+  defp expiration_observation_stale?(observed_at, timestamp) when is_binary(observed_at) do
+    case DateTime.from_iso8601(observed_at) do
+      {:ok, observed_at, _offset} ->
+        DateTime.diff(timestamp, observed_at, :second) >= @expiration_refresh_ttl_seconds
+
+      _invalid ->
+        true
+    end
+  end
+
+  defp expiration_observation_stale?(_observed_at, _timestamp), do: true
+
+  defp next_expiration_future?(expires_at, timestamp) when is_binary(expires_at) do
+    case DateTime.from_iso8601(expires_at) do
+      {:ok, expires_at, _offset} ->
+        DateTime.compare(expires_at, timestamp) == :gt
+
+      _invalid ->
+        false
+    end
+  end
+
+  defp next_expiration_future?(_expires_at, _timestamp), do: false
+
+  defp reset_credit_summary(%{"rate_limit_reset_credits" => %{} = reset_credits}),
+    do: reset_credits
+
+  defp reset_credit_summary(%{} = payload), do: payload
+  defp reset_credit_summary(_payload), do: %{}
+
+  defp credit_list_payload(%{"rate_limit_reset_credits" => %{"credits" => credits}})
+       when is_list(credits),
+       do: {:ok, credits}
+
+  defp credit_list_payload(%{"credits" => credits}) when is_list(credits), do: {:ok, credits}
+  defp credit_list_payload(_payload), do: :error
+
+  defp credit_list_from_payload(payload) do
+    case credit_list_payload(payload) do
+      {:ok, credits} -> credits
+      :error -> []
+    end
+  end
 
   defp available_expiration_iso8601s(credits) when is_list(credits) do
     credits

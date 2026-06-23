@@ -72,7 +72,7 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
     candidates = candidate_order(refresh_plan)
 
     candidates
-    |> Enum.find(&threshold_redeemable_candidate?(&1, candidates))
+    |> Enum.find(&early_redeemable_candidate?(&1, candidates))
     |> case do
       {assignment, identity} ->
         redeem_and_refilter(result, refresh_plan, assignment, identity)
@@ -227,6 +227,11 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
 
   defp redeemable_candidate?(_candidate), do: false
 
+  defp early_redeemable_candidate?(candidate, candidates) when is_list(candidates) do
+    threshold_redeemable_candidate?(candidate, candidates) or
+      expiring_redeemable_candidate?(candidate)
+  end
+
   defp threshold_redeemable_candidate?(
          {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity},
          candidates
@@ -239,6 +244,18 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
   end
 
   defp threshold_redeemable_candidate?(_candidate, _candidates), do: false
+
+  defp expiring_redeemable_candidate?(
+         {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity} = candidate
+       ) do
+    policy = SavedResets.auto_policy(identity)
+    timestamp = now()
+
+    saved_reset_available?(identity, policy) and SavedResets.expires_soon?(identity, timestamp) and
+      redeemable_expiring_weekly_window?(candidate, policy, timestamp)
+  end
+
+  defp expiring_redeemable_candidate?(_candidate), do: false
 
   defp saved_reset_available?(%UpstreamIdentity{} = identity, policy) do
     snapshot = SavedResets.snapshot(identity)
@@ -255,6 +272,19 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
     |> Windows.list_quota_windows()
     |> Enum.any?(fn window ->
       weekly_exhausted_window?(window, now()) and
+        natural_reset_far_enough?(window.reset_at, policy.min_blocked_minutes)
+    end)
+  end
+
+  defp redeemable_expiring_weekly_window?(
+         {%PoolUpstreamAssignment{}, %UpstreamIdentity{} = identity},
+         policy,
+         timestamp
+       ) do
+    identity
+    |> Windows.list_quota_windows()
+    |> Enum.any?(fn window ->
+      weekly_used_window?(window, timestamp) and
         natural_reset_far_enough?(window.reset_at, policy.min_blocked_minutes)
     end)
   end
@@ -279,11 +309,18 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
   defp weekly_pressure_window?(window, policy) do
     timestamp = now()
 
+    weekly_usable_window?(window, timestamp) and
+      used_percent_at_or_above?(window.used_percent, policy.quota_threshold_percent)
+  end
+
+  defp weekly_used_window?(window, timestamp) do
+    weekly_usable_window?(window, timestamp) and used_percent_above_zero?(window.used_percent)
+  end
+
+  defp weekly_usable_window?(window, timestamp) do
     WindowClassifier.weekly_secondary?(window) and
       window.source_precision in ["observed", "authoritative"] and
-      Windows.fresh_window?(window, timestamp) and match?(%DateTime{}, window.reset_at) and
-      natural_reset_far_enough?(window.reset_at, policy.min_blocked_minutes) and
-      used_percent_at_or_above?(window.used_percent, policy.quota_threshold_percent)
+      Windows.fresh_window?(window, timestamp) and match?(%DateTime{}, window.reset_at)
   end
 
   defp used_percent_at_or_above?(%Decimal{} = used_percent, threshold) when is_integer(threshold),
@@ -294,6 +331,12 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
        do: value >= threshold
 
   defp used_percent_at_or_above?(_value, _threshold), do: false
+
+  defp used_percent_above_zero?(%Decimal{} = used_percent),
+    do: Decimal.compare(used_percent, Decimal.new(0)) == :gt
+
+  defp used_percent_above_zero?(value) when is_number(value), do: value > 0
+  defp used_percent_above_zero?(_value), do: false
 
   defp weekly_exhausted_window?(window, timestamp) do
     WindowClassifier.weekly_secondary?(window) and match?(%DateTime{}, window.reset_at) and

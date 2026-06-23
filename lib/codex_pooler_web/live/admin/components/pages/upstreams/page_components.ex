@@ -624,7 +624,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                   ]}
                 />
                 <p class="text-xs leading-5 text-base-content/65">
-                  The early mode waits until every eligible account in the Pool is also near the configured weekly quota limit.
+                  Early mode waits until every eligible account in the Pool is also near the configured weekly quota limit. Expiring saved resets may also redeem early when this account already has weekly usage.
                 </p>
               </div>
 

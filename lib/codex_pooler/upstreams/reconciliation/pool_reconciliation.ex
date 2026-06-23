@@ -436,7 +436,16 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         {:ok, %{status: status, body: body}} when status in 200..299 ->
           case Quota.Windows.codex_usage_quota_windows_from_payload(body, observed_at) do
             {:ok, windows} ->
-              body = maybe_enrich_saved_reset_payload(identity, access_token, body, url, timeout)
+              body =
+                maybe_enrich_saved_reset_payload(
+                  identity,
+                  access_token,
+                  body,
+                  url,
+                  observed_at,
+                  timeout
+                )
+
               result = {:ok, body, url, windows}
 
               # Reason: successful usage probes prefer account-primary quota evidence immediately.
@@ -466,51 +475,120 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     end)
   end
 
-  defp maybe_enrich_saved_reset_payload(identity, access_token, payload, usage_url, timeout)
+  defp maybe_enrich_saved_reset_payload(
+         identity,
+         access_token,
+         payload,
+         usage_url,
+         observed_at,
+         timeout
+       )
        when is_map(payload) do
     case SavedResets.count_from_usage_payload(payload) do
       {:reported, count} when count > 0 ->
-        case fetch_reset_credits_payload(identity, access_token, usage_url, timeout) do
-          {:ok, reset_credits} -> merge_reset_credit_snapshot(payload, reset_credits)
-          :error -> payload
-        end
+        maybe_refresh_reset_credit_expirations(
+          identity,
+          access_token,
+          payload,
+          usage_url,
+          observed_at,
+          timeout,
+          count
+        )
 
       _unreported_or_empty ->
         payload
     end
   end
 
-  defp maybe_enrich_saved_reset_payload(_identity, _access_token, payload, _usage_url, _timeout),
-    do: payload
+  defp maybe_enrich_saved_reset_payload(
+         _identity,
+         _access_token,
+         payload,
+         _usage_url,
+         _observed_at,
+         _timeout
+       ),
+       do: payload
 
-  defp fetch_reset_credits_payload(identity, access_token, usage_url, timeout) do
-    with {:ok, url} <- reset_credits_url(usage_url),
-         {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) <-
-           Req.get(url,
+  defp maybe_refresh_reset_credit_expirations(
+         identity,
+         access_token,
+         payload,
+         usage_url,
+         observed_at,
+         timeout,
+         count
+       ) do
+    if SavedResets.reset_credit_list_refresh_due?(identity, count, observed_at) do
+      refresh_reset_credit_expirations(
+        identity,
+        access_token,
+        payload,
+        usage_url,
+        observed_at,
+        timeout
+      )
+    else
+      SavedResets.reuse_expiration_metadata(payload, identity)
+    end
+  end
+
+  defp refresh_reset_credit_expirations(
+         identity,
+         access_token,
+         payload,
+         usage_url,
+         observed_at,
+         timeout
+       ) do
+    case fetch_reset_credits_payload(identity, access_token, usage_url, observed_at, timeout) do
+      {:ok, reset_credits} -> merge_reset_credit_snapshot(payload, reset_credits)
+      :error -> SavedResets.reuse_expiration_metadata(payload, identity, observed_at)
+    end
+  end
+
+  defp fetch_reset_credits_payload(identity, access_token, usage_url, observed_at, timeout) do
+    usage_url
+    |> reset_credits_urls()
+    |> Enum.reduce_while(:error, fn url, _last_result ->
+      case Req.get(url,
              headers: codex_usage_headers(access_token, identity.chatgpt_account_id),
              retry: false,
              receive_timeout: timeout
            ) do
-      {:ok, body}
-    else
-      _unavailable -> :error
-    end
+        {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
+          {:halt, {:ok, Map.put(body, "expires_observed_at", DateTime.to_iso8601(observed_at))}}
+
+        _unavailable ->
+          {:cont, :error}
+      end
+    end)
   end
 
-  defp reset_credits_url(usage_url) do
-    case URI.parse(usage_url).path do
+  defp reset_credits_urls(usage_url) do
+    parsed = URI.parse(usage_url)
+    base = %{parsed | query: nil, fragment: nil}
+
+    case parsed.path do
       "/backend-api/wham/usage" ->
-        {:ok,
-         %{URI.parse(usage_url) | path: "/backend-api/wham/rate-limit-reset-credits"}
-         |> URI.to_string()}
+        [uri_with_path(base, "/backend-api/wham/rate-limit-reset-credits")]
 
       "/wham/usage" ->
-        {:ok, %{URI.parse(usage_url) | path: "/wham/rate-limit-reset-credits"} |> URI.to_string()}
+        [uri_with_path(base, "/wham/rate-limit-reset-credits")]
+
+      path when path in ["/api/codex/usage", "/backend-api/codex/usage"] ->
+        [
+          uri_with_path(base, "/backend-api/wham/rate-limit-reset-credits"),
+          uri_with_path(base, "/wham/rate-limit-reset-credits")
+        ]
 
       _path ->
-        :error
+        []
     end
   end
+
+  defp uri_with_path(%URI{} = uri, path), do: %{uri | path: path} |> URI.to_string()
 
   defp merge_reset_credit_snapshot(payload, reset_credits) do
     reset_credit_summary = Map.get(payload, "rate_limit_reset_credits") || %{}
