@@ -179,6 +179,18 @@ If the first chosen upstream account returns a retryable backend status, rate li
 
 Fallback doesn't bypass hard checks. It won't use a paused account, an account without model support, an account with unusable quota evidence, or an account that conflicts with session or file affinity. For session-bound work, fallback is intentionally limited because moving the request to another account could break the conversation state.
 
+## Saved Reset Redemption During Routing
+
+Saved reset redemption is quota recovery, not a routing strategy. It cannot make a paused, unassigned, unsupported, unhealthy, or session-conflicting upstream eligible.
+
+Auto redemption is default-disabled per upstream account because saved resets are limited provider capacity. When an operator enables it, the gateway may attempt one redemption only after required quota filtering reaches `quota_exhausted` and every candidate is blocked by weekly quota exhaustion. The selected candidate must have a reported saved-reset count greater than its `Keep credits` policy, no redemption already in progress, and a natural reset far enough away to satisfy `Min blocked minutes`.
+
+If auto redemption applies a saved reset, Codex Pooler refreshes quota evidence and filters candidates again before strategy ordering. If no saved reset can be applied, or the redemption result does not change quota evidence, the original quota exhaustion stands. Manual `Redeem saved reset` from the upstream cockpit uses the same metadata-only redemption boundary but is an operator action, not an in-flight routing fallback.
+
+Saved-reset observations and redemption attempt state are stored on `upstream_identities.metadata`; routing and redemption metadata stores bounded status, result codes, timestamps, HTTP status, and before/after counts only. It does not store raw provider payloads, credit identifiers, redemption request identifiers, tokens, prompts, request bodies, or response bodies.
+
+Saved reset counts do not boost ranking. `quota_first` still orders only already-eligible candidates by usable remaining quota; saved reset metadata only determines whether an opt-in quota recovery attempt is allowed.
+
 ## What Operators Configure
 
 Operators configure routing from the admin UI. The exact visibility depends on role, but the user-facing controls are:
@@ -197,7 +209,7 @@ Operators configure routing from the admin UI. The exact visibility depends on r
     </tr>
     <tr>
       <td>Upstreams</td>
-      <td>Upstream account readiness, lifecycle state, Pool assignment, model support, quota evidence freshness, and reauth state</td>
+      <td>Upstream account readiness, lifecycle state, Pool assignment, model support, quota evidence freshness, saved reset count, saved reset redemption policy, and reauth state</td>
     </tr>
     <tr>
       <td>Pool API keys</td>

@@ -21,6 +21,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
   attr :rename_account_form, :any, default: nil
   attr :deleting_account, :map, default: nil
   attr :delete_account_form, :any, required: true
+  attr :saved_reset_policy_form, :any, required: true
+  attr :confirming_saved_reset_redemption, :map, default: nil
   attr :refresh_data_message, :string, default: nil
   attr :uploads, :map, required: true
   attr :datetime_preferences, :map, required: true
@@ -58,7 +60,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
       <Charts.request_section cockpit={@cockpit} />
       <Charts.pool_contribution_section cockpit={@cockpit} />
       <Sections.recent_events_section cockpit={@cockpit} datetime_preferences={@datetime_preferences} />
-      <Sections.actions_section cockpit={@cockpit} />
+      <Sections.actions_section
+        cockpit={@cockpit}
+        saved_reset_policy_form={@saved_reset_policy_form}
+        confirming_saved_reset_redemption={@confirming_saved_reset_redemption}
+      />
       <Sections.related_links_section cockpit={@cockpit} />
       <Sections.refresh_section cockpit={@cockpit} refresh_data_message={@refresh_data_message} />
     </section>

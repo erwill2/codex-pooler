@@ -13,6 +13,8 @@ defmodule CodexPooler.Upstreams do
   alias CodexPooler.Upstreams.{
     Import,
     OAuthFlows,
+    SavedResetPolicy,
+    SavedResetRedemptionEnqueue,
     Secrets,
     TokenRefreshEnqueue
   }
@@ -171,6 +173,28 @@ defmodule CodexPooler.Upstreams do
   defdelegate enqueue_token_refresh_for_scope(scope, identity_or_id, opts \\ []),
     to: TokenRefreshEnqueue,
     as: :enqueue_for_scope
+
+  @spec update_saved_reset_policy_for_scope(Scope.t(), identity_ref(), map()) ::
+          lifecycle_result()
+  defdelegate update_saved_reset_policy_for_scope(scope, identity_or_id, attrs),
+    to: SavedResetPolicy,
+    as: :update_for_scope
+
+  @spec enqueue_saved_reset_redemption_for_scope(
+          Scope.t(),
+          identity_ref(),
+          Ecto.UUID.t(),
+          keyword()
+        ) ::
+          lifecycle_result()
+  defdelegate enqueue_saved_reset_redemption_for_scope(
+                scope,
+                identity_or_id,
+                pool_id,
+                opts \\ []
+              ),
+              to: SavedResetRedemptionEnqueue,
+              as: :enqueue_for_scope
 
   @spec sync_pool_assignments_for_pool_edit(Pool.t(), [Ecto.UUID.t()], keyword()) ::
           :ok | {:error, term()}

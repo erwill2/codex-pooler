@@ -10,6 +10,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   alias CodexPooler.Upstreams.Auth.TokenRefresh
   alias CodexPooler.Upstreams.EndpointMetadata
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPooler.Upstreams.Secrets
@@ -44,6 +45,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     case load_active_assignment_with_identity(pool_id, assignment_id) do
       {%PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity} ->
         quota_step = refresh_reconciliation_quota(identity, assignment, opts)
+        result_identity = step_identity(quota_step, identity)
 
         if identity_conflict_step?(quota_step) do
           assignment =
@@ -56,7 +58,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
            %{
              status: :failed,
              assignment: assignment,
-             identity: identity,
+             identity: result_identity,
              health: health_step,
              quota: quota_step
            }}
@@ -73,7 +75,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
            %{
              status: status,
              assignment: assignment,
-             identity: identity,
+             identity: result_identity,
              health: health_step,
              quota: quota_step
            }}
@@ -139,14 +141,15 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         })
 
       {:windows, windows, identity_attrs} ->
-        upsert_reconciliation_quota(identity, windows, identity_attrs, nil)
+        upsert_reconciliation_quota(identity, windows, identity_attrs, nil, nil)
 
-      {:usage, %UpstreamIdentity{} = usage_identity, payload, windows} ->
+      {:usage, %UpstreamIdentity{} = usage_identity, payload, windows, usage_url} ->
         upsert_reconciliation_quota(
           usage_identity,
           windows,
           identity_attrs_from_codex_usage_payload(payload),
-          payload
+          payload,
+          usage_url
         )
     end
   end
@@ -166,18 +169,23 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     end
   end
 
-  defp upsert_reconciliation_quota(identity, windows, identity_attrs, payload)
+  defp upsert_reconciliation_quota(identity, windows, identity_attrs, payload, usage_url)
        when is_list(windows) do
-    case Quota.Windows.upsert_quota_windows(identity, windows,
-           delete_missing?: true,
-           identity_attrs: identity_attrs
-         ) do
-      {:ok, refreshed} ->
-        if is_map(payload), do: maybe_update_identity_plan(identity, payload)
+    observed_at = now()
 
+    case persist_reconciliation_quota(
+           identity,
+           windows,
+           identity_attrs,
+           payload,
+           observed_at,
+           usage_url
+         ) do
+      {:ok, %{windows: refreshed, identity: updated_identity}} ->
         step_result(:succeeded, "quota_refreshed", "quota windows refreshed", %{
           "window_count" => length(refreshed)
         })
+        |> Map.put(:identity, updated_identity)
 
       {:error, {:identity_conflict, :workspace_identity_mismatch, conflict}} ->
         identity_conflict_step(conflict)
@@ -187,8 +195,76 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     end
   end
 
-  defp upsert_reconciliation_quota(_identity, _windows, _identity_attrs, _payload),
+  defp upsert_reconciliation_quota(_identity, _windows, _identity_attrs, _payload, _usage_url),
     do: step_result(:failed, "quota_refresh_unavailable", "quota windows were not available")
+
+  @doc false
+  @spec refresh_quota_from_usage(UpstreamIdentity.t(), PoolUpstreamAssignment.t(), keyword()) ::
+          {:ok, UpstreamIdentity.t()} | {:error, term()}
+  def refresh_quota_from_usage(
+        %UpstreamIdentity{} = identity,
+        %PoolUpstreamAssignment{} = assignment,
+        opts \\ []
+      ) do
+    with {:ok, access_token} <- Secrets.decrypt_active_secret(identity, "access_token"),
+         observed_at <- now(),
+         {:ok, payload, usage_url, windows} <-
+           fetch_codex_usage_payload(identity, assignment, access_token, observed_at, opts),
+         {:ok, %{identity: updated_identity}} <-
+           persist_reconciliation_quota(
+             identity,
+             windows,
+             identity_attrs_from_codex_usage_payload(payload),
+             payload,
+             observed_at,
+             usage_url
+           ) do
+      {:ok, updated_identity}
+    end
+  end
+
+  defp persist_reconciliation_quota(
+         identity,
+         windows,
+         identity_attrs,
+         payload,
+         observed_at,
+         usage_url
+       ) do
+    case Quota.Windows.upsert_quota_windows(identity, windows,
+           delete_missing?: true,
+           identity_attrs: identity_attrs
+         ) do
+      {:ok, refreshed} ->
+        if is_map(payload), do: maybe_update_identity_plan(identity, payload)
+
+        {:ok,
+         %{
+           windows: refreshed,
+           identity: maybe_update_saved_reset_snapshot(identity, payload, observed_at, usage_url)
+         }}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp maybe_update_saved_reset_snapshot(identity, payload, observed_at, usage_url)
+       when is_map(payload) do
+    identity
+    |> UpstreamIdentity.changeset(%{
+      metadata:
+        identity.metadata
+        |> Kernel.||(%{})
+        |> Map.put("saved_resets", SavedResets.usage_snapshot(payload, observed_at, usage_url)),
+      updated_at: observed_at
+    })
+    |> Repo.update!()
+    |> Repo.reload!()
+  end
+
+  defp maybe_update_saved_reset_snapshot(identity, _payload, _observed_at, _usage_url),
+    do: identity
 
   defp metadata_quota_windows(identity, assignment) do
     identity_windows = Quota.Windows.quota_windows_from_metadata(identity.metadata)
@@ -211,8 +287,8 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
          {:ok, access_token} <- Secrets.decrypt_active_secret(identity, "access_token"),
          observed_at <- now() do
       case fetch_codex_usage_payload(identity, assignment, access_token, observed_at, opts) do
-        {:ok, payload, _url, windows} ->
-          {:usage, identity, payload, windows}
+        {:ok, payload, usage_url, windows} ->
+          {:usage, identity, payload, windows, usage_url}
 
         {:error, {:upstream_status, status}} when status in [401, 403] ->
           maybe_retry_codex_usage_after_token_refresh(identity, assignment, observed_at, opts)
@@ -311,7 +387,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   defp fetch_codex_usage_after_successful_token_refresh(refreshed_identity, assignment, opts) do
     with {:ok, access_token} <- Secrets.decrypt_active_secret(refreshed_identity, "access_token"),
          observed_at <- now(),
-         {:ok, payload, _url, windows} <-
+         {:ok, payload, usage_url, windows} <-
            fetch_codex_usage_payload(
              refreshed_identity,
              assignment,
@@ -319,7 +395,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
              observed_at,
              opts
            ) do
-      {:usage, refreshed_identity, payload, windows}
+      {:usage, refreshed_identity, payload, windows, usage_url}
     else
       _unavailable -> :auth_unavailable
     end
@@ -567,6 +643,9 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
       "details" => step.details
     }
   end
+
+  defp step_identity(%{identity: %UpstreamIdentity{} = identity}, _fallback), do: identity
+  defp step_identity(_step, fallback), do: fallback
 
   defp safe_error_message(%{message: message}) when is_binary(message), do: message
   defp safe_error_message(%Ecto.Changeset{}), do: "quota window validation failed"

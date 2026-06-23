@@ -9,6 +9,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   alias CodexPooler.Upstreams.Auth.TokenRefresh
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.DateTimeDisplay
@@ -28,6 +29,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
   @token_burn_recent_seconds 5 * 60
   @token_burn_baseline_seconds 60 * 60
+  @usable_refresh_statuses ~w(succeeded imported refreshing)
 
   @type assignment_snapshot :: %{
           required(:id) => Ecto.UUID.t(),
@@ -62,6 +64,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:recent_tokens) => non_neg_integer(),
           required(:baseline_tokens) => non_neg_integer()
         }
+  @type action :: %{
+          required(:available?) => boolean(),
+          required(:reason) => String.t() | nil
+        }
   @type account_snapshot :: %{
           required(:identity) => UpstreamIdentity.t(),
           required(:label) => String.t(),
@@ -79,6 +85,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:reauth_required?) => boolean(),
           required(:reauth_reason_code) => String.t() | nil,
           required(:reauth_reason_message) => String.t() | nil,
+          required(:saved_resets) => SavedResets.snapshot_projection(),
+          required(:saved_reset_policy) => SavedResets.auto_policy_projection(),
+          required(:saved_reset_redemption_action) => action(),
           required(:token_burn) => token_burn(),
           required(:assignments) => [assignment_snapshot()],
           required(:quota_readiness) => quota_readiness(),
@@ -281,7 +290,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
     refresh_job = identity |> Jobs.list_recent_token_refresh_jobs(limit: 1) |> List.first()
 
-    %{
+    account = %{
       identity: identity,
       label: account_label(identity),
       workspace_ref: workspace_ref(identity.workspace_id),
@@ -301,13 +310,64 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       reauth_required?: reauth_required?(identity),
       reauth_reason_code: reauth_reason_code(identity),
       reauth_reason_message: reauth_reason_message(identity),
+      saved_resets: SavedResets.snapshot(identity),
+      saved_reset_policy: SavedResets.auto_policy(identity),
       token_burn: Map.fetch!(token_burns, identity.id),
       assignments: identity_assignments,
       quota_readiness: quota_readiness,
       routing_readiness: routing_readiness,
       quota_limits: quota_limit_rows(quota_windows, datetime_preferences)
     }
+
+    Map.put(account, :saved_reset_redemption_action, saved_reset_redemption_action(account))
   end
+
+  defp saved_reset_redemption_action(account) do
+    cond do
+      account.identity.status == "deleted" ->
+        action(false, "deleted accounts cannot redeem saved resets")
+
+      account.identity.status == "disabled" ->
+        action(false, "disabled accounts cannot redeem saved resets")
+
+      not auth_clearly_usable?(account) ->
+        action(false, "saved reset redemption requires usable credentials")
+
+      account.assignments == [] ->
+        action(false, "saved reset redemption requires a Pool assignment")
+
+      account.saved_resets.reported? == false ->
+        action(false, "saved reset count is not reported")
+
+      account.saved_resets.available? == false ->
+        action(false, "no saved resets are available")
+
+      account.saved_resets.in_progress? == true ->
+        action(false, "saved reset redemption is already in progress")
+
+      true ->
+        action(true, nil)
+    end
+  end
+
+  defp action(true, _reason), do: %{available?: true, reason: nil}
+  defp action(false, reason), do: %{available?: false, reason: reason}
+
+  defp auth_clearly_usable?(%{
+         reauth_required?: false,
+         refresh_status: refresh_status,
+         access_token_label: access_token_label
+       }) do
+    refresh_status in @usable_refresh_statuses and
+      not expired_access_token_label?(access_token_label)
+  end
+
+  defp auth_clearly_usable?(_account), do: false
+
+  defp expired_access_token_label?(label) when is_binary(label),
+    do: String.starts_with?(label, "access token expired")
+
+  defp expired_access_token_label?(_label), do: false
 
   defp identity_assignments(identity, assignments, quota_readiness) do
     assignments

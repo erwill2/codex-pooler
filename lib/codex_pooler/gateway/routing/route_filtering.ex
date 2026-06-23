@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Gateway.Routing.QuotaRefresh.{Executor, Plan}
+  alias CodexPooler.Gateway.Routing.SavedResetAutoRedeem
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
 
   @type candidate :: CandidateEligibility.FilterInput.candidate()
@@ -76,8 +77,19 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
        ) do
     case Plan.filter_eligible_candidates(filter_input) do
       {:refreshable_quota, refresh_plan} ->
-        refresh_plan
-        |> Executor.refresh_stale_candidates()
+        refreshed_result = Executor.refresh_stale_candidates(refresh_plan)
+
+        refreshed_result
+        |> SavedResetAutoRedeem.maybe_redeem_before_quota_exhaustion(refresh_plan, quota_mode)
+        |> SavedResetAutoRedeem.maybe_redeem_after_quota_exhaustion(refresh_plan, quota_mode)
+        |> maybe_allow_missing_quota(filter_input, quota_mode)
+
+      {:ok, _candidates, _decision} = result ->
+        result
+        |> SavedResetAutoRedeem.maybe_redeem_before_quota_exhaustion(
+          %{filter_input: filter_input},
+          quota_mode
+        )
         |> maybe_allow_missing_quota(filter_input, quota_mode)
 
       result ->
@@ -92,12 +104,20 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
        ) do
     case Plan.filter_eligible_candidates(filter_input, route_state) do
       {:refreshable_quota, refresh_plan} ->
-        refresh_plan
-        |> Executor.refresh_stale_candidates()
+        refreshed_result = Executor.refresh_stale_candidates(refresh_plan)
+
+        refreshed_result
+        |> SavedResetAutoRedeem.maybe_redeem_before_quota_exhaustion(refresh_plan, quota_mode)
+        |> SavedResetAutoRedeem.maybe_redeem_after_quota_exhaustion(refresh_plan, quota_mode)
         |> maybe_allow_missing_quota(filter_input, quota_mode, route_state)
 
-      {:ok, candidates, quota_decision} ->
-        {:ok, candidates, quota_decision, route_state}
+      {:ok, _candidates, _decision} = result ->
+        result
+        |> SavedResetAutoRedeem.maybe_redeem_before_quota_exhaustion(
+          %{filter_input: filter_input, route_state: route_state},
+          quota_mode
+        )
+        |> maybe_allow_missing_quota(filter_input, quota_mode, route_state)
     end
   end
 

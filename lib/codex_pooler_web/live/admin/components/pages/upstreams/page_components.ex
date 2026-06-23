@@ -10,6 +10,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   alias CodexPoolerWeb.Admin.UpstreamFilterForm
 
   @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"
+  @saved_reset_docs_url "https://docs.codex-pooler.com/operators/upstreams/#saved-resets"
 
   attr :pools, :list, required: true
   attr :pool_options, :list, required: true
@@ -31,6 +32,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :oauth_link_error, :map, default: nil
   attr :renaming_account, :map, default: nil
   attr :rename_account_form, :any, default: nil
+  attr :editing_saved_reset_policy, :map, default: nil
+  attr :saved_reset_policy_form, :any, required: true
+  attr :confirming_saved_reset_redemption, :map, default: nil
   attr :upstream_accounts, :list, required: true
   attr :uploads, :map, required: true
   attr :datetime_preferences, :map, required: true
@@ -41,7 +45,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
       <AdminComponents.page_header
         id="upstream-account-page-header"
         title="Upstreams"
-        description="Import Codex auth.json, check readiness, and keep account access current."
+        description="Link upstream accounts, monitor routing capacity, and manage credential, quota, and saved-reset recovery."
       >
         <:actions>
           <AdminComponents.action_button
@@ -78,6 +82,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
       />
 
       <.rename_account_dialog account={@renaming_account} form={@rename_account_form} />
+      <.saved_reset_policy_dialog
+        account={@editing_saved_reset_policy}
+        form={@saved_reset_policy_form}
+        confirming_saved_reset_redemption={@confirming_saved_reset_redemption}
+      />
 
       <section id="upstream-account-surface" class="grid min-w-0 gap-4">
         <.upstream_filter_form
@@ -535,6 +544,205 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
       </div>
       <form method="dialog" class="modal-backdrop">
         <button type="button" phx-click="cancel_rename_account">close</button>
+      </form>
+    </dialog>
+    """
+  end
+
+  attr :account, :map, default: nil
+  attr :form, :any, default: nil
+  attr :confirming_saved_reset_redemption, :map, default: nil
+
+  defp saved_reset_policy_dialog(assigns) do
+    assigns = assign(assigns, :saved_reset_docs_url, @saved_reset_docs_url)
+
+    ~H"""
+    <dialog :if={@account && @form} id="saved-reset-policy-dialog" class="modal" open>
+      <div
+        id="saved-reset-policy-dialog-panel"
+        class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl"
+      >
+        <div class="border-b border-base-300 px-6 py-5">
+          <p class="text-sm font-semibold uppercase tracking-wide text-primary">
+            Codex saved resets
+          </p>
+          <h2 class="mt-1 text-2xl font-bold text-base-content">Manage saved reset bank</h2>
+          <p class="mt-2 text-sm leading-6 text-base-content/70">
+            A saved reset is a banked reset credit for this account. Choose when the account may spend saved resets and redeem one manually when needed.
+          </p>
+        </div>
+
+        <div class="grid gap-5 p-6">
+          <.form
+            id="saved-reset-policy-form"
+            for={@form}
+            phx-change="validate_saved_reset_policy"
+            phx-submit="save_saved_reset_policy"
+            autocomplete="off"
+            class="grid gap-4"
+          >
+            <div class="grid gap-1">
+              <.input
+                field={@form[:auto_redeem_enabled]}
+                type="checkbox"
+                id="saved-reset-policy-auto-redeem-enabled"
+                name="saved_reset_policy[auto_redeem_enabled]"
+                label="Auto redeem saved resets"
+              />
+              <p class="text-xs leading-5 text-base-content/65">
+                Let Codex Pooler spend a banked reset automatically when the Pool is at risk and this account has more resets than the reserve below.
+              </p>
+            </div>
+
+            <div class="grid gap-4 md:grid-cols-[minmax(0,1.1fr)_minmax(9rem,0.9fr)]">
+              <div class="grid gap-1">
+                <.input
+                  field={@form[:trigger_mode]}
+                  type="select"
+                  id="saved-reset-policy-trigger-mode"
+                  name="saved_reset_policy[trigger_mode]"
+                  label="When automatic redemption can start"
+                  options={[
+                    {"Only after work is blocked", "blocked"},
+                    {"Before work stops near the quota limit", "threshold"}
+                  ]}
+                />
+                <p class="text-xs leading-5 text-base-content/65">
+                  The early mode waits until every eligible account in the Pool is also near the configured weekly quota limit.
+                </p>
+              </div>
+
+              <div class="grid gap-1">
+                <.input
+                  field={@form[:quota_threshold_percent]}
+                  type="number"
+                  id="saved-reset-policy-quota-threshold-percent"
+                  name="saved_reset_policy[quota_threshold_percent]"
+                  label="Near-limit threshold"
+                  min="1"
+                  max="100"
+                  step="1"
+                />
+                <p class="text-xs leading-5 text-base-content/65">
+                  Used only by early mode. 95 means redeem when fresh weekly quota evidence shows at least 95% used.
+                </p>
+              </div>
+            </div>
+
+            <div class="grid gap-1">
+              <.input
+                field={@form[:min_blocked_minutes]}
+                type="number"
+                id="saved-reset-policy-min-blocked-minutes"
+                name="saved_reset_policy[min_blocked_minutes]"
+                label="Natural reset buffer"
+                min="0"
+              />
+              <p class="text-xs leading-5 text-base-content/65">
+                Do not spend a saved reset when the weekly quota will reset naturally within this many minutes. Use 0 only when operators accept aggressive fail-open routing.
+              </p>
+            </div>
+
+            <div class="grid gap-1">
+              <.input
+                field={@form[:keep_credits]}
+                type="number"
+                id="saved-reset-policy-keep-credits"
+                name="saved_reset_policy[keep_credits]"
+                label="Resets to keep in bank"
+                min="0"
+              />
+              <p class="text-xs leading-5 text-base-content/65">
+                Automatic redemption stops when the available reset count is at or below this reserve. Manual redemption below remains an explicit operator action.
+              </p>
+            </div>
+          </.form>
+
+          <section
+            id="saved-reset-manual-redemption"
+            class="grid gap-3 rounded-lg border border-base-300 bg-base-200/30 p-4"
+          >
+            <div class="grid gap-1">
+              <h3 class="text-sm font-semibold text-base-content">Redeem one banked reset now</h3>
+              <p class="text-sm leading-6 text-base-content/70">
+                Spend one saved reset now for this account. Policy changes only control future automatic redemption.
+              </p>
+            </div>
+
+            <div
+              :if={@confirming_saved_reset_redemption != @account}
+              class="flex flex-wrap items-center gap-3"
+            >
+              <AdminComponents.action_button
+                id="saved-reset-redemption-open-confirmation"
+                icon="hero-battery-100"
+                label="Redeem one saved reset"
+                phx-click="open_saved_reset_redemption_confirmation"
+                phx-value-id={@account.identity.id}
+                disabled={!@account.saved_reset_redemption_action.available?}
+                variant={:secondary}
+              />
+              <p
+                :if={!@account.saved_reset_redemption_action.available?}
+                id="saved-reset-redemption-disabled-reason"
+                class="text-xs leading-5 text-base-content/60"
+              >
+                {@account.saved_reset_redemption_action.reason}
+              </p>
+            </div>
+
+            <div
+              :if={@confirming_saved_reset_redemption == @account}
+              id="saved-reset-redemption-confirmation"
+              class="grid gap-3 rounded-lg border border-warning/30 bg-warning/10 p-3"
+            >
+              <p class="text-sm leading-6 text-base-content/80">
+                Confirm that this account should spend one saved reset now. The action is queued separately from the policy form.
+              </p>
+              <div class="flex flex-wrap items-center gap-2">
+                <AdminComponents.action_button
+                  id="saved-reset-redemption-confirm"
+                  icon="hero-check"
+                  label="Confirm redemption"
+                  phx-click="redeem_saved_reset"
+                  phx-value-id={@account.identity.id}
+                  variant={:primary}
+                />
+                <AdminComponents.action_button
+                  id="saved-reset-redemption-cancel"
+                  icon="hero-x-mark"
+                  label="Keep reset in bank"
+                  phx-click="cancel_saved_reset_redemption"
+                />
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <AdminComponents.dialog_footer
+          id="saved-reset-policy-dialog-footer"
+          docs_url={@saved_reset_docs_url}
+        >
+          <:actions>
+            <AdminComponents.action_button
+              id="saved-reset-policy-cancel"
+              icon="hero-x-mark"
+              label="Cancel"
+              phx-click="cancel_saved_reset_policy"
+            />
+            <AdminComponents.action_button
+              id="saved-reset-policy-submit"
+              icon="hero-check"
+              label="Save policy"
+              type="submit"
+              form="saved-reset-policy-form"
+              variant={:primary}
+            />
+          </:actions>
+        </AdminComponents.dialog_footer>
+      </div>
+      <form method="dialog" class="modal-backdrop">
+        <button type="button" phx-click="cancel_saved_reset_policy">close</button>
       </form>
     </dialog>
     """

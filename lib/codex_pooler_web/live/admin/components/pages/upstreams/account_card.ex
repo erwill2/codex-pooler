@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
 
   use CodexPoolerWeb, :html
 
+  alias CodexPooler.Upstreams.SavedResets
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.Format
@@ -22,6 +23,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
       |> assign(:workspace_context_label, workspace_context_label(assigns.account))
       |> assign(:workspace_context_title, workspace_context_title(assigns.account))
       |> assign(:routing_readiness, routing_readiness(assigns.account))
+      |> assign(:saved_resets, saved_resets(assigns.account))
+      |> assign(:saved_reset_policy, saved_reset_policy(assigns.account))
 
     ~H"""
     <article
@@ -62,6 +65,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
           id={"upstream-account-#{@account.identity.id}-header-actions"}
           class="flex shrink-0 items-center gap-2 self-center"
         >
+          <.saved_reset_count_badge
+            id={"upstream-account-#{@account.identity.id}-saved-reset-count"}
+            identity_id={@account.identity.id}
+            disabled={@account.identity.status == "deleted"}
+            saved_resets={@saved_resets}
+            saved_reset_policy={@saved_reset_policy}
+          />
           <.upstream_plan_indicator account={@account} account_index={@account_index} />
           <.upstream_account_actions account={@account} />
         </div>
@@ -153,6 +163,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
     </article>
     """
   end
+
+  defp saved_resets(%{saved_resets: saved_resets}), do: saved_resets
+  defp saved_resets(%{identity: identity}), do: SavedResets.snapshot(identity)
+  defp saved_resets(_account), do: SavedResets.snapshot(nil)
+
+  defp saved_reset_policy(%{saved_reset_policy: saved_reset_policy}), do: saved_reset_policy
+  defp saved_reset_policy(%{identity: identity}), do: SavedResets.auto_policy(identity)
 
   attr :account, :map, required: true
 
@@ -265,6 +282,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
         </li>
         <li>
           <AdminComponents.dropdown_action_item
+            id={"saved-reset-policy-upstream-account-#{@account.identity.id}"}
+            icon="hero-battery-100"
+            label="Saved resets"
+            phx-click="open_saved_reset_policy"
+            phx-value-id={@account.identity.id}
+            disabled={@account.identity.status == "deleted"}
+          />
+        </li>
+        <li>
+          <AdminComponents.dropdown_action_item
             id={"delete-upstream-account-#{@account.identity.id}"}
             icon="hero-trash"
             label="Delete"
@@ -302,6 +329,77 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountCard do
     />
     """
   end
+
+  attr :id, :string, required: true
+  attr :identity_id, :string, required: true
+  attr :saved_resets, :map, required: true
+  attr :saved_reset_policy, :map, required: true
+  attr :disabled, :boolean, default: false
+
+  defp saved_reset_count_badge(
+         %{saved_resets: %{reported?: true, available_count: count}} = assigns
+       )
+       when is_integer(count) and count > 0 do
+    assigns =
+      assigns
+      |> assign(:badge_class, saved_reset_count_badge_class(assigns.saved_reset_policy))
+      |> assign(:badge_icon_class, saved_reset_count_badge_icon_class(assigns.saved_reset_policy))
+      |> assign(:policy_state_label, saved_reset_policy_state_label(assigns.saved_reset_policy))
+
+    ~H"""
+    <button
+      id={@id}
+      type="button"
+      data-role="upstream-saved-reset-count-badge"
+      class={@badge_class}
+      aria-label={"Saved resets: #{@saved_resets.available_count}; #{@policy_state_label}"}
+      title={"#{@saved_resets.label}; #{@policy_state_label}"}
+      phx-click="open_saved_reset_policy"
+      phx-value-id={@identity_id}
+      disabled={@disabled}
+    >
+      <.icon
+        name="hero-battery-100"
+        class={@badge_icon_class}
+      />
+      <span>{@saved_resets.available_count}</span>
+    </button>
+    """
+  end
+
+  defp saved_reset_count_badge(assigns) do
+    ~H"""
+    """
+  end
+
+  defp saved_reset_count_badge_class(%{enabled?: true}) do
+    [
+      saved_reset_count_badge_base_class(),
+      "border-success/40 bg-success/15 text-success hover:bg-success/20 dark:border-success/60 dark:bg-success/20 dark:text-success"
+    ]
+  end
+
+  defp saved_reset_count_badge_class(_policy) do
+    [
+      saved_reset_count_badge_base_class(),
+      "border-violet-500/50 bg-violet-500/10 text-violet-700 hover:bg-violet-500/15 dark:border-violet-300/50 dark:bg-violet-400/10 dark:text-violet-200"
+    ]
+  end
+
+  defp saved_reset_count_badge_base_class do
+    "inline-flex cursor-pointer items-center rounded-full border px-2.5 py-1 text-xs font-medium leading-none transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-default disabled:opacity-70 gap-1.5 self-center whitespace-nowrap tabular-nums"
+  end
+
+  defp saved_reset_count_badge_icon_class(%{enabled?: true}) do
+    "size-3 shrink-0 text-current"
+  end
+
+  defp saved_reset_count_badge_icon_class(_policy) do
+    "size-3 shrink-0 text-violet-600 dark:text-violet-300"
+  end
+
+  defp saved_reset_policy_state_label(%{enabled?: true}), do: "auto redeem active"
+  defp saved_reset_policy_state_label(_policy), do: "auto redeem inactive"
 
   attr :account, :map, required: true
   attr :routing_readiness, :map, required: true

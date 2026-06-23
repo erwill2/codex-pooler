@@ -6,6 +6,7 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
   alias CodexPooler.Jobs.{
     AccountReconciliationWorker,
     Options,
+    SavedResetRedemptionWorker,
     TokenRefreshWorker
   }
 
@@ -76,6 +77,21 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
     end
   end
 
+  @spec enqueue_saved_reset_redemption(assignment_ref(), keyword()) :: job_insert_result()
+  def enqueue_saved_reset_redemption(assignment_or_id, opts \\ []) do
+    with {:ok, assignment_id} <- assignment_id(assignment_or_id) do
+      %{
+        "pool_upstream_assignment_id" => assignment_id,
+        "trigger_kind" => Keyword.get(opts, :trigger_kind, "admin_manual")
+      }
+      |> SavedResetRedemptionWorker.new(
+        Options.job_options(opts, unique_keys: [:pool_upstream_assignment_id])
+      )
+      |> Oban.insert()
+      |> tap_saved_reset_redemption_enqueue(assignment_or_id)
+    end
+  end
+
   @spec enqueue_scheduled_identity_account_reconciliation(PoolUpstreamAssignment.t(), keyword()) ::
           job_insert_result()
   def enqueue_scheduled_identity_account_reconciliation(
@@ -115,6 +131,28 @@ defmodule CodexPooler.Jobs.UpstreamEnqueue do
   end
 
   defp tap_job_status_event(result, _pool_id, _worker, _status), do: result
+
+  defp tap_saved_reset_redemption_enqueue(
+         {:ok, %Oban.Job{conflict?: true}} = result,
+         _assignment_or_id
+       ),
+       do: result
+
+  defp tap_saved_reset_redemption_enqueue(
+         {:ok, job} = result,
+         %PoolUpstreamAssignment{} = assignment
+       ) do
+    Events.broadcast_job_status(assignment.pool_id, "saved_reset_redemption", %{
+      pool_upstream_assignment_id: assignment.id,
+      id: Integer.to_string(job.id),
+      worker: "saved_reset_redemption",
+      status: "scheduled"
+    })
+
+    result
+  end
+
+  defp tap_saved_reset_redemption_enqueue(result, _assignment_or_id), do: result
 
   defp tap_assignment_priming_enqueue_result(
          {:ok, %Oban.Job{conflict?: true}} = result,

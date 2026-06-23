@@ -1,0 +1,721 @@
+defmodule CodexPooler.Upstreams.SavedResetRedemption do
+  @moduledoc """
+  Redeems Codex saved reset credits with metadata-only persistence.
+  """
+
+  import Ecto.Query
+
+  alias CodexPooler.Events
+  alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Assignments.PoolAssignments
+  alias CodexPooler.Upstreams.EndpointMetadata
+  alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
+  alias CodexPooler.Upstreams.SavedResets
+  alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPooler.Upstreams.Secrets
+
+  @assignment_active PoolUpstreamAssignment.active_status()
+  @identity_deleted UpstreamIdentity.deleted_status()
+  @identity_disabled UpstreamIdentity.disabled_status()
+  @default_receive_timeout 15_000
+  @stale_grace_ms 60_000
+  @known_noop_codes ~w(already_redeemed no_credit nothing_to_reset)
+
+  @type trigger_kind :: String.t()
+
+  @type lifecycle_error :: %{required(:code) => atom(), required(:message) => String.t()}
+
+  @type redeem_result :: %{
+          required(:status) => :succeeded | :failed | :noop,
+          required(:identity) => UpstreamIdentity.t(),
+          required(:assignment) => PoolUpstreamAssignment.t(),
+          required(:applied?) => boolean(),
+          required(:code) => String.t(),
+          optional(:available_count_before) => non_neg_integer(),
+          optional(:available_count_after) => non_neg_integer(),
+          optional(:http_status) => non_neg_integer(),
+          optional(:reason) => String.t()
+        }
+
+  @type claim :: %{
+          required(:identity) => UpstreamIdentity.t(),
+          required(:assignment) => PoolUpstreamAssignment.t(),
+          required(:attempt_id) => Ecto.UUID.t(),
+          required(:generation) => non_neg_integer(),
+          required(:trigger_kind) => trigger_kind(),
+          required(:started_at) => DateTime.t(),
+          required(:receive_timeout) => non_neg_integer()
+        }
+
+  @spec redeem(PoolUpstreamAssignment.t() | Ecto.UUID.t(), keyword()) ::
+          {:ok, redeem_result()} | {:error, lifecycle_error() | :redemption_in_progress}
+  def redeem(assignment_or_id, opts \\ []) do
+    trigger_kind = Keyword.get(opts, :trigger_kind, "admin_manual")
+    receive_timeout = Keyword.get(opts, :receive_timeout, @default_receive_timeout)
+    started_at = Keyword.get_lazy(opts, :started_at, &now/0)
+
+    opts =
+      opts
+      |> Keyword.put(:trigger_kind, trigger_kind)
+      |> Keyword.put(:receive_timeout, receive_timeout)
+
+    with {:ok, assignment, identity} <- load_assignment_identity(assignment_or_id),
+         {:ok, claim} <-
+           claim_attempt(assignment, identity, trigger_kind, receive_timeout, started_at) do
+      do_redeem(claim, opts)
+    end
+  end
+
+  defp load_assignment_identity(assignment_or_id) do
+    assignment_or_id
+    |> assignment_id()
+    |> load_active_assignment()
+  end
+
+  defp load_active_assignment(assignment_id) when is_binary(assignment_id) do
+    case Repo.get(PoolUpstreamAssignment, assignment_id) do
+      %PoolUpstreamAssignment{status: @assignment_active} = assignment ->
+        load_active_identity(assignment)
+
+      _missing_or_inactive ->
+        {:error, lifecycle_error(:pool_assignment_not_found, "pool assignment was not found")}
+    end
+  end
+
+  defp load_active_assignment(_assignment_id),
+    do: {:error, lifecycle_error(:pool_assignment_not_found, "pool assignment was not found")}
+
+  defp load_active_identity(%PoolUpstreamAssignment{} = assignment) do
+    case Repo.get(UpstreamIdentity, assignment.upstream_identity_id) do
+      %UpstreamIdentity{status: status} = identity
+      when status not in [@identity_deleted, @identity_disabled] ->
+        {:ok, assignment, identity}
+
+      _missing_or_inactive ->
+        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
+    end
+  end
+
+  defp claim_attempt(assignment, identity, trigger_kind, receive_timeout, started_at) do
+    Repo.transaction(fn ->
+      identity.id
+      |> lock_identity!()
+      |> claim_locked_identity!(assignment, trigger_kind, receive_timeout, started_at)
+    end)
+    |> case do
+      {:ok, claim} -> {:ok, claim}
+      {:error, :redemption_in_progress} -> {:error, :redemption_in_progress}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp claim_locked_identity!(
+         locked_identity,
+         assignment,
+         trigger_kind,
+         receive_timeout,
+         started_at
+       ) do
+    metadata = locked_identity.metadata || %{}
+    redemption = metadata["saved_reset_redemption"]
+
+    if redemption_in_progress_for_trigger?(redemption, started_at, receive_timeout, trigger_kind) do
+      Repo.rollback(:redemption_in_progress)
+    else
+      locked_identity
+      |> maybe_mark_stale_admin_redemption!(metadata, redemption, trigger_kind, started_at)
+      |> build_redemption_claim!(
+        locked_identity,
+        assignment,
+        trigger_kind,
+        receive_timeout,
+        started_at
+      )
+    end
+  end
+
+  defp redemption_in_progress_for_trigger?(redemption, started_at, receive_timeout, trigger_kind) do
+    fresh_redemption?(redemption, started_at, receive_timeout) or
+      (stale_redemption?(redemption) and trigger_kind == "gateway_auto")
+  end
+
+  defp maybe_mark_stale_admin_redemption!(
+         locked_identity,
+         metadata,
+         redemption,
+         "admin_manual",
+         started_at
+       ) do
+    if stale_redemption?(redemption) do
+      mark_stale_redemption_failed!(locked_identity, redemption, started_at).metadata || %{}
+    else
+      metadata
+    end
+  end
+
+  defp maybe_mark_stale_admin_redemption!(
+         _locked_identity,
+         metadata,
+         _redemption,
+         _trigger_kind,
+         _started_at
+       ),
+       do: metadata
+
+  defp build_redemption_claim!(
+         metadata,
+         locked_identity,
+         assignment,
+         trigger_kind,
+         receive_timeout,
+         started_at
+       ) do
+    attempt_id = Ecto.UUID.generate()
+    generation = next_generation(metadata)
+
+    claimed_identity =
+      update_redemption_metadata!(locked_identity, metadata, %{
+        "status" => "redeeming",
+        "attempt_id" => attempt_id,
+        "generation" => generation,
+        "trigger_kind" => trigger_kind,
+        "started_at" => DateTime.to_iso8601(started_at),
+        "finished_at" => nil,
+        "result" => nil
+      })
+
+    %{
+      identity: claimed_identity,
+      assignment: assignment,
+      attempt_id: attempt_id,
+      generation: generation,
+      trigger_kind: trigger_kind,
+      started_at: started_at,
+      receive_timeout: receive_timeout
+    }
+  end
+
+  defp do_redeem(%{identity: identity, assignment: assignment} = claim, opts) do
+    case Secrets.decrypt_active_secret(identity, "access_token") do
+      {:ok, access_token} ->
+        identity
+        |> SavedResets.snapshot()
+        |> endpoint_family_result(identity, assignment, access_token, claim, opts)
+        |> finalize_attempt(claim)
+
+      {:error, _reason} ->
+        finalize_attempt(
+          %{
+            status: :failed,
+            applied?: false,
+            code: "missing_access_token",
+            reason: "active access token was not available"
+          },
+          claim
+        )
+    end
+  end
+
+  defp endpoint_family_result(
+         %{path_style: "chatgpt_api"} = snapshot,
+         identity,
+         assignment,
+         access_token,
+         claim,
+         _opts
+       ) do
+    with {:ok, list_url, consume_url} <- chatgpt_reset_urls(identity, assignment, snapshot),
+         {:ok, list_result} <-
+           list_chatgpt_credits(list_url, identity, access_token, claim.receive_timeout) do
+      case list_result do
+        %{credit_id: nil, available_count: available_count, http_status: http_status} ->
+          update_saved_reset_count!(identity, snapshot, available_count, claim.started_at)
+
+          %{
+            status: :noop,
+            applied?: false,
+            code: "no_credit",
+            available_count_before: available_count,
+            available_count_after: 0,
+            http_status: http_status
+          }
+
+        %{credit_id: credit_id, available_count: available_count} ->
+          consume_credit(
+            consume_url,
+            identity,
+            access_token,
+            %{"credit_id" => credit_id, "redeem_request_id" => Ecto.UUID.generate()},
+            available_count,
+            claim,
+            :chatgpt
+          )
+      end
+    else
+      {:error, result} -> result
+    end
+  end
+
+  defp endpoint_family_result(
+         %{path_style: "codex_api"} = snapshot,
+         identity,
+         assignment,
+         access_token,
+         claim,
+         _opts
+       ) do
+    case codex_reset_url(identity, assignment, snapshot) do
+      {:ok, consume_url} ->
+        consume_credit(
+          consume_url,
+          identity,
+          access_token,
+          %{"redeem_request_id" => Ecto.UUID.generate()},
+          snapshot.available_count,
+          claim,
+          :codex
+        )
+
+      {:error, result} ->
+        result
+    end
+  end
+
+  defp endpoint_family_result(_snapshot, _identity, _assignment, _access_token, _claim, _opts) do
+    %{
+      status: :noop,
+      applied?: false,
+      code: "saved_reset_endpoint_unknown"
+    }
+  end
+
+  defp list_chatgpt_credits(url, identity, access_token, receive_timeout) do
+    case Req.get(url,
+           headers: request_headers(access_token, identity.chatgpt_account_id, :get),
+           retry: false,
+           receive_timeout: receive_timeout
+         ) do
+      {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
+        {:ok, parse_chatgpt_credit_list(body, status)}
+
+      {:ok, %{status: status}} ->
+        {:error, failed_result(http_code(status), status)}
+
+      {:error, _reason} ->
+        {:error, transport_failed_result()}
+    end
+  end
+
+  defp parse_chatgpt_credit_list(body, http_status) do
+    credits = Map.get(body, "credits")
+    usable_credit = first_usable_credit(credits)
+
+    available_count =
+      case non_negative_truncated_integer(Map.get(body, "available_count")) do
+        {:ok, count} -> count
+        :error -> Enum.count(List.wrap(credits), &usable_credit?/1)
+      end
+
+    %{
+      credit_id: usable_credit && usable_credit["id"],
+      available_count: available_count,
+      http_status: http_status
+    }
+  end
+
+  defp first_usable_credit(credits) when is_list(credits),
+    do: Enum.find(credits, &usable_credit?/1)
+
+  defp first_usable_credit(_credits), do: nil
+
+  defp usable_credit?(%{"id" => id} = credit) when is_binary(id) do
+    not Map.has_key?(credit, "status") or credit["status"] == "available"
+  end
+
+  defp usable_credit?(_credit), do: false
+
+  defp consume_credit(
+         url,
+         identity,
+         access_token,
+         body,
+         available_count_before,
+         claim,
+         endpoint_kind
+       ) do
+    case Req.post(url,
+           headers: request_headers(access_token, identity.chatgpt_account_id, :post),
+           json: body,
+           retry: false,
+           receive_timeout: claim.receive_timeout
+         ) do
+      {:ok, %{status: status, body: response_body}} ->
+        response_code(response_body, status, endpoint_kind)
+        |> result_from_response(status, available_count_before, identity, claim.assignment, claim)
+
+      {:error, _reason} ->
+        transport_failed_result()
+    end
+  end
+
+  defp result_from_response(code, status, available_count_before, identity, assignment, claim) do
+    cond do
+      code == "reset" ->
+        case PoolReconciliation.refresh_quota_from_usage(identity, assignment,
+               receive_timeout: claim.receive_timeout
+             ) do
+          {:ok, refreshed_identity} ->
+            available_count_after = SavedResets.snapshot(refreshed_identity).available_count
+
+            %{
+              status: :succeeded,
+              applied?: true,
+              code: code,
+              available_count_before: available_count_before,
+              available_count_after: available_count_after,
+              http_status: status
+            }
+
+          {:error, _reason} ->
+            %{
+              status: :failed,
+              applied?: false,
+              code: "post_reset_usage_refresh_failed",
+              available_count_before: available_count_before,
+              http_status: status,
+              reason: "quota refresh after saved reset failed"
+            }
+        end
+
+      code in @known_noop_codes ->
+        %{
+          status: :noop,
+          applied?: false,
+          code: code,
+          available_count_before: available_count_before,
+          http_status: status
+        }
+
+      true ->
+        %{
+          status: :failed,
+          applied?: false,
+          code: code,
+          available_count_before: available_count_before,
+          http_status: status,
+          reason: "saved reset redemption failed"
+        }
+    end
+  end
+
+  defp response_code(body, status, endpoint_kind) do
+    cond do
+      endpoint_kind == :codex and status == 404 ->
+        "saved_reset_endpoint_unavailable"
+
+      is_map(body) and is_binary(body["code"]) ->
+        sanitize_result_code(body["code"])
+
+      status in 200..299 ->
+        "reset"
+
+      true ->
+        http_code(status)
+    end
+  end
+
+  defp chatgpt_reset_urls(identity, assignment, snapshot) do
+    base = reset_base_url(identity, assignment)
+
+    case snapshot.usage_path do
+      "/wham/usage" ->
+        {:ok, base <> "/wham/rate-limit-reset-credits",
+         base <> "/wham/rate-limit-reset-credits/consume"}
+
+      "/backend-api/wham/usage" ->
+        {:ok, base <> "/backend-api/wham/rate-limit-reset-credits",
+         base <> "/backend-api/wham/rate-limit-reset-credits/consume"}
+
+      nil ->
+        {:ok, base <> "/backend-api/wham/rate-limit-reset-credits",
+         base <> "/backend-api/wham/rate-limit-reset-credits/consume"}
+
+      _usage_path ->
+        {:error, %{status: :noop, applied?: false, code: "saved_reset_endpoint_unknown"}}
+    end
+  end
+
+  defp codex_reset_url(identity, assignment, snapshot) do
+    base = reset_base_url(identity, assignment)
+
+    case snapshot.usage_path do
+      "/api/codex/usage" ->
+        {:ok, base <> "/api/codex/rate-limit-reset-credits/consume"}
+
+      "/backend-api/codex/usage" ->
+        {:ok, base <> "/backend-api/codex/rate-limit-reset-credits/consume"}
+
+      nil ->
+        {:ok, base <> "/api/codex/rate-limit-reset-credits/consume"}
+
+      _usage_path ->
+        {:error, %{status: :noop, applied?: false, code: "saved_reset_endpoint_unknown"}}
+    end
+  end
+
+  defp reset_base_url(identity, assignment) do
+    identity
+    |> EndpointMetadata.usage_base_url(assignment)
+    |> EndpointMetadata.normalize_base_url()
+  end
+
+  defp request_headers(access_token, chatgpt_account_id, request_kind) do
+    headers = [
+      {"authorization", "Bearer " <> String.trim(access_token)},
+      {"accept", "application/json"}
+    ]
+
+    headers =
+      if request_kind == :post do
+        headers ++ [{"content-type", "application/json"}]
+      else
+        headers
+      end
+
+    if send_chatgpt_account_header?(chatgpt_account_id) do
+      headers ++ [{"chatgpt-account-id", chatgpt_account_id}]
+    else
+      headers
+    end
+  end
+
+  defp send_chatgpt_account_header?(chatgpt_account_id) when is_binary(chatgpt_account_id) do
+    chatgpt_account_id = String.trim(chatgpt_account_id)
+
+    chatgpt_account_id != "" and not String.starts_with?(chatgpt_account_id, "email_") and
+      not String.starts_with?(chatgpt_account_id, "local_")
+  end
+
+  defp send_chatgpt_account_header?(_chatgpt_account_id), do: false
+
+  defp finalize_attempt(result, claim) do
+    Repo.transaction(fn ->
+      identity = lock_identity!(claim.identity.id)
+      metadata = identity.metadata || %{}
+      redemption = metadata["saved_reset_redemption"] || %{}
+
+      if redemption["attempt_id"] == claim.attempt_id and
+           redemption["generation"] == claim.generation do
+        finished_at = now()
+        final_status = Atom.to_string(result.status)
+
+        updated_identity =
+          update_redemption_metadata!(identity, metadata, %{
+            "status" => final_status,
+            "attempt_id" => claim.attempt_id,
+            "generation" => claim.generation,
+            "trigger_kind" => claim.trigger_kind,
+            "started_at" => DateTime.to_iso8601(claim.started_at),
+            "finished_at" => DateTime.to_iso8601(finished_at),
+            "result" => metadata_result(result)
+          })
+
+        updated_identity
+      else
+        identity
+      end
+    end)
+    |> case do
+      {:ok, updated_identity} ->
+        broadcast_redemption(updated_identity)
+
+        {:ok,
+         result
+         |> Map.put(:identity, updated_identity)
+         |> Map.put(:assignment, claim.assignment)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp metadata_result(result) do
+    %{
+      "code" => result.code,
+      "applied" => result.applied?,
+      "available_count_before" => Map.get(result, :available_count_before),
+      "available_count_after" => Map.get(result, :available_count_after),
+      "http_status" => Map.get(result, :http_status)
+    }
+  end
+
+  defp update_saved_reset_count!(identity, snapshot, available_count, observed_at) do
+    metadata = identity.metadata || %{}
+
+    identity
+    |> UpstreamIdentity.changeset(%{
+      metadata:
+        Map.put(metadata, "saved_resets", %{
+          "status" => "reported",
+          "available_count" => available_count,
+          "source" => "codex_reset_credits_api",
+          "path_style" => snapshot.path_style,
+          "observed_at" => DateTime.to_iso8601(observed_at),
+          "usage_path" => snapshot.usage_path,
+          "reason" => nil
+        }),
+      updated_at: observed_at
+    })
+    |> Repo.update!()
+  end
+
+  defp mark_stale_redemption_failed!(identity, redemption, finished_at) do
+    metadata = identity.metadata || %{}
+    generation = next_generation(metadata)
+
+    update_redemption_metadata!(identity, metadata, %{
+      "status" => "failed",
+      "attempt_id" => redemption["attempt_id"] || Ecto.UUID.generate(),
+      "generation" => generation,
+      "trigger_kind" => redemption["trigger_kind"] || "admin_manual",
+      "started_at" => redemption["started_at"],
+      "finished_at" => DateTime.to_iso8601(finished_at),
+      "result" => %{
+        "code" => "stale_redemption_unknown",
+        "applied" => false,
+        "available_count_before" => nil,
+        "available_count_after" => nil,
+        "http_status" => nil
+      }
+    })
+  end
+
+  defp update_redemption_metadata!(identity, metadata, redemption) do
+    timestamp = now()
+
+    identity
+    |> UpstreamIdentity.changeset(%{
+      metadata: Map.put(metadata || %{}, "saved_reset_redemption", redemption),
+      updated_at: timestamp
+    })
+    |> Repo.update!()
+  end
+
+  defp broadcast_redemption(identity) do
+    identity.id
+    |> PoolAssignments.list_pool_assignments_for_identity()
+    |> Enum.each(fn assignment ->
+      Events.broadcast_upstreams(assignment.pool_id, "upstream_account_saved_reset_redeemed", %{
+        assignment_id: assignment.id,
+        upstream_identity_id: identity.id
+      })
+    end)
+  end
+
+  defp lock_identity!(identity_id) do
+    Repo.one!(
+      from identity in UpstreamIdentity,
+        where: identity.id == ^identity_id,
+        lock: "FOR UPDATE"
+    )
+  end
+
+  defp fresh_redemption?(
+         %{"status" => "redeeming", "started_at" => started_at},
+         now,
+         receive_timeout
+       ) do
+    case parse_datetime(started_at) do
+      %DateTime{} = started_at ->
+        DateTime.diff(now, started_at, :millisecond) < receive_timeout + @stale_grace_ms
+
+      nil ->
+        false
+    end
+  end
+
+  defp fresh_redemption?(_redemption, _now, _receive_timeout), do: false
+
+  defp stale_redemption?(%{"status" => "redeeming"}), do: true
+  defp stale_redemption?(_redemption), do: false
+
+  defp next_generation(metadata) do
+    case get_in(metadata || %{}, ["saved_reset_redemption", "generation"]) do
+      generation when is_integer(generation) and generation >= 0 -> generation + 1
+      _generation -> 1
+    end
+  end
+
+  defp non_negative_truncated_integer(value) when is_integer(value), do: {:ok, max(value, 0)}
+
+  defp non_negative_truncated_integer(value) when is_float(value) do
+    {:ok, value |> trunc() |> max(0)}
+  rescue
+    _error -> :error
+  end
+
+  defp non_negative_truncated_integer(%Decimal{} = value) do
+    {:ok, value |> Decimal.round(0, :down) |> Decimal.to_integer() |> max(0)}
+  rescue
+    _error -> :error
+  end
+
+  defp non_negative_truncated_integer(value) when is_binary(value) do
+    case Decimal.parse(String.trim(value)) do
+      {decimal, ""} -> non_negative_truncated_integer(decimal)
+      _invalid -> :error
+    end
+  rescue
+    _error -> :error
+  end
+
+  defp non_negative_truncated_integer(_value), do: :error
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> DateTime.truncate(datetime, :microsecond)
+      _invalid -> nil
+    end
+  end
+
+  defp parse_datetime(_value), do: nil
+
+  defp failed_result(code, http_status) do
+    %{
+      status: :failed,
+      applied?: false,
+      code: code,
+      http_status: http_status,
+      reason: "saved reset redemption failed"
+    }
+  end
+
+  defp transport_failed_result do
+    %{
+      status: :failed,
+      applied?: false,
+      code: "transport_error",
+      reason: "saved reset redemption request failed"
+    }
+  end
+
+  defp http_code(status) when is_integer(status), do: "http_#{status}"
+
+  defp sanitize_result_code(code) when is_binary(code) do
+    code =
+      code
+      |> String.downcase()
+      |> String.replace(~r/[^a-z0-9_]+/, "_")
+      |> String.trim("_")
+      |> String.slice(0, 80)
+
+    if code == "", do: "unknown_result", else: code
+  end
+
+  defp assignment_id(%PoolUpstreamAssignment{id: id}), do: id
+  defp assignment_id(id) when is_binary(id), do: id
+  defp assignment_id(_assignment_or_id), do: nil
+
+  defp lifecycle_error(code, message), do: %{code: code, message: message}
+  defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+end

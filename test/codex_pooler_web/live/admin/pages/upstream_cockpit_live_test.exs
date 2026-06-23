@@ -8,6 +8,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   alias CodexPooler.Audit
   alias CodexPooler.Events
   alias CodexPooler.FakeOpenAIAuthProvider
+  alias CodexPooler.Jobs.SavedResetRedemptionWorker
   alias CodexPooler.Pools
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
@@ -916,6 +917,118 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert missing_assignment_cockpit.assignments.empty? == true
     assert missing_assignment_cockpit.flags.missing_assignments? == true
+  end
+
+  @tag :saved_reset_cockpit
+  test "saved reset cockpit metric, policy form, and confirmed manual redemption enqueue", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "saved-reset-cockpit", name: "Saved Reset Cockpit"})
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Saved Reset Cockpit Codex",
+        identity_metadata: %{
+          "access_token_expires_at" => DateTime.to_iso8601(DateTime.add(now, 2, :hour)),
+          "token_refresh" => %{
+            "status" => "succeeded",
+            "finished_at" => DateTime.to_iso8601(DateTime.add(now, -5, :minute))
+          },
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 1,
+            "source" => "codex_usage_api",
+            "path_style" => "codex",
+            "usage_path" => "/api/codex/usage",
+            "observed_at" => DateTime.to_iso8601(now)
+          }
+        }
+      })
+
+    assert {:ok, cockpit} = UpstreamCockpitReadModel.load_visible(scope, identity.id)
+    assert cockpit.saved_resets.label == "1 saved reset"
+    assert cockpit.saved_resets.available? == true
+    assert cockpit.saved_reset_policy.enabled? == false
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    metric_selector = "#upstream-status-summary-saved-resets"
+
+    assert has_element?(
+             view,
+             "#{metric_selector} [data-role='metric-card-value']",
+             "1 saved reset"
+           )
+
+    assert has_element?(view, metric_selector, "Auto redeem off")
+
+    assert has_element?(view, "#saved-reset-policy-auto-redeem-enabled")
+    assert has_element?(view, "#saved-reset-policy-min-blocked-minutes")
+    assert has_element?(view, "#saved-reset-policy-keep-credits")
+    assert has_element?(view, "#saved-reset-policy-trigger-mode")
+    assert has_element?(view, "#saved-reset-policy-quota-threshold-percent")
+    assert has_element?(view, "#saved-reset-policy-submit", "Save policy")
+
+    view
+    |> element("#saved-reset-policy-form")
+    |> render_submit(%{
+      "saved_reset_policy" => %{
+        "auto_redeem_enabled" => "on",
+        "trigger_mode" => "threshold",
+        "quota_threshold_percent" => "90",
+        "min_blocked_minutes" => " 15 ",
+        "keep_credits" => " 2 "
+      }
+    })
+
+    reloaded_identity = Repo.get!(UpstreamIdentity, identity.id)
+    assert reloaded_identity.saved_reset_auto_redeem_enabled == true
+    assert reloaded_identity.saved_reset_auto_redeem_min_blocked_minutes == 15
+    assert reloaded_identity.saved_reset_auto_redeem_keep_credits == 2
+    assert reloaded_identity.saved_reset_auto_redeem_trigger_mode == "threshold"
+    assert reloaded_identity.saved_reset_auto_redeem_quota_threshold_percent == 90
+    assert has_element?(view, metric_selector, "Auto redeem on · near 90% · keep 2")
+
+    action_selector = "#cockpit-redeem-saved-reset-upstream-account-#{identity.id}"
+    assert has_element?(view, action_selector, "Redeem saved reset")
+
+    assert render_click(view, "redeem_saved_reset", %{"id" => identity.id, "pool-id" => pool.id}) =~
+             "Confirm saved reset redemption before queueing it"
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where: job.worker == ^worker_name(SavedResetRedemptionWorker)
+             ),
+             :count
+           ) == 0
+
+    view |> element(action_selector) |> render_click()
+
+    assert has_element?(view, "#cockpit-saved-reset-redemption-confirmation")
+    assert has_element?(view, "#cockpit-saved-reset-redemption-confirm", "Confirm redemption")
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where: job.worker == ^worker_name(SavedResetRedemptionWorker)
+             ),
+             :count
+           ) == 0
+
+    view |> element("#cockpit-saved-reset-redemption-confirm") |> render_click()
+
+    assert [job] =
+             Repo.all(
+               from job in Oban.Job,
+                 where: job.worker == ^worker_name(SavedResetRedemptionWorker)
+             )
+
+    assert job.args["pool_upstream_assignment_id"] == assignment.id
+    assert job.args["trigger_kind"] == "admin_manual"
+    refute Map.has_key?(job.args, "credit_id")
+    refute Map.has_key?(job.args, "redeem_request_id")
   end
 
   @tag :status_assignments_privacy
@@ -3545,4 +3658,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
              "##{footer_id}-docs-link [data-role='admin-dialog-docs-icon']"
            )
   end
+
+  defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
 end

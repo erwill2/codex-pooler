@@ -3,7 +3,7 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
 
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Jobs
-  alias CodexPooler.Jobs.AccountReconciliationWorker
+  alias CodexPooler.Jobs.{AccountReconciliationWorker, SavedResetRedemptionWorker}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
@@ -345,6 +345,29 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
       assert result.assignment.metadata["quota_priming"]["status"] == "stale"
       assert result.assignment.metadata["quota_priming"]["stale_window_count"] == 1
       assert result.assignment.metadata["quota_priming"]["usable_window_count"] == 0
+    end
+  end
+
+  describe "saved reset redemption jobs" do
+    test "deduplicates duplicate redemption enqueue for the same upstream assignment" do
+      %{assignment: assignment} = upstream_assignment_fixture()
+
+      assert {:ok, first_job} =
+               Jobs.enqueue_saved_reset_redemption(assignment, trigger_kind: "admin_manual")
+
+      assert {:ok, duplicate_job} =
+               Jobs.enqueue_saved_reset_redemption(assignment.id, trigger_kind: "operator_retry")
+
+      refute first_job.conflict?
+      assert duplicate_job.conflict?
+      assert duplicate_job.id == first_job.id
+
+      assert [job] = all_enqueued(worker: SavedResetRedemptionWorker)
+      assert job.id == first_job.id
+      assert job.args["pool_upstream_assignment_id"] == assignment.id
+      assert job.args["trigger_kind"] == "admin_manual"
+      refute Map.has_key?(job.args, "credit_id")
+      refute Map.has_key?(job.args, "redeem_request_id")
     end
   end
 

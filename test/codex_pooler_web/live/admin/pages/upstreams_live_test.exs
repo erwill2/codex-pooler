@@ -14,6 +14,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   alias CodexPooler.Events.PostgresBridge
   alias CodexPooler.FakeOpenAIAuthProvider
   alias CodexPooler.Jobs.TokenRefreshWorker
+  alias CodexPooler.Jobs.SavedResetRedemptionWorker
   alias CodexPooler.Mailer
   alias CodexPooler.Pools
   alias CodexPooler.Repo
@@ -733,6 +734,308 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     refute html =~ "Workspace reference legacy"
   end
 
+  test "renders saved reset count as a clickable header badge on upstream account cards", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "saved-reset-card", name: "Saved Reset Card"})
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: active_identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Saved Reset Codex",
+        identity_metadata: %{
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 2,
+            "source" => "codex_usage_api",
+            "path_style" => "codex",
+            "usage_path" => "/api/codex/usage",
+            "observed_at" => DateTime.to_iso8601(observed_at)
+          }
+        }
+      })
+
+    active_identity
+    |> UpstreamIdentity.changeset(%{
+      saved_reset_auto_redeem_enabled: true,
+      saved_reset_auto_redeem_min_blocked_minutes: 45,
+      saved_reset_auto_redeem_keep_credits: 1
+    })
+    |> Repo.update!()
+
+    %{identity: inactive_identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Manual Saved Reset Codex",
+        identity_metadata: %{
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 1,
+            "source" => "codex_usage_api",
+            "path_style" => "codex",
+            "usage_path" => "/api/codex/usage",
+            "observed_at" => DateTime.to_iso8601(observed_at)
+          }
+        }
+      })
+
+    %{identity: empty_identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Empty Saved Reset Codex",
+        identity_metadata: %{
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 0,
+            "source" => "codex_usage_api",
+            "path_style" => "codex",
+            "usage_path" => "/api/codex/usage",
+            "observed_at" => DateTime.to_iso8601(observed_at)
+          }
+        }
+      })
+
+    accounts = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+    active_account = Enum.find(accounts, &(&1.identity.id == active_identity.id))
+    inactive_account = Enum.find(accounts, &(&1.identity.id == inactive_identity.id))
+
+    assert active_account.saved_resets.label == "2 saved resets"
+    assert active_account.saved_resets.available? == true
+    assert active_account.saved_reset_policy.enabled? == true
+    assert active_account.saved_reset_policy.keep_credits == 1
+    assert inactive_account.saved_resets.label == "1 saved reset"
+    assert inactive_account.saved_reset_policy.enabled? == false
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    active_badge_id = "upstream-account-#{active_identity.id}-saved-reset-count"
+
+    active_badge_selector =
+      "##{active_badge_id}[data-role='upstream-saved-reset-count-badge'][aria-label='Saved resets: 2; auto redeem active']"
+
+    assert has_element?(view, active_badge_selector, "2")
+    assert has_element?(view, "#{active_badge_selector} .hero-battery-100.size-3.text-current")
+
+    active_card = view |> element("#upstream-account-#{active_identity.id}") |> render()
+    active_badge_class = html_element_class(active_card, active_badge_id)
+
+    assert active_badge_class =~ "bg-success/15"
+    assert active_badge_class =~ "text-success"
+    assert active_badge_class =~ "border-success/40"
+    refute active_badge_class =~ "bg-violet-500/10"
+    refute active_badge_class =~ "text-violet-700"
+    refute active_badge_class =~ "ring-"
+    refute active_badge_class =~ "border-dashed"
+
+    assert upstream_header_badge_order(active_card) == [
+             active_badge_id,
+             "upstream-account-#{active_identity.id}-plan-label"
+           ]
+
+    inactive_badge_id = "upstream-account-#{inactive_identity.id}-saved-reset-count"
+
+    inactive_badge_selector =
+      "##{inactive_badge_id}[data-role='upstream-saved-reset-count-badge'][aria-label='Saved resets: 1; auto redeem inactive']"
+
+    assert has_element?(view, inactive_badge_selector, "1")
+
+    assert has_element?(
+             view,
+             "#{inactive_badge_selector} .hero-battery-100.size-3.text-violet-600"
+           )
+
+    inactive_card = view |> element("#upstream-account-#{inactive_identity.id}") |> render()
+    inactive_badge_class = html_element_class(inactive_card, inactive_badge_id)
+
+    assert inactive_badge_class =~ "bg-violet-500/10"
+    assert inactive_badge_class =~ "text-violet-700"
+    assert inactive_badge_class =~ "border-violet-500/50"
+    refute inactive_badge_class =~ "ring-"
+    refute inactive_badge_class =~ "border-dashed"
+
+    assert upstream_header_badge_order(inactive_card) == [
+             inactive_badge_id,
+             "upstream-account-#{inactive_identity.id}-plan-label"
+           ]
+
+    refute has_element?(view, "#upstream-account-#{empty_identity.id}-saved-reset-count")
+
+    refute has_element?(view, "#upstream-account-#{active_identity.id}-saved-resets")
+    refute has_element?(view, "#upstream-account-#{active_identity.id}", "Auto redeem on")
+
+    view |> element(active_badge_selector) |> render_click()
+
+    assert has_element?(view, "#saved-reset-policy-dialog", "Manage saved reset bank")
+  end
+
+  test "edits saved reset policy from the upstream account dropdown without redeeming resets", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "saved-reset-policy", name: "Saved Reset Policy"})
+
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Saved Reset Policy Codex",
+        identity_metadata: %{
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 2,
+            "source" => "codex_usage_api",
+            "path_style" => "codex",
+            "usage_path" => "/api/codex/usage",
+            "observed_at" => DateTime.to_iso8601(observed_at)
+          }
+        }
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    action_selector = "#saved-reset-policy-upstream-account-#{identity.id}"
+    assert has_element?(view, action_selector, "Saved resets")
+
+    view |> element(action_selector) |> render_click()
+
+    assert has_element?(view, "#saved-reset-policy-dialog")
+    assert has_element?(view, "#saved-reset-policy-auto-redeem-enabled")
+    assert has_element?(view, "#saved-reset-policy-trigger-mode")
+    assert has_element?(view, "#saved-reset-policy-quota-threshold-percent")
+    assert has_element?(view, "#saved-reset-policy-min-blocked-minutes")
+    assert has_element?(view, "#saved-reset-policy-keep-credits")
+    assert has_element?(view, "#saved-reset-manual-redemption")
+    assert has_element?(view, "#saved-reset-policy-submit")
+    assert has_element?(view, "#saved-reset-manual-redemption", "Spend one saved reset now")
+
+    assert has_element?(
+             view,
+             "#saved-reset-policy-dialog-panel > div:first-child",
+             "A saved reset is a banked reset credit for this account"
+           )
+
+    refute render(view) =~ "Saved resets are earned reset credits reported by Codex"
+    refute has_element?(view, "#saved-reset-policy-explanation")
+    refute has_element?(view, "#saved-reset-policy-account-summary")
+
+    view
+    |> element("#saved-reset-policy-form")
+    |> render_change(%{
+      "saved_reset_policy" => %{
+        "auto_redeem_enabled" => "true",
+        "trigger_mode" => "threshold",
+        "quota_threshold_percent" => "101",
+        "min_blocked_minutes" => "-1",
+        "keep_credits" => "-1"
+      }
+    })
+
+    assert has_element?(view, "#saved-reset-policy-dialog")
+    assert has_element?(view, "#saved-reset-policy-quota-threshold-percent.input-error")
+    assert has_element?(view, "#saved-reset-policy-min-blocked-minutes.input-error")
+    assert has_element?(view, "#saved-reset-policy-keep-credits.input-error")
+    assert has_element?(view, "#saved-reset-policy-dialog", "must be greater than or equal to 0")
+    assert has_element?(view, "#saved-reset-policy-dialog", "must be less than or equal to 100")
+
+    view
+    |> element("#saved-reset-policy-form")
+    |> render_submit(%{
+      "saved_reset_policy" => %{
+        "auto_redeem_enabled" => "true",
+        "trigger_mode" => "threshold",
+        "quota_threshold_percent" => "92",
+        "min_blocked_minutes" => "15",
+        "keep_credits" => "1"
+      }
+    })
+
+    reloaded_identity = Repo.get!(UpstreamIdentity, identity.id)
+    assert reloaded_identity.saved_reset_auto_redeem_enabled == true
+    assert reloaded_identity.saved_reset_auto_redeem_min_blocked_minutes == 15
+    assert reloaded_identity.saved_reset_auto_redeem_keep_credits == 1
+    assert reloaded_identity.saved_reset_auto_redeem_trigger_mode == "threshold"
+    assert reloaded_identity.saved_reset_auto_redeem_quota_threshold_percent == 92
+    refute has_element?(view, "#saved-reset-policy-dialog")
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where: job.worker == ^worker_name(SavedResetRedemptionWorker)
+             ),
+             :count
+           ) == 0
+  end
+
+  test "confirms manual saved reset redemption from the upstream account dialog", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "saved-reset-dialog-manual",
+        name: "Saved Reset Dialog Manual"
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: identity, assignment: assignment} =
+      active_upstream_assignment_fixture(pool, %{
+        account_label: "Manual Saved Reset Dialog Codex",
+        metadata: %{
+          "access_token_expires_at" => DateTime.to_iso8601(DateTime.add(now, 2, :hour)),
+          "token_refresh" => %{
+            "status" => "succeeded",
+            "finished_at" => DateTime.to_iso8601(DateTime.add(now, -5, :minute))
+          },
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 1,
+            "source" => "codex_usage_api",
+            "path_style" => "codex_api",
+            "usage_path" => "/api/codex/usage",
+            "observed_at" => DateTime.to_iso8601(now)
+          }
+        }
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    view
+    |> element("#saved-reset-policy-upstream-account-#{identity.id}")
+    |> render_click()
+
+    assert has_element?(view, "#saved-reset-policy-dialog")
+    assert has_element?(view, "#saved-reset-redemption-open-confirmation")
+
+    view
+    |> element("#saved-reset-redemption-open-confirmation")
+    |> render_click()
+
+    assert has_element?(view, "#saved-reset-redemption-confirmation")
+    assert has_element?(view, "#saved-reset-redemption-confirm", "Confirm redemption")
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where: job.worker == ^worker_name(SavedResetRedemptionWorker)
+             ),
+             :count
+           ) == 0
+
+    view
+    |> element("#saved-reset-redemption-confirm")
+    |> render_click()
+
+    assert [job] =
+             Repo.all(
+               from job in Oban.Job,
+                 where: job.worker == ^worker_name(SavedResetRedemptionWorker)
+             )
+
+    assert job.args["pool_upstream_assignment_id"] == assignment.id
+    assert job.args["trigger_kind"] == "admin_manual"
+    refute Map.has_key?(job.args, "credit_id")
+    refute Map.has_key?(job.args, "redeem_request_id")
+  end
+
   @tag :upstream_filters
   test "renders URL-backed upstream filter controls without legacy select fallbacks", %{
     conn: conn,
@@ -1138,7 +1441,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#upstream-account-page-header",
-             "Import Codex auth.json, check readiness, and keep account access current."
+             "Link upstream accounts, monitor routing capacity, and manage credential, quota, and saved-reset recovery."
            )
 
     refute has_element?(view, "#upstream-account-form")
@@ -3774,6 +4077,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     ~r/id="(upstream-page-(?:create-invite|import-auth-json|oauth-link)-action)"/
     |> Regex.scan(html, capture: :all_but_first)
     |> List.flatten()
+  end
+
+  defp upstream_header_badge_order(html) do
+    ~r/id="(upstream-account-[^"]+-(?:saved-reset-count|plan-label))"/
+    |> Regex.scan(html, capture: :all_but_first)
+    |> List.flatten()
+  end
+
+  defp html_element_class(html, id) do
+    assert [_match, class] = Regex.run(~r/id="#{Regex.escape(id)}"[^>]*class="([^"]+)"/, html)
+    class
   end
 
   defp assert_admin_dialog_docs_link(view, footer_id) do

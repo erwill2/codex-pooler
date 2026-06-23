@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   alias CodexPooler.Admin.UpstreamCockpitReadModel, as: AdminUpstreamCockpitReadModel
   alias CodexPooler.Audit
   alias CodexPooler.Pools
+  alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
   alias CodexPoolerWeb.DateTimeDisplay
@@ -23,7 +24,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:onboarding_method) => String.t() | nil,
           required(:plan_label) => String.t() | nil,
           required(:plan_reported?) => boolean(),
-          required(:safe_account_id_label) => String.t()
+          required(:safe_account_id_label) => String.t(),
+          required(:saved_resets) => SavedResets.snapshot_projection(),
+          required(:saved_reset_policy) => SavedResets.auto_policy_projection()
         }
   @type header :: %{
           required(:title) => String.t(),
@@ -200,6 +203,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:pause) => action(),
           required(:reactivate) => action(),
           required(:refresh_token) => action(),
+          required(:redeem_saved_reset) => action(),
           required(:replace_auth_json) => action(),
           required(:oauth_relink) => action(),
           required(:reinvite) => action(),
@@ -232,6 +236,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:actions) => actions(),
           required(:oauth_flows) => oauth_flow_state(),
           required(:sections) => sections(),
+          required(:saved_resets) => SavedResets.snapshot_projection(),
+          required(:saved_reset_policy) => SavedResets.auto_policy_projection(),
           required(:flags) => flags()
         }
 
@@ -268,6 +274,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     recent_events = recent_events(account.identity, scope)
     actions = actions(account)
     oauth_flows = oauth_flows(account, scope)
+    saved_resets = saved_resets(account)
+    saved_reset_policy = saved_reset_policy(account)
     sections = sections(flags, assignments, charts, recent_events, actions)
 
     %{
@@ -277,6 +285,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       charts: charts,
       recent_events: recent_events,
       actions: actions,
+      saved_resets: saved_resets,
+      saved_reset_policy: saved_reset_policy,
       oauth_flows: oauth_flows,
       sections: sections,
       flags: flags
@@ -304,9 +314,21 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       onboarding_method: identity.onboarding_method,
       plan_label: account.plan_label,
       plan_reported?: account.plan_reported?,
-      safe_account_id_label: safe_account_id_label(identity.chatgpt_account_id)
+      safe_account_id_label: safe_account_id_label(identity.chatgpt_account_id),
+      saved_resets: saved_resets(account),
+      saved_reset_policy: saved_reset_policy(account)
     }
   end
+
+  defp saved_resets(%{saved_resets: saved_resets}), do: saved_resets
+
+  defp saved_resets(%{identity: %UpstreamIdentity{} = identity}),
+    do: SavedResets.snapshot(identity)
+
+  defp saved_reset_policy(%{saved_reset_policy: saved_reset_policy}), do: saved_reset_policy
+
+  defp saved_reset_policy(%{identity: %UpstreamIdentity{} = identity}),
+    do: SavedResets.auto_policy(identity)
 
   defp header(account, safe_identity) do
     %{
@@ -545,6 +567,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   defp actions(account) do
     status = account.identity.status
     recovery_eligible? = recovery_eligible?(account)
+    redeem_saved_reset = redeem_saved_reset_action(account)
 
     %{
       rename: action(status != "deleted", "deleted accounts cannot be renamed"),
@@ -556,6 +579,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           status in ["active", "refresh_due", "refresh_failed"],
           "token refresh is unavailable"
         ),
+      redeem_saved_reset: redeem_saved_reset,
       replace_auth_json: action(recovery_eligible?, "credential replacement is not needed"),
       oauth_relink:
         action(
@@ -571,6 +595,34 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       empty?: false,
       degraded?: recovery_eligible?
     }
+  end
+
+  defp redeem_saved_reset_action(account) do
+    cond do
+      account.identity.status == "deleted" ->
+        action(false, "deleted accounts cannot redeem saved resets")
+
+      account.identity.status == "disabled" ->
+        action(false, "disabled accounts cannot redeem saved resets")
+
+      not auth_clearly_usable?(account) ->
+        action(false, "saved reset redemption requires usable credentials")
+
+      account.assignments == [] ->
+        action(false, "saved reset redemption requires a Pool assignment")
+
+      account.saved_resets.reported? == false ->
+        action(false, "saved reset count is not reported")
+
+      account.saved_resets.available? == false ->
+        action(false, "no saved resets are available")
+
+      account.saved_resets.in_progress? == true ->
+        action(false, "saved reset redemption is already in progress")
+
+      true ->
+        action(true, nil)
+    end
   end
 
   defp action(true, _reason), do: %{available?: true, reason: nil}

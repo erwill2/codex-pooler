@@ -12,6 +12,7 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
 
   @statuses ~w(pending active paused refresh_due refreshing refresh_failed reauth_required deleted disabled errored)
   @onboarding_methods ~w(browser device import invite)
+  @saved_reset_auto_redeem_trigger_modes ~w(blocked threshold)
   @plan_family_format ~r/^[a-z0-9]+(?:-[a-z0-9]+)*$/
 
   @type t :: %__MODULE__{}
@@ -35,6 +36,11 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
     field :headers_profile_version, :integer
     field :last_successful_refresh_at, :utc_datetime_usec
     field :last_successful_sync_at, :utc_datetime_usec
+    field :saved_reset_auto_redeem_enabled, :boolean, default: false
+    field :saved_reset_auto_redeem_min_blocked_minutes, :integer, default: 60
+    field :saved_reset_auto_redeem_keep_credits, :integer, default: 0
+    field :saved_reset_auto_redeem_trigger_mode, :string, default: "blocked"
+    field :saved_reset_auto_redeem_quota_threshold_percent, :integer, default: 95
     field :disabled_at, :utc_datetime_usec
     field :created_by_user_id, :binary_id
     field :created_at, :utc_datetime_usec
@@ -61,6 +67,11 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
       :headers_profile_version,
       :last_successful_refresh_at,
       :last_successful_sync_at,
+      :saved_reset_auto_redeem_enabled,
+      :saved_reset_auto_redeem_min_blocked_minutes,
+      :saved_reset_auto_redeem_keep_credits,
+      :saved_reset_auto_redeem_trigger_mode,
+      :saved_reset_auto_redeem_quota_threshold_percent,
       :disabled_at,
       :created_by_user_id,
       :created_at,
@@ -85,6 +96,16 @@ defmodule CodexPooler.Upstreams.Schemas.UpstreamIdentity do
       :metadata
     ])
     |> validate_number(:headers_profile_version, greater_than: 0)
+    |> validate_number(:saved_reset_auto_redeem_min_blocked_minutes, greater_than_or_equal_to: 0)
+    |> validate_number(:saved_reset_auto_redeem_keep_credits, greater_than_or_equal_to: 0)
+    |> validate_inclusion(
+      :saved_reset_auto_redeem_trigger_mode,
+      @saved_reset_auto_redeem_trigger_modes
+    )
+    |> validate_number(:saved_reset_auto_redeem_quota_threshold_percent,
+      greater_than_or_equal_to: 1,
+      less_than_or_equal_to: 100
+    )
     |> validate_inclusion(:status, @statuses)
     |> validate_inclusion(:onboarding_method, @onboarding_methods)
     |> validate_format(:plan_family, @plan_family_format)

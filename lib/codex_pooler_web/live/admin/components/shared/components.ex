@@ -551,7 +551,7 @@ defmodule CodexPoolerWeb.Admin.Components do
 
   attr :rest, :global,
     include:
-      ~w(href navigate patch method disabled form phx-click phx-disable-with phx-value-id phx-value-step)
+      ~w(href navigate patch method disabled form phx-click phx-disable-with phx-value-id phx-value-pool-id phx-value-step)
 
   def action_button(assigns) do
     assigns = assign(assigns, :class, action_button_class(assigns.variant, assigns.size))

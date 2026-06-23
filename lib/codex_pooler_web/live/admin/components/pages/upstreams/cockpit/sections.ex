@@ -182,6 +182,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
   end
 
   attr :cockpit, :map, required: true
+  attr :saved_reset_policy_form, :any, required: true
+  attr :confirming_saved_reset_redemption, :map, default: nil
 
   def actions_section(assigns) do
     ~H"""
@@ -226,6 +228,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
           phx-value-id={@cockpit.identity.id}
         />
         <.cockpit_action_button
+          id={"cockpit-redeem-saved-reset-upstream-account-#{@cockpit.identity.id}"}
+          label="Redeem saved reset"
+          action={@cockpit.actions.redeem_saved_reset}
+          icon="hero-bolt"
+          phx-click="open_saved_reset_redemption_confirmation"
+          phx-value-id={@cockpit.identity.id}
+          phx-value-pool-id={default_pool_id(@cockpit)}
+        />
+        <.cockpit_action_button
           id={"cockpit-replace-auth-json-upstream-account-#{@cockpit.identity.id}"}
           label="Replace auth.json"
           icon="hero-document-arrow-up"
@@ -254,6 +265,127 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
           phx-value-id={@cockpit.identity.id}
         />
       </div>
+      <div
+        :if={confirming_saved_reset_redemption?(@confirming_saved_reset_redemption, @cockpit)}
+        id="cockpit-saved-reset-redemption-confirmation"
+        class="mx-4 mb-4 grid gap-3 rounded-box border border-warning/30 bg-warning/10 p-4"
+      >
+        <div class="grid gap-1">
+          <h3 class="text-sm font-semibold text-base-content">Confirm saved reset redemption</h3>
+          <p class="text-sm leading-6 text-base-content/75">
+            This queues one manual redemption for the selected upstream account. It is separate from the saved-reset policy form.
+          </p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <AdminComponents.action_button
+            id="cockpit-saved-reset-redemption-confirm"
+            icon="hero-check"
+            label="Confirm redemption"
+            phx-click="redeem_saved_reset"
+            phx-value-id={@cockpit.identity.id}
+            phx-value-pool-id={default_pool_id(@cockpit)}
+            variant={:primary}
+          />
+          <AdminComponents.action_button
+            id="cockpit-saved-reset-redemption-cancel"
+            icon="hero-x-mark"
+            label="Keep reset in bank"
+            phx-click="cancel_saved_reset_redemption"
+          />
+        </div>
+      </div>
+      <.form
+        id="saved-reset-policy-form"
+        for={@saved_reset_policy_form}
+        phx-submit="save_saved_reset_policy"
+        autocomplete="off"
+        class="grid gap-4 border-t border-base-300 p-4"
+      >
+        <fieldset class="grid gap-4">
+          <legend class="sr-only">Auto redeem policy</legend>
+          <div
+            id="saved-reset-policy-auto-redeem-control"
+            class="grid gap-3 rounded-box border border-base-300 bg-base-200/30 p-4 lg:grid-cols-[minmax(0,1fr)_18rem] lg:items-start"
+          >
+            <div class="grid max-w-3xl gap-1">
+              <p class="text-sm font-semibold text-base-content">Auto redeem policy</p>
+              <p class="text-xs leading-5 text-base-content/60">
+                Automatic redemption can wait until weekly quota is blocked, or start earlier near the quota limit when fresh Pool evidence shows every eligible account is also under pressure. The reset buffer prevents spending when the weekly reset is close.
+              </p>
+            </div>
+            <label
+              id="saved-reset-policy-auto-redeem-card"
+              for="saved-reset-policy-auto-redeem-enabled"
+              class="flex min-h-12 w-full cursor-pointer items-center justify-between gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-2 transition-colors hover:border-primary/50 hover:bg-primary/5"
+            >
+              <span class="text-sm font-medium text-base-content">Auto redeem saved resets</span>
+              <input type="hidden" name="saved_reset_policy[auto_redeem_enabled]" value="false" />
+              <input
+                id="saved-reset-policy-auto-redeem-enabled"
+                type="checkbox"
+                name="saved_reset_policy[auto_redeem_enabled]"
+                value="true"
+                checked={form_checkbox_checked?(@saved_reset_policy_form[:auto_redeem_enabled])}
+                class="toggle toggle-primary toggle-sm shrink-0"
+              />
+            </label>
+          </div>
+
+          <div id="saved-reset-policy-controls" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            <.input
+              field={@saved_reset_policy_form[:trigger_mode]}
+              type="select"
+              id="saved-reset-policy-trigger-mode"
+              name="saved_reset_policy[trigger_mode]"
+              label="Auto trigger"
+              class="select select-bordered w-full"
+              options={[
+                {"Blocked", "blocked"},
+                {"Near limit", "threshold"}
+              ]}
+            />
+            <.input
+              field={@saved_reset_policy_form[:quota_threshold_percent]}
+              type="number"
+              id="saved-reset-policy-quota-threshold-percent"
+              name="saved_reset_policy[quota_threshold_percent]"
+              label="Near limit %"
+              class="input input-bordered w-full"
+              min="1"
+              max="100"
+              step="1"
+            />
+            <.input
+              field={@saved_reset_policy_form[:min_blocked_minutes]}
+              type="number"
+              id="saved-reset-policy-min-blocked-minutes"
+              name="saved_reset_policy[min_blocked_minutes]"
+              label="Reset buffer min"
+              class="input input-bordered w-full"
+              min="0"
+            />
+            <.input
+              field={@saved_reset_policy_form[:keep_credits]}
+              type="number"
+              id="saved-reset-policy-keep-credits"
+              name="saved_reset_policy[keep_credits]"
+              label="Keep credits"
+              class="input input-bordered w-full"
+              min="0"
+            />
+          </div>
+        </fieldset>
+
+        <div class="flex justify-end border-t border-base-300/70 pt-3">
+          <AdminComponents.action_button
+            id="saved-reset-policy-submit"
+            label="Save policy"
+            icon="hero-check"
+            type="submit"
+            variant={:primary}
+          />
+        </div>
+      </.form>
       <:footer>
         <p class="text-sm text-base-content/65">
           Assignment and Pool changes stay on linked admin pages; this cockpit only mutates the upstream identity lifecycle and credentials.
@@ -409,8 +541,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
     """
   end
 
+  defp form_checkbox_checked?(field) do
+    Phoenix.HTML.Form.normalize_value("checkbox", field.value)
+  end
+
   defp default_pool_id(%{assignments: %{items: [%{pool_id: pool_id} | _items]}}), do: pool_id
   defp default_pool_id(_cockpit), do: nil
+
+  defp confirming_saved_reset_redemption?(%{identity_id: identity_id}, %{
+         identity: %{id: identity_id}
+       }),
+       do: true
+
+  defp confirming_saved_reset_redemption?(_confirmation, _cockpit), do: false
 
   defp reinvite_path(cockpit) do
     pool_id = default_pool_id(cockpit)

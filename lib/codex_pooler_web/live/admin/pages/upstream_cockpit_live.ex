@@ -39,6 +39,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
         rename_account_form: nil,
         deleting_account: nil,
         delete_account_form: delete_account_form(nil),
+        saved_reset_policy_form: saved_reset_policy_form(%{}),
+        confirming_saved_reset_redemption: nil,
         subscribed_pool_ids: MapSet.new()
       )
       |> allow_upload(:auth_json,
@@ -94,7 +96,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
       {:noreply,
        assign(socket,
          renaming_account: %{id: identity_id, label: socket.assigns.cockpit.header.title},
-         rename_account_form: rename_account_form(socket.assigns.cockpit.header.title)
+         rename_account_form: rename_account_form(socket.assigns.cockpit.header.title),
+         confirming_saved_reset_redemption: nil
        )}
     else
       {:noreply, put_unavailable_action_error(socket, :rename)}
@@ -184,7 +187,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
        |> cancel_auth_json_upload_entries()
        |> assign(
          importing_auth_json: true,
-         auth_json_form: auth_json_form_for_pool(socket, pool_id)
+         auth_json_form: auth_json_form_for_pool(socket, pool_id),
+         confirming_saved_reset_redemption: nil
        )}
     else
       {:noreply, put_unavailable_action_error(socket, :replace_auth_json)}
@@ -207,6 +211,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
          |> close_rename_account_dialog()
          |> close_delete_account_dialog()
          |> close_oauth_relink_dialog()
+         |> close_saved_reset_redemption_confirmation()
          |> assign(oauth_relinking: true, oauth_relink_form: oauth_relink_form())}
 
       true ->
@@ -371,7 +376,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
       {:noreply,
        assign(socket,
          deleting_account: account,
-         delete_account_form: delete_account_form(account)
+         delete_account_form: delete_account_form(account),
+         confirming_saved_reset_redemption: nil
        )}
     else
       {:noreply, put_unavailable_action_error(socket, :delete)}
@@ -403,6 +409,69 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
 
       {:error, form} ->
         {:noreply, assign(socket, :delete_account_form, form)}
+    end
+  end
+
+  def handle_event("save_saved_reset_policy", %{"saved_reset_policy" => params}, socket) do
+    case Upstreams.update_saved_reset_policy_for_scope(
+           socket.assigns.current_scope,
+           socket.assigns.cockpit.identity.id,
+           params
+         ) do
+      {:ok, _result} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "Saved reset policy updated")
+         |> load_cockpit()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, error_message(reason))}
+    end
+  end
+
+  def handle_event(
+        "open_saved_reset_redemption_confirmation",
+        %{"id" => identity_id} = params,
+        socket
+      ) do
+    pool_id = Map.get(params, "pool-id") || Map.get(params, "pool_id")
+
+    cond do
+      identity_id != socket.assigns.cockpit.identity.id ->
+        {:noreply, put_flash(socket, :error, "Upstream account was not found")}
+
+      action_available?(socket, :redeem_saved_reset, identity_id) ->
+        {:noreply,
+         assign(socket, :confirming_saved_reset_redemption, %{
+           identity_id: identity_id,
+           pool_id: pool_id,
+           label: socket.assigns.cockpit.header.title
+         })}
+
+      true ->
+        {:noreply, put_unavailable_action_error(socket, :redeem_saved_reset)}
+    end
+  end
+
+  def handle_event("cancel_saved_reset_redemption", _params, socket) do
+    {:noreply, close_saved_reset_redemption_confirmation(socket)}
+  end
+
+  def handle_event("redeem_saved_reset", %{"id" => identity_id} = params, socket) do
+    pool_id = Map.get(params, "pool-id") || Map.get(params, "pool_id")
+
+    cond do
+      identity_id != socket.assigns.cockpit.identity.id ->
+        {:noreply, put_flash(socket, :error, "Upstream account was not found")}
+
+      not saved_reset_redemption_confirmed?(socket, identity_id, pool_id) ->
+        {:noreply, put_flash(socket, :error, "Confirm saved reset redemption before queueing it")}
+
+      action_available?(socket, :redeem_saved_reset, identity_id) ->
+        enqueue_saved_reset_redemption(socket, identity_id, pool_id)
+
+      true ->
+        {:noreply, put_unavailable_action_error(socket, :redeem_saved_reset)}
     end
   end
 
@@ -438,6 +507,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
         rename_account_form={@rename_account_form}
         deleting_account={@deleting_account}
         delete_account_form={@delete_account_form}
+        saved_reset_policy_form={@saved_reset_policy_form}
+        confirming_saved_reset_redemption={@confirming_saved_reset_redemption}
         refresh_data_message={@refresh_data_message}
         uploads={@uploads}
         datetime_preferences={@datetime_preferences}
@@ -588,7 +659,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
     |> maybe_subscribe_pool_events(cockpit)
     |> assign(
       cockpit: cockpit,
-      dialog_pool_options: dialog_pool_options(socket.assigns.current_scope)
+      dialog_pool_options: dialog_pool_options(socket.assigns.current_scope),
+      saved_reset_policy_form: saved_reset_policy_form(cockpit.saved_reset_policy)
     )
   end
 
@@ -639,6 +711,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
       cockpit.actions |> Map.fetch!(action_key) |> Map.fetch!(:available?)
   end
 
+  defp saved_reset_redemption_confirmed?(socket, identity_id, pool_id) do
+    case socket.assigns.confirming_saved_reset_redemption do
+      %{identity_id: ^identity_id, pool_id: ^pool_id} -> true
+      _confirmation -> false
+    end
+  end
+
   defp put_unavailable_action_error(socket, action_key) do
     action = Map.fetch!(socket.assigns.cockpit.actions, action_key)
     reason = action.reason || "action is unavailable"
@@ -648,6 +727,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
   defp action_label(:replace_auth_json), do: "Replace auth.json"
   defp action_label(:oauth_relink), do: "OAuth relink"
   defp action_label(:refresh_token), do: "Refresh token"
+  defp action_label(:redeem_saved_reset), do: "Redeem saved reset"
 
   defp action_label(action_key),
     do: action_key |> to_string() |> String.replace("_", " ") |> String.capitalize()
@@ -664,12 +744,55 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
     |> Phoenix.Component.to_form(as: :rename)
   end
 
+  defp saved_reset_policy_form(policy) when is_map(policy) do
+    Phoenix.Component.to_form(
+      %{
+        "auto_redeem_enabled" => Map.get(policy, :enabled?, false),
+        "trigger_mode" => Map.get(policy, :trigger_mode, "blocked"),
+        "quota_threshold_percent" => Map.get(policy, :quota_threshold_percent, 95),
+        "min_blocked_minutes" => Map.get(policy, :min_blocked_minutes, 60),
+        "keep_credits" => Map.get(policy, :keep_credits, 0)
+      },
+      as: :saved_reset_policy
+    )
+  end
+
+  defp enqueue_saved_reset_redemption(socket, identity_id, pool_id) do
+    case Upstreams.enqueue_saved_reset_redemption_for_scope(
+           socket.assigns.current_scope,
+           identity_id,
+           pool_id,
+           trigger_kind: "admin_upstream_cockpit_live"
+         ) do
+      {:ok, %{status: :already_queued}} ->
+        {:noreply,
+         socket
+         |> close_saved_reset_redemption_confirmation()
+         |> put_flash(:info, "Saved reset redemption is already queued")
+         |> load_cockpit()}
+
+      {:ok, _result} ->
+        {:noreply,
+         socket
+         |> close_saved_reset_redemption_confirmation()
+         |> put_flash(:info, "Saved reset redemption queued")
+         |> load_cockpit()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, error_message(reason))}
+    end
+  end
+
   defp close_rename_account_dialog(socket) do
     assign(socket, renaming_account: nil, rename_account_form: nil)
   end
 
   defp close_delete_account_dialog(socket) do
     assign(socket, deleting_account: nil, delete_account_form: delete_account_form(nil))
+  end
+
+  defp close_saved_reset_redemption_confirmation(socket) do
+    assign(socket, :confirming_saved_reset_redemption, nil)
   end
 
   defp close_oauth_relink_dialog(socket) do

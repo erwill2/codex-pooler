@@ -107,6 +107,11 @@ defmodule CodexPooler.Jobs do
     UpstreamEnqueue.enqueue_assignment_priming(pool_or_id, assignment_or_id, opts)
   end
 
+  @spec enqueue_saved_reset_redemption(assignment_ref(), keyword()) :: job_insert_result()
+  def enqueue_saved_reset_redemption(assignment_or_id, opts \\ []) do
+    UpstreamEnqueue.enqueue_saved_reset_redemption(assignment_or_id, opts)
+  end
+
   @spec enqueue_runtime_state_cleanup(keyword()) :: job_insert_result()
   def enqueue_runtime_state_cleanup(opts \\ []) do
     args =

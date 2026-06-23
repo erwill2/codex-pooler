@@ -160,6 +160,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
         compact_mobile={true}
       />
       <AdminComponents.metric_card
+        id="upstream-status-summary-saved-resets"
+        icon="hero-arrow-path"
+        label="Saved resets"
+        value={@cockpit.saved_resets.label}
+        description={saved_reset_summary_description(@cockpit.saved_reset_policy)}
+        tone={saved_reset_summary_tone(@cockpit.saved_resets)}
+        compact_mobile={true}
+      />
+      <AdminComponents.metric_card
         id="upstream-status-summary-requests"
         icon="hero-arrow-path-rounded-square"
         label="Request posture"
@@ -268,6 +277,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
   defp quota_summary_tone(%{missing?: true}), do: :warning
   defp quota_summary_tone(%{degraded?: true}), do: :warning
   defp quota_summary_tone(_quota), do: :success
+
+  defp saved_reset_summary_description(%{
+         enabled?: true,
+         trigger_mode: "threshold",
+         keep_credits: keep_credits,
+         quota_threshold_percent: threshold
+       }),
+       do: "Auto redeem on · near #{threshold}% · keep #{keep_credits}"
+
+  defp saved_reset_summary_description(%{enabled?: true, keep_credits: keep_credits}),
+    do: "Auto redeem on · blocked · keep #{keep_credits}"
+
+  defp saved_reset_summary_description(_policy), do: "Auto redeem off"
+
+  defp saved_reset_summary_tone(%{available?: true}), do: :success
+  defp saved_reset_summary_tone(%{reported?: true}), do: :neutral
+  defp saved_reset_summary_tone(_saved_resets), do: :warning
 
   defp request_summary_label(%{state: "empty"}), do: "No request traffic"
   defp request_summary_label(%{state: state}), do: Formatting.humanize_state(state)
