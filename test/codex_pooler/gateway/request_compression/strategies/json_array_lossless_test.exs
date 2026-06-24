@@ -157,8 +157,11 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.JsonArrayLosslessTes
                :original_bytes,
                :original_tokens,
                :row_count,
-               :strategy
+               :strategy,
+               :token_count_mode
              ]
+
+      assert metadata.token_count_mode in [:exact, :bounded_original]
     end
 
     test "does not retain state between calls" do

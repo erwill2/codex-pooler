@@ -93,8 +93,11 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.JsonDocumentLossless
                :original_bytes,
                :original_tokens,
                :strategy,
+               :token_count_mode,
                :top_level_key_count
              ]
+
+      assert metadata.token_count_mode in [:exact, :bounded_original]
     end
   end
 end
