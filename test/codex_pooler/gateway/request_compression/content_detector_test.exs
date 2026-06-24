@@ -242,6 +242,79 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetectorTest do
       end
     end
 
+    test "detects column-bearing direct search output" do
+      column_bearing =
+        1..3
+        |> Enum.map_join("\n", &"lib/column_result.ex:#{&1}:#{&1 * 2}: column match #{&1}")
+
+      assert %{
+               kind: :search,
+               confidence: confidence,
+               compressible: true,
+               strategy: :search_results
+             } = ContentDetector.detect(column_bearing)
+
+      assert confidence >= 0.6
+    end
+
+    test "detects grep context output with separators and dash context lines" do
+      direct_context = """
+      lib/context.ex-9- before direct match
+      lib/context.ex:10: direct match one
+      lib/context.ex-11- after direct match
+      --
+      lib/context.ex-19- before second match
+      lib/context.ex:20: direct match two
+      lib/context.ex-21- after second match
+      """
+
+      grouped_context = """
+      lib/grouped_context.ex
+      9- grouped context before
+      10: grouped match one
+      11- grouped context after
+      --
+      19- grouped context before second
+      20: grouped match two
+      21- grouped context after second
+      """
+
+      for body <- [direct_context, grouped_context] do
+        assert %{
+                 kind: :search,
+                 confidence: confidence,
+                 compressible: true,
+                 strategy: :search_results
+               } = ContentDetector.detect(body)
+
+        assert confidence >= 0.6
+      end
+    end
+
+    test "keeps unsupported grep shape-only outputs out of search detection" do
+      unsupported = [
+        """
+        lib/matched_one.ex
+        lib/matched_two.ex
+        lib/matched_three.ex
+        """,
+        """
+        lib/count_one.ex:3
+        lib/count_two.ex:0
+        lib/count_three.ex:12
+        """,
+        """
+        lib/only_one.ex:needle
+        lib/only_two.ex:needle
+        lib/only_three.ex:needle
+        """
+      ]
+
+      for body <- unsupported do
+        assert_noop(:text, ContentDetector.detect(body))
+      end
+    end
+
     test "keeps prose headings and malformed nul fragments out of search detection" do
       prose_heading = """
       Search results from the last review.

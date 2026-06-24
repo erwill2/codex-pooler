@@ -36,11 +36,14 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
   @search_heading_regex ~r/\b(?:search results|results for|matches for|found\s+\d+\s+(?:results|matches))\b/i
   @numbered_result_regex ~r/^\s*(?:\d+[\).]\s+|[-*]\s+).+\s-\s.+$/m
   @path_match_regex ~r/^\s*[\w.\/-]+:\d+(?::\d+)?:\s*\S/m
+  @path_context_regex ~r/^\s*[\w.\/-]+-\d+(?:-\d+)?-\s*\S/m
   @nul_path_match_regex ~r/^[^\x00\r\n]+\x00\d+(?::\d+)?:\s*\S/m
   @grouped_line_match_regex ~r/^\s*\d+(?::\d+)?:\s*\S/
+  @grouped_line_context_regex ~r/^\s*\d+(?:-\d+)?-\s*\S/
   @grouped_heading_path_regex ~r/^[\w.\/-]+$/u
   @grouped_heading_extension_regex ~r/(?:^|\/)[\w.-]+\.[A-Za-z0-9][A-Za-z0-9_-]*$/u
   @grouped_heading_sentence_punctuation_regex ~r/[!?;]|\.\s*$/
+  @grouped_separator_regex ~r/^\s*--\s*$/
   @max_grouped_heading_bytes 240
   @url_regex ~r/https?:\/\/\S+/i
   @snippet_separator_regex ~r/\s-\s/
@@ -177,6 +180,7 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
   defp search_points(content) do
     numbered_results = scan_count(@numbered_result_regex, content)
     path_matches = scan_count(@path_match_regex, content)
+    path_context_lines = scan_count(@path_context_regex, content)
     nul_matches = scan_count(@nul_path_match_regex, content)
     grouped_matches = grouped_search_match_count(content)
     structural_matches = path_matches + nul_matches + grouped_matches
@@ -188,7 +192,7 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
       cond_score(numbered_results, [{2, 30}, {1, 15}]),
       cond_score(structural_matches, [{3, 45}, {2, 35}, {1, 15}]),
       score(structural_matches >= 2, 15),
-      score(nul_matches >= 2 or grouped_matches >= 2, 10),
+      score(nul_matches >= 2 or grouped_matches >= 2 or path_context_lines >= 2, 10),
       cond_score(urls, [{2, 20}, {1, 10}]),
       score(separators >= 2, 10)
     ]
@@ -254,12 +258,23 @@ defmodule CodexPooler.Gateway.RequestCompression.ContentDetector do
   end
 
   defp count_grouped_lines_after(content, heading_index) do
-    matches =
+    {matches, _context_lines} =
       content
       |> lines()
       |> Enum.drop(heading_index + 1)
-      |> Enum.take_while(&Regex.match?(@grouped_line_match_regex, &1))
-      |> length()
+      |> Enum.reduce_while({0, 0}, fn line, {matches, context_lines} ->
+        cond do
+          Regex.match?(@grouped_line_match_regex, line) ->
+            {:cont, {matches + 1, context_lines}}
+
+          Regex.match?(@grouped_line_context_regex, line) or
+              Regex.match?(@grouped_separator_regex, line) ->
+            {:cont, {matches, context_lines + 1}}
+
+          true ->
+            {:halt, {matches, context_lines}}
+        end
+      end)
 
     if matches >= 2, do: matches, else: 0
   end

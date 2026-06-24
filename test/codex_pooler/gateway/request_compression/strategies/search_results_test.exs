@@ -100,6 +100,96 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResultsTest do
       assert_safe_metadata(metadata, :search_results, sentinel)
     end
 
+    test "compresses column-bearing direct output without dropping columns" do
+      sentinel = "DROP_ME_COLUMN_SEARCH_SENTINEL"
+      content = column_bearing_fixture(sentinel)
+
+      assert {:ok, %{content: compressed, metadata: metadata}} =
+               SearchResults.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_matches: 2,
+                 max_files: 1,
+                 max_matches_per_file: 3,
+                 max_matches: 3
+               )
+
+      assert compressed =~ "lib/column_result.ex"
+      assert compressed =~ "  1:2: column match 1 kept"
+      assert compressed =~ "  2:4: column match 2 kept"
+      assert compressed =~ "  3:6: column match 3 kept"
+      refute compressed =~ sentinel
+
+      assert metadata.strategy == :search_results
+      assert metadata.original_file_count == 1
+      assert metadata.compressed_file_count == 1
+      assert metadata.original_match_count == 12
+      assert metadata.compressed_match_count == 3
+      assert_safe_metadata(metadata, :search_results, sentinel)
+    end
+
+    test "preserves grep context separators and direct dash context lines" do
+      sentinel = "DROP_ME_GREP_CONTEXT_SENTINEL"
+      content = direct_context_search_fixture(sentinel)
+
+      assert {:ok, %{content: compressed, metadata: metadata}} =
+               SearchResults.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_matches: 2,
+                 max_files: 2,
+                 max_matches_per_file: 8,
+                 max_matches: 3
+               )
+
+      assert compressed =~ "lib/context_1.ex"
+      assert compressed =~ "  9- before first direct match"
+      assert compressed =~ "  10: direct match 1 kept"
+      assert compressed =~ "  11- after first direct match"
+      assert compressed =~ "--"
+      assert compressed =~ "  29- before second direct match"
+      assert compressed =~ "  30: direct match 2 kept"
+      assert compressed =~ "  31- after second direct match"
+      refute compressed =~ sentinel
+
+      assert metadata.strategy == :search_results
+      assert metadata.original_file_count == 2
+      assert metadata.original_match_count == 4
+      assert metadata.compressed_match_count == 3
+      assert_safe_metadata(metadata, :search_results, sentinel)
+    end
+
+    test "preserves grouped grep dash context lines" do
+      sentinel = "DROP_ME_GROUPED_CONTEXT_SENTINEL"
+      content = grouped_context_search_fixture(sentinel)
+
+      assert {:ok, %{content: compressed, metadata: metadata}} =
+               SearchResults.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_matches: 2,
+                 max_files: 1,
+                 max_matches_per_file: 2,
+                 max_matches: 2
+               )
+
+      assert compressed =~ "lib/grouped_context.ex"
+      assert compressed =~ "  9- grouped context before"
+      assert compressed =~ "  10: grouped match one kept"
+      assert compressed =~ "  11- grouped context after"
+      assert compressed =~ "--"
+      assert compressed =~ "  19- grouped context before second"
+      assert compressed =~ "  20: grouped match two kept"
+      assert compressed =~ "  21- grouped context after second"
+      refute compressed =~ sentinel
+
+      assert metadata.strategy == :search_results
+      assert metadata.original_file_count == 1
+      assert metadata.original_match_count == 3
+      assert metadata.compressed_match_count == 2
+      assert_safe_metadata(metadata, :search_results, sentinel)
+    end
+
     test "rejects byte-shrinking rewrites that do not shrink tokens" do
       padding = String.duplicate(" ", 20)
 
@@ -152,6 +242,26 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResultsTest do
       assert :skip = SearchResults.compress(malformed_nul, min_bytes: 0, min_matches: 1)
     end
 
+    test "skips unsupported grep shape-only outputs" do
+      unsupported = [
+        files_with_matches_fixture(),
+        count_only_fixture(),
+        only_matching_fixture()
+      ]
+
+      for content <- unsupported do
+        assert :skip =
+                 SearchResults.compress(content,
+                   model: @model,
+                   min_bytes: 0,
+                   min_matches: 1,
+                   max_files: 2,
+                   max_matches_per_file: 2,
+                   max_matches: 3
+                 )
+      end
+    end
+
     test "does not retain state between calls" do
       assert {:ok, _result} =
                SearchResults.compress(search_fixture("DROP_ME_STALE_SEARCH"),
@@ -170,6 +280,66 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResultsTest do
                  min_matches: 1
                )
     end
+  end
+
+  defp direct_context_search_fixture(sentinel) do
+    """
+    lib/context_1.ex-9- before first direct match
+    lib/context_1.ex:10: direct match 1 kept
+    lib/context_1.ex-11- after first direct match
+    --
+    lib/context_1.ex-29- before second direct match
+    lib/context_1.ex:30: direct match 2 kept
+    lib/context_1.ex-31- after second direct match
+    lib/context_2.ex:5: another file match kept
+    lib/context_2.ex:6: another file match #{sentinel}
+    """
+  end
+
+  defp grouped_context_search_fixture(sentinel) do
+    """
+    lib/grouped_context.ex
+    9- grouped context before
+    10: grouped match one kept
+    11- grouped context after
+    --
+    19- grouped context before second
+    20: grouped match two kept
+    21- grouped context after second
+    30: grouped match three #{sentinel}
+    """
+  end
+
+  defp files_with_matches_fixture do
+    """
+    lib/matched_one.ex
+    lib/matched_two.ex
+    lib/matched_three.ex
+    """
+  end
+
+  defp count_only_fixture do
+    """
+    lib/count_one.ex:3
+    lib/count_two.ex:0
+    lib/count_three.ex:12
+    """
+  end
+
+  defp only_matching_fixture do
+    """
+    lib/only_one.ex:needle
+    lib/only_two.ex:needle
+    lib/only_three.ex:needle
+    """
+  end
+
+  defp column_bearing_fixture(sentinel) do
+    1..12
+    |> Enum.map_join("\n", fn index ->
+      marker = if index == 4, do: sentinel, else: "kept"
+      "lib/column_result.ex:#{index}:#{index * 2}: column match #{index} #{marker}"
+    end)
   end
 
   defp grouped_search_fixture(sentinel) do
@@ -221,6 +391,7 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.SearchResultsTest do
   defp assert_safe_metadata(metadata, strategy, sentinel) do
     assert Enum.all?(metadata, fn
              {:strategy, ^strategy} -> true
+             {:token_count_mode, value} -> value in [:exact, :bounded_original]
              {_key, value} -> is_integer(value)
            end)
 
