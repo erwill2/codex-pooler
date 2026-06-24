@@ -43,6 +43,7 @@ defmodule CodexPooler.Gateway.RequestCompression.Metadata do
     elapsed_ms
     original_bytes
     original_tokens
+    original_tokens_lower_bound
     saved_bytes
     saved_tokens
     skipped_count
@@ -57,6 +58,7 @@ defmodule CodexPooler.Gateway.RequestCompression.Metadata do
     token_savings_ratio
   ))
   @identifier_keys MapSet.new(~w(route_class tokenizer transport))
+  @token_count_modes ~w(exact bounded_original)
   @safe_keys MapSet.new(~w(
     attempted
     byte_savings_percent
@@ -70,6 +72,7 @@ defmodule CodexPooler.Gateway.RequestCompression.Metadata do
     enabled
     original_bytes
     original_tokens
+    original_tokens_lower_bound
     reason
     route_class
     saved_bytes
@@ -79,6 +82,7 @@ defmodule CodexPooler.Gateway.RequestCompression.Metadata do
     strategies
     token_savings_percent
     token_savings_ratio
+    token_count_mode
     tokenizer_input_skipped_count
     protected_tool_output_skipped_count
     tokenizer
@@ -110,6 +114,10 @@ defmodule CodexPooler.Gateway.RequestCompression.Metadata do
       )
       |> put_optional_value("transport", safe_identifier(metadata_value(metadata, :transport)))
       |> put_optional_value("tokenizer", safe_identifier(metadata_value(metadata, :tokenizer)))
+      |> put_optional_value(
+        "token_count_mode",
+        token_count_mode_name(metadata_value(metadata, :token_count_mode))
+      )
       |> put_optional_integer("candidate_count", metadata_value(metadata, :candidate_count))
       |> put_optional_integer("compressed_count", metadata_value(metadata, :compressed_count))
       |> put_optional_integer("skipped_count", metadata_value(metadata, :skipped_count))
@@ -187,6 +195,12 @@ defmodule CodexPooler.Gateway.RequestCompression.Metadata do
     |> allow_value(@reasons)
   end
 
+  defp token_count_mode_name(value) do
+    value
+    |> safe_identifier()
+    |> allow_value(@token_count_modes)
+  end
+
   defp allow_value(nil, _allowed), do: nil
   defp allow_value(value, allowed), do: if(value in allowed, do: value)
 
@@ -204,15 +218,28 @@ defmodule CodexPooler.Gateway.RequestCompression.Metadata do
   end
 
   defp put_token_savings(metadata, source) do
+    mode = token_count_mode_name(metadata_value(source, :token_count_mode))
     original = non_negative_integer(metadata_value(source, :original_tokens))
+
+    original_lower_bound =
+      non_negative_integer(metadata_value(source, :original_tokens_lower_bound))
+
     compressed = non_negative_integer(metadata_value(source, :compressed_tokens))
     saved = saved_count(source, :saved_tokens, original, compressed)
 
-    metadata
-    |> put_optional_value("original_tokens", original)
-    |> put_optional_value("compressed_tokens", compressed)
-    |> put_optional_value("saved_tokens", saved)
-    |> put_savings_ratio("token_savings", original, saved)
+    case mode do
+      "bounded_original" ->
+        metadata
+        |> put_optional_value("original_tokens_lower_bound", original_lower_bound)
+        |> put_optional_value("compressed_tokens", compressed)
+
+      _mode ->
+        metadata
+        |> put_optional_value("original_tokens", original)
+        |> put_optional_value("compressed_tokens", compressed)
+        |> put_optional_value("saved_tokens", saved)
+        |> put_savings_ratio("token_savings", original, saved)
+    end
   end
 
   defp put_savings_ratio(metadata, _prefix, nil, _saved), do: metadata
@@ -272,6 +299,9 @@ defmodule CodexPooler.Gateway.RequestCompression.Metadata do
 
   defp sanitize_value("status", value), do: allowed_or_redacted(value, @statuses)
   defp sanitize_value("reason", value), do: allowed_or_redacted(value, @reasons)
+
+  defp sanitize_value("token_count_mode", value),
+    do: allowed_or_redacted(value, @token_count_modes)
 
   defp sanitize_value("strategies", value) when is_list(value) do
     value

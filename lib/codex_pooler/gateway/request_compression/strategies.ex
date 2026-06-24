@@ -8,8 +8,10 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies do
           required(:strategy) => atom(),
           required(:original_bytes) => non_neg_integer(),
           required(:compressed_bytes) => non_neg_integer(),
-          required(:original_tokens) => non_neg_integer(),
           required(:compressed_tokens) => non_neg_integer(),
+          required(:token_count_mode) => :exact | :bounded_original,
+          optional(:original_tokens) => non_neg_integer(),
+          optional(:original_tokens_lower_bound) => non_neg_integer(),
           optional(atom()) => non_neg_integer()
         }
   @type skip_reason :: :tokenizer_input_limit
@@ -26,9 +28,9 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies do
 
     with {:ok, model} <- model(opts),
          true <- compressed_bytes < original_bytes,
-         {:ok, original_tokens} <- count_tokens(model, original),
+         {:ok, original_token_count} <- count_original_tokens(model, original),
          {:ok, compressed_tokens} <- count_tokens(model, compressed),
-         true <- compressed_tokens < original_tokens do
+         true <- compressed_tokens < original_token_count.count do
       metadata =
         counts
         |> safe_counts()
@@ -36,9 +38,10 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies do
           strategy: strategy,
           original_bytes: original_bytes,
           compressed_bytes: compressed_bytes,
-          original_tokens: original_tokens,
-          compressed_tokens: compressed_tokens
+          compressed_tokens: compressed_tokens,
+          token_count_mode: original_token_count.mode
         })
+        |> put_original_token_count(original_token_count)
 
       {:ok, %{content: compressed, metadata: metadata}}
     else
@@ -174,6 +177,34 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies do
       {:ok, count, _metadata} -> {:ok, count}
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp count_original_tokens(model, content) do
+    case count_tokens(model, content) do
+      {:ok, count} ->
+        {:ok, %{count: count, mode: :exact}}
+
+      {:error, :tokenizer_input_limit} ->
+        count_original_token_lower_bound(model, content)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp count_original_token_lower_bound(model, content) do
+    case TokenCounter.count_lower_bound(model, content) do
+      {:ok, count, _metadata} -> {:ok, %{count: count, mode: :bounded_original}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp put_original_token_count(metadata, %{count: count, mode: :exact}) do
+    Map.put(metadata, :original_tokens, count)
+  end
+
+  defp put_original_token_count(metadata, %{count: count, mode: :bounded_original}) do
+    Map.put(metadata, :original_tokens_lower_bound, count)
   end
 
   defp safe_counts(counts) do

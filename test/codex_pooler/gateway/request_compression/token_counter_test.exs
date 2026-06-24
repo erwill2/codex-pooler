@@ -97,4 +97,36 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounterTest do
                TokenCounter.count("gpt-4o", "Hello, world!")
     end
   end
+
+  describe "count_lower_bound/2" do
+    test "keeps exact semantics for small inputs" do
+      content = "example command output line\nERROR sample failure\n"
+
+      assert TokenCounter.count_lower_bound("gpt-4o", content) ==
+               TokenCounter.count("gpt-4o", content)
+    end
+
+    test "returns a conservative count for oversized inputs without exposing content" do
+      sentinel = "SENSITIVE_SENTINEL_bounded_tool_output"
+      content = String.duplicate("bounded sanitized line\n", 600) <> sentinel
+
+      assert {:error, :tokenizer_input_limit} = TokenCounter.count("gpt-4o", content)
+
+      assert {:ok, count, metadata} = TokenCounter.count_lower_bound("gpt-4o", content)
+      assert count > 0
+      assert metadata == %{tokenizer: "codex_pooler:tiktoken", encoding: "o200k_base"}
+      refute inspect(metadata) =~ sentinel
+    end
+
+    test "returns controlled errors for invalid oversized binaries" do
+      invalid = String.duplicate("valid ", 2_000) <> <<255>>
+
+      assert {:error, :tokenizer_input_limit} = TokenCounter.count_lower_bound("gpt-4o", invalid)
+    end
+
+    test "returns controlled errors for unknown models" do
+      assert {:error, :unsupported_model} =
+               TokenCounter.count_lower_bound("unknown-tokenizer-port-model", "Hello, world!")
+    end
+  end
 end

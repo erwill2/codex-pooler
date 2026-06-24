@@ -23,8 +23,6 @@ defmodule CodexPooler.Gateway.RequestCompression do
   @max_body_bytes 1_048_576
   # At most 50 planned output candidates are processed for one dispatch.
   @max_candidate_count 50
-  @max_candidate_tokenization_bytes 8_192
-
   @type upstream_payload :: binary() | {:multipart, list()} | term()
 
   @spec maybe_compress(upstream_payload(), term(), RequestOptions.t()) ::
@@ -265,8 +263,7 @@ defmodule CodexPooler.Gateway.RequestCompression do
          %{compressible: true, strategy: strategy} = candidate,
          opts
        ) do
-    with :ok <- candidate_tokenization_input_within_limit(candidate),
-         {:ok, module} <- strategy_module(strategy),
+    with {:ok, module} <- strategy_module(strategy),
          {:ok, output} <-
            JsonStringRanges.decode_string(upstream_payload, Map.from_struct(candidate)),
          {:ok, compressed_content, strategy_metadata} <-
@@ -287,13 +284,6 @@ defmodule CodexPooler.Gateway.RequestCompression do
   end
 
   defp candidate_replacement(_upstream_payload, _candidate, _opts), do: :skip
-
-  defp candidate_tokenization_input_within_limit(%{output_byte_size: output_byte_size})
-       when is_integer(output_byte_size) and output_byte_size > @max_candidate_tokenization_bytes do
-    {:skip, :tokenizer_input_limit}
-  end
-
-  defp candidate_tokenization_input_within_limit(_candidate), do: :ok
 
   defp strategy_module(strategy) when is_atom(strategy) do
     case Map.fetch(@strategy_modules, strategy) do
@@ -412,12 +402,30 @@ defmodule CodexPooler.Gateway.RequestCompression do
   end
 
   defp put_token_counts(metadata, strategy_metadata) do
-    original_tokens = sum_metadata(strategy_metadata, :original_tokens)
+    token_count_mode = token_count_mode(strategy_metadata)
     compressed_tokens = sum_metadata(strategy_metadata, :compressed_tokens)
 
-    metadata
-    |> maybe_put_positive_count(:original_tokens, original_tokens)
-    |> maybe_put_positive_count(:compressed_tokens, compressed_tokens)
+    case token_count_mode do
+      :exact ->
+        original_tokens = sum_metadata(strategy_metadata, :original_tokens)
+
+        metadata
+        |> put_token_count_mode(token_count_mode)
+        |> maybe_put_positive_count(:original_tokens, original_tokens)
+        |> maybe_put_positive_count(:compressed_tokens, compressed_tokens)
+
+      :bounded_original ->
+        lower_bound = sum_metadata(strategy_metadata, :original_tokens_lower_bound)
+
+        metadata
+        |> put_token_count_mode(token_count_mode)
+        |> maybe_put_positive_count(:original_tokens_lower_bound, lower_bound)
+        |> maybe_put_positive_count(:compressed_tokens, compressed_tokens)
+
+      nil ->
+        metadata
+        |> maybe_put_positive_count(:compressed_tokens, compressed_tokens)
+    end
   end
 
   defp put_strategy_summary(metadata, strategy_metadata) do
@@ -452,6 +460,23 @@ defmodule CodexPooler.Gateway.RequestCompression do
 
   defp maybe_put_positive_count(metadata, _key, 0), do: metadata
   defp maybe_put_positive_count(metadata, key, value), do: Map.put(metadata, key, value)
+
+  defp put_token_count_mode(metadata, mode), do: Map.put(metadata, :token_count_mode, mode)
+
+  defp token_count_mode(strategy_metadata) do
+    modes =
+      strategy_metadata
+      |> Enum.map(&metadata_value(&1, :token_count_mode))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+
+    cond do
+      modes == [] -> nil
+      :bounded_original in modes -> :bounded_original
+      modes == [:exact] -> :exact
+      true -> :bounded_original
+    end
+  end
 
   defp tokenizer(strategy_metadata) do
     Enum.find_value(strategy_metadata, fn item ->

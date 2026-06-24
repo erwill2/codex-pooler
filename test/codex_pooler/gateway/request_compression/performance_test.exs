@@ -70,7 +70,7 @@ defmodule CodexPooler.Gateway.RequestCompression.PerformanceTest do
     end
 
     test "skips long-run compressible candidates within the local dispatch budget" do
-      sentinel = "PRIVATE_LONG_RUN_SENTINEL"
+      sentinel = "SANITIZED_LONG_RUN_SENTINEL"
       long_run = String.duplicate("a", 10_000) <> sentinel
       output = "[\n  " <> Jason.encode!(long_run) <> "\n]"
 
@@ -112,6 +112,91 @@ defmodule CodexPooler.Gateway.RequestCompression.PerformanceTest do
       assert finite_elapsed_ms?(compression)
       refute Map.has_key?(compression, "original_tokens")
       refute inspect(compression) =~ sentinel
+    end
+
+    test "compresses oversized log-like shell and function outputs once bounded accounting is available" do
+      shell_sentinel = "SANITIZED_SHELL_OVERSIZED_SENTINEL"
+      function_sentinel = "SANITIZED_FUNCTION_OVERSIZED_SENTINEL"
+
+      shell_output = oversized_log_fixture("shell", shell_sentinel)
+      function_output = oversized_log_fixture("function", function_sentinel)
+
+      assert byte_size(shell_output) > 8_192
+      assert byte_size(function_output) > 8_192
+
+      body =
+        encode_request([
+          %{
+            "type" => "function_call",
+            "call_id" => "call_oversized_function_output",
+            "name" => "run_command",
+            "arguments" => "{}"
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_oversized_function_output",
+            "output" => function_output
+          },
+          %{
+            "type" => "local_shell_call_output",
+            "call_id" => "call_oversized_shell_output",
+            "output" => shell_output
+          }
+        ])
+
+      {context, request_options} = request_context()
+      started = System.monotonic_time(:millisecond)
+
+      assert {compressed_body, compressed_options} =
+               RequestCompression.maybe_compress(body, context, request_options)
+
+      elapsed_ms = System.monotonic_time(:millisecond) - started
+      compression = compressed_options.runtime.payload_compression
+
+      assert elapsed_ms <= @local_budget_ms
+      assert compressed_body != body
+
+      compressed_outputs =
+        compressed_body
+        |> Jason.decode!()
+        |> Map.fetch!("input")
+        |> Enum.filter(&(&1["type"] in ["local_shell_call_output", "function_call_output"]))
+        |> Enum.map(&Map.fetch!(&1, "output"))
+
+      assert length(compressed_outputs) == 2
+      assert Enum.all?(compressed_outputs, &(&1 =~ "[compressed log output: omitted"))
+      refute Enum.any?(compressed_outputs, &String.contains?(&1, shell_sentinel))
+      refute Enum.any?(compressed_outputs, &String.contains?(&1, function_sentinel))
+
+      assert %{
+               "enabled" => true,
+               "attempted" => true,
+               "status" => "compressed",
+               "candidate_count" => 2,
+               "compressed_count" => 2,
+               "skipped_count" => 0,
+               "original_bytes" => original_bytes,
+               "compressed_bytes" => compressed_bytes,
+               "original_tokens_lower_bound" => original_tokens_lower_bound,
+               "compressed_tokens" => compressed_tokens
+             } = compression
+
+      assert original_bytes == byte_size(body)
+      assert compressed_bytes == byte_size(compressed_body)
+      assert compressed_bytes < original_bytes
+      assert compressed_tokens < original_tokens_lower_bound
+      assert compression["token_count_mode"] == "bounded_original"
+      assert "log_output" in compression["strategies"]
+      finite_elapsed_ms?(compression)
+      refute Map.has_key?(compression, "original_tokens")
+      refute Map.has_key?(compression, "saved_tokens")
+      refute Map.has_key?(compression, "token_savings_ratio")
+      refute Map.has_key?(compression, "token_savings_percent")
+      refute Map.has_key?(compression, "tokenizer_input_skipped_count")
+      refute inspect(compression) =~ shell_sentinel
+      refute inspect(compression) =~ function_sentinel
+      refute inspect(compression) =~ "call_oversized_function_output"
+      refute inspect(compression) =~ "call_oversized_shell_output"
     end
 
     test "handles a sanitized one MiB fixture within the local dispatch budget" do
@@ -224,6 +309,29 @@ defmodule CodexPooler.Gateway.RequestCompression.PerformanceTest do
 
     prefix <>
       String.duplicate("x", max(bytes - byte_size(prefix), 0))
+  end
+
+  defp oversized_log_fixture(kind, omitted_sentinel) do
+    middle =
+      1..420
+      |> Enum.map(fn
+        210 -> "ordinary #{kind} line 210 #{omitted_sentinel}"
+        index -> "ordinary #{kind} line #{index} with repeated sanitized diagnostic context"
+      end)
+
+    [
+      "command started",
+      "context before first",
+      "error: first #{kind} failure",
+      "context after first"
+    ]
+    |> Kernel.++(middle)
+    |> Kernel.++([
+      "context before final",
+      "fatal: final #{kind} failure",
+      "context after final"
+    ])
+    |> Enum.join("\n")
   end
 
   defp extra_byte(index, extra_candidates) when index <= extra_candidates, do: 1

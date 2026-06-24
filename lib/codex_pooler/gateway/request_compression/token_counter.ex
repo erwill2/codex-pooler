@@ -23,6 +23,7 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter do
           | :invalid_rank_file
           | :tokenizer_input_limit
   @type count_result :: {:ok, non_neg_integer(), metadata()} | {:error, error_reason()}
+  @type lower_bound_result :: {:ok, non_neg_integer(), metadata()} | {:error, error_reason()}
 
   @max_input_bytes 8_192
   @max_bpe_chunk_bytes 1_024
@@ -44,6 +45,21 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter do
 
   @spec count_tokens(String.t(), String.t()) :: count_result()
   def count_tokens(model, text), do: count(model, text)
+
+  @spec count_lower_bound(String.t(), String.t()) :: lower_bound_result()
+  def count_lower_bound(model, text) when is_binary(model) and is_binary(text) do
+    with {:ok, encoding} <- encoding_for_model(model),
+         {:ok, ranks} <- Ranks.load(encoding),
+         {:ok, bounded_text} <- bounded_prefix(text),
+         {:ok, chunks} <- safe_chunks(bounded_text, encoding) do
+      count =
+        Enum.reduce(chunks, 0, fn chunk, acc -> acc + BPE.count(chunk, ranks) end)
+
+      {:ok, count, metadata(encoding)}
+    end
+  end
+
+  def count_lower_bound(_model, _text), do: {:error, :unsupported_model}
 
   @spec max_input_bytes() :: pos_integer()
   def max_input_bytes, do: @max_input_bytes
@@ -93,6 +109,31 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter do
       {:error, :tokenizer_input_limit}
     else
       :ok
+    end
+  end
+
+  defp bounded_prefix(text) do
+    cond do
+      not String.valid?(text) ->
+        {:error, :tokenizer_input_limit}
+
+      byte_size(text) <= @max_input_bytes ->
+        {:ok, text}
+
+      true ->
+        text
+        |> binary_part(0, @max_input_bytes)
+        |> trim_to_valid_prefix()
+    end
+  end
+
+  defp trim_to_valid_prefix(prefix) do
+    if String.valid?(prefix) do
+      {:ok, prefix}
+    else
+      prefix
+      |> binary_part(0, byte_size(prefix) - 1)
+      |> trim_to_valid_prefix()
     end
   end
 
