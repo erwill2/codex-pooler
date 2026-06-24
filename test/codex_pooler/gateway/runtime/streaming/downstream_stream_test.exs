@@ -274,6 +274,60 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       assert DownstreamStream.keepalive_allowed?(state)
     end
 
+    test "tracks oversized public OpenAI Responses terminal passthrough" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      terminal =
+        [
+          "event: response.completed\n",
+          "data: ",
+          Jason.encode!(%{
+            "type" => "response.completed",
+            "response" => %{
+              "id" => "resp_public_large_terminal",
+              "status" => "completed",
+              "output" => [
+                %{
+                  "type" => "message",
+                  "content" => [
+                    %{
+                      "type" => "output_text",
+                      "text" => String.duplicate("large terminal text ", 4_000)
+                    }
+                  ]
+                }
+              ],
+              "usage" => %{"input_tokens" => 7, "output_tokens" => 5, "total_tokens" => 12}
+            }
+          })
+        ]
+        |> IO.iodata_to_binary()
+
+      assert byte_size(terminal) > StreamProtocol.max_incomplete_sse_block_bytes()
+
+      split_at = StreamProtocol.max_incomplete_sse_block_bytes() + 1
+      first = binary_part(terminal, 0, split_at)
+      second = binary_part(terminal, split_at, byte_size(terminal) - split_at)
+
+      assert {^first, state} =
+               DownstreamStream.normalize_data(first, "/v1/responses", opts, state)
+
+      assert is_nil(DownstreamStream.terminal_outcome(state))
+
+      assert {^second, state} =
+               DownstreamStream.normalize_data(second, "/v1/responses", opts, state)
+
+      assert DownstreamStream.terminal_outcome(state) == :completed
+      assert {nil, ^state} = DownstreamStream.synthetic_terminal_failure(state, :interrupted)
+    end
+
     test "synthesizes a sanitized terminal failure with the observed public response id" do
       opts =
         RequestOptions.build(

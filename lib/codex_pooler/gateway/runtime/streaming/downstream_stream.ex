@@ -29,6 +29,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
         |> Map.put(:public_openai_responses_data_seen?, false)
         |> Map.put(:public_openai_responses_terminal_seen?, false)
         |> Map.put(:public_openai_responses_response_id, nil)
+        |> Map.put(:public_openai_responses_terminal_kind, nil)
 
       true ->
         state
@@ -79,6 +80,13 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
 
   def keepalive_allowed?(_state), do: true
 
+  @spec terminal_outcome(state()) :: :completed | :incomplete | :failed | nil
+  def terminal_outcome(%{public_openai_responses_terminal_kind: kind})
+      when kind in [:completed, :incomplete, :failed],
+      do: kind
+
+  def terminal_outcome(_state), do: nil
+
   @spec synthetic_terminal_failure(state(), term()) :: {binary() | nil, state()}
   def synthetic_terminal_failure(
         %{
@@ -118,12 +126,25 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
     state =
       state
       |> Map.put(:public_openai_responses, stream_state)
+      |> maybe_mark_passthrough_terminal(stream_state)
       |> track_public_openai_responses_output(data)
 
     {data, state}
   end
 
   defp normalize_public_openai_responses_stream_data(data, state), do: {data, state}
+
+  defp maybe_mark_passthrough_terminal(state, stream_state) do
+    case StreamProtocol.public_openai_responses_passthrough_terminal_kind(stream_state) do
+      kind when kind in [:completed, :incomplete, :failed] ->
+        state
+        |> Map.put(:public_openai_responses_terminal_seen?, true)
+        |> Map.put(:public_openai_responses_terminal_kind, kind)
+
+      _kind ->
+        state
+    end
+  end
 
   defp track_public_openai_responses_output(state, data) when is_binary(data) do
     {blocks, _buffer} = StreamProtocol.complete_sse_blocks(data, bounded?: false)
@@ -134,7 +155,9 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
   end
 
   defp track_public_openai_responses_block(state, "data: [DONE]") do
-    %{state | public_openai_responses_terminal_seen?: true}
+    state
+    |> Map.put(:public_openai_responses_terminal_seen?, true)
+    |> Map.put(:public_openai_responses_terminal_kind, :completed)
   end
 
   defp track_public_openai_responses_block(state, block) do
@@ -249,10 +272,14 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
   end
 
   defp maybe_mark_public_openai_responses_terminal_seen(state, event) do
-    if StreamProtocol.terminal_outcome_event(event) do
-      %{state | public_openai_responses_terminal_seen?: true}
-    else
-      state
+    case StreamProtocol.terminal_outcome_event(event) do
+      {:ok, %{kind: kind}} when kind in [:completed, :incomplete, :failed] ->
+        state
+        |> Map.put(:public_openai_responses_terminal_seen?, true)
+        |> Map.put(:public_openai_responses_terminal_kind, kind)
+
+      _outcome ->
+        state
     end
   end
 

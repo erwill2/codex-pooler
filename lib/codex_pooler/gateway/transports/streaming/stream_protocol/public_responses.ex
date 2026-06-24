@@ -5,15 +5,36 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
+  @type passthrough_terminal_state :: %{
+          required(:event_type) => String.t(),
+          required(:json_started?) => boolean(),
+          required(:depth) => non_neg_integer(),
+          required(:in_string?) => boolean(),
+          required(:escaped?) => boolean(),
+          required(:complete?) => boolean()
+        }
   @type state :: %{
           required(:buffer) => binary(),
           required(:created?) => boolean(),
           required(:text_delta?) => boolean(),
-          required(:passthrough?) => boolean()
+          required(:passthrough?) => boolean(),
+          required(:passthrough_terminal) => passthrough_terminal_state() | nil,
+          required(:passthrough_terminal_kind) => atom() | nil,
+          required(:passthrough_terminal_seen?) => boolean()
         }
 
   @spec new_state() :: state()
-  def new_state, do: %{buffer: "", created?: false, text_delta?: false, passthrough?: false}
+  def new_state do
+    %{
+      buffer: "",
+      created?: false,
+      text_delta?: false,
+      passthrough?: false,
+      passthrough_terminal: nil,
+      passthrough_terminal_kind: nil,
+      passthrough_terminal_seen?: false
+    }
+  end
 
   @terminal_buffer_markers [
     "data: [DONE]",
@@ -40,12 +61,12 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
 
       blocks == [] and StreamProtocol.oversized_incomplete_sse_block?(buffer) ->
         record_oversized_incomplete(byte_size(buffered_data))
-        {buffered_data, %{state | buffer: "", passthrough?: true}}
+        {buffered_data, enter_passthrough(buffered_data, state)}
 
       StreamProtocol.oversized_incomplete_sse_block?(buffer) ->
         record_oversized_incomplete(byte_size(buffered_data))
         {iodata, state} = normalize_complete_blocks(blocks, state)
-        {[iodata, buffer] |> IO.iodata_to_binary(), %{state | buffer: "", passthrough?: true}}
+        {[iodata, buffer] |> IO.iodata_to_binary(), enter_passthrough(buffer, state)}
 
       true ->
         normalize_blocks(blocks, buffer, state)
@@ -61,13 +82,165 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
         passthrough = binary_part(data, 0, passthrough_size)
         rest = binary_part(data, passthrough_size, byte_size(data) - passthrough_size)
 
-        state = %{state | passthrough?: false, buffer: ""}
+        state =
+          state
+          |> track_passthrough_terminal_data(passthrough)
+          |> then(&%{&1 | passthrough?: false, buffer: "", passthrough_terminal: nil})
+
         {normalized_rest, state} = normalize_data(rest, state)
 
         {[passthrough, normalized_rest] |> IO.iodata_to_binary(), state}
 
       nil ->
-        {data, state}
+        {data, track_passthrough_terminal_data(state, data)}
+    end
+  end
+
+  @spec passthrough_terminal_kind(state()) :: atom() | nil
+  def passthrough_terminal_kind(%{passthrough_terminal_kind: kind}) when is_atom(kind), do: kind
+  def passthrough_terminal_kind(_state), do: nil
+
+  defp enter_passthrough(data, state) do
+    data
+    |> passthrough_terminal_event_type()
+    |> case do
+      event_type when is_binary(event_type) ->
+        state
+        |> Map.put(:passthrough_terminal, new_passthrough_terminal(event_type))
+        |> track_passthrough_terminal_data(data)
+
+      nil ->
+        %{state | passthrough_terminal: nil}
+    end
+    |> then(&%{&1 | buffer: "", passthrough?: true})
+  end
+
+  defp new_passthrough_terminal(event_type) do
+    %{
+      event_type: event_type,
+      json_started?: false,
+      depth: 0,
+      in_string?: false,
+      escaped?: false,
+      complete?: false
+    }
+  end
+
+  defp passthrough_terminal_event_type(data) do
+    {event_type, decoded} = stream_block_event(data)
+    type = event_type || decoded_string(decoded, "type") || terminal_marker_type(data)
+
+    if terminal_event?(type), do: type
+  end
+
+  defp terminal_marker_type(data) when is_binary(data) do
+    cond do
+      terminal_marker?(data, "response.completed") -> "response.completed"
+      terminal_marker?(data, "response.failed") -> "response.failed"
+      terminal_marker?(data, "response.incomplete") -> "response.incomplete"
+      terminal_marker?(data, "error") -> "error"
+      true -> nil
+    end
+  end
+
+  defp terminal_marker?(data, type) do
+    String.contains?(data, "event: #{type}") or
+      String.contains?(data, "event:#{type}") or
+      String.contains?(data, ~s("type":"#{type}")) or
+      String.contains?(data, ~s("type": "#{type}"))
+  end
+
+  defp track_passthrough_terminal_data(
+         %{passthrough_terminal: %{complete?: false} = terminal} = state,
+         data
+       )
+       when is_binary(data) do
+    terminal = scan_passthrough_terminal_json(data, terminal)
+
+    state
+    |> Map.put(:passthrough_terminal, terminal)
+    |> maybe_put_passthrough_terminal_kind(terminal)
+    |> Map.put(
+      :passthrough_terminal_seen?,
+      state.passthrough_terminal_seen? or terminal.complete?
+    )
+  end
+
+  defp track_passthrough_terminal_data(state, _data), do: state
+
+  defp maybe_put_passthrough_terminal_kind(state, %{complete?: true, event_type: event_type}) do
+    Map.put(state, :passthrough_terminal_kind, terminal_kind(event_type))
+  end
+
+  defp maybe_put_passthrough_terminal_kind(state, _terminal), do: state
+
+  defp terminal_kind("response.completed"), do: :completed
+  defp terminal_kind("response.incomplete"), do: :incomplete
+  defp terminal_kind(_event_type), do: :failed
+
+  defp scan_passthrough_terminal_json(data, terminal),
+    do: scan_passthrough_terminal_json(data, 0, terminal)
+
+  defp scan_passthrough_terminal_json(data, offset, terminal)
+       when offset >= byte_size(data) or terminal.complete?,
+       do: terminal
+
+  defp scan_passthrough_terminal_json(data, offset, %{json_started?: false} = terminal) do
+    case :binary.at(data, offset) do
+      ?{ ->
+        scan_passthrough_terminal_json(data, offset + 1, %{
+          terminal
+          | json_started?: true,
+            depth: 1
+        })
+
+      _byte ->
+        scan_passthrough_terminal_json(data, offset + 1, terminal)
+    end
+  end
+
+  defp scan_passthrough_terminal_json(
+         data,
+         offset,
+         %{in_string?: true, escaped?: true} = terminal
+       ) do
+    scan_passthrough_terminal_json(data, offset + 1, %{terminal | escaped?: false})
+  end
+
+  defp scan_passthrough_terminal_json(
+         data,
+         offset,
+         %{in_string?: true, escaped?: false} = terminal
+       ) do
+    case :binary.at(data, offset) do
+      ?\\ -> scan_passthrough_terminal_json(data, offset + 1, %{terminal | escaped?: true})
+      ?" -> scan_passthrough_terminal_json(data, offset + 1, %{terminal | in_string?: false})
+      _byte -> scan_passthrough_terminal_json(data, offset + 1, terminal)
+    end
+  end
+
+  defp scan_passthrough_terminal_json(data, offset, terminal) do
+    case :binary.at(data, offset) do
+      ?" ->
+        scan_passthrough_terminal_json(data, offset + 1, %{terminal | in_string?: true})
+
+      ?{ ->
+        scan_passthrough_terminal_json(data, offset + 1, %{
+          terminal
+          | depth: terminal.depth + 1
+        })
+
+      ?} when terminal.depth <= 1 ->
+        %{terminal | depth: 0, complete?: true}
+
+      ?} ->
+        scan_passthrough_terminal_json(data, offset + 1, %{
+          terminal
+          | depth: terminal.depth - 1
+        })
+
+      _byte ->
+        scan_passthrough_terminal_json(data, offset + 1, terminal)
     end
   end
 

@@ -14,7 +14,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelay do
           | {:terminal_stream_failure, StreamProtocol.terminal_failure()}
           | {:terminal_stream_failure, relay_state(), StreamProtocol.terminal_failure()}
   @type stream_finalization_result :: {:ok, term()} | {:error, term()}
-  @type before_finalize_failure_result :: {:ok, relay_state(), iodata()} | {:error, term()}
+  @type before_finalize_failure_result ::
+          {:ok, relay_state(), iodata()} | {:success, relay_state(), iodata()} | {:error, term()}
   @type before_finalize_success_result ::
           {:ok, relay_state(), iodata()} | {:failure, relay_state(), iodata(), term()}
   @type first_event_retry_result :: {:ok, relay_state()} | {:error, term()}
@@ -94,9 +95,14 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelay do
 
   defp finalize_stream_parse_error(state, chunks, reason, handlers) do
     reason = stream_parse_error_reason(reason)
-    {state, chunks} = run_before_finalize_failure_hook(state, chunks, reason, handlers)
 
-    stream_finalization_result(handlers.finalize_failure.(chunks, reason), state)
+    case run_before_finalize_failure_hook(state, chunks, reason, handlers) do
+      {:success, state, chunks} ->
+        stream_finalization_result(handlers.finalize_success.(chunks), state)
+
+      {:failure, state, chunks, reason} ->
+        stream_finalization_result(handlers.finalize_failure.(chunks, reason), state)
+    end
   end
 
   defp stream_parse_error_reason(%Req.TransportError{reason: :timeout} = reason),
@@ -187,9 +193,13 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelay do
   end
 
   defp finish_stream_parts({:error, state, chunks, reason}, _response, handlers) do
-    {state, chunks} = run_before_finalize_failure_hook(state, chunks, reason, handlers)
+    case run_before_finalize_failure_hook(state, chunks, reason, handlers) do
+      {:success, state, chunks} ->
+        stream_finalization_result(handlers.finalize_success.(chunks), state)
 
-    stream_finalization_result(handlers.finalize_failure.(chunks, reason), state)
+      {:failure, state, chunks, reason} ->
+        stream_finalization_result(handlers.finalize_failure.(chunks, reason), state)
+    end
   end
 
   defp run_before_finalize_success_hook(state, chunks, handlers) do
@@ -215,13 +225,21 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamRelay do
     case Map.get(handlers, :before_finalize_failure) do
       callback when is_function(callback, 2) ->
         case callback.(state, reason) do
-          {:ok, state, data} -> {state, append_stream_chunk(chunks, data)}
-          {:error, _write_reason} -> {state, chunks}
-          _other -> {state, chunks}
+          {:success, state, data} ->
+            {:success, state, append_stream_chunk(chunks, data)}
+
+          {:ok, state, data} ->
+            {:failure, state, append_stream_chunk(chunks, data), reason}
+
+          {:error, _write_reason} ->
+            {:failure, state, chunks, reason}
+
+          _other ->
+            {:failure, state, chunks, reason}
         end
 
       _callback ->
-        {state, chunks}
+        {:failure, state, chunks, reason}
     end
   end
 

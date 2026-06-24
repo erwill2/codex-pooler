@@ -64,7 +64,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
           required(:buffer) => binary(),
           required(:created?) => boolean(),
           required(:text_delta?) => boolean(),
-          required(:passthrough?) => boolean()
+          required(:passthrough?) => boolean(),
+          required(:passthrough_terminal) => PublicResponses.passthrough_terminal_state() | nil,
+          required(:passthrough_terminal_kind) => atom() | nil,
+          required(:passthrough_terminal_seen?) => boolean()
         }
   @type websocket_frame_headers :: %{optional(String.t()) => String.t()}
 
@@ -121,6 +124,11 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
           {binary(), public_openai_responses_stream_state()}
   def normalize_public_openai_responses_sse_data(data, state),
     do: PublicResponses.normalize_data(data, state)
+
+  @spec public_openai_responses_passthrough_terminal_kind(public_openai_responses_stream_state()) ::
+          atom() | nil
+  def public_openai_responses_passthrough_terminal_kind(state),
+    do: PublicResponses.passthrough_terminal_kind(state)
 
   @spec synthetic_public_openai_responses_failure_sse(String.t() | nil, term()) :: binary()
   def synthetic_public_openai_responses_failure_sse(response_id, _reason) do
@@ -399,14 +407,22 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol do
 
   @spec sse_field(binary(), binary()) :: binary() | nil
   def sse_field(block, name) do
-    prefix = name <> ": "
+    prefix = name <> ":"
 
     block
     |> String.split("\n")
     |> Enum.map(&String.trim/1)
-    |> Enum.find_value(fn line ->
-      if String.starts_with?(line, prefix), do: String.replace_prefix(line, prefix, "")
+    |> Enum.flat_map(fn line ->
+      if String.starts_with?(line, prefix) do
+        [line |> String.replace_prefix(prefix, "") |> String.trim_leading()]
+      else
+        []
+      end
     end)
+    |> case do
+      [] -> nil
+      values -> Enum.join(values, "\n")
+    end
   end
 
   @spec decode_sse_data(term()) :: map()

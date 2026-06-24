@@ -218,17 +218,36 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
 
   defp http_stream_terminal_failure_writer do
     fn state, reason ->
-      write_public_openai_responses_terminal_failure(state, reason)
+      case DownstreamStream.terminal_outcome(state) do
+        terminal when terminal in [:completed, :incomplete] ->
+          {:success, state, ""}
+
+        _missing_or_failed_terminal ->
+          write_public_openai_responses_terminal_failure(state, reason)
+      end
     end
   end
 
   defp http_stream_terminal_success_hook do
     fn state ->
-      case write_public_openai_responses_terminal_failure(state, :upstream_stream_interrupted) do
-        {:ok, state, ""} -> {:ok, state, ""}
-        {:ok, state, data} -> {:failure, state, data, :upstream_stream_interrupted}
-        {:error, _reason} -> {:failure, state, "", :upstream_stream_interrupted}
+      case DownstreamStream.terminal_outcome(state) do
+        :failed ->
+          {:failure, state, "", :upstream_stream_interrupted}
+
+        terminal when terminal in [:completed, :incomplete] ->
+          {:ok, state, ""}
+
+        _missing_terminal ->
+          missing_public_openai_responses_terminal_result(state)
       end
+    end
+  end
+
+  defp missing_public_openai_responses_terminal_result(state) do
+    case write_public_openai_responses_terminal_failure(state, :upstream_stream_interrupted) do
+      {:ok, state, ""} -> {:ok, state, ""}
+      {:ok, state, data} -> {:failure, state, data, :upstream_stream_interrupted}
+      {:error, _reason} -> {:failure, state, "", :upstream_stream_interrupted}
     end
   end
 

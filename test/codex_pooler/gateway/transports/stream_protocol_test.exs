@@ -208,6 +208,77 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
       refute Process.get({:openai_responses_stream_state, "resp_explicit_state"})
     end
 
+    test "tracks oversized terminal passthrough without trailing SSE separator" do
+      state = StreamProtocol.public_openai_responses_stream_state()
+
+      terminal =
+        [
+          "event: response.completed\n",
+          "data: ",
+          Jason.encode!(%{
+            "type" => "response.completed",
+            "response" => %{
+              "id" => "resp_large_terminal_without_separator",
+              "output" => [
+                %{
+                  "content" => [
+                    %{
+                      "type" => "output_text",
+                      "text" => String.duplicate("terminal passthrough text ", 4_000)
+                    }
+                  ]
+                }
+              ],
+              "usage" => %{"input_tokens" => 7, "output_tokens" => 5, "total_tokens" => 12}
+            }
+          })
+        ]
+        |> IO.iodata_to_binary()
+
+      assert byte_size(terminal) > StreamProtocol.max_incomplete_sse_block_bytes()
+
+      split_at = StreamProtocol.max_incomplete_sse_block_bytes() + 1
+      first = binary_part(terminal, 0, split_at)
+      second = binary_part(terminal, split_at, byte_size(terminal) - split_at)
+
+      assert {^first, state} =
+               StreamProtocol.normalize_public_openai_responses_sse_data(first, state)
+
+      assert StreamProtocol.public_openai_responses_passthrough_terminal_kind(state) == nil
+
+      assert {^second, state} =
+               StreamProtocol.normalize_public_openai_responses_sse_data(second, state)
+
+      assert StreamProtocol.public_openai_responses_passthrough_terminal_kind(state) == :completed
+    end
+
+    test "accepts SSE fields without a space after the colon" do
+      state = StreamProtocol.public_openai_responses_stream_state()
+
+      terminal =
+        [
+          "event:response.completed\n",
+          "data:",
+          Jason.encode!(%{
+            "type" => "response.completed",
+            "response" => %{
+              "id" => "resp_no_space_sse_fields",
+              "output" => [
+                %{"content" => [%{"type" => "output_text", "text" => "no-space terminal text"}]}
+              ]
+            }
+          })
+        ]
+        |> IO.iodata_to_binary()
+
+      assert {chunk, state} =
+               StreamProtocol.normalize_public_openai_responses_sse_data(terminal, state)
+
+      assert state == StreamProtocol.public_openai_responses_stream_state()
+      assert chunk =~ "event: response.completed\n"
+      assert chunk =~ "no-space terminal text"
+    end
+
     test "keeps nonterminal response buffers incomplete until the SSE separator arrives" do
       state = StreamProtocol.public_openai_responses_stream_state()
 

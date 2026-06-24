@@ -3295,6 +3295,89 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :streaming_sequence
+  test "POST /v1/responses streaming accepts oversized terminal response without trailing separator",
+       %{conn: conn} do
+    terminal_padding = String.duplicate("oversized terminal output ", 4_000)
+
+    terminal =
+      [
+        "event: response.completed\n",
+        "data: ",
+        Jason.encode!(%{
+          "type" => "response.completed",
+          "response" => %{
+            "id" => "resp_v1_large_terminal_without_separator",
+            "status" => "completed",
+            "output" => [
+              %{
+                "type" => "message",
+                "content" => [%{"type" => "output_text", "text" => terminal_padding}]
+              }
+            ],
+            "usage" => %{
+              "input_tokens" => 85_826,
+              "output_tokens" => 699,
+              "total_tokens" => 86_525
+            },
+            "service_tier" => "standard"
+          }
+        })
+      ]
+      |> IO.iodata_to_binary()
+
+    assert byte_size(terminal) > RetainedBody.max_bytes()
+    split_at = RetainedBody.max_bytes() + 1
+    first = binary_part(terminal, 0, split_at)
+    second = binary_part(terminal, split_at, byte_size(terminal) - split_at)
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [first, second],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic oversized terminal-buffer stream request",
+        "stream" => true
+      })
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+
+    events = public_sse_events(conn.resp_body)
+    event_names = Enum.map(events, & &1["event"])
+
+    assert "response.completed" in event_names
+    refute "response.failed" in event_names
+    assert conn.resp_body =~ "resp_v1_large_terminal_without_separator"
+    refute conn.resp_body =~ "upstream_stream_error"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.transport == "http_sse"
+    assert request.status == "succeeded"
+    assert request.usage_status == "usage_known"
+    assert is_nil(request.last_error_code)
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "succeeded"
+    assert attempt.usage_status == "usage_known"
+    assert is_nil(attempt.network_error_code)
+
+    persistence_text = inspect({request.request_metadata, attempt.response_metadata})
+    refute persistence_text =~ "synthetic oversized terminal-buffer stream request"
+    refute persistence_text =~ terminal_padding
+  end
+
+  @tag :streaming_sequence
   test "POST /v1/responses streaming preserves ordinary response.incomplete", %{conn: conn} do
     upstream =
       start_upstream(
