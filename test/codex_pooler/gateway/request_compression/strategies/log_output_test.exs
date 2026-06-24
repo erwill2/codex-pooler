@@ -92,6 +92,111 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.LogOutputTest do
       assert metadata.important_line_count == 2
     end
 
+    test "skips when summary failure count exceeds discovered failure blocks" do
+      content =
+        failure_log_fixture(3,
+          summary: "Failed! - Failed: 5, Passed: 7, Skipped: 0, Total: 12",
+          sentinel: "DROP_ME_INCOMPLETE_FAILURE_LOG"
+        )
+
+      assert :skip =
+               LogOutput.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_lines: 1,
+                 head_lines: 0,
+                 tail_lines: 0,
+                 context_lines: 0,
+                 max_important_lines: 6
+               )
+    end
+
+    test "compresses when every reported failure block remains visible" do
+      sentinel = "DROP_ME_COMPLETE_FAILURE_LOG"
+
+      content =
+        failure_log_fixture(3,
+          summary: "Failed! - Failed: 3, Passed: 7, Skipped: 0, Total: 10",
+          sentinel: sentinel
+        )
+
+      assert {:ok, %{content: compressed, metadata: metadata}} =
+               LogOutput.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_lines: 1,
+                 head_lines: 0,
+                 tail_lines: 0,
+                 context_lines: 0,
+                 max_important_lines: 8
+               )
+
+      assert compressed =~ "MyTests.Case1"
+      assert compressed =~ "MyTests.Case2"
+      assert compressed =~ "MyTests.Case3"
+      assert compressed =~ "Failed! - Failed: 3"
+      refute compressed =~ sentinel
+      assert metadata.important_line_count == 7
+      assert_safe_metadata(metadata, :log_output, sentinel)
+    end
+
+    test "recognizes combined failures-colon summary formats" do
+      content =
+        failure_log_fixture(3,
+          summary: "Tests run: 12, Failures: 3, Errors: 2, Skipped: 0",
+          sentinel: "DROP_ME_JUNIT_FAILURE_LOG"
+        )
+
+      assert :skip =
+               LogOutput.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_lines: 1,
+                 head_lines: 0,
+                 tail_lines: 0,
+                 context_lines: 0,
+                 max_important_lines: 6
+               )
+    end
+
+    test "adds failure and error summary categories without double-counting repeated wording" do
+      content =
+        failure_log_fixture(4,
+          summary: "Tests run: 12, Failed: 3, Failures: 3, Errors: 2, Skipped: 0",
+          sentinel: "DROP_ME_REPEATED_JUNIT_FAILURE_LOG"
+        )
+
+      assert :skip =
+               LogOutput.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_lines: 1,
+                 head_lines: 0,
+                 tail_lines: 0,
+                 context_lines: 0,
+                 max_important_lines: 8
+               )
+    end
+
+    test "recognizes terse count-before-failed summary formats" do
+      content =
+        failure_log_fixture(3,
+          summary: "Tests: 20 failed, 3 passed, 23 total",
+          sentinel: "DROP_ME_TERSE_FAILED_SUMMARY_LOG"
+        )
+
+      assert :skip =
+               LogOutput.compress(content,
+                 model: @model,
+                 min_bytes: 0,
+                 min_lines: 1,
+                 head_lines: 0,
+                 tail_lines: 0,
+                 context_lines: 0,
+                 max_important_lines: 6
+               )
+    end
+
     test "skips malformed, too-small, and nonmatching input" do
       assert :skip = LogOutput.compress(:not_text)
       assert :skip = LogOutput.compress(<<255>>, min_bytes: 0)
@@ -163,6 +268,32 @@ defmodule CodexPooler.Gateway.RequestCompression.Strategies.LogOutputTest do
       "fatal: final failure",
       "context after final"
     ])
+    |> Enum.join("\n")
+  end
+
+  defp failure_log_fixture(failure_count, opts) do
+    summary = Keyword.fetch!(opts, :summary)
+    sentinel = Keyword.fetch!(opts, :sentinel)
+
+    failure_blocks =
+      Enum.flat_map(1..failure_count//1, fn index ->
+        [
+          "error: MyTests.Case#{index} failed",
+          "stack context for case #{index}",
+          "assertion failed: expected #{index}"
+        ] ++ Enum.map(1..4//1, &"ordinary separator #{index}.#{&1}")
+      end)
+
+    filler =
+      Enum.map(1..120//1, fn
+        60 -> "ordinary build line 60 #{sentinel}"
+        index -> "ordinary build line #{index}"
+      end)
+
+    ["test suite started"]
+    |> Kernel.++(failure_blocks)
+    |> Kernel.++(filler)
+    |> Kernel.++([summary])
     |> Enum.join("\n")
   end
 

@@ -66,6 +66,43 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_direct_compression"
     end
 
+    test "preserves original output when failure summaries prove compression incomplete" do
+      omitted_sentinel = "incomplete failure detail omitted sentinel"
+      original_output = incomplete_failure_log_fixture(omitted_sentinel)
+
+      body =
+        Jason.encode!(%{
+          "model" => @supported_model,
+          "input" => [
+            %{
+              "type" => "local_shell_call_output",
+              "call_id" => "call_incomplete_failure_details",
+              "output" => original_output
+            }
+          ]
+        })
+
+      {context, request_options} = request_context(body)
+
+      assert {^body, compressed_options} =
+               RequestCompression.maybe_compress(body, context, request_options)
+
+      assert %{
+               "enabled" => true,
+               "attempted" => true,
+               "status" => "no_change",
+               "reason" => "no_rewrites",
+               "route_class" => "proxy_http",
+               "transport" => "http_json",
+               "candidate_count" => 1,
+               "compressed_count" => 0,
+               "skipped_count" => 1
+             } = metadata = compressed_options.runtime.payload_compression
+
+      refute inspect(metadata) =~ omitted_sentinel
+      refute inspect(metadata) =~ "call_incomplete_failure_details"
+    end
+
     test "preserves excluded function tool outputs before compression" do
       omitted_sentinel = "excluded tool omitted sentinel"
       original_output = compression_log_fixture(omitted_sentinel)
@@ -410,6 +447,28 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       "fatal: final failure",
       "context after final"
     ])
+    |> Enum.join("\n")
+  end
+
+  defp incomplete_failure_log_fixture(omitted_sentinel) do
+    failure_blocks =
+      Enum.flat_map(1..3//1, fn index ->
+        [
+          "error: Integration.Case#{index} failed",
+          "assertion failed: expected #{index}"
+        ] ++ Enum.map(1..4//1, &"ordinary separator #{index}.#{&1}")
+      end)
+
+    filler =
+      Enum.map(1..96//1, fn
+        48 -> "ordinary build line 48 #{omitted_sentinel}"
+        index -> "ordinary build line #{index}"
+      end)
+
+    ["command started"]
+    |> Kernel.++(failure_blocks)
+    |> Kernel.++(filler)
+    |> Kernel.++(["Failed! - Failed: 5, Passed: 7, Skipped: 0, Total: 12"])
     |> Enum.join("\n")
   end
 
