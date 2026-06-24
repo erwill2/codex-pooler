@@ -2434,7 +2434,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert Enum.at(result.payload["input"], 3)["call_id"] == "call_fixture_replay"
   end
 
-  test "Responses preserves item metadata on native and translated replay items" do
+  test "Responses preserves item metadata and Codex internal turn metadata on replay items" do
+    passthrough_key = "internal_chat_message_metadata_passthrough"
+
     payload = %{
       "model" => "gpt-fixture-text",
       "previous_response_id" => "resp_fixture_metadata",
@@ -2445,12 +2447,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "id" => "rs_fixture_metadata",
           "summary" => [%{"type" => "summary_text", "text" => "synthetic summary"}],
           "encrypted_content" => nil,
-          "metadata" => %{"turn_id" => "turn_reasoning"}
+          "metadata" => %{"turn_id" => "turn_reasoning_legacy"},
+          passthrough_key => %{"turn_id" => "turn_reasoning"}
         },
         %{
           "role" => "assistant",
           "content" => [%{"type" => "output_text", "text" => "synthetic assistant replay"}],
-          "metadata" => %{"turn_id" => "turn_message"}
+          "metadata" => %{"turn_id" => "turn_message_legacy"},
+          passthrough_key => %{"turn_id" => "turn_message"}
         },
         %{
           "type" => "function_call",
@@ -2458,18 +2462,21 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "call_id" => "call_fixture_native_metadata",
           "name" => "lookup_fixture",
           "arguments" => "{}",
-          "metadata" => %{"turn_id" => "turn_call"}
+          "metadata" => %{"turn_id" => "turn_call_legacy"},
+          passthrough_key => %{"turn_id" => "turn_call"}
         },
         %{
           "type" => "function_call_output",
           "id" => "fco_fixture_metadata",
           "call_id" => "call_fixture_native_metadata",
           "output" => "synthetic tool output",
-          "metadata" => %{"turn_id" => "turn_output"}
+          "metadata" => %{"turn_id" => "turn_output_legacy"},
+          passthrough_key => %{"turn_id" => "turn_output"}
         },
         %{
           "role" => "assistant",
-          "metadata" => %{"turn_id" => "turn_rebuilt_call"},
+          "metadata" => %{"turn_id" => "turn_rebuilt_call_legacy"},
+          passthrough_key => %{"turn_id" => "turn_rebuilt_call"},
           "tool_calls" => [
             %{
               "id" => "call_fixture_rebuilt_metadata",
@@ -2485,7 +2492,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "role" => "tool",
           "tool_call_id" => "call_fixture_rebuilt_metadata",
           "content" => "synthetic translated tool output",
-          "metadata" => %{"turn_id" => "turn_rebuilt_output"}
+          "metadata" => %{"turn_id" => "turn_rebuilt_output_legacy"},
+          passthrough_key => %{"turn_id" => "turn_rebuilt_output"}
         }
       ]
     }
@@ -2493,6 +2501,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     assert {:ok, result} = Responses.coerce(payload, collect_openai_response_stream: true)
 
     assert Enum.map(result.payload["input"], &get_in(&1, ["metadata", "turn_id"])) == [
+             "turn_reasoning_legacy",
+             "turn_message_legacy",
+             "turn_call_legacy",
+             "turn_output_legacy",
+             "turn_rebuilt_call_legacy",
+             "turn_rebuilt_output_legacy"
+           ]
+
+    assert Enum.map(result.payload["input"], &get_in(&1, [passthrough_key, "turn_id"])) == [
              "turn_reasoning",
              "turn_message",
              "turn_call",
@@ -2500,6 +2517,50 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              "turn_rebuilt_call",
              "turn_rebuilt_output"
            ]
+  end
+
+  test "Responses rejects malformed Codex internal turn metadata on translated replay items" do
+    passthrough_key = "internal_chat_message_metadata_passthrough"
+
+    invalid_inputs = [
+      %{
+        "role" => "assistant",
+        passthrough_key => "turn_fixture_invalid",
+        "tool_calls" => [
+          %{
+            "id" => "call_fixture_invalid_parent",
+            "type" => "function",
+            "function" => %{"name" => "terminal", "arguments" => "{}"}
+          }
+        ]
+      },
+      %{
+        "role" => "assistant",
+        "tool_calls" => [
+          %{
+            "id" => "call_fixture_invalid_child",
+            passthrough_key => "turn_fixture_invalid",
+            "type" => "function",
+            "function" => %{"name" => "terminal", "arguments" => "{}"}
+          }
+        ]
+      },
+      %{
+        "role" => "tool",
+        "tool_call_id" => "call_fixture_invalid_output",
+        "content" => "synthetic translated tool output",
+        passthrough_key => "turn_fixture_invalid"
+      }
+    ]
+
+    Enum.each(invalid_inputs, fn input ->
+      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "previous_response_id" => "resp_fixture_metadata",
+                 "input" => [input]
+               })
+    end)
   end
 
   @tag :responses_coercion

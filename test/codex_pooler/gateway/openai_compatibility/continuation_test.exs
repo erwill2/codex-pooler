@@ -188,6 +188,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
         )
 
       setup = gateway_setup(upstream)
+      passthrough_key = "internal_chat_message_metadata_passthrough"
 
       response_conn =
         conn
@@ -200,20 +201,23 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
             %{
               "role" => "assistant",
               "id" => "msg_v1_opencode_assistant",
-              "content" => [%{"type" => "output_text", "text" => "synthetic assistant replay"}]
+              "content" => [%{"type" => "output_text", "text" => "synthetic assistant replay"}],
+              passthrough_key => %{"turn_id" => "turn_v1_message"}
             },
             %{
               "type" => "reasoning",
               "id" => "rs_v1_opencode_reasoning",
               "summary" => [%{"type" => "summary_text", "text" => "synthetic summary"}],
-              "encrypted_content" => nil
+              "encrypted_content" => nil,
+              passthrough_key => %{"turn_id" => "turn_v1_reasoning"}
             },
             %{
               "type" => "function_call",
               "id" => "fc_v1_opencode_call",
               "call_id" => "call_v1_opencode_replay",
               "name" => "lookup_fixture",
-              "arguments" => "{\"value\":\"sample\"}"
+              "arguments" => "{\"value\":\"sample\"}",
+              passthrough_key => %{"turn_id" => "turn_v1_call"}
             },
             %{
               "type" => "function_call_output",
@@ -221,7 +225,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
               "output" => [
                 %{"type" => "input_text", "text" => "synthetic tool text"},
                 %{"type" => "input_image", "image_url" => "https://example.com/sample.png"}
-              ]
+              ],
+              passthrough_key => %{"turn_id" => "turn_v1_output"}
             }
           ]
         })
@@ -245,6 +250,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       assert captured.json["input"] |> Enum.at(3) |> Map.get("output") |> Enum.map(& &1["type"]) ==
                ["input_text", "input_image"]
 
+      assert Enum.map(captured.json["input"], &get_in(&1, [passthrough_key, "turn_id"])) == [
+               "turn_v1_message",
+               "turn_v1_reasoning",
+               "turn_v1_call",
+               "turn_v1_output"
+             ]
+
       metadata = persisted_gateway_metadata(setup.pool.id)
       refute metadata =~ "synthetic assistant replay"
       refute metadata =~ "synthetic summary"
@@ -254,6 +266,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       refute metadata =~ "rs_v1_opencode_reasoning"
       refute metadata =~ "fc_v1_opencode_call"
       refute metadata =~ "call_v1_opencode_replay"
+      refute metadata =~ "turn_v1_message"
+      refute metadata =~ "turn_v1_reasoning"
+      refute metadata =~ "turn_v1_call"
+      refute metadata =~ "turn_v1_output"
       refute metadata =~ "raw_request"
     end
 

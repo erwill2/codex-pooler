@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
   alias CodexPooler.Gateway.Payloads.ToolResultShape
 
   @input_audio_formats ~w(mp3 wav)
+  @metadata_passthrough_key "internal_chat_message_metadata_passthrough"
 
   def normalize_input(%{"input" => input} = payload) when is_binary(input) do
     {:ok, Map.put(payload, "input", [input_text_message(input)])}
@@ -116,15 +117,23 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
 
   defp normalize_input_item(%{"role" => "assistant", "tool_calls" => tool_calls} = item)
        when is_list(tool_calls) do
-    normalize_assistant_tool_calls(tool_calls, Map.get(item, "metadata"))
+    with {:ok, parent_metadata_passthrough} <- optional_metadata_passthrough(item) do
+      normalize_assistant_tool_calls(
+        tool_calls,
+        Map.get(item, "metadata"),
+        parent_metadata_passthrough
+      )
+    end
   end
 
   defp normalize_input_item(%{"role" => "tool"} = item) do
     with {:ok, call_id} <- tool_call_id(item),
-         {:ok, output} <- tool_output(item) do
+         {:ok, output} <- tool_output(item),
+         {:ok, metadata_passthrough} <- optional_metadata_passthrough(item) do
       {:ok,
        %{"type" => "function_call_output", "call_id" => call_id, "output" => output}
-       |> put_optional_metadata(Map.get(item, "metadata"))}
+       |> put_optional_metadata(Map.get(item, "metadata"))
+       |> put_optional_metadata_passthrough(metadata_passthrough)}
     end
   end
 
@@ -188,10 +197,10 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
     end
   end
 
-  defp normalize_assistant_tool_calls(tool_calls, parent_metadata) do
+  defp normalize_assistant_tool_calls(tool_calls, parent_metadata, parent_metadata_passthrough) do
     tool_calls
     |> Enum.reduce_while({:ok, []}, fn tool_call, {:ok, acc} ->
-      case normalize_assistant_tool_call(tool_call, parent_metadata) do
+      case normalize_assistant_tool_call(tool_call, parent_metadata, parent_metadata_passthrough) do
         {:ok, item} -> {:cont, {:ok, [item | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -204,27 +213,33 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
 
   defp normalize_assistant_tool_call(
          %{"function" => %{"name" => name, "arguments" => arguments}} = item,
-         parent_metadata
+         parent_metadata,
+         parent_metadata_passthrough
        )
        when is_binary(name) and is_binary(arguments) do
-    case clean_string(Map.get(item, "call_id")) || clean_string(Map.get(item, "id")) do
-      nil ->
-        {:error, Error.invalid_request("input item shape is not translatable", "input")}
+    with {:ok, metadata_passthrough} <- optional_metadata_passthrough(item) do
+      case clean_string(Map.get(item, "call_id")) || clean_string(Map.get(item, "id")) do
+        nil ->
+          {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
-      call_id ->
-        {:ok,
-         %{
-           "type" => "function_call",
-           "call_id" => call_id,
-           "name" => name,
-           "arguments" => arguments
-         }
-         |> put_optional_id(Map.get(item, "response_item_id"))
-         |> put_optional_metadata(Map.get(item, "metadata") || parent_metadata)}
+        call_id ->
+          {:ok,
+           %{
+             "type" => "function_call",
+             "call_id" => call_id,
+             "name" => name,
+             "arguments" => arguments
+           }
+           |> put_optional_id(Map.get(item, "response_item_id"))
+           |> put_optional_metadata(Map.get(item, "metadata") || parent_metadata)
+           |> put_optional_metadata_passthrough(
+             metadata_passthrough || parent_metadata_passthrough
+           )}
+      end
     end
   end
 
-  defp normalize_assistant_tool_call(_item, _parent_metadata),
+  defp normalize_assistant_tool_call(_item, _parent_metadata, _parent_metadata_passthrough),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp normalize_assistant_replay_content(content) do
@@ -272,6 +287,22 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
     do: Map.put(item, "metadata", metadata)
 
   defp put_optional_metadata(item, _metadata), do: item
+
+  defp optional_metadata_passthrough(%{@metadata_passthrough_key => nil}), do: {:ok, nil}
+
+  defp optional_metadata_passthrough(%{@metadata_passthrough_key => metadata})
+       when is_map(metadata),
+       do: {:ok, metadata}
+
+  defp optional_metadata_passthrough(%{@metadata_passthrough_key => _metadata}),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp optional_metadata_passthrough(_item), do: {:ok, nil}
+
+  defp put_optional_metadata_passthrough(item, metadata) when is_map(metadata),
+    do: Map.put(item, @metadata_passthrough_key, metadata)
+
+  defp put_optional_metadata_passthrough(item, _metadata), do: item
 
   defp input_text_message(text) do
     %{
@@ -616,10 +647,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
              "id",
              "phase",
              "status",
-             "metadata"
+             "metadata",
+             @metadata_passthrough_key
            ]),
          :ok <- validate_optional_id(item),
-         :ok <- validate_optional_metadata(item),
+         :ok <- validate_optional_item_metadata(item),
          :ok <- validate_optional_assistant_phase(item),
          :ok <- validate_optional_assistant_status(item) do
       validate_assistant_replay_content(content)
@@ -674,10 +706,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
              "id",
              "summary",
              "encrypted_content",
-             "metadata"
+             "metadata",
+             @metadata_passthrough_key
            ]),
          :ok <- validate_nonblank(id),
-         :ok <- validate_optional_metadata(item),
+         :ok <- validate_optional_item_metadata(item),
          :ok <- validate_reasoning_replay_encrypted_content(Map.get(item, "encrypted_content")) do
       validate_reasoning_replay_summary(summary)
     end
@@ -688,8 +721,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
        )
        when is_binary(encrypted_content) do
     with :ok <-
-           validate_exact_item_keys(item, ["type", "summary", "encrypted_content", "metadata"]),
-         :ok <- validate_optional_metadata(item),
+           validate_exact_item_keys(item, [
+             "type",
+             "summary",
+             "encrypted_content",
+             "metadata",
+             @metadata_passthrough_key
+           ]),
+         :ok <- validate_optional_item_metadata(item),
          :ok <- validate_nonblank(encrypted_content) do
       validate_reasoning_replay_summary(summary)
     end
@@ -731,11 +770,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
              "arguments",
              "id",
              "namespace",
-             "metadata"
+             "metadata",
+             @metadata_passthrough_key
            ]),
          :ok <- validate_nonblank(call_id),
          :ok <- validate_nonblank(name),
-         :ok <- validate_optional_metadata(item),
+         :ok <- validate_optional_item_metadata(item),
          :ok <- validate_optional_namespace(item) do
       validate_optional_id(item)
     end
@@ -748,17 +788,31 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
     cond do
       Map.has_key?(item, "output") ->
         with :ok <-
-               validate_exact_item_keys(item, ["type", "call_id", "output", "id", "metadata"]),
+               validate_exact_item_keys(item, [
+                 "type",
+                 "call_id",
+                 "output",
+                 "id",
+                 "metadata",
+                 @metadata_passthrough_key
+               ]),
              :ok <- validate_nonblank(Map.get(item, "call_id")),
-             :ok <- validate_optional_metadata(item),
+             :ok <- validate_optional_item_metadata(item),
              :ok <- validate_optional_id(item) do
           validate_function_call_output(Map.get(item, "output"))
         end
 
       Map.has_key?(item, "result") ->
         with :ok <-
-               validate_exact_item_keys(item, ["type", "call_id", "result", "id", "metadata"]),
-             :ok <- validate_optional_metadata(item),
+               validate_exact_item_keys(item, [
+                 "type",
+                 "call_id",
+                 "result",
+                 "id",
+                 "metadata",
+                 @metadata_passthrough_key
+               ]),
+             :ok <- validate_optional_item_metadata(item),
              :ok <- validate_nonblank(Map.get(item, "call_id")) do
           validate_optional_id(item)
         end
@@ -796,6 +850,12 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
 
   defp validate_optional_id(_item), do: :ok
 
+  defp validate_optional_item_metadata(item) do
+    with :ok <- validate_optional_metadata(item) do
+      validate_optional_metadata_passthrough(item)
+    end
+  end
+
   defp validate_optional_metadata(%{"metadata" => nil}), do: :ok
 
   defp validate_optional_metadata(%{"metadata" => metadata}) when is_map(metadata),
@@ -805,6 +865,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp validate_optional_metadata(_item), do: :ok
+
+  defp validate_optional_metadata_passthrough(%{@metadata_passthrough_key => nil}), do: :ok
+
+  defp validate_optional_metadata_passthrough(%{@metadata_passthrough_key => metadata})
+       when is_map(metadata),
+       do: validate_json_value(metadata)
+
+  defp validate_optional_metadata_passthrough(%{@metadata_passthrough_key => _metadata}),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_optional_metadata_passthrough(_item), do: :ok
 
   defp validate_optional_namespace(%{"namespace" => namespace}) when is_binary(namespace),
     do: validate_nonblank(namespace)
