@@ -214,7 +214,8 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                  "path_like_group_heading",
                  "minimum_grouped_matches",
                  "hunk_header_required"
-               ]
+               ],
+               log_output: ["failure_summary_guard"]
              }
     end
 
