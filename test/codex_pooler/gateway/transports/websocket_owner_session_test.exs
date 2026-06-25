@@ -387,10 +387,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
     assert_receive {:websocket_owner_harness_barrier, barrier_pid, ^block_ref}
 
-    assert {:current_stacktrace, stacktrace} =
-             Process.info(submit_task.pid, :current_stacktrace)
+    owner_state = :sys.get_state(owner)
 
-    assert stack_has_mfa?(stacktrace, WebsocketOwnerSession, :await_reserved_frame, 3)
+    assert %{active_turn: %{task_pid: task_pid, submitter_monitor: submitter_monitor}} =
+             owner_state
+
+    assert is_pid(task_pid)
+    assert is_reference(submitter_monitor)
+    assert task_pid != submit_task.pid
 
     assert {:ok, second_downstream} =
              WebsocketOwnerSession.attach_downstream(owner, %{
@@ -418,6 +422,52 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
 
     owner_state = :sys.get_state(owner)
     refute inspect(owner_state) =~ @sentinel
+  end
+
+  test "submitter exit while upstream worker is blocked clears active turn", context do
+    block_ref = make_ref()
+
+    upstream =
+      WebsocketOwnerNodeHarness.fake_upstream_boundary(self(),
+        block_ref: block_ref,
+        messages: ["delta-before-submitter-exit", "delta-after-submitter-exit"]
+      )
+
+    {:ok, owner} = start_owner(context, upstream: upstream)
+    assert_receive {:websocket_owner_harness_upstream_started, _upstream_pid}
+
+    {:ok, downstream} =
+      WebsocketOwnerSession.attach_downstream(owner, downstream_target("submitter-exit"))
+
+    parent = self()
+
+    submitter =
+      spawn(fn ->
+        result = WebsocketOwnerSession.submit_frame(owner, downstream, @sentinel)
+        send(parent, {:websocket_owner_submitter_result, result})
+      end)
+
+    assert_receive {:websocket_owner_frame, "submitter-exit", 1,
+                    {:data, "delta-before-submitter-exit"}}
+
+    assert_receive {:websocket_owner_harness_barrier, upstream_worker_pid, ^block_ref}
+
+    upstream_worker_ref = Process.monitor(upstream_worker_pid)
+    submitter_ref = Process.monitor(submitter)
+
+    Process.exit(submitter, :shutdown)
+    assert_receive {:DOWN, ^submitter_ref, :process, ^submitter, :shutdown}
+    assert_receive {:DOWN, ^upstream_worker_ref, :process, ^upstream_worker_pid, :shutdown}
+
+    assert_receive {:websocket_owner_frame, "submitter-exit", 1,
+                    {:error, :client_disconnected, safe_payload}}
+
+    assert safe_payload.code == "client_disconnected"
+    assert %{active_turn: nil} = await_active_turn_cleared(owner)
+    refute_received {:websocket_owner_submitter_result, _result}
+
+    refute_receive {:websocket_owner_frame, "submitter-exit", 1,
+                    {:data, "delta-after-submitter-exit"}}
   end
 
   test "active upstream request completes when downstream exits first", context do
@@ -580,6 +630,21 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
     end
   end
 
+  defp await_active_turn_cleared(owner, attempts \\ 100)
+
+  defp await_active_turn_cleared(owner, attempts) when attempts > 0 do
+    case :sys.get_state(owner) do
+      %{active_turn: nil} = state ->
+        state
+
+      _state ->
+        yield_once({:await_active_turn_cleared, owner, attempts})
+        await_active_turn_cleared(owner, attempts - 1)
+    end
+  end
+
+  defp await_active_turn_cleared(owner, 0), do: :sys.get_state(owner)
+
   defp start_owner(context, opts) do
     WebsocketOwnerSession.start_owner(
       Keyword.merge(opts,
@@ -641,12 +706,5 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSessionTest do
         send(parent, {:collected_owner_frame, label, message})
         collector_loop(parent, label)
     end
-  end
-
-  defp stack_has_mfa?(stacktrace, module, function, arity) do
-    Enum.any?(stacktrace, fn
-      {^module, ^function, ^arity, _location} -> true
-      _frame -> false
-    end)
   end
 end

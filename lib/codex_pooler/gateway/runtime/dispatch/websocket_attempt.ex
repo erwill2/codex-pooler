@@ -425,7 +425,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt do
            context
            | attempt: attempt,
              started: System.monotonic_time(:millisecond),
-             retry_count: (context.retry_count || 0) + 1,
+             retry_count: context.retry_count + 1,
              allow_retry?: false
          }}
 

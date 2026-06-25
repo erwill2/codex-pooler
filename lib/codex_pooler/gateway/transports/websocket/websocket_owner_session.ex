@@ -151,13 +151,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   defp submit_upstream(owner, downstream, upstream_payload)
        when is_map(downstream) do
-    case reserve_frame(owner, downstream) do
-      {:ok, reservation} ->
-        start_reserved_frame(owner, reservation, upstream_payload)
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    GenServer.call(owner, {:submit_upstream, downstream, upstream_payload}, :infinity)
   end
 
   @spec push_downstream(GenServer.server(), WebsocketOwnerContract.downstream_payload()) ::
@@ -276,50 +270,40 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     end
   end
 
-  def handle_call({:reserve_frame, _downstream}, _from, %{draining?: true} = state) do
+  def handle_call({:submit_upstream, _downstream, _payload}, _from, %{draining?: true} = state) do
     {:reply, {:error, :owner_drained}, state}
   end
 
-  def handle_call({:reserve_frame, downstream}, _from, %{active_turn: active_turn} = state)
+  def handle_call(
+        {:submit_upstream, downstream, _payload},
+        _from,
+        %{active_turn: active_turn} = state
+      )
       when not is_nil(active_turn) do
     {:reply, stale_or_busy(state.downstream, downstream), state}
   end
 
-  def handle_call({:reserve_frame, downstream}, _from, state) do
+  def handle_call({:submit_upstream, downstream, upstream_payload}, from, state) do
     case downstream_status(state.downstream, downstream) do
       :active ->
         ref = make_ref()
+        task = start_upstream_task(state, ref, upstream_payload)
+        {submitter_pid, _tag} = from
 
-        reservation = %{
+        active_turn = %{
           ref: ref,
-          owner: self(),
-          upstream_pid: state.upstream_pid,
-          upstream_sender: state.upstream_sender
+          task_pid: task.pid,
+          task_ref: task.ref,
+          submitter_monitor: Process.monitor(submitter_pid),
+          reply_to: from,
+          downstream: state.downstream
         }
 
-        active_turn = %{ref: ref, task_ref: nil, downstream: state.downstream}
-        {:reply, {:ok, reservation}, %{state | active_turn: active_turn}}
+        {:noreply, %{state | active_turn: active_turn}}
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
     end
-  end
-
-  def handle_call(
-        {:activate_reserved_frame, ref, %Task{pid: task_pid, ref: task_ref}},
-        _from,
-        %{active_turn: %{ref: ref}} = state
-      ) do
-    active_turn =
-      state.active_turn
-      |> Map.put(:task_pid, task_pid)
-      |> Map.put(:task_ref, task_ref)
-
-    {:reply, :ok, %{state | active_turn: active_turn}}
-  end
-
-  def handle_call({:activate_reserved_frame, _ref, _task_ref}, _from, state) do
-    {:reply, {:error, :stale_owner}, state}
   end
 
   def handle_call({:push_downstream, payload}, _from, state) do
@@ -327,19 +311,6 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
       :ok -> {:reply, :ok, state}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
-  end
-
-  def handle_call(
-        {:finish_reserved_frame, ref, result},
-        _from,
-        %{active_turn: %{ref: ref}} = state
-      ) do
-    result = effective_active_turn_result(state.active_turn, result)
-    {:reply, {:ok, result}, finish_active_turn(state, result)}
-  end
-
-  def handle_call({:finish_reserved_frame, _ref, _result}, _from, state) do
-    {:reply, {:error, :stale_owner}, state}
   end
 
   @impl GenServer
@@ -354,13 +325,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
   def handle_info({:websocket_owner_upstream_frame, _ref, _payload}, state), do: {:noreply, state}
 
   def handle_info({ref, result}, %{active_turn: %{task_ref: ref}} = state) do
-    Process.demonitor(ref, [:flush])
+    result = effective_active_turn_result(state.active_turn, result)
+    reply_active_turn(state, result)
 
     {:noreply, finish_active_turn(state, result)}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{active_turn: %{task_ref: ref}} = state) do
-    {:noreply, finish_active_turn(state, {:error, owner_error(reason)})}
+    result = state.active_turn |> effective_active_turn_result({:error, owner_error(reason)})
+    reply_active_turn(state, result)
+
+    {:noreply, finish_active_turn(state, result)}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, _pid, _reason},
+        %{active_turn: %{submitter_monitor: ref} = active_turn} = state
+      ) do
+    cancel_active_turn_task(active_turn)
+
+    {:noreply, finish_active_turn(state, {:error, :client_disconnected})}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{downstream_monitor: ref} = state) do
@@ -429,49 +413,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     :exit, _reason -> false
   end
 
-  defp reserve_frame(owner, downstream) do
-    GenServer.call(owner, {:reserve_frame, downstream}, owner_call_timeout())
-  end
+  defp start_upstream_task(state, ref, upstream_payload) do
+    reservation = %{
+      owner: self(),
+      ref: ref,
+      upstream_pid: state.upstream_pid,
+      upstream_sender: state.upstream_sender
+    }
 
-  defp activate_reserved_frame(owner, ref, task_ref) do
-    GenServer.call(owner, {:activate_reserved_frame, ref, task_ref}, owner_call_timeout())
-  end
-
-  defp finish_reserved_frame(owner, ref, result) do
-    GenServer.call(owner, {:finish_reserved_frame, ref, result}, owner_call_timeout())
-  end
-
-  defp start_reserved_frame(owner, reservation, upstream_payload) do
-    task =
-      Task.Supervisor.async_nolink(@task_supervisor, fn ->
-        Process.flag(:sensitive, true)
-        send_upstream(reservation, upstream_payload)
-      end)
-
-    case activate_reserved_frame(owner, reservation.ref, task) do
-      :ok ->
-        await_reserved_frame(owner, reservation.ref, task)
-
-      {:error, reason} ->
-        _result = Task.shutdown(task, :brutal_kill)
-        {:error, reason}
-    end
-  end
-
-  defp await_reserved_frame(owner, ref, task) do
-    :erlang.garbage_collect(self())
-
-    result =
-      case Task.yield(task, :infinity) || Task.shutdown(task, :brutal_kill) do
-        {:ok, task_result} -> task_result
-        {:exit, _reason} -> {:error, :owner_crashed}
-        nil -> {:error, :owner_crashed}
-      end
-
-    case finish_reserved_frame(owner, ref, result) do
-      {:ok, effective_result} -> effective_result
-      {:error, reason} -> {:error, reason}
-    end
+    Task.Supervisor.async_nolink(@task_supervisor, fn ->
+      Process.flag(:sensitive, true)
+      send_upstream(reservation, upstream_payload)
+    end)
   end
 
   defp send_upstream(
@@ -527,8 +480,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
 
   defp effective_active_turn_result(_active_turn, result), do: result
 
+  defp reply_active_turn(%{active_turn: %{reply_to: reply_to}}, result) do
+    GenServer.reply(reply_to, result)
+  end
+
   defp finish_active_turn(state, result) do
     downstream = active_turn_downstream(state)
+    clear_active_turn_monitors(state.active_turn)
 
     case result do
       :ok -> _result = send_downstream(downstream, :complete)
@@ -541,6 +499,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession do
     state
     |> Map.put(:active_turn, nil)
     |> maybe_schedule_idle_shutdown()
+  end
+
+  defp clear_active_turn_monitors(active_turn) when is_map(active_turn) do
+    active_turn
+    |> Map.take([:task_ref, :submitter_monitor])
+    |> Map.values()
+    |> Enum.each(fn
+      ref when is_reference(ref) -> Process.demonitor(ref, [:flush])
+      _value -> :ok
+    end)
   end
 
   defp put_active_turn_downstream(%{active_turn: active_turn} = state, downstream)
