@@ -33,67 +33,11 @@ defmodule CodexPooler.Alerts.Evaluator do
         }
 
   @spec evaluate_rule(AlertRule.t(), evaluation_opts()) :: [candidate()]
-  def evaluate_rule(rule, opts \\ [])
-
-  def evaluate_rule(%AlertRule{state: "disabled"} = rule, opts) do
+  def evaluate_rule(%AlertRule{} = rule, opts \\ []) do
     timestamp = evaluation_timestamp(opts)
+    {candidates, _projection_cache} = evaluate_rule_with_projection_cache(rule, timestamp, %{})
 
-    [clear_candidate(rule, dedupe_key_for_rule(rule, nil), timestamp)]
-  end
-
-  def evaluate_rule(%AlertRule{rule_kind: "pool_no_usable_assignments"} = rule, opts) do
-    timestamp = evaluation_timestamp(opts)
-    projection = pool_projection(rule.pool_id, rule.model, timestamp)
-    dedupe_key = dedupe_key_for_rule(rule, nil)
-
-    if projection.usable_assignment_count == 0 do
-      [pool_match_candidate(rule, dedupe_key, projection, "no_usable_assignments", timestamp)]
-    else
-      [clear_candidate(rule, dedupe_key, timestamp)]
-    end
-  end
-
-  def evaluate_rule(%AlertRule{rule_kind: "pool_low_usable_assignments"} = rule, opts) do
-    timestamp = evaluation_timestamp(opts)
-    min_usable = rule.min_usable_assignments || 1
-    projection = pool_projection(rule.pool_id, rule.model, timestamp)
-    dedupe_key = dedupe_key_for_rule(rule, nil)
-
-    if projection.usable_assignment_count > 0 and projection.usable_assignment_count < min_usable do
-      [pool_match_candidate(rule, dedupe_key, projection, "low_usable_assignments", timestamp)]
-    else
-      [clear_candidate(rule, dedupe_key, timestamp)]
-    end
-  end
-
-  def evaluate_rule(%AlertRule{rule_kind: "pool_all_assignments_in_state"} = rule, opts) do
-    timestamp = evaluation_timestamp(opts)
-    projection = pool_projection(rule.pool_id, rule.model, timestamp)
-    dedupe_key = dedupe_key_for_rule(rule, nil)
-    target_state = rule.target_state
-
-    if (target_state && projection.enabled_assignment_count > 0) and
-         all_in_state?(projection, target_state) do
-      [pool_match_candidate(rule, dedupe_key, projection, target_state, timestamp)]
-    else
-      [clear_candidate(rule, dedupe_key, timestamp)]
-    end
-  end
-
-  def evaluate_rule(%AlertRule{rule_kind: "upstream_quota_threshold"} = rule, opts) do
-    timestamp = evaluation_timestamp(opts)
-
-    rule.pool_id
-    |> enabled_assigned_identity_projections(rule.model, timestamp)
-    |> Enum.map(&threshold_candidate(rule, &1, timestamp))
-  end
-
-  def evaluate_rule(%AlertRule{rule_kind: "upstream_auth_state"} = rule, opts) do
-    timestamp = evaluation_timestamp(opts)
-
-    rule.pool_id
-    |> enabled_assigned_identity_projections(rule.model, timestamp)
-    |> Enum.map(&auth_state_candidate(rule, &1, timestamp))
+    candidates
   end
 
   @spec evaluate_active_rules(evaluation_opts()) :: [candidate()]
@@ -212,14 +156,6 @@ defmodule CodexPooler.Alerts.Evaluator do
     {candidates, projection_cache}
   end
 
-  defp pool_projection(pool_id, model, timestamp) do
-    pool_projection_from_assignments(
-      pool_id,
-      model,
-      assigned_identity_projections(pool_id, model, timestamp)
-    )
-  end
-
   defp pool_projection_from_cache(pool_id, model, timestamp, projection_cache) do
     {assignments, projection_cache} =
       assigned_identity_projections_from_cache(pool_id, model, timestamp, projection_cache)
@@ -279,12 +215,6 @@ defmodule CodexPooler.Alerts.Evaluator do
         usable_assignment?: usable_assignment?(row, quota_projection)
       })
     end)
-  end
-
-  defp enabled_assigned_identity_projections(pool_id, model, timestamp) do
-    pool_id
-    |> assigned_identity_projections(model, timestamp)
-    |> Enum.reject(&(&1.assignment_status in @disabled_assignment_states))
   end
 
   defp assignment_rows(pool_id) do
