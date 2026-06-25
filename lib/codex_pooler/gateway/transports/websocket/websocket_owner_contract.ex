@@ -68,6 +68,69 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
     :client_disconnected
   ]
 
+  @safe_error_payloads %{
+    owner_busy: [
+      status: 409,
+      code: "owner_busy",
+      message: "websocket owner is busy",
+      reason: "owner_busy_backpressure"
+    ],
+    owner_forward_timeout: [
+      status: 504,
+      code: "owner_forward_timeout",
+      message: "websocket owner forwarding timed out",
+      reason: "owner_forward_timeout"
+    ],
+    owner_unavailable: [
+      status: 503,
+      code: "owner_unavailable",
+      message: "websocket owner is unavailable",
+      reason: "owner_unavailable"
+    ],
+    owner_crashed: [
+      status: 502,
+      code: "owner_crashed",
+      message: "websocket owner stopped unexpectedly",
+      reason: "owner_crashed"
+    ],
+    owner_drained: [
+      status: 503,
+      code: "owner_drained",
+      message: "websocket owner is draining",
+      reason: "owner_drained"
+    ],
+    client_disconnected: [
+      status: 499,
+      code: "client_disconnected",
+      message: "websocket client disconnected",
+      reason: "client_disconnected"
+    ],
+    stale_owner: [
+      status: 409,
+      code: "stale_owner",
+      message: "websocket owner lease is stale",
+      reason: "stale_owner"
+    ],
+    duplicate_downstream: [
+      status: 409,
+      code: "duplicate_downstream",
+      message: "websocket downstream was replaced",
+      reason: "duplicate_downstream"
+    ],
+    stale_downstream: [
+      status: 409,
+      code: "stale_downstream",
+      message: "websocket downstream is stale",
+      reason: "stale_downstream"
+    ],
+    owner_forwarding_disabled: [
+      status: 503,
+      code: "owner_forwarding_disabled",
+      message: "websocket owner forwarding is disabled",
+      reason: "owner_forwarding_disabled"
+    ]
+  }
+
   @default_forward_timeout_ms 5_000
   @default_owner_call_timeout_ms 5_000
   @default_downstream_send_timeout_ms 1_000
@@ -87,110 +150,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract do
   @spec default_downstream_send_timeout_ms() :: pos_integer()
   def default_downstream_send_timeout_ms, do: @default_downstream_send_timeout_ms
 
-  @spec safe_error_payload(owner_error(), term()) :: {:ok, safe_error_payload()}
-  def safe_error_payload(:owner_busy, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 409,
-       code: "owner_busy",
-       message: "websocket owner is busy",
-       reason: "owner_busy_backpressure"
-     )}
-  end
-
-  def safe_error_payload(:owner_forward_timeout, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 504,
-       code: "owner_forward_timeout",
-       message: "websocket owner forwarding timed out",
-       reason: "owner_forward_timeout"
-     )}
-  end
-
-  def safe_error_payload(:owner_unavailable, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 503,
-       code: "owner_unavailable",
-       message: "websocket owner is unavailable",
-       reason: "owner_unavailable"
-     )}
-  end
-
-  def safe_error_payload(:owner_crashed, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 502,
-       code: "owner_crashed",
-       message: "websocket owner stopped unexpectedly",
-       reason: "owner_crashed"
-     )}
-  end
-
-  def safe_error_payload(:owner_drained, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 503,
-       code: "owner_drained",
-       message: "websocket owner is draining",
-       reason: "owner_drained"
-     )}
-  end
-
-  def safe_error_payload(:client_disconnected, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 499,
-       code: "client_disconnected",
-       message: "websocket client disconnected",
-       reason: "client_disconnected"
-     )}
-  end
-
-  def safe_error_payload(:stale_owner, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 409,
-       code: "stale_owner",
-       message: "websocket owner lease is stale",
-       reason: "stale_owner"
-     )}
-  end
-
-  def safe_error_payload(:duplicate_downstream, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 409,
-       code: "duplicate_downstream",
-       message: "websocket downstream was replaced",
-       reason: "duplicate_downstream"
-     )}
-  end
-
-  def safe_error_payload(:stale_downstream, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 409,
-       code: "stale_downstream",
-       message: "websocket downstream is stale",
-       reason: "stale_downstream"
-     )}
-  end
-
-  def safe_error_payload(:owner_forwarding_disabled, _unsafe_context) do
-    {:ok,
-     payload(
-       status: 503,
-       code: "owner_forwarding_disabled",
-       message: "websocket owner forwarding is disabled",
-       reason: "owner_forwarding_disabled"
-     )}
-  end
-
   @spec safe_error_payload(term(), term()) ::
           {:ok, safe_error_payload()} | {:error, :unknown_owner_error}
-  def safe_error_payload(_unknown_error, _unsafe_context), do: {:error, :unknown_owner_error}
+  def safe_error_payload(error, _unsafe_context) do
+    case Map.fetch(@safe_error_payloads, error) do
+      {:ok, payload_attrs} -> {:ok, payload(payload_attrs)}
+      :error -> {:error, :unknown_owner_error}
+    end
+  end
 
   @spec downstream_message?(term()) :: boolean()
   def downstream_message?({:websocket_owner_frame, correlation_id, downstream_epoch, payload})
