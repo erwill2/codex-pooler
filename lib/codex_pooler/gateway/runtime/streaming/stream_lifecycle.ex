@@ -5,9 +5,9 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycle do
 
   alias CodexPooler.Gateway.Runtime.Dispatch
   alias CodexPooler.Gateway.Runtime.Dispatch.CandidateDispatch
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
   alias CodexPooler.Gateway.Runtime.Dispatch.PreparedContext
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
@@ -66,7 +66,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycle do
   @spec first_event_retry_handler(ResponseContext.t(), dispatch_candidate(), keyword()) ::
           first_event_retry()
   def first_event_retry_handler(
-        %ResponseContext{context: %DispatchContext{} = context} = response_context,
+        %ResponseContext{context: %SelectedCandidateContext{} = context} = response_context,
         dispatch_candidate,
         opts
       )

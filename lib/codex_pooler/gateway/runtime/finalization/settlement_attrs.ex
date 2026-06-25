@@ -1,13 +1,13 @@
 defmodule CodexPooler.Gateway.Runtime.Finalization.SettlementAttrs do
   @moduledoc false
 
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
 
   @type attrs :: map()
   @type opts :: keyword()
 
-  @spec success(DispatchContext.t(), pos_integer(), map(), opts()) :: attrs()
-  def success(%DispatchContext{} = context, status, attempt_metadata, opts) do
+  @spec success(SelectedCandidateContext.t(), pos_integer(), map(), opts()) :: attrs()
+  def success(%SelectedCandidateContext{} = context, status, attempt_metadata, opts) do
     %{
       response_status_code: status,
       retry_count: context.retry_count || context.index,
@@ -16,9 +16,23 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SettlementAttrs do
     }
   end
 
-  @spec failure(DispatchContext.t(), pos_integer(), String.t(), String.t(), map(), opts()) ::
+  @spec failure(
+          SelectedCandidateContext.t(),
+          pos_integer(),
+          String.t(),
+          String.t(),
+          map(),
+          opts()
+        ) ::
           attrs()
-  def failure(%DispatchContext{} = context, status, code, message, attempt_metadata, opts) do
+  def failure(
+        %SelectedCandidateContext{} = context,
+        status,
+        code,
+        message,
+        attempt_metadata,
+        opts
+      ) do
     %{
       response_status_code: status,
       retry_count: context.retry_count || context.index,
@@ -31,7 +45,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SettlementAttrs do
   end
 
   @spec partial_stream_failure(
-          DispatchContext.t(),
+          SelectedCandidateContext.t(),
           pos_integer(),
           String.t(),
           String.t(),
@@ -39,7 +53,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SettlementAttrs do
           opts()
         ) :: attrs()
   def partial_stream_failure(
-        %DispatchContext{} = context,
+        %SelectedCandidateContext{} = context,
         status,
         code,
         message,
@@ -56,8 +70,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SettlementAttrs do
     }
   end
 
-  @spec latency(DispatchContext.t(), opts()) :: non_neg_integer()
-  def latency(%DispatchContext{} = context, opts) do
+  @spec latency(SelectedCandidateContext.t(), opts()) :: non_neg_integer()
+  def latency(%SelectedCandidateContext{} = context, opts) do
     cond do
       Keyword.has_key?(opts, :latency_ms) -> Keyword.fetch!(opts, :latency_ms)
       Keyword.has_key?(opts, :started) -> elapsed_ms(Keyword.fetch!(opts, :started))

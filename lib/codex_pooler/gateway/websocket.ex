@@ -8,7 +8,7 @@ defmodule CodexPooler.Gateway.Websocket do
   alias CodexPooler.Gateway.Payloads.{ContinuityPayload, PayloadNormalizer, RequestOptions}
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn, SessionContinuity}
   alias CodexPooler.Gateway.Runtime.Finalization.Interruption
-  alias CodexPooler.Gateway.Service
+  alias CodexPooler.Gateway.Runtime.Service
   alias CodexPooler.Gateway.Transports.Admission
 
   alias CodexPooler.Gateway.Transports.Websocket.{

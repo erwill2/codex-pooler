@@ -6,8 +6,8 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.SessionContinuity
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Runtime.Streaming.DownstreamStream
   alias CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector
@@ -30,9 +30,9 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
         }
   @type stream_dispatch_result :: StreamTypes.stream_dispatch_result()
 
-  @spec streaming_result(Req.Response.t(), DispatchContext.t(), callbacks()) ::
+  @spec streaming_result(Req.Response.t(), SelectedCandidateContext.t(), callbacks()) ::
           stream_dispatch_result()
-  def streaming_result(response, %DispatchContext{} = context, callbacks) do
+  def streaming_result(response, %SelectedCandidateContext{} = context, callbacks) do
     finalization_callbacks = Map.fetch!(callbacks, :finalization_callbacks)
 
     cond do
@@ -47,7 +47,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
     end
   end
 
-  defp relay_streaming_result(response, %DispatchContext{} = context, callbacks) do
+  defp relay_streaming_result(response, %SelectedCandidateContext{} = context, callbacks) do
     result = %{
       status: response.status,
       headers: stream_headers(response, context.request_options)
@@ -66,7 +66,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
     end
   end
 
-  defp stream_result(response, %DispatchContext{} = context, callbacks) do
+  defp stream_result(response, %SelectedCandidateContext{} = context, callbacks) do
     fn conn ->
       response_context = %ResponseContext{context: context, response: response}
 
@@ -79,7 +79,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
     end
   end
 
-  defp websocket_stream_result(response, writer, %DispatchContext{} = context, callbacks) do
+  defp websocket_stream_result(response, writer, %SelectedCandidateContext{} = context, callbacks) do
     fn ->
       response_context = %ResponseContext{context: context, response: response}
 

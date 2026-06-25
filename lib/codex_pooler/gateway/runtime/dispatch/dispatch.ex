@@ -11,6 +11,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
   alias CodexPooler.Gateway.Routing.{BridgeRing, ModelMetadata, RoutePlanInput, RoutingSelection}
   alias CodexPooler.Gateway.Runtime.Dispatch.Context
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
 
   @type dispatch_input :: %{
@@ -25,9 +26,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
         }
 
   @type dispatch_callback ::
-          (Context.t() ->
+          (SelectedCandidateContext.t() ->
              {:ok, GatewayContracts.gateway_result()} | {:error, map()} | {:retry, term()})
-  @type dispatch_context :: Context.t()
+  @type dispatch_context :: Context.t() | SelectedCandidateContext.t()
   @type dispatch_result ::
           {:ok, GatewayContracts.gateway_result()} | {:error, map()} | {:retry, term() | nil}
 
@@ -162,7 +163,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
     end
   end
 
-  defp begin_candidate_circuit(%Context{} = context, %RoutingSelection{} = selection) do
+  defp begin_candidate_circuit(
+         %SelectedCandidateContext{} = context,
+         %RoutingSelection{} = selection
+       ) do
     case RoutingSelection.begin_circuit(selection, context.auth, context.model) do
       {:ok, %{circuit_state: circuit_state}} ->
         {:ok, put_routing_circuit_state(context, circuit_state)}
@@ -197,16 +201,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
         selected_context =
           context
           |> refresh_request_options(request_options)
-          |> Map.merge(%{
-            reserved: %{context.reserved | request: request},
-            assignment: selection.assignment,
-            identity: selection.identity,
-            index: selection.index,
-            retry_count: selection.index,
-            allow_retry?: allow_retry?,
-            routing_attempt_metadata: selection.attempt_metadata,
-            route_class: selection.route_class
-          })
+          |> Map.put(:reserved, %{context.reserved | request: request})
+          |> SelectedCandidateContext.from_dispatch_context(selection, allow_retry?)
 
         {:ok, selected_context}
 
@@ -228,7 +224,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
     ModelMetadata.bool_metadata(metadata, "use_responses_lite")
   end
 
-  defp put_routing_circuit_state(%Context{} = context, %RoutingCircuitState{} = state) do
+  defp put_routing_circuit_state(
+         %SelectedCandidateContext{} = context,
+         %RoutingCircuitState{} = state
+       ) do
     request_options =
       RequestOptions.put_routing(context.request_options, routing_circuit_state: state)
 
@@ -237,9 +236,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
     |> Map.put(:routing_circuit_state, state)
   end
 
-  defp put_routing_circuit_state(%Context{} = context, nil), do: context
+  defp put_routing_circuit_state(%SelectedCandidateContext{} = context, nil), do: context
 
-  defp persist_route_metadata(%Context{} = context) do
+  defp persist_route_metadata(%SelectedCandidateContext{} = context) do
     case Accounting.persist_request_metadata(context.reserved.request,
            reload?: route_metadata_reload?(context)
          ) do
@@ -256,9 +255,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
     end
   end
 
-  defp route_metadata_reload?(%Context{index: index}), do: index != 0
+  defp route_metadata_reload?(%SelectedCandidateContext{index: index}), do: index != 0
 
-  defp start_dispatch_attempt(%Context{} = context) do
+  defp start_dispatch_attempt(%SelectedCandidateContext{} = context) do
     case Accounting.create_attempt(context.reserved.request, context.assignment, %{
            model: context.model,
            pricing_snapshot: Map.get(context.reserved, :pricing_snapshot),
@@ -290,7 +289,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
     }
   end
 
-  defp handle_unavailable_routing_circuit(%Context{} = context, reason) do
+  defp handle_unavailable_routing_circuit(%SelectedCandidateContext{} = context, reason) do
     if context.allow_retry? do
       {:retry, reason}
     else

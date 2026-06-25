@@ -1,8 +1,8 @@
 defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
   @moduledoc false
 
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Streaming.Types, as: StreamTypes
 
   alias CodexPooler.Gateway.Runtime.Finalization.{
@@ -13,7 +13,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     SideEffects
   }
 
-  alias CodexPooler.Gateway.Runtime.Routing.RouteLifecycle
+  alias CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Quotas.Evidence.CodexParsers.RateLimitReachedType
 
@@ -23,7 +23,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
         }
   @type stream_failure :: StreamProtocol.terminal_failure()
   @type finalization_result :: AttemptSettlement.settlement_result()
-  @type health_result :: RouteLifecycle.success_result()
+  @type health_result :: DispatchLifecycle.success_result()
 
   @spec finalize_success(binary(), ResponseContext.t(), callbacks()) ::
           finalization_result()
@@ -169,33 +169,34 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
   def error_code(:upstream_unauthorized), do: "upstream_unauthorized"
   def error_code(_reason), do: "upstream_stream_error"
 
-  @spec record_health_failure(term(), term(), DispatchContext.t()) :: health_result()
+  @spec record_health_failure(term(), term(), SelectedCandidateContext.t()) :: health_result()
   def record_health_failure({:chunk, _reason}, _code, _context), do: :ok
 
-  def record_health_failure(_reason, code, %DispatchContext{} = context)
+  def record_health_failure(_reason, code, %SelectedCandidateContext{} = context)
       when is_binary(code) do
     if health_neutral_error_code?(code) do
-      RouteLifecycle.neutral_completion(context)
+      DispatchLifecycle.neutral_completion(context)
     else
       route_failure(context, code)
     end
   end
 
-  def record_health_failure(_reason, code, %DispatchContext{} = context) do
+  def record_health_failure(_reason, code, %SelectedCandidateContext{} = context) do
     route_failure(context, code)
   end
 
-  @spec record_terminal_health_failure(term(), term(), DispatchContext.t()) :: health_result()
-  def record_terminal_health_failure(code, headers, %DispatchContext{} = context)
+  @spec record_terminal_health_failure(term(), term(), SelectedCandidateContext.t()) ::
+          health_result()
+  def record_terminal_health_failure(code, headers, %SelectedCandidateContext{} = context)
       when is_binary(code) do
     if health_neutral_terminal_failure?(code, headers) do
-      RouteLifecycle.neutral_completion(context)
+      DispatchLifecycle.neutral_completion(context)
     else
       record_health_failure(code, code, context)
     end
   end
 
-  def record_terminal_health_failure(code, _headers, %DispatchContext{} = context) do
+  def record_terminal_health_failure(code, _headers, %SelectedCandidateContext{} = context) do
     record_health_failure(code, code, context)
   end
 
@@ -206,7 +207,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
          _headers,
          context
        ),
-       do: RouteLifecycle.neutral_completion(context)
+       do: DispatchLifecycle.neutral_completion(context)
 
   defp record_stream_failure_health(reason, code, nil, _headers, context) do
     record_health_failure(reason, code, context)
@@ -217,8 +218,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     record_terminal_health_failure(health_code, headers, context)
   end
 
-  defp route_failure(%DispatchContext{} = context, code) do
-    case RouteLifecycle.failure(context, code) do
+  defp route_failure(%SelectedCandidateContext{} = context, code) do
+    case DispatchLifecycle.failure(context, code) do
       {:ok, _demotion_reason} -> :ok
       {:error, gateway_error} -> {:error, gateway_error}
     end

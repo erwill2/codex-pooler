@@ -1,4 +1,4 @@
-defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycleTest do
+defmodule CodexPooler.Gateway.Runtime.Routing.DispatchLifecycleTest do
   use CodexPoolerWeb.ConnCase, async: false
 
   import ExUnit.CaptureLog
@@ -11,8 +11,8 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycleTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context
-  alias CodexPooler.Gateway.Runtime.Routing.RouteLifecycle
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
+  alias CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle
 
   @endpoint_path "/backend-api/codex/responses"
 
@@ -33,13 +33,12 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycleTest do
     request = invalid_request(reserved.request.id)
     candidates = [{setup.assignment, setup.identity}]
 
-    context = %Context{
+    context = %SelectedCandidateContext{
       auth: auth,
       endpoint: @endpoint_path,
       payload: payload,
       model: setup.model,
       reserved: %{request: request},
-      candidates: candidates,
       request_options: request_options,
       route_plan:
         BridgeRing.plan_route(%{
@@ -62,7 +61,7 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycleTest do
                   status: 500,
                   code: "gateway_accounting_failed",
                   message: "gateway accounting finalization failed"
-                }} = RouteLifecycle.failure(context, "upstream_5xx")
+                }} = DispatchLifecycle.failure(context, "upstream_5xx")
       end)
 
     assert log =~ "operation=merge_route_failure_metadata"
@@ -85,13 +84,12 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycleTest do
 
     candidates = [{setup.assignment, setup.identity}]
 
-    context = %Context{
+    context = %SelectedCandidateContext{
       auth: auth,
       endpoint: @endpoint_path,
       payload: payload,
       model: setup.model,
       reserved: reserved,
-      candidates: candidates,
       request_options: request_options,
       route_plan:
         BridgeRing.plan_route(%{
@@ -114,7 +112,7 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycleTest do
                   status: 500,
                   code: "gateway_accounting_failed",
                   message: "gateway accounting finalization failed"
-                }} = RouteLifecycle.failure(context, "upstream_5xx")
+                }} = DispatchLifecycle.failure(context, "upstream_5xx")
       end)
 
     assert log =~ "operation=record_route_circuit_failure"

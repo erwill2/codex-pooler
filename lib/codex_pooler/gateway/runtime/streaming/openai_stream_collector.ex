@@ -4,16 +4,16 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
   alias CodexPooler.Gateway.OpenAICompatibility.{Images, Responses}
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.SessionContinuity
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamRelay
 
-  @spec collect_response(Req.Response.t(), Context.t(), map()) ::
+  @spec collect_response(Req.Response.t(), SelectedCandidateContext.t(), map()) ::
           {:ok, map()} | {:error, term()}
-  def collect_response(response, %Context{} = context, finalization_callbacks) do
+  def collect_response(response, %SelectedCandidateContext{} = context, finalization_callbacks) do
     collect_stream(response, context, finalization_callbacks, fn body ->
       with {:ok, response_body} <- Responses.response_from_sse(body) do
         {:ok, %{status: 200, headers: json_headers(), raw_body: Jason.encode!(response_body)}}
@@ -21,8 +21,9 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
     end)
   end
 
-  @spec collect_image(Req.Response.t(), Context.t(), map()) :: {:ok, map()} | {:error, term()}
-  def collect_image(response, %Context{} = context, finalization_callbacks) do
+  @spec collect_image(Req.Response.t(), SelectedCandidateContext.t(), map()) ::
+          {:ok, map()} | {:error, term()}
+  def collect_image(response, %SelectedCandidateContext{} = context, finalization_callbacks) do
     collect_stream(response, context, finalization_callbacks, fn body ->
       with {:ok, image_body} <- Images.image_response_from_sse(body) do
         {:ok, %{status: 200, headers: json_headers(), body: image_body}}
@@ -46,7 +47,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector do
 
   def collect_response?(_request_options), do: false
 
-  defp collect_stream(response, %Context{} = context, finalization_callbacks, parser) do
+  defp collect_stream(
+         response,
+         %SelectedCandidateContext{} = context,
+         finalization_callbacks,
+         parser
+       ) do
     state = %{chunks: [], rate_limit: RateLimitObserver.event_state()}
     response_context = %ResponseContext{context: context, response: response}
 

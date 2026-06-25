@@ -1,7 +1,7 @@
 defmodule CodexPooler.Gateway.Runtime.Dispatch.PreparedContext do
   @moduledoc false
 
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
 
   defstruct [
     :context,
@@ -11,7 +11,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreparedContext do
   ]
 
   @type t :: %__MODULE__{
-          context: Context.t(),
+          context: SelectedCandidateContext.t(),
           url: String.t(),
           token: String.t(),
           upstream_payload: binary() | {:multipart, list()}

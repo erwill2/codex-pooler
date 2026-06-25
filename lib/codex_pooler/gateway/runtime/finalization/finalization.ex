@@ -3,8 +3,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   Finalizes gateway runtime dispatch attempts after upstream transport returns.
   """
 
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Runtime.Streaming.Types, as: StreamTypes
 
@@ -18,7 +18,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     Websocket
   }
 
-  alias CodexPooler.Gateway.Runtime.Routing.RouteLifecycle
+  alias CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.RouteClass
 
@@ -54,13 +54,13 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
   @spec handle_http_response(
           Req.Response.t(),
-          DispatchContext.t(),
+          SelectedCandidateContext.t(),
           callbacks()
         ) ::
           {:ok, map()} | {:error, map()} | {:retry, term()}
   def handle_http_response(
         %Req.Response{status: status} = response,
-        %DispatchContext{} = context,
+        %SelectedCandidateContext{} = context,
         _callbacks
       )
       when status == 429 or status >= 500 do
@@ -79,7 +79,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
   def handle_http_response(
         %Req.Response{status: status} = response,
-        %DispatchContext{} = context,
+        %SelectedCandidateContext{} = context,
         callbacks
       )
       when status >= 200 and status < 300 do
@@ -103,7 +103,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
   def handle_http_response(
         %Req.Response{status: status} = response,
-        %DispatchContext{} = context,
+        %SelectedCandidateContext{} = context,
         _callbacks
       ) do
     %{identity: identity} = context
@@ -121,9 +121,9 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   defp normalize_stream_result({:error, reason}), do: {:error, reason}
   defp normalize_stream_result(result), do: {:ok, result}
 
-  @spec handle_dispatch_error(term(), DispatchContext.t(), non_neg_integer()) ::
+  @spec handle_dispatch_error(term(), SelectedCandidateContext.t(), non_neg_integer()) ::
           {:error, map()} | {:retry, term()}
-  def handle_dispatch_error(reason, %DispatchContext{} = context, latency) do
+  def handle_dispatch_error(reason, %SelectedCandidateContext{} = context, latency) do
     %{
       request_options: request_options
     } = context
@@ -149,7 +149,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   end
 
   @spec finalize_completed_websocket_response(
-          DispatchContext.t(),
+          SelectedCandidateContext.t(),
           completed_websocket_finalization()
         ) :: {:ok, map()} | {:error, map()}
   defdelegate finalize_completed_websocket_response(context, finalization),
@@ -157,14 +157,17 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     as: :finalize_completed
 
   @spec finalize_terminal_websocket_response(
-          DispatchContext.t(),
+          SelectedCandidateContext.t(),
           terminal_websocket_finalization()
         ) :: {:ok, map()} | {:error, map()}
   defdelegate finalize_terminal_websocket_response(context, finalization),
     to: Websocket,
     as: :finalize_terminal
 
-  @spec finalize_failed_websocket_response(DispatchContext.t(), failed_websocket_finalization()) ::
+  @spec finalize_failed_websocket_response(
+          SelectedCandidateContext.t(),
+          failed_websocket_finalization()
+        ) ::
           {:error, map()}
   defdelegate finalize_failed_websocket_response(context, finalization),
     to: Websocket,
@@ -208,7 +211,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
   defp finalize_retryable_status_or_failure(
          %Req.Response{status: status} = response,
-         %DispatchContext{} = context,
+         %SelectedCandidateContext{} = context,
          body
        ) do
     %{
@@ -246,7 +249,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
   defp finalize_dispatch_error_after_route_failure(
          reason,
-         %DispatchContext{} = context,
+         %SelectedCandidateContext{} = context,
          latency,
          code,
          attempt_metadata
@@ -291,24 +294,29 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     end
   end
 
-  defp record_status_route_failure(%DispatchContext{} = context, status) do
+  defp record_status_route_failure(%SelectedCandidateContext{} = context, status) do
     status |> status_demotion_code() |> record_dispatch_route_failure(context)
   end
 
-  defp record_dispatch_route_failure(code, %DispatchContext{} = context) do
-    case RouteLifecycle.failure(context, code) do
+  defp record_dispatch_route_failure(code, %SelectedCandidateContext{} = context) do
+    case DispatchLifecycle.failure(context, code) do
       {:ok, _demotion_reason} -> :ok
       {:error, gateway_error} -> {:error, gateway_error}
     end
   end
 
-  defp maybe_record_unauthorized_route_failure(401, %DispatchContext{} = context) do
+  defp maybe_record_unauthorized_route_failure(401, %SelectedCandidateContext{} = context) do
     record_dispatch_route_failure("upstream_unauthorized", context)
   end
 
-  defp maybe_record_unauthorized_route_failure(_status, %DispatchContext{}), do: :ok
+  defp maybe_record_unauthorized_route_failure(_status, %SelectedCandidateContext{}), do: :ok
 
-  defp finalize_upstream_status_failure(response, %DispatchContext{} = context, body, opts \\ []) do
+  defp finalize_upstream_status_failure(
+         response,
+         %SelectedCandidateContext{} = context,
+         body,
+         opts \\ []
+       ) do
     %{
       reserved: reserved,
       attempt: attempt,
@@ -350,7 +358,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
     end
   end
 
-  defp finalize_invalid_json_response(response, %DispatchContext{} = context) do
+  defp finalize_invalid_json_response(response, %SelectedCandidateContext{} = context) do
     %{reserved: reserved, attempt: attempt, request_options: request_options} = context
 
     latency = elapsed_ms(context.started)
@@ -377,7 +385,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
   defp finalize_successful_json_response(
          response,
-         %DispatchContext{} = context,
+         %SelectedCandidateContext{} = context,
          body,
          callbacks
        ) do

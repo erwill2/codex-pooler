@@ -1,7 +1,7 @@
 defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
   @moduledoc false
 
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
 
   alias CodexPooler.Gateway.Runtime.Finalization.{
     AttemptSettlement,
@@ -15,7 +15,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
 
-  @spec finalize_completed(DispatchContext.t(), map()) :: {:ok, map()} | {:error, map()}
+  @spec finalize_completed(SelectedCandidateContext.t(), map()) :: {:ok, map()} | {:error, map()}
   def finalize_completed(context, finalization) do
     %{
       body: body,
@@ -59,7 +59,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
     end
   end
 
-  @spec finalize_terminal(DispatchContext.t(), map()) :: {:ok, map()} | {:error, map()}
+  @spec finalize_terminal(SelectedCandidateContext.t(), map()) :: {:ok, map()} | {:error, map()}
   def finalize_terminal(context, finalization) do
     %{body: body, terminal: terminal} = finalization
 
@@ -144,7 +144,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
   defp websocket_terminal_outcome("response.completed", _body), do: {:ok, %{kind: :completed}}
   defp websocket_terminal_outcome(_terminal, body), do: StreamProtocol.terminal_outcome(body)
 
-  @spec finalize_failed(DispatchContext.t(), map()) :: {:error, map()}
+  @spec finalize_failed(SelectedCandidateContext.t(), map()) :: {:error, map()}
   def finalize_failed(context, %{reason: :client_disconnected} = finalization) do
     %{headers: headers, started: started} = finalization
 
@@ -251,7 +251,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
   defp maybe_put_transport_failure_metadata(metadata, _finalization), do: metadata
 
   defp finalize_failed_after_health(
-         %DispatchContext{allow_retry?: true, reserved: reserved, attempt: attempt},
+         %SelectedCandidateContext{allow_retry?: true, reserved: reserved, attempt: attempt},
          %{body: "", reason: reason, started: started},
          code,
          metadata

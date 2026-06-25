@@ -1,7 +1,7 @@
 defmodule CodexPooler.Gateway.Runtime.Dispatch.ResponseContext do
   @moduledoc false
 
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
 
   defstruct [
     :context,
@@ -9,7 +9,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.ResponseContext do
   ]
 
   @type t :: %__MODULE__{
-          context: Context.t(),
+          context: SelectedCandidateContext.t(),
           response: Req.Response.t()
         }
 end

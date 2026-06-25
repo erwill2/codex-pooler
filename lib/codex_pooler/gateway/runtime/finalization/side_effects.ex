@@ -3,19 +3,31 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
 
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.RouteLifecycle, as: RoutingRouteLifecycle
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
-  alias CodexPooler.Gateway.Runtime.Routing.RouteLifecycle
+  alias CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle
   alias CodexPooler.Jobs
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
 
-  @spec record_success(DispatchContext.t(), map(), binary(), RequestOptions.t() | map(), map()) ::
+  @spec record_success(
+          SelectedCandidateContext.t(),
+          map(),
+          binary(),
+          RequestOptions.t() | map(),
+          map()
+        ) ::
           :ok
-  def record_success(%DispatchContext{} = context, payload, body, request_options, callbacks) do
+  def record_success(
+        %SelectedCandidateContext{} = context,
+        payload,
+        body,
+        request_options,
+        callbacks
+      ) do
     RoutingRouteLifecycle.log_optional_result(
       "route_lifecycle_success",
       route_lifecycle_metadata(context),
-      RouteLifecycle.success(context)
+      DispatchLifecycle.success(context)
     )
 
     callbacks.register_continuity.(
@@ -53,7 +65,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.SideEffects do
     end
   end
 
-  defp route_lifecycle_metadata(%DispatchContext{} = context) do
+  defp route_lifecycle_metadata(%SelectedCandidateContext{} = context) do
     [
       pool_upstream_assignment_id: context.assignment.id,
       route_class: context.route_class

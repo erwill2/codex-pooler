@@ -5,8 +5,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.CandidateDispatch do
   alias CodexPooler.Gateway.Payloads.PayloadNormalizer
   alias CodexPooler.Gateway.RequestCompression
   alias CodexPooler.Gateway.Runtime.Dispatch
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context
   alias CodexPooler.Gateway.Runtime.Dispatch.PreparedContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization
   alias CodexPooler.Upstreams.EndpointMetadata
   alias CodexPooler.Upstreams.Secrets
@@ -22,7 +22,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.CandidateDispatch do
   end
 
   @spec dispatch_from(
-          Context.t(),
+          SelectedCandidateContext.t(),
           non_neg_integer(),
           dispatch_candidate()
         ) :: dispatch_candidate_result()
@@ -35,7 +35,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.CandidateDispatch do
     )
   end
 
-  defp decrypt_and_dispatch_candidate(%Context{} = context, dispatch_fun) do
+  defp decrypt_and_dispatch_candidate(%SelectedCandidateContext{} = context, dispatch_fun) do
     with {:ok, token} <-
            Secrets.decrypt_active_secret(context.identity, @secret_kind),
          {:ok, url} <-

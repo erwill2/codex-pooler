@@ -1,4 +1,4 @@
-defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycle do
+defmodule CodexPooler.Gateway.Runtime.Routing.DispatchLifecycle do
   @moduledoc false
 
   alias CodexPooler.Accounting
@@ -7,13 +7,13 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycle do
   alias CodexPooler.Gateway.Routing.BridgeRing
   alias CodexPooler.Gateway.Routing.RouteLifecycle, as: RoutingRouteLifecycle
   alias CodexPooler.Gateway.Routing.RoutingSelection
-  alias CodexPooler.Gateway.Runtime.Dispatch.Context, as: DispatchContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
 
   @type gateway_error :: Contracts.gateway_error()
   @type success_result :: :ok | {:error, gateway_error()}
 
-  @spec success(DispatchContext.t()) :: success_result()
-  def success(%DispatchContext{} = context) do
+  @spec success(SelectedCandidateContext.t()) :: success_result()
+  def success(%SelectedCandidateContext{} = context) do
     RoutingRouteLifecycle.selection_success(
       context.auth,
       context.model,
@@ -21,8 +21,8 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycle do
     )
   end
 
-  @spec failure(DispatchContext.t(), term()) :: {:ok, term()} | {:error, map()}
-  def failure(%DispatchContext{} = context, code) do
+  @spec failure(SelectedCandidateContext.t(), term()) :: {:ok, term()} | {:error, map()}
+  def failure(%SelectedCandidateContext{} = context, code) do
     case RoutingRouteLifecycle.selection_failure(
            context.auth,
            context.model,
@@ -38,8 +38,8 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycle do
     end
   end
 
-  @spec neutral_completion(DispatchContext.t()) :: success_result()
-  def neutral_completion(%DispatchContext{} = context) do
+  @spec neutral_completion(SelectedCandidateContext.t()) :: success_result()
+  def neutral_completion(%SelectedCandidateContext{} = context) do
     RoutingRouteLifecycle.selection_neutral_completion(
       context.auth,
       context.model,
@@ -47,7 +47,7 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycle do
     )
   end
 
-  defp merge_failure_metadata(%DispatchContext{} = context, demotion_reason) do
+  defp merge_failure_metadata(%SelectedCandidateContext{} = context, demotion_reason) do
     case Accounting.merge_request_metadata(
            context.reserved.request,
            BridgeRing.demotion_metadata(demotion_reason)
@@ -65,7 +65,7 @@ defmodule CodexPooler.Gateway.Runtime.Routing.RouteLifecycle do
     end
   end
 
-  defp routing_selection(%DispatchContext{} = context) do
+  defp routing_selection(%SelectedCandidateContext{} = context) do
     %RoutingSelection{
       assignment: context.assignment,
       identity: context.identity,

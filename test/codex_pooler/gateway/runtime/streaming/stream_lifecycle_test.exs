@@ -14,7 +14,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeDemotion, RoutingCircuitState}
   alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
-  alias CodexPooler.Gateway.Runtime.Dispatch.{Context, ResponseContext}
+  alias CodexPooler.Gateway.Runtime.Dispatch.{ResponseContext, SelectedCandidateContext}
   alias CodexPooler.Gateway.Runtime.Finalization.Streaming
   alias CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector
   alias CodexPooler.Gateway.Runtime.Streaming.StreamLifecycle
@@ -467,13 +467,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
         {setup.fallback_assignment, setup.fallback_identity}
       ])
 
-    %Context{
+    %SelectedCandidateContext{
       auth: auth,
       endpoint: @endpoint_path,
       payload: payload(setup),
       model: setup.model,
       reserved: %{request: request},
-      candidates: candidates,
       request_options: request_options,
       route_plan:
         BridgeRing.plan_route(%{

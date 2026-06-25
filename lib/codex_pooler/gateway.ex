@@ -9,7 +9,7 @@ defmodule CodexPooler.Gateway do
 
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Service
+  alias CodexPooler.Gateway.Runtime.Service
 
   @type auth :: CodexPooler.Access.auth_context()
   @type payload :: map()
