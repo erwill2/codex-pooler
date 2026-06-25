@@ -9,6 +9,10 @@ defmodule CodexPooler.Mailer.ConfigTest do
       assert MailerConfig.from_settings(%{enabled: false}) == {:ok, nil}
     end
 
+    test "probe options preserve the disabled SMTP return shape" do
+      assert MailerConfig.probe_options(%{enabled: false}) == {:ok, nil}
+    end
+
     test "builds SMTP config from typed instance settings" do
       smtp_settings = %{
         enabled: true,

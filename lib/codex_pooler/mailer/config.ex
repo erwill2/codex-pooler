@@ -51,14 +51,21 @@ defmodule CodexPooler.Mailer.Config do
 
   @spec probe_options(Settings.t() | map()) :: {:ok, keyword() | nil} | {:error, map()}
   def probe_options(settings_or_smtp) do
-    with {:ok, %{adapter_config: adapter_config}} <- from_settings(settings_or_smtp) do
-      probe_options =
-        adapter_config
-        |> Keyword.put(:timeout, @probe_timeout_ms)
-        |> Keyword.put(:retries, 0)
-        |> maybe_require_auth()
+    case from_settings(settings_or_smtp) do
+      {:ok, nil} ->
+        {:ok, nil}
 
-      {:ok, probe_options}
+      {:ok, %{adapter_config: adapter_config}} ->
+        probe_options =
+          adapter_config
+          |> Keyword.put(:timeout, @probe_timeout_ms)
+          |> Keyword.put(:retries, 0)
+          |> maybe_require_auth()
+
+        {:ok, probe_options}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
