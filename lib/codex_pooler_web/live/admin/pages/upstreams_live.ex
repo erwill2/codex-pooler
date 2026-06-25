@@ -68,10 +68,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   def handle_params(params, _uri, socket) do
     {:noreply,
      socket
-     |> close_auth_json_dialog()
-     |> close_rename_account_dialog()
-     |> close_oauth_link_dialog()
-     |> close_saved_reset_policy_dialog()
+     |> close_account_workflow_dialogs()
      |> load_upstreams(params)}
   end
 
@@ -155,8 +152,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   def handle_event("open_import_auth_json", params, socket) do
     {:noreply,
      socket
-     |> cancel_auth_json_upload_entries()
-     |> close_saved_reset_policy_dialog()
+     |> close_account_workflow_dialogs()
      |> assign(
        importing_auth_json: true,
        auth_json_form: auth_json_form_for_open(socket.assigns.pools, params)
@@ -172,10 +168,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
 
     {:noreply,
      socket
-     |> close_auth_json_dialog()
-     |> close_rename_account_dialog()
-     |> close_oauth_link_dialog()
-     |> close_saved_reset_policy_dialog()
+     |> close_account_workflow_dialogs()
      |> assign(
        oauth_linking: true,
        oauth_link_mode: :link,
@@ -195,10 +188,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
           {:ok, pool_id} ->
             {:noreply,
              socket
-             |> close_auth_json_dialog()
-             |> close_rename_account_dialog()
-             |> close_oauth_link_dialog()
-             |> close_saved_reset_policy_dialog()
+             |> close_account_workflow_dialogs()
              |> assign(
                oauth_linking: true,
                oauth_link_mode: :relink,
@@ -229,63 +219,21 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   def handle_event("start_oauth_browser", params, socket) do
-    case selected_oauth_pool(socket, params) do
-      nil ->
-        {:noreply, assign_oauth_error(socket, OAuthCallback.safe_error(:unauthorized_pool))}
-
-      pool ->
-        case Upstreams.start_browser_oauth(
-               socket.assigns.current_scope,
-               pool,
-               oauth_start_opts(socket)
-             ) do
-          {:ok, %{flow: %OAuthFlow{} = flow, authorization_url: authorization_url}} ->
-            {:noreply,
-             socket
-             |> cancel_oauth_poll_timer()
-             |> assign(
-               oauth_link_flow: flow,
-               oauth_link_authorization_url: authorization_url,
-               oauth_link_result: %{message: "Browser authorization pending"},
-               oauth_link_error: nil,
-               oauth_link_pool_id: pool.id,
-               oauth_link_form: oauth_link_form(pool.id)
-             )}
-
-          {:error, reason} ->
-            {:noreply, assign_oauth_error(socket, reason)}
-        end
-    end
+    begin_oauth_link(
+      socket,
+      params,
+      &Upstreams.start_browser_oauth/3,
+      &assign_browser_oauth_started/3
+    )
   end
 
   def handle_event("start_oauth_device", params, socket) do
-    case selected_oauth_pool(socket, params) do
-      nil ->
-        {:noreply, assign_oauth_error(socket, OAuthCallback.safe_error(:unauthorized_pool))}
-
-      pool ->
-        case Upstreams.start_device_oauth(
-               socket.assigns.current_scope,
-               pool,
-               oauth_start_opts(socket)
-             ) do
-          {:ok, %{flow: %OAuthFlow{} = flow}} ->
-            {:noreply,
-             socket
-             |> assign(
-               oauth_link_flow: flow,
-               oauth_link_authorization_url: nil,
-               oauth_link_result: %{message: "Device authorization pending"},
-               oauth_link_error: nil,
-               oauth_link_pool_id: pool.id,
-               oauth_link_form: oauth_link_form(pool.id)
-             )
-             |> schedule_oauth_device_poll(flow)}
-
-          {:error, reason} ->
-            {:noreply, assign_oauth_error(socket, reason)}
-        end
-    end
+    begin_oauth_link(
+      socket,
+      params,
+      &Upstreams.start_device_oauth/3,
+      &assign_device_oauth_started/3
+    )
   end
 
   def handle_event("submit_oauth_callback", %{"oauth_link" => oauth_params}, socket) do
@@ -380,9 +328,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
       account ->
         {:noreply,
          socket
-         |> close_auth_json_dialog()
-         |> close_rename_account_dialog()
-         |> close_oauth_link_dialog()
+         |> close_account_workflow_dialogs()
          |> assign(
            editing_saved_reset_policy: account,
            saved_reset_policy_form: saved_reset_policy_form(account.saved_reset_policy),
@@ -619,20 +565,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   defp do_import_auth_json(socket, pool, auth_json_params, content) do
     case Upstreams.import_codex_auth_json(socket.assigns.current_scope, pool, content) do
       {:ok, %{status: :created}} ->
-        {:noreply,
-         socket
-         |> put_flash(:info, "Codex auth.json imported")
-         |> assign(:auth_json_form, UpstreamAuthJsonImport.empty_form())
-         |> assign(:importing_auth_json, false)
-         |> reload_upstreams()}
+        {:noreply, assign_auth_json_import_success(socket, "Codex auth.json imported")}
 
       {:ok, %{status: :existing}} ->
         {:noreply,
-         socket
-         |> put_flash(:info, "Codex auth.json matched an existing account; tokens updated")
-         |> assign(:auth_json_form, UpstreamAuthJsonImport.empty_form())
-         |> assign(:importing_auth_json, false)
-         |> reload_upstreams()}
+         assign_auth_json_import_success(
+           socket,
+           "Codex auth.json matched an existing account; tokens updated"
+         )}
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:noreply,
@@ -651,6 +591,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
            UpstreamAuthJsonImport.form_for_pool(auth_json_params["pool_id"])
          )}
     end
+  end
+
+  defp assign_auth_json_import_success(socket, message) do
+    socket
+    |> put_flash(:info, message)
+    |> assign(:auth_json_form, UpstreamAuthJsonImport.empty_form())
+    |> assign(:importing_auth_json, false)
+    |> reload_upstreams()
   end
 
   @impl true
@@ -748,6 +696,38 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
 
   defp reload_upstreams(socket), do: load_upstreams(socket, socket.assigns.filter_values)
 
+  defp begin_oauth_link(socket, params, start_oauth, assign_started) do
+    case selected_oauth_pool(socket, params) do
+      nil ->
+        {:noreply, assign_oauth_error(socket, OAuthCallback.safe_error(:unauthorized_pool))}
+
+      pool ->
+        case start_oauth.(socket.assigns.current_scope, pool, oauth_start_opts(socket)) do
+          {:ok, result} ->
+            {:noreply, assign_started.(socket, pool, result)}
+
+          {:error, reason} ->
+            {:noreply, assign_oauth_error(socket, reason)}
+        end
+    end
+  end
+
+  defp assign_browser_oauth_started(
+         socket,
+         pool,
+         %{flow: %OAuthFlow{} = flow, authorization_url: authorization_url}
+       ) do
+    socket
+    |> cancel_oauth_poll_timer()
+    |> assign_oauth_pending(pool.id, flow, "Browser authorization pending", authorization_url)
+  end
+
+  defp assign_device_oauth_started(socket, pool, %{flow: %OAuthFlow{} = flow}) do
+    socket
+    |> assign_oauth_pending(pool.id, flow, "Device authorization pending", nil)
+    |> schedule_oauth_device_poll(flow)
+  end
+
   defp poll_oauth_device(socket, flow_id) do
     case Upstreams.poll_device_oauth(socket.assigns.current_scope, flow_id) do
       {:ok, %{status: :completed, flow: %OAuthFlow{} = flow}} ->
@@ -756,12 +736,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
       {:ok, %{status: :pending, flow: %OAuthFlow{} = flow}} ->
         {:noreply,
          socket
-         |> assign(
-           oauth_link_flow: flow,
-           oauth_link_authorization_url: nil,
-           oauth_link_result: %{message: "Device authorization pending"},
-           oauth_link_error: nil,
-           oauth_link_form: oauth_link_form(socket.assigns.oauth_link_pool_id)
+         |> assign_oauth_pending(
+           socket.assigns.oauth_link_pool_id,
+           flow,
+           "Device authorization pending",
+           nil
          )
          |> schedule_oauth_device_poll(flow)}
 
@@ -780,14 +759,29 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   defp complete_oauth_link(socket, %OAuthFlow{} = flow) do
     socket
     |> cancel_oauth_poll_timer()
-    |> assign(
+    |> assign_oauth_completed(flow)
+    |> reload_upstreams()
+  end
+
+  defp assign_oauth_pending(socket, pool_id, %OAuthFlow{} = flow, message, authorization_url) do
+    assign(socket,
+      oauth_link_flow: flow,
+      oauth_link_authorization_url: authorization_url,
+      oauth_link_result: %{message: message},
+      oauth_link_error: nil,
+      oauth_link_pool_id: pool_id,
+      oauth_link_form: oauth_link_form(pool_id)
+    )
+  end
+
+  defp assign_oauth_completed(socket, %OAuthFlow{} = flow) do
+    assign(socket,
       oauth_link_flow: flow,
       oauth_link_authorization_url: nil,
       oauth_link_result: %{message: oauth_complete_message(socket)},
       oauth_link_error: nil,
       oauth_link_form: oauth_link_form(socket.assigns.oauth_link_pool_id)
     )
-    |> reload_upstreams()
   end
 
   @spec oauth_complete_message(Phoenix.LiveView.Socket.t()) :: String.t()
@@ -974,6 +968,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
       [] -> [{"No active Pools available", ""}]
       options -> options
     end
+  end
+
+  defp close_account_workflow_dialogs(socket) do
+    socket
+    |> close_auth_json_dialog()
+    |> close_rename_account_dialog()
+    |> close_oauth_link_dialog()
+    |> close_saved_reset_policy_dialog()
   end
 
   defp close_auth_json_dialog(socket) do
