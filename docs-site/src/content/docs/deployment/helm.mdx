@@ -75,6 +75,7 @@ That secret must provide the release values needed before Codex Pooler can read 
 - `totp-key-version`
 - `upstream-secret-key`
 - `upstream-secret-key-version`
+- `release-cookie`, when app clustering is enabled and you use the default clustering cookie key
 
 Don't put upstream access tokens, Pool API keys, MCP tokens, cookies, `auth.json`, SMTP passwords, or raw client payloads into chart values.
 
@@ -84,12 +85,12 @@ Set the public host through chart values:
 
 ```yaml
 config:
-  host: pooler.example.com
+  host: codex-pooler.example.com
 
 ingress:
   enabled: true
   hosts:
-    - host: pooler.example.com
+    - host: codex-pooler.example.com
       paths:
         - path: /
           pathType: Prefix
@@ -201,14 +202,12 @@ The chart defaults the web app to one replica. If `app.replicaCount` is `2` or
 higher, the chart treats websocket owner forwarding as required.
 
 The current chart guard rejects multi-replica app rendering unless app clustering
-is enabled and app pods participate in that cluster:
+is enabled and app pods participate in that cluster. App participation defaults
+to enabled, so the minimal multi-replica values shape is:
 
 ```yaml
 clustering:
   enabled: true
-  query: <headless-service-dns-name>
-  participants:
-    app: true
 
 app:
   replicaCount: 2
@@ -217,6 +216,113 @@ app:
 With that shape, the chart renders `CODEX_POOLER_WEBSOCKET_OWNER_FORWARDING=true`
 on app pods automatically. Render the chart and verify the topology before
 raising `app.replicaCount`.
+
+## Flux multi-replica example
+
+This example shows a Flux `HelmRepository` and `HelmRelease` for two app
+replicas. It uses public placeholders only. It assumes:
+
+- a Kubernetes Secret named `codex-pooler-secrets` exists in that namespace
+- the Secret contains the required release keys plus `release-cookie`
+- Postgres is reachable through the Secret's `database-url`
+- `https://codex-pooler.example.com` is the public app URL
+
+The example leaves chart defaults out of `values`. In particular, it does not set
+`image.pullPolicy`, `secrets.create`, `secrets.existingSecret`, app probes,
+rollout strategy, termination grace, worker or scheduler replica counts, or
+explicit websocket owner-forwarding values.
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: codex-pooler
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: icoretech
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: https://icoretech.github.io/helm
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: codex-pooler
+  namespace: codex-pooler
+spec:
+  releaseName: codex-pooler
+  chart:
+    spec:
+      chart: codex-pooler
+      version: ">= 0.4.2"
+      sourceRef:
+        kind: HelmRepository
+        name: icoretech
+        namespace: flux-system
+  interval: 5m
+  timeout: 3m
+  install:
+    remediation:
+      retries: -1
+  upgrade:
+    remediation:
+      retries: -1
+      strategy: uninstall
+      remediateLastFailure: true
+  values:
+    image:
+      repository: ghcr.io/icoretech/codex-pooler
+      tag: 0.4.2
+    config:
+      host: codex-pooler.example.com
+    ingress:
+      enabled: true
+      className: nginx
+      annotations:
+        cert-manager.io/cluster-issuer: letsencrypt
+      hosts:
+        - host: codex-pooler.example.com
+          paths:
+            - path: /
+              pathType: Prefix
+      tls:
+        - secretName: codex-pooler-tls
+          hosts:
+            - codex-pooler.example.com
+    monitoring:
+      serviceMonitor:
+        enabled: true
+        labels:
+          release: kube-prometheus-stack
+        interval: 10s
+        scrapeTimeout: 5s
+    clustering:
+      enabled: true
+      participants:
+        worker: false
+        scheduler: false
+    app:
+      replicaCount: 2
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: codex-pooler
+                    app.kubernetes.io/instance: codex-pooler
+                    app.kubernetes.io/component: app
+                topologyKey: kubernetes.io/hostname
+```
+
+When `app.replicaCount` is `2` or higher, the chart enables websocket owner
+forwarding automatically. Keep `clustering.participants.worker` and
+`clustering.participants.scheduler` disabled unless those roles also need BEAM
+cluster membership in your environment.
 
 ## Render safely before install
 
@@ -229,9 +335,9 @@ helm template codex-pooler icoretech/codex-pooler \
   --version 0.4.2 \
   --set image.repository=ghcr.io/icoretech/codex-pooler \
   --set image.tag=0.4.2 \
-  --set config.host=pooler.example.com \
+  --set config.host=codex-pooler.example.com \
   --set ingress.enabled=true \
-  --set ingress.hosts[0].host=pooler.example.com
+  --set ingress.hosts[0].host=codex-pooler.example.com
 ```
 
 {/* x-release-please-end */}
