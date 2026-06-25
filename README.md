@@ -1,9 +1,24 @@
 <h1 align="center">Codex Pooler</h1>
 
 <p align="center">
-  <strong>One gateway for many Codex accounts.</strong><br>
-  Pool capacity, preserve sessions, route requests, and expose stable API keys
-  for agents and tools.
+  <strong>The full featured self-hosted Codex gateway, for teams, agents and you. Works with:</strong><br>
+  <br>
+  <a href="https://docs.codex-pooler.com/clients/opencode/" title="OpenCode"><img src=".github/assets/opencode-favicon.png" alt="OpenCode" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/codex-cli/" title="Codex CLI and Codex Desktop"><img src=".github/assets/codex-cli-favicon.png" alt="Codex CLI and Codex Desktop" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/openclaw/" title="OpenClaw"><img src=".github/assets/openclaw-favicon.png" alt="OpenClaw" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/hermes/" title="Hermes Agent"><img src=".github/assets/hermes-favicon.png" alt="Hermes Agent" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/pi/" title="Pi"><img src=".github/assets/pi-favicon.png" alt="Pi" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/omp/" title="OMP"><img src=".github/assets/omp-favicon.png" alt="OMP" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/kilo/" title="Kilo"><img src=".github/assets/kilo-favicon.png" alt="Kilo" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/aider/" title="Aider"><img src=".github/assets/aider-favicon.png" alt="Aider" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/continue/" title="Continue"><img src=".github/assets/continue-favicon.png" alt="Continue" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/cline/" title="Cline"><img src=".github/assets/cline-favicon.png" alt="Cline" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/goose/" title="Goose"><img src=".github/assets/goose-favicon.png" alt="Goose" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/windmill/" title="Windmill AI"><img src=".github/assets/windmill-favicon.png" alt="Windmill AI" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/openhands/" title="OpenHands"><img src=".github/assets/openhands-favicon.png" alt="OpenHands" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/openai-compatible/" title="OpenAI-compatible SDKs"><img src=".github/assets/python-favicon.png" alt="OpenAI-compatible SDKs" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/openai-compatible/" title="OpenAI-compatible SDKs"><img src=".github/assets/nodejs-favicon.png" alt="OpenAI-compatible SDKs" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/openai-compatible/" title="Vercel AI SDK"><img src=".github/assets/vercel-favicon.png" alt="Vercel AI SDK" width="24" height="24"></a>
 </p>
 
 <p align="center">
@@ -43,51 +58,60 @@
   </tr>
 </table>
 
-Codex Pooler is a self-hosted gateway for sharing Codex account capacity across
-agents, tools, and teams.
+Codex Pooler is a self-hosted gateway for running Codex-compatible agents,
+tools, and automation through stable Pool API keys. It works with one upstream
+Codex account for credential isolation, client normalization, metadata-only
+operations, and saved reset visibility; add more accounts when you want shared
+capacity and routing across eligible accounts.
 
-Instead of binding each client to one Codex account, you add accounts to Pools
-and issue stable Pool API keys. Clients send familiar Codex backend or
-OpenAI-compatible requests; Codex Pooler selects the right account based on
-model support, limits, session continuity, routing policy, and health.
+Clients send familiar Codex backend or OpenAI-compatible requests; Codex Pooler
+selects an eligible account based on model support, quota evidence, limits,
+session continuity, routing policy, and health. The Pool key stays stable while
+upstream assignments, lifecycle state, reset policy, and capacity change behind
+it.
 
-Operators get one place to manage accounts, keys, routing, request accounting,
-audit logs, and health without storing prompts, files, audio, images, bearer
-tokens, or raw Codex secrets. Instance owners keep the global administration
-surface, while instance admins work only with their assigned Pools.
+Operators get one place to manage Pools, accounts, API keys, saved resets,
+routing, request accounting, audit logs, and health without storing prompts,
+files, audio, images, bearer tokens, or raw Codex secrets. Instance owners keep
+the global administration surface, while instance admins work only with their
+assigned Pools.
 
 ## Highlights
 
-- **One key for many accounts:** group Codex accounts into Pools and give
-  clients stable Pool API keys instead of binding each tool to one account
-- **Smarter capacity sharing:** route each request to an eligible account with
-  available limits, matching model support, health, session state, and Pool
+- 🔑 **Stable Pool API keys:** give clients one Pool credential whether the Pool
+  currently has one upstream account or several, without distributing raw Codex
+  account material
+- 🎯 **Eligibility-aware routing:** route each request to an account with compatible
+  model support, usable quota evidence, matching health, session state, and Pool
   policy
-- **Codex backend compatibility:** point Codex-compatible clients at Codex
+- 🧩 **Codex backend compatibility:** point Codex-compatible clients at Codex
   Pooler and keep responses, compacting, usage, files, audio, images, and
-  backend websocket flows working through pooled accounts
-- **OpenAI-compatible SDK surface:** let `/v1`-only apps and agent tools use
-  multiple Codex subscriptions behind one gateway, with supported requests
-  translated and routed through Codex capacity to help contain API spend
-- **Session-aware websockets:** keep resumable Codex sessions and websocket
+  backend websocket flows working through assigned accounts
+- 🔌 **OpenAI-compatible SDK surface:** let `/v1`-only apps and agent tools use
+  Codex capacity through the same Pool boundary, with supported requests
+  translated and routed to help contain API spend
+- 🔁 **Session-aware websockets:** keep resumable Codex sessions and websocket
   reconnects attached to the right upstream account without translating backend
   websocket traffic through an HTTP compatibility layer
-- **Prompt-cache locality:** use a transient `prompt_cache_key` to prefer the
+- ⚡ **Prompt-cache locality:** use a transient `prompt_cache_key` to prefer the
   same eligible upstream account for repeat stateless requests, improving
   provider-side cache locality without storing prompts or responses locally
-- **Per-Pool request compression:** optionally compress upstream-bound
+- 🗜️ **Per-Pool request compression:** optionally compress upstream-bound
   Responses tool outputs before dispatch on supported request routes. The
   option is disabled by default, request-side only, and records safe aggregate
   savings without storing raw outputs.
-- **Operator dashboard:** manage Pool-scoped accounts, API keys, invites,
-  usage, request logs, audit logs, MCP access, and the owner-only jobs,
+- 🏦 **Saved reset management:** surface reported saved or banked reset credits on
+  upstream accounts, show known expirations when available, and let operators
+  redeem manually or opt into guarded auto-redemption policy
+- 🖥️ **Operator dashboard:** manage Pool-scoped accounts, API keys, invites, saved
+  resets, usage, request logs, audit logs, MCP access, and the owner-only jobs,
   operators, and system settings surfaces
-- **Privacy-minded observability:** store request, routing, and audit metadata
+- 🛡️ **Privacy-minded observability:** store request, routing, and audit metadata
   without storing prompts, file bodies, audio, images, bearer tokens, cookies,
   raw Codex account tokens, or raw API keys
-- **Configurable without code changes:** tune Pool policy, gateway defaults,
+- ⚙️ **Configurable without code changes:** tune Pool policy, gateway defaults,
   diagnostics, model support, limits, and operational settings from the admin UI
-- **Built for self-hosting:** run on Elixir/Erlang's fault-tolerant runtime,
+- 🐳 **Built for self-hosting:** run on Elixir/Erlang's fault-tolerant runtime,
   start locally with Docker Compose, or deploy the Helm chart with separate web,
   worker, scheduler, and migration roles for Kubernetes-friendly, multinode
   growth
@@ -1340,9 +1364,12 @@ docker compose down -v
 After bootstrap:
 
 1. Create a Pool in `/admin/pools`
-2. Link, import, or invite Codex accounts in `/admin/upstreams`
+2. Link, import, or invite one or more Codex accounts in `/admin/upstreams`
 3. Create a Pool API key in `/admin/api-keys`
 4. Point Codex or SDK clients at one of the runtime base URLs:
+
+One upstream account is enough for a working setup. Additional upstreams expand
+the same Pool into shared capacity without changing client credentials.
 
 Prefer `OAuth` in `/admin/upstreams` for new operator-managed upstream
 accounts when browser authorization is practical. The admin dialog links the
@@ -1390,77 +1417,21 @@ audit rows for archived or deleted Pools remain owner-only.
 
 ## Runtime Compatibility
 
-Codex Pooler supports two client-facing shapes:
+Use the client guides when wiring a specific tool. At a glance, clients pick one
+of two public shapes:
 
-- **Codex backend clients:** `/backend-api/codex/*`, `/backend-api/files`,
-  `/backend-api/transcribe`, usage routes, and backend websocket response
-  streams
-- **OpenAI-style SDK clients:** `/v1/models`, `/v1/responses`,
-  `/v1/chat/completions`, `/v1/files`, `/v1/audio/transcriptions`, selected
-  image endpoints, and narrow Responses websocket compatibility on
-  `GET /v1/responses`
+- **Codex backend clients** use `/backend-api/codex` for Codex-native behavior
+  such as sessions, compacting, files, audio, images, and backend websockets.
+- **OpenAI-compatible clients** use `/v1` for supported SDK-style Responses,
+  chat, files, audio, image, and model-list calls.
 
-The `/v1` surface is compatibility, not a second engine. Supported requests are
-translated into Codex-compatible calls, then routed through the same Pool rules,
-limit checks, accounting, and account selection path. `/v1/realtime` and OpenAI
-Realtime SDK websocket or session routes are not supported.
-
-OpenAI Responses remote MCP tool definitions such as top-level tools[type=mcp] and nested additional_tools tools[type=mcp] are rejected before upstream dispatch; use client-side MCP configuration or Codex Pooler's separate /mcp operator endpoint for metadata tooling.
-
-Public `/v1` responses preserve client-facing OpenAI shapes where possible:
-
-- `/v1/chat/completions` returns content-filter stops as
-  `finish_reason: "content_filter"`; max-output fallbacks still use the
-  `finish_reason: "length"` shape.
-- Server-class upstream, gateway, or provider failures redact provider and
-  internal text. Clients receive safe generic server errors such as
-  `upstream request failed`, while explicit local validation failures remain
-  `invalid_request_error` responses with safe details.
-- `/v1/files` direct uploads accept only public HTTPS upstream `upload_url`
-  values. Loopback, private, reserved, NAT64, userinfo, non-HTTPS, and raw
-  control or whitespace URLs are rejected before the direct PUT.
-
-Continuity headers are local routing inputs. Codex Pooler chooses them in this
-order: `x-codex-window-id` > `x-codex-session-id` > `session-id` >
-`x-session-id` > `x-session-affinity` > `session_id` >
-`x-codex-conversation-id`. `session-id`, `x-session-id`, and
-`x-session-affinity` are not forwarded upstream. The raw `x-codex-window-id`
-value is hashed before it becomes a local persisted session key. Local timing
-regressions showed `/v1/responses` HTTP streaming and Responses websocket paths
-stay inside the observed client budgets with the existing stream timeout
-settings, so no new route-specific timeout defaults are required.
-
-Backend regular HTTP Responses and compact routes forward request-scoped
-`x-codex-turn-state` plus the approved lineage metadata headers upstream:
-`x-codex-turn-metadata`, `x-codex-window-id`,
-`x-codex-parent-thread-id`, `x-codex-installation-id`, and
-`x-openai-subagent`. They also relay upstream `x-codex-turn-state` response
-headers downstream. Public `/v1/responses` and websocket request headers do not
-use that backend-only forwarding lane; backend websocket request-scoped turn
-state travels in `response.create.client_metadata["x-codex-turn-state"]`, and
-raw metadata values are not persisted.
-
-Request compression is a per-Pool admin option stored as
-`request_compression_enabled`. It is disabled by default. When enabled, Codex
-Pooler can rewrite request-side Responses tool-output payloads before upstream
-dispatch for these routes only: `POST /backend-api/codex/responses`,
-`POST /backend-api/codex/v1/responses`,
-`POST /backend-api/codex/v1/chat/completions`, `POST /v1/responses`,
-`POST /v1/chat/completions`, `POST /backend-api/codex/responses/compact`,
-`POST /backend-api/codex/v1/responses/compact`, and backend or narrow public
-Responses websocket `response.create` work. Multipart, file, audio, image,
-admin, MCP, usage, and other non-Responses requests are not eligible; public
-`/v1/responses/compact` remains unsupported because it has no upstream compact
-dispatch.
-
-Compression preserves protected exact-output tool results before rewriting:
-default exact-output function tools `Read`, `Glob`, `Grep`, `Write`, and `Edit`,
-plus external retrieval outputs, stay byte-for-byte upstream-bound. Output-only
-function tool results also fail closed as protected when the tool name is not
-available. Only aggregate skip counts are recorded in safe `payload_compression`
-metadata.
-Request compression is request-side only. Codex Pooler does not store raw tool
-outputs or raw response bodies.
+Both paths authenticate with Pool API keys and route through the same Pool
+policy, account health, model support, quota evidence, session continuity, and
+metadata-only accounting. Codex Pooler is intentionally not a wildcard OpenAI
+proxy; unsupported API areas fail predictably. For exact route details, use the
+[Runtime Routes](https://docs.codex-pooler.com/reference/runtime-routes/)
+reference and the
+[OpenAI-compatible client guide](https://docs.codex-pooler.com/clients/openai-compatible/).
 
 ## Operator MCP Service
 
