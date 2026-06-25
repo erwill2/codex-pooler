@@ -66,7 +66,7 @@ No. Codex Pooler stores metadata for routing, accounting, audit, request logs, f
 
 ## How do I start Codex Pooler locally?
 
-Clone the repository, run `scripts/self-host/generate-env.sh`, start the stack with `docker compose up -d`, open `http://localhost:4000`, create the first owner, create a Pool, assign an upstream account, create a Pool API key, and point the first client at `/backend-api/codex` or `/v1`.
+Clone the repository, run `scripts/self-host/generate-env.sh`, run `docker compose pull`, start the stack with `docker compose up -d`, open `http://localhost:4000`, create the first owner, create a Pool, assign an upstream account, create a Pool API key, and point the first client at `/backend-api/codex` or `/v1`.
 
 ## What deployment options are documented?
 
