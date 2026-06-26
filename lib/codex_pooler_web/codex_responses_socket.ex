@@ -68,6 +68,14 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       {:ok, {:data, data}} ->
         {:push, {:text, downstream_response_chunk(data)}, state}
 
+      {:ok, {:error, :owner_drained, payload}} ->
+        state =
+          state
+          |> Map.put(:websocket_owner_drain_observed?, true)
+          |> cancel_tracked_response_tasks(:owner_drained)
+
+        {:push, {:text, Jason.encode!(websocket_error(payload))}, state}
+
       {:ok, {:error, _reason, payload}} ->
         {:push, {:text, Jason.encode!(websocket_error(payload))}, state}
 
@@ -83,6 +91,18 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
   end
 
   def handle_info({:codex_response_done, pid, :ok}, state) do
+    state =
+      state
+      |> remove_tracked_response_task(pid)
+      |> maybe_start_queued_response_task()
+
+    {:ok, state}
+  end
+
+  def handle_info(
+        {:codex_response_done, pid, {:error, _reason}},
+        %{websocket_owner_drain_observed?: true} = state
+      ) do
     state =
       state
       |> remove_tracked_response_task(pid)
@@ -130,7 +150,7 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
       |> Map.get(:tasks, MapSet.new())
       |> await_response_tasks(@pre_cleanup_response_task_drain_ms)
 
-    cleanup_websocket_session(state)
+    cleanup_websocket_session(reason, state)
 
     close_upstream_websocket_session(state)
 
@@ -374,6 +394,17 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     end
   end
 
+  defp cancel_tracked_response_tasks(state, reason) do
+    state
+    |> Map.get(:tasks, MapSet.new())
+    |> Enum.each(fn
+      pid when is_pid(pid) -> Process.exit(pid, {:shutdown, reason})
+      _value -> :ok
+    end)
+
+    state
+  end
+
   defp pop_task_monitor(state, pid) do
     {monitor, task_monitors} =
       state
@@ -398,10 +429,22 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
         response_task_failure()
     catch
       kind, reason ->
-        log_response_task_failure(kind, reason, __STACKTRACE__, payload, state, opts)
-        response_task_failure()
+        if owner_drained_response_task_exit?(kind, reason, state) do
+          DownstreamSession.retarget_error_payload(:owner_drained)
+        else
+          log_response_task_failure(kind, reason, __STACKTRACE__, payload, state, opts)
+          response_task_failure()
+        end
     end
   end
+
+  defp owner_drained_response_task_exit?(:exit, :normal, state),
+    do: owner_forwarded_socket?(state)
+
+  defp owner_drained_response_task_exit?(:exit, {:normal, _details}, state),
+    do: owner_forwarded_socket?(state)
+
+  defp owner_drained_response_task_exit?(_kind, _reason, _state), do: false
 
   defp response_task_opts(state) do
     if DownstreamSession.owner?(state) do
@@ -420,12 +463,12 @@ defmodule CodexPoolerWeb.CodexResponsesSocket do
     )
   end
 
-  defp cleanup_websocket_session(%{websocket_owner_downstream: downstream} = state)
+  defp cleanup_websocket_session(reason, %{websocket_owner_downstream: downstream} = state)
        when is_map(downstream) do
-    DownstreamSession.cleanup(state)
+    DownstreamSession.cleanup(state, reason)
   end
 
-  defp cleanup_websocket_session(state) do
+  defp cleanup_websocket_session(_reason, state) do
     state
     |> Map.get(:codex_session)
     |> Websocket.interrupt_codex_session(state.opts)
