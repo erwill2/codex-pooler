@@ -2,6 +2,11 @@ defmodule CodexPooler.Gateway.Service do
   @moduledoc """
   Backward-compatible facade for runtime gateway execution.
 
+  Internal callers should use `CodexPooler.Gateway`, the current public gateway
+  facade. This module remains only for older external/internal compatibility
+  references that may still call the historical `CodexPooler.Gateway.Service`
+  name; remove it after a release cycle that documents the replacement.
+
   New runtime orchestration code belongs in `CodexPooler.Gateway.Runtime.Service`.
   """
 

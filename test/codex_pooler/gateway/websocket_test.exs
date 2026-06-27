@@ -11,7 +11,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession}
-  alias CodexPooler.Gateway.Service
+  alias CodexPooler.Gateway, as: RuntimeGateway
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Pools
@@ -439,7 +439,7 @@ defmodule CodexPooler.Gateway.WebsocketTest do
          push_frame
        )
        when is_binary(raw_payload) and is_function(push_frame, 1) do
-    Service.execute_websocket_response(auth, raw_payload, request_options, push_frame)
+    RuntimeGateway.execute_websocket_response(auth, raw_payload, request_options, push_frame)
   end
 
   defp websocket_request_options(%CodexSession{} = session, request_id) do

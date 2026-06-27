@@ -27,7 +27,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     RoutingCircuitState
   }
 
-  alias CodexPooler.Gateway.Service
+  alias CodexPooler.Gateway, as: RuntimeGateway
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Pools
   alias CodexPooler.Repo
@@ -2731,7 +2731,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     capture_log(fn ->
       assert {:error, %{code: "upstream_request_failed"}} =
-               execute_gateway_service(
+               execute_gateway(
                  auth,
                  "/backend-api/codex/responses",
                  %{
@@ -2804,7 +2804,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -2890,7 +2890,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -2945,7 +2945,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{raw_body: body}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses/compact",
                %{
@@ -3006,10 +3006,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       )
 
     assert {:ok, %{raw_body: typed_body}} =
-             Service.execute(auth, "/backend-api/codex/responses/compact", payload, typed_opts)
+             RuntimeGateway.execute(
+               auth,
+               "/backend-api/codex/responses/compact",
+               payload,
+               typed_opts
+             )
 
     assert {:ok, %{raw_body: boundary_body}} =
-             Service.execute(
+             RuntimeGateway.execute(
                auth,
                "/backend-api/codex/responses/compact",
                payload,
@@ -5081,7 +5086,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5205,7 +5210,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5299,7 +5304,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5532,7 +5537,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5585,7 +5590,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5646,7 +5651,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5710,7 +5715,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5774,7 +5779,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5838,7 +5843,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5906,7 +5911,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -5972,7 +5977,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -6033,7 +6038,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -6187,7 +6192,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -6303,7 +6308,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             execute_gateway_service(
+             execute_gateway(
                auth,
                "/backend-api/codex/responses",
                %{
@@ -8474,9 +8479,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     )
   end
 
-  defp execute_gateway_service(auth, endpoint, payload, opts) do
+  defp execute_gateway(auth, endpoint, payload, opts) do
     request_options = RequestOptions.build(opts, endpoint, payload)
-    Service.execute(auth, endpoint, payload, request_options)
+    RuntimeGateway.execute(auth, endpoint, payload, request_options)
   end
 
   defp execute_stream_after_releasing_barrier(
@@ -8497,7 +8502,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         end
 
         assert {:ok, %{stream: stream}} =
-                 execute_gateway_service(
+                 execute_gateway(
                    auth,
                    "/backend-api/codex/responses",
                    payload,

@@ -18,7 +18,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
   alias CodexPooler.Gateway.Runtime.Finalization.Streaming
   alias CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector
   alias CodexPooler.Gateway.Runtime.Streaming.StreamLifecycle
-  alias CodexPooler.Gateway.Service
+  alias CodexPooler.Gateway
   alias CodexPooler.Repo
 
   @endpoint_path "/backend-api/codex/responses"
@@ -664,7 +664,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             Service.execute(
+             Gateway.execute(
                auth,
                @endpoint_path,
                payload(setup),

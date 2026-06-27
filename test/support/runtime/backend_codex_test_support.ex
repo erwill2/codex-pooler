@@ -28,7 +28,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
   }
 
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Service
+  alias CodexPooler.Gateway
   alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
@@ -68,7 +68,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     assert {:ok, %{stream: stream}} =
-             Service.execute(
+             Gateway.execute(
                auth,
                "/backend-api/codex/responses",
                %{

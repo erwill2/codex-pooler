@@ -14,7 +14,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.OperationalSettings
-  alias CodexPooler.Gateway.Service
+  alias CodexPooler.Gateway
   alias CodexPooler.Repo
 
   @raw_prompt_sentinel "TASK5_OPENAI_RAW_PROMPT_SENTINEL"
@@ -54,7 +54,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
                )
 
       assert {:ok, response} =
-               Service.execute(auth, result.endpoint, result.payload, result.request_options)
+               Gateway.execute(auth, result.endpoint, result.payload, result.request_options)
 
       assert response.status == 200
       assert %{"id" => "resp_task5_success"} = Jason.decode!(response.raw_body)
@@ -95,7 +95,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
              )
 
     assert {:ok, response} =
-             Service.execute(auth, result.endpoint, result.payload, result.request_options)
+             Gateway.execute(auth, result.endpoint, result.payload, result.request_options)
 
     assert response.status == 400
     assert FakeUpstream.count(upstream) == 1
