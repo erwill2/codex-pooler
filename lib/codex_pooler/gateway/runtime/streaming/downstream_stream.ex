@@ -115,6 +115,22 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStream do
 
   def synthetic_terminal_failure(state, _reason), do: {nil, state}
 
+  @spec terminal_missing_interruption_reason(state(), term()) :: term()
+  def terminal_missing_interruption_reason(_state, {:upstream_idle_timeout, _reason} = reason),
+    do: reason
+
+  def terminal_missing_interruption_reason(
+        %{
+          public_openai_responses_data_seen?: true,
+          public_openai_responses_terminal_seen?: false
+        },
+        original_reason
+      ) do
+    {:upstream_stream_interrupted, original_reason}
+  end
+
+  def terminal_missing_interruption_reason(_state, original_reason), do: original_reason
+
   defp normalize_public_openai_chat_stream_data(
          data,
          %{public_openai_chat: stream_state} = state

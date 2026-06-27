@@ -34,7 +34,13 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
 
-  alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn, SessionContinuity}
+  alias CodexPooler.Gateway.Persistence.{
+    BridgeDemotion,
+    CodexSession,
+    CodexTurn,
+    RoutingCircuitState,
+    SessionContinuity
+  }
 
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Repo
@@ -3256,6 +3262,68 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :streaming_sequence
+  test "POST /v1/responses streaming keeps non-timeout terminal-missing interruptions health-neutral after visible data",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.abrupt_close_mid_stream([
+          {"response.output_text.delta",
+           %{
+             "type" => "response.output_text.delta",
+             "delta" => "visible-before-abrupt-close",
+             "response" => %{"id" => "resp_visible_before_abrupt_close"}
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic abrupt stream interruption request",
+        "stream" => true
+      })
+
+    assert [content_type] = get_resp_header(conn, "content-type")
+    assert content_type =~ "text/event-stream"
+    assert conn.status == 200
+    assert conn.resp_body =~ "visible-before-abrupt-close"
+    assert conn.resp_body =~ "event: response.failed\n"
+    assert conn.resp_body =~ ~s("code":"upstream_stream_error")
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.endpoint == "/backend-api/codex/responses"
+    assert request.transport == "http_sse"
+    assert request.status == "failed"
+    assert request.last_error_code == "upstream_stream_error"
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.network_error_code == "upstream_stream_error"
+
+    assert %{
+             "reason_class" => "upstream_stream_interrupted",
+             "reason" => "closed_before_terminal",
+             "phase" => "upstream_close",
+             "terminal_seen" => false,
+             "pre_visible_output" => false,
+             "text_frame_count" => text_frame_count,
+             "exception" => "Finch.TransportError"
+           } = attempt.response_metadata["transport_failure"]
+
+    assert text_frame_count >= 1
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+
+    persistence_text = inspect({request.request_metadata, attempt.response_metadata})
+    refute persistence_text =~ "synthetic abrupt stream interruption request"
+    refute persistence_text =~ "visible-before-abrupt-close"
+  end
+
+  @tag :streaming_sequence
   test "POST /v1/responses streaming accepts terminal response buffer without trailing separator",
        %{conn: conn} do
     terminal =
@@ -4215,6 +4283,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
       assert attempt.status == "failed"
       assert attempt.network_error_code == "stream_idle_timeout"
+      refute Map.has_key?(attempt.response_metadata, "transport_failure")
     after
       Process.send_after(upstream_pid, {:fake_upstream_release_timeout, release_ref}, 250)
       Mint.HTTP.close(http_conn)

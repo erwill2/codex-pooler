@@ -1,6 +1,8 @@
 defmodule CodexPooler.Accounting.RollupsTest do
   use CodexPooler.DataCase, async: false
 
+  alias Ecto.Migration.Runner
+
   alias CodexPooler.Accounting.{
     DailyRollup,
     HourlyModelUsageRollup,
@@ -779,7 +781,7 @@ defmodule CodexPooler.Accounting.RollupsTest do
     do: value |> Decimal.normalize() |> Decimal.to_string(:normal)
 
   defp run_unknown_usage_projection_migration! do
-    Ecto.Migration.Runner.run(
+    Runner.run(
       Repo,
       Repo.config(),
       20_260_626_133_501,

@@ -23,6 +23,7 @@ defmodule CodexPooler.FakeUpstream do
           | {:sse, [String.t()]}
           | {:sse_headers, [String.t()], [{String.t(), String.t()}]}
           | {:delayed_sse, [String.t()], pos_integer(), pid() | nil}
+          | {:abrupt_close_mid_stream, [String.t()]}
           | {:websocket_text, [String.t()]}
           | {:websocket_sse_then_close, [String.t()], non_neg_integer(), String.t()}
           | {:sequence, [mode()]}
@@ -175,6 +176,10 @@ defmodule CodexPooler.FakeUpstream do
     chunks = if include_done?, do: chunks ++ ["data: [DONE]\n\n"], else: chunks
 
     {:delayed_sse, chunks, interval_ms, notify}
+  end
+
+  def abrupt_close_mid_stream(events) when is_list(events) do
+    {:abrupt_close_mid_stream, Enum.map(events, &sse_chunk/1)}
   end
 
   def barrier_sse_stream(events, opts) do
@@ -475,6 +480,20 @@ defmodule CodexPooler.FakeUpstream do
       notify_chunk_sent(notify, index)
       conn
     end)
+  end
+
+  defp respond(_pid, conn, {:abrupt_close_mid_stream, chunks}, _request) do
+    conn =
+      conn
+      |> Plug.Conn.put_resp_header("cache-control", "no-cache")
+      |> Plug.Conn.put_resp_content_type("text/event-stream")
+      |> Plug.Conn.send_chunked(200)
+
+    Enum.each(chunks, fn chunk ->
+      {:ok, _conn} = Plug.Conn.chunk(conn, chunk)
+    end)
+
+    Process.exit(self(), :kill)
   end
 
   defp respond(_pid, conn, {:barrier_sse, chunks, barrier_after, notify, release_ref}, _request) do

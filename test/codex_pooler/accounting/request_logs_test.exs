@@ -5,6 +5,8 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
   import CodexPooler.AccountingTestSupport
   import CodexPooler.PoolerFixtures
 
+  alias Ecto.Migration.Runner
+
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request, RequestLogFact, RequestLogFacts}
   alias CodexPooler.Accounting.RequestLogs.SettlementPresentation
@@ -598,7 +600,7 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
   end
 
   defp run_unknown_usage_projection_migration! do
-    Ecto.Migration.Runner.run(
+    Runner.run(
       Repo,
       Repo.config(),
       20_260_626_133_501,
@@ -2299,6 +2301,86 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
     refute inspect(log.debug) =~ "raw stream body"
     refute inspect(log.debug) =~ "raw visible response body"
     refute inspect(log.debug) =~ "Bearer sk-example-hidden"
+  end
+
+  test "request log debug projection prefers persisted stream transport failure metadata" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-debug-http-sse-persisted-transport-failure",
+        endpoint: "/v1/responses",
+        transport: "http_sse",
+        status: "failed",
+        correlation_id: "debug-http-sse-persisted-transport-failure",
+        response_status_code: 200,
+        request_metadata: %{
+          "codex_session_id" => "session-http-sse-persisted-transport-failure",
+          "codex_session_key" => "session-key-http-sse-persisted-transport-failure",
+          "request_body" => "todo6 raw prompt sentinel should stay hidden"
+        }
+      })
+      |> Ecto.Changeset.change(last_error_code: "upstream_stream_error")
+      |> Repo.update!()
+
+    request
+    |> attempt_fixture(assignment, %{
+      status: "failed",
+      retryable: false,
+      upstream_status_code: 200,
+      usage_status: "usage_known"
+    })
+    |> Ecto.Changeset.change(%{
+      latency_ms: 765,
+      network_error_code: "stream_parse_error",
+      error_message: "todo6 raw attempt body sentinel must stay hidden",
+      response_metadata: %{
+        "error_kind" => "stream_interrupted",
+        "content_type" => "text/event-stream",
+        "status_code" => 200,
+        "raw_body" => "todo6 raw response body sentinel should stay hidden",
+        "raw_headers" => %{"authorization" => "Bearer sk-todo6-header-sentinel"},
+        "transport_failure" => %{
+          "exception" => "Finch.TransportError",
+          "reason_class" => "upstream_stream_interrupted",
+          "reason" => "closed_before_terminal",
+          "phase" => "upstream_close",
+          "pre_visible_output" => false,
+          "terminal_seen" => false,
+          "text_frame_count" => 2,
+          "raw_message" => "todo6 raw transport sentinel should stay hidden",
+          "headers" => %{"authorization" => "Bearer sk-todo6-transport-sentinel"}
+        }
+      }
+    })
+    |> Repo.update!()
+
+    assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+    assert [attempt_debug] = log.debug.attempts
+
+    assert attempt_debug.network_error_code == "stream_parse_error"
+
+    assert attempt_debug.transport_failure == %{
+             exception: "Finch.TransportError",
+             reason_class: "upstream_stream_interrupted",
+             reason: "closed_before_terminal",
+             phase: "upstream_close",
+             pre_visible_output: false,
+             terminal_seen: false,
+             text_frame_count: 2
+           }
+
+    debug = inspect(log.debug)
+
+    refute debug =~ "session-http-sse-persisted-transport-failure"
+    refute debug =~ "session-key-http-sse-persisted-transport-failure"
+    refute debug =~ "todo6 raw prompt sentinel"
+    refute debug =~ "todo6 raw attempt body sentinel"
+    refute debug =~ "todo6 raw response body sentinel"
+    refute debug =~ "todo6 raw transport sentinel"
+    refute debug =~ "Bearer sk-todo6-header-sentinel"
+    refute debug =~ "Bearer sk-todo6-transport-sentinel"
   end
 
   test "request log debug projection classifies supported stream interruption families" do
