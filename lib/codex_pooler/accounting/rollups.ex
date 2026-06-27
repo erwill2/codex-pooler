@@ -412,45 +412,9 @@ defmodule CodexPooler.Accounting.Rollups do
     delta = rollup_delta(request, settlement)
     date = DateTime.to_date(settlement.occurred_at || now())
 
-    upsert_rollup!(%{dimension_kind: "pool", pool_id: request.pool_id}, date, delta)
-
-    upsert_rollup!(
-      %{dimension_kind: "api_key", pool_id: request.pool_id, api_key_id: request.api_key_id},
-      date,
-      delta
-    )
-
-    if settlement.pool_upstream_assignment_id do
-      upsert_rollup!(
-        %{
-          dimension_kind: "pool_upstream_assignment",
-          pool_id: request.pool_id,
-          pool_upstream_assignment_id: settlement.pool_upstream_assignment_id
-        },
-        date,
-        delta
-      )
-    end
-
-    if settlement.upstream_identity_id do
-      upsert_rollup!(
-        %{
-          dimension_kind: "upstream_identity",
-          pool_id: request.pool_id,
-          upstream_identity_id: settlement.upstream_identity_id
-        },
-        date,
-        delta
-      )
-    end
-
-    if request.model_id do
-      upsert_rollup!(
-        %{dimension_kind: "model", pool_id: request.pool_id, model_id: request.model_id},
-        date,
-        delta
-      )
-    end
+    request
+    |> daily_rollup_identities(settlement)
+    |> Enum.each(&upsert_rollup!(&1, date, delta))
 
     upsert_hourly_model_usage_rollup!(request, settlement, delta)
 
@@ -458,6 +422,43 @@ defmodule CodexPooler.Accounting.Rollups do
   end
 
   def accumulate!(%Request{}, %LedgerEntry{}), do: :ok
+
+  defp daily_rollup_identities(%Request{} = request, %LedgerEntry{} = settlement) do
+    [
+      %{dimension_kind: "pool", pool_id: request.pool_id},
+      %{dimension_kind: "api_key", pool_id: request.pool_id, api_key_id: request.api_key_id},
+      pool_upstream_assignment_identity(request, settlement),
+      upstream_identity_identity(request, settlement),
+      model_identity(request)
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp pool_upstream_assignment_identity(%Request{} = request, %LedgerEntry{} = settlement) do
+    if settlement.pool_upstream_assignment_id do
+      %{
+        dimension_kind: "pool_upstream_assignment",
+        pool_id: request.pool_id,
+        pool_upstream_assignment_id: settlement.pool_upstream_assignment_id
+      }
+    end
+  end
+
+  defp upstream_identity_identity(%Request{} = request, %LedgerEntry{} = settlement) do
+    if settlement.upstream_identity_id do
+      %{
+        dimension_kind: "upstream_identity",
+        pool_id: request.pool_id,
+        upstream_identity_id: settlement.upstream_identity_id
+      }
+    end
+  end
+
+  defp model_identity(%Request{model_id: model_id, pool_id: pool_id}) when is_binary(model_id) do
+    %{dimension_kind: "model", pool_id: pool_id, model_id: model_id}
+  end
+
+  defp model_identity(%Request{}), do: nil
 
   @spec list(term(), keyword()) :: [term()]
   def list(pool_or_id, opts \\ []) do
