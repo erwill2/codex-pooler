@@ -189,7 +189,7 @@ defmodule CodexPooler.Gateway.Runtime.Service do
              request_options,
              candidates
            )
-           |> RouteFiltering.filter_candidates(route_state),
+           |> RouteFiltering.filter_candidates_with_route_state(route_state),
          :ok <- SessionContinuity.ensure_unique_turn(request_options),
          {:ok, reserved} <-
            reserve_and_start_turn(auth, model, payload, endpoint, request_options, route_state) do
