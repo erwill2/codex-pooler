@@ -447,6 +447,42 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       assert failure.event_type == "response.failed"
     end
 
+    test "copies top-level public Responses terminal error into response failure" do
+      opts =
+        RequestOptions.build(
+          %{public_openai_responses_stream: true},
+          "/v1/responses",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      failed =
+        sse_event("response.failed", %{
+          "type" => "response.failed",
+          "response" => %{
+            "id" => "resp_public_failed_top_level_error",
+            "status" => "failed"
+          },
+          "error" => %{
+            "type" => "invalid_request_error",
+            "code" => "context_length_exceeded"
+          }
+        })
+
+      assert {chunk, state} =
+               DownstreamStream.normalize_data(failed, "/v1/responses", opts, state)
+
+      assert [%{"event" => "response.failed", "data" => data}] = public_sse_events(chunk)
+      assert data["error"]["code"] == "context_length_exceeded"
+
+      assert {:failed, failure} = DownstreamStream.terminal_outcome(state)
+      assert failure.event_type == "response.failed"
+
+      assert {data["response"]["error"]["code"], failure.code} ==
+               {"context_length_exceeded", "context_length_exceeded"}
+    end
+
     test "synthesizes a sanitized terminal failure with the observed public response id" do
       opts =
         RequestOptions.build(

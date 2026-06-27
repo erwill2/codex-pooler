@@ -2748,6 +2748,62 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert FakeUpstream.count(upstream) == 1
   end
 
+  @tag :provider_invalid_request_redaction
+  test "POST /v1/responses collected SSE preserves safe terminal error codes", %{conn: conn} do
+    provider_message =
+      "provider 400 leaked https://provider.internal.example/context?key=sk-secret and prompt SENTINEL_COLLECT"
+
+    upstream_error =
+      provider_invalid_request_error("context_length_exceeded", provider_message, "input")
+
+    cases = [
+      {"top-level only",
+       %{
+         "type" => "response.failed",
+         "error" => upstream_error,
+         "response" => %{
+           "id" => "resp_v1_collect_top_level_error",
+           "status" => "failed"
+         }
+       }},
+      {"nested",
+       %{
+         "type" => "response.failed",
+         "response" => %{
+           "id" => "resp_v1_collect_nested_error",
+           "status" => "failed",
+           "error" => upstream_error
+         }
+       }}
+    ]
+
+    Enum.each(cases, fn {_label, terminal_event} ->
+      upstream = start_upstream(FakeUpstream.sse_stream([{"response.failed", terminal_event}]))
+      setup = gateway_setup(upstream)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic collected provider invalid request"
+        })
+
+      assert %{"error" => error} = json_response(response, 502)
+      assert error["message"] == "upstream request failed"
+      assert error["type"] == "server_error"
+      assert error["code"] == "context_length_exceeded"
+      refute Map.has_key?(error, "param")
+      refute response.resp_body =~ provider_message
+      refute response.resp_body =~ "provider.internal.example"
+      refute response.resp_body =~ "sk-secret"
+      refute response.resp_body =~ "SENTINEL_COLLECT"
+      refute response.resp_body =~ "input"
+      assert FakeUpstream.count(upstream) == 1
+    end)
+  end
+
   @tag :server_error_redaction
   test "POST /v1/responses SSE collection redacts safe-looking terminal 502 errors" do
     provider_message =
@@ -2778,6 +2834,38 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute inspect(error) =~ "upstream.internal.example"
     refute inspect(error) =~ "/internal/rate"
     refute inspect(error) =~ "provider_stack"
+  end
+
+  @tag :server_error_redaction
+  test "POST /v1/responses SSE collection redacts top-level-only terminal errors" do
+    provider_message =
+      "provider failed at https://upstream.internal.example/internal/context?token=secret"
+
+    upstream_error =
+      provider_invalid_request_error("context_length_exceeded", provider_message, "input")
+
+    body =
+      "event: response.failed\n" <>
+        "data: " <>
+        Jason.encode!(%{
+          "type" => "response.failed",
+          "error" => upstream_error,
+          "response" => %{
+            "id" => "resp_v1_collect_top_level_only_failed",
+            "status" => "failed"
+          }
+        }) <>
+        "\n\n"
+
+    assert {:error, error} = Responses.response_from_sse(body)
+    assert error.status == 502
+    assert error.message == "upstream request failed"
+    assert error.code == "context_length_exceeded"
+    assert error.param == nil
+    refute inspect(error) =~ "provider failed"
+    refute inspect(error) =~ "upstream.internal.example"
+    refute inspect(error) =~ "/internal/context"
+    refute inspect(error) =~ "input"
   end
 
   @tag :server_error_redaction
