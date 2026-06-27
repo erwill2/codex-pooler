@@ -243,10 +243,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive.AccountLifecycleWorkflow do
     put_flash(socket, :error, "#{action_label(action_key)} is not available: #{reason}")
   end
 
-  defp action_label(:replace_auth_json), do: "Replace auth.json"
-  defp action_label(:oauth_relink), do: "OAuth relink"
   defp action_label(:refresh_token), do: "Refresh token"
-  defp action_label(:redeem_saved_reset), do: "Redeem saved reset"
 
   defp action_label(action_key),
     do: action_key |> to_string() |> String.replace("_", " ") |> String.capitalize()

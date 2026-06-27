@@ -90,16 +90,17 @@ defmodule CodexPooler.Alerts.WebhookDelivery do
   def retry_delay_seconds(attempt_number), do: Map.get(@retry_delays_seconds, attempt_number, 0)
 
   defp deliver_after_pending_attempt(attempt, incident, channel, endpoint_url, timestamp) do
-    with {:ok, signing_secret} <- recover_signing_secret(channel) do
-      deliver_pending_attempt(
-        attempt,
-        incident,
-        channel,
-        endpoint_url,
-        signing_secret,
-        timestamp
-      )
-    else
+    case recover_signing_secret(channel) do
+      {:ok, signing_secret} ->
+        deliver_pending_attempt(
+          attempt,
+          incident,
+          channel,
+          endpoint_url,
+          signing_secret,
+          timestamp
+        )
+
       {:failure, code, message} ->
         finalize_failed_attempt(attempt, code, message, false, nil, timestamp)
     end
