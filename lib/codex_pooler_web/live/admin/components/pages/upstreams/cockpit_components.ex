@@ -3,8 +3,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
 
   use CodexPoolerWeb, :html
 
-  alias CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.{Charts, Dialogs, Sections, Summary}
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog
 
   attr :cockpit, :map, required: true
   attr :auth_json_form, :any, required: true

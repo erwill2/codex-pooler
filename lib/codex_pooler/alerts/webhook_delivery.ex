@@ -16,8 +16,8 @@ defmodule CodexPooler.Alerts.WebhookDelivery do
 
   alias CodexPooler.Alerts.{WebhookPayload, WebhookSigning}
   alias CodexPooler.InstanceSettings.AppSecretCrypto
-  alias CodexPooler.TransportFailureReason
   alias CodexPooler.Repo
+  alias CodexPooler.TransportFailureReason
 
   @delivery_adapter "webhook"
   @default_cooldown_minutes AlertRule.default_cooldown_minutes()

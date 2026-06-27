@@ -1,8 +1,8 @@
 defmodule CodexPooler.GatewayTest do
   use CodexPooler.DataCase, async: true
 
-  alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway
+  alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Usage
 
   test "execute rejects whitespace-only model values as missing model" do

@@ -11,6 +11,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeDemotion, RoutingCircuitState}
   alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
@@ -18,7 +19,6 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
   alias CodexPooler.Gateway.Runtime.Finalization.Streaming
   alias CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector
   alias CodexPooler.Gateway.Runtime.Streaming.StreamLifecycle
-  alias CodexPooler.Gateway
   alias CodexPooler.Repo
 
   @endpoint_path "/backend-api/codex/responses"

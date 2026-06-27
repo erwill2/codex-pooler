@@ -20,6 +20,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
   alias CodexPooler.Catalog.PricingSnapshot
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Files.FileRecord
+  alias CodexPooler.Gateway
+  alias CodexPooler.Gateway.Payloads.RequestOptions
 
   alias CodexPooler.Gateway.Persistence.{
     BridgeAffinity,
@@ -27,8 +29,6 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     RoutingCircuitState
   }
 
-  alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway
   alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams

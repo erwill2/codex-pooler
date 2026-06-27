@@ -7,12 +7,12 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
   alias CodexPooler.Jobs
   alias CodexPooler.Pools
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.JobFilterForm
   alias CodexPoolerWeb.Admin.JobsPageComponents.DetailDrawer
   alias CodexPoolerWeb.Admin.JobsPageComponents.Explorer
-  alias CodexPoolerWeb.Admin.JobFilterForm
   alias CodexPoolerWeb.Admin.JobsPageComponents.Filters
-  alias CodexPoolerWeb.Admin.JobsReadModel
   alias CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards
+  alias CodexPoolerWeb.Admin.JobsReadModel
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.DateTimeDisplay
 

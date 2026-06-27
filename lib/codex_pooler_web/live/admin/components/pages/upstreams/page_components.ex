@@ -5,9 +5,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.PoolFilterComponents
+  alias CodexPoolerWeb.Admin.UpstreamFilterForm
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog
-  alias CodexPoolerWeb.Admin.UpstreamFilterForm
   alias CodexPoolerWeb.DateTimeDisplay
 
   @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"

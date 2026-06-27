@@ -12,9 +12,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
   alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.Audit.AuditEvent
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway
   alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.OperationalSettings
-  alias CodexPooler.Gateway
   alias CodexPooler.Repo
 
   @raw_prompt_sentinel "TASK5_OPENAI_RAW_PROMPT_SENTINEL"

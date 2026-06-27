@@ -32,8 +32,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   }
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
-  alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard
   alias CodexPoolerWeb.DateTimeDisplay
 
   setup :register_and_log_in_user

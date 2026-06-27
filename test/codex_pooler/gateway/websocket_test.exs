@@ -9,9 +9,9 @@ defmodule CodexPooler.Gateway.WebsocketTest do
   alias CodexPooler.Access
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway, as: RuntimeGateway
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession}
-  alias CodexPooler.Gateway, as: RuntimeGateway
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Pools
