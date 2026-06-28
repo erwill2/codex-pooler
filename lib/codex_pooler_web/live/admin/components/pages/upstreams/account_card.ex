@@ -48,7 +48,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
       id={"upstream-account-#{@account.identity.id}"}
       data-role="upstream-account-card"
       class={[
-        "min-w-0 rounded-box border border-l-2 border-base-300 bg-base-100 shadow-sm transition-colors",
+        "min-w-0 rounded-box border border-l-2 border-base-300 bg-base-100 transition-colors",
         @routing_readiness.border_class
       ]}
     >

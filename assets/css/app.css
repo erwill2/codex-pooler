@@ -165,6 +165,18 @@ body {
   font-family: "Roboto Condensed", ui-sans-serif, system-ui, sans-serif;
 }
 
+[data-role="upstream-account-card"].border-l-success {
+  border-left-color: var(--color-success);
+}
+
+[data-role="upstream-account-card"].border-l-warning {
+  border-left-color: var(--color-warning);
+}
+
+[data-role="upstream-account-card"].border-l-error {
+  border-left-color: var(--color-error);
+}
+
 .policy-editor-tabs > li {
   flex: 1 1 0;
 }

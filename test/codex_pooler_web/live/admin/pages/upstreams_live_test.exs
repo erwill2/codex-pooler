@@ -2514,8 +2514,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert blocked_html =~ ~s(id="upstream-account-#{blocked_id}")
     assert blocked_html =~ ~s(id="upstream-account-#{blocked_id}-routing-readiness")
 
-    assert blocked_html =~
-             ~s(class="min-w-0 rounded-box border border-l-2 border-base-300 bg-base-100 shadow-sm transition-colors border-l-warning")
+    card_class = html_element_class(blocked_html, "upstream-account-#{blocked_id}")
+
+    assert card_class =~ "border-l-2"
+    assert card_class =~ "border-base-300"
+    assert card_class =~ "border-l-warning"
+    refute card_class =~ "shadow-sm"
 
     assert [_match, routing_contract] =
              Regex.run(
