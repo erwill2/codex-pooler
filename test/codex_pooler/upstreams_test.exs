@@ -4221,6 +4221,65 @@ defmodule CodexPooler.UpstreamsTest do
              ]
     end
 
+    test "falls back to backend wham usage when Codex usage paths return HTML 403" do
+      html_403 = "<!doctype html><html><body>Forbidden</body></html>"
+
+      {:ok, upstream} =
+        FakeUpstream.start_link(
+          {:sequence,
+           [
+             FakeUpstream.raw_response(html_403,
+               status: 403,
+               headers: [{"content-type", "text/html; charset=utf-8"}]
+             ),
+             FakeUpstream.raw_response(html_403,
+               status: 403,
+               headers: [{"content-type", "text/html; charset=utf-8"}]
+             ),
+             FakeUpstream.raw_response(html_403,
+               status: 403,
+               headers: [{"content-type", "text/html; charset=utf-8"}]
+             ),
+             FakeUpstream.json_response(
+               weekly_only_payload(%{
+                 "additional_rate_limits" => [
+                   %{
+                     "limit_name" => "GPT-5.3-Codex-Spark",
+                     "metered_feature" => "codex_bengalfox",
+                     "rate_limit" => %{
+                       "primary_window" => %{
+                         "used_percent" => 45,
+                         "limit_window_seconds" => 604_800,
+                         "reset_after_seconds" => 1_200
+                       }
+                     }
+                   }
+                 ]
+               })
+             )
+           ]}
+        )
+
+      on_exit(fn -> FakeUpstream.stop(upstream) end)
+
+      %{identity: identity, pool: pool, assignment: assignment} =
+        usage_assignment_fixture(upstream)
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :succeeded
+
+      windows = QuotaWindows.list_quota_windows(identity)
+      assert Enum.any?(windows, &(&1.quota_key == "account" and &1.window_kind == "secondary"))
+      refute Enum.any?(windows, &(&1.window_kind == "primary"))
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/api/codex/usage",
+               "/backend-api/codex/usage",
+               "/wham/usage",
+               "/backend-api/wham/usage"
+             ]
+    end
+
     test "stores 5h and weekly quota windows from Codex response headers" do
       identity = active_identity_fixture()
       reset_at = DateTime.add(DateTime.utc_now(), 600, :second) |> DateTime.truncate(:second)

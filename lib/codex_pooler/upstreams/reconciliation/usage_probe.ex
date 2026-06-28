@@ -169,8 +169,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
       {:ok, %{status: 404}} ->
         :not_found
 
-      {:ok, %{status: status}} when status in [401, 403, 429] ->
-        {:halt_error, {:upstream_status, status}}
+      {:ok, %Req.Response{status: status} = response} when status in [401, 403] ->
+        auth_path_unavailable_response(status, response)
+
+      {:ok, %{status: 429}} ->
+        {:halt_error, {:upstream_status, 429}}
 
       {:ok, %{status: status}} ->
         {:halt_error, {:upstream_status, status}}
@@ -179,6 +182,42 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
         {:halt_error, reason}
     end
   end
+
+  @spec auth_path_unavailable_response(pos_integer(), Req.Response.t()) :: usage_probe_result()
+  defp auth_path_unavailable_response(status, %Req.Response{} = response) do
+    if html_response?(response) do
+      :not_found
+    else
+      {:halt_error, {:upstream_status, status}}
+    end
+  end
+
+  @spec html_response?(Req.Response.t()) :: boolean()
+  defp html_response?(%Req.Response{body: body} = response) do
+    html_body?(body) or
+      response
+      |> Req.Response.get_header("content-type")
+      |> Enum.any?(&html_content_type?/1)
+  end
+
+  @spec html_body?(term()) :: boolean()
+  defp html_body?(body) when is_binary(body) do
+    body
+    |> String.trim_leading()
+    |> String.downcase()
+    |> String.starts_with?(["<!doctype html", "<html"])
+  end
+
+  defp html_body?(_body), do: false
+
+  @spec html_content_type?(term()) :: boolean()
+  defp html_content_type?(content_type) when is_binary(content_type) do
+    content_type
+    |> String.downcase()
+    |> String.contains?("text/html")
+  end
+
+  defp html_content_type?(_content_type), do: false
 
   @spec usage_probe_success(
           term(),
