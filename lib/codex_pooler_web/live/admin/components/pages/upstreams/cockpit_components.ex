@@ -64,6 +64,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
         cockpit={@cockpit}
         saved_reset_policy_form={@saved_reset_policy_form}
         confirming_saved_reset_redemption={@confirming_saved_reset_redemption}
+        datetime_preferences={@datetime_preferences}
       />
       <Sections.related_links_section cockpit={@cockpit} />
       <Sections.refresh_section cockpit={@cockpit} refresh_data_message={@refresh_data_message} />
