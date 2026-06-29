@@ -734,7 +734,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     refute html =~ "Workspace reference legacy"
   end
 
-  test "toggles the account card between quota and saved reset panels from the header badge", %{
+  test "opens saved reset dialog from the header badge and toggles the Pools mini panel", %{
     conn: conn,
     scope: scope
   } do
@@ -870,17 +870,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     active_badge_id = "upstream-account-#{active_identity.id}-saved-reset-count"
 
     active_badge_selector =
-      "##{active_badge_id}[data-role='upstream-saved-reset-count-badge'][aria-label='Show saved reset bank: 2 saved resets'][aria-controls='upstream-account-#{active_identity.id}-saved-reset-panel'][aria-pressed='false']"
+      "##{active_badge_id}[data-role='upstream-saved-reset-count-badge'][aria-label='Open saved reset bank: 2 saved resets'][aria-controls='saved-reset-policy-dialog'][aria-haspopup='dialog'][phx-click='open_saved_reset_policy'][phx-value-id='#{active_identity.id}']"
 
     assert has_element?(view, active_badge_selector, "2")
     assert has_element?(view, "#{active_badge_selector} .hero-battery-100.size-3.text-current")
 
     refute has_element?(view, "#upstream-saved-reset-count-popover-#{active_identity.id}")
-
-    refute has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel [data-role='upstream-saved-reset-available-count']"
-           )
+    refute has_element?(view, "#upstream-account-#{active_identity.id}-saved-reset-panel")
+    refute has_element?(view, "#saved-reset-policy-dialog")
 
     assert has_element?(
              view,
@@ -894,26 +891,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel[aria-hidden='true'][inert]",
-             "Saved reset bank"
+             "#upstream-account-#{active_identity.id}-pools-panel[aria-hidden='true'][inert]",
+             "routing lane"
            )
 
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-policy-state.cursor-pointer[phx-click='open_saved_reset_policy'][phx-value-id='#{active_identity.id}']",
-             "Auto redeem active"
-           )
+    active_pools_trigger_selector =
+      "#upstream-account-#{active_identity.id}-pools-panel-trigger[phx-click='toggle_account_pools_panel'][phx-value-id='#{active_identity.id}'][aria-controls='upstream-account-#{active_identity.id}-pools-panel'][aria-expanded='false']"
 
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-policy-state .hero-cog-6-tooth"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel > div:first-child",
-             "Policy"
-           )
+    assert has_element?(view, active_pools_trigger_selector, "Pools")
 
     refute has_element?(view, "#upstream-account-#{active_identity.id}-saved-reset-manage")
 
@@ -926,11 +911,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              view,
              "#upstream-account-#{active_identity.id}-saved-reset-meter [data-role='upstream-saved-reset-meter-title']",
              "Banked Resets"
-           )
-
-    refute has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-meter"
            )
 
     assert has_element?(
@@ -978,59 +958,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              "Next expires"
            )
 
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-expiration-labels",
-             "Expiration"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-expiration-labels",
-             "Left"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-expiration-labels",
-             "Seen"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-expiration-date-0",
-             first_expiration_label
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-expiration-date-1",
-             second_expiration_label
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-expiration-first-seen-0[data-role='saved-reset-expiration-first-seen']",
-             first_seen_label
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-expiration-first-seen-1[data-role='saved-reset-expiration-first-seen']",
-             second_seen_label
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-expiration-time-left-0",
-             "in "
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel #upstream-account-#{active_identity.id}-saved-reset-expiration-time-left-0 .hero-clock"
-           )
-
     active_card = view |> element("#upstream-account-#{active_identity.id}") |> render()
     active_badge_class = html_element_class(active_card, active_badge_id)
 
@@ -1041,9 +968,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     active_usage_panel_class =
       html_element_class(active_card, "upstream-account-#{active_identity.id}-usage-panel")
-
-    active_saved_panel_class =
-      html_element_class(active_card, "upstream-account-#{active_identity.id}-saved-reset-panel")
 
     active_saved_meter_segment_1_class =
       html_element_class(
@@ -1073,16 +997,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     refute active_badge_class =~ "text-violet-700"
     refute active_badge_class =~ "border-dashed"
     assert active_usage_panel_class =~ "max-h-[28rem]"
-    assert active_saved_panel_class =~ "max-h-0"
     assert active_usage_panel_class =~ "transition-opacity"
-    assert active_saved_panel_class =~ "transition-opacity"
     refute active_usage_panel_class =~ "translate-y"
-    refute active_saved_panel_class =~ "translate-y"
     refute active_usage_panel_class =~ "transition-[max-height"
-    refute active_saved_panel_class =~ "transition-[max-height"
-    refute active_saved_panel_class =~ "rounded-box"
-    refute active_saved_panel_class =~ "border-base-300"
-    refute active_saved_panel_class =~ "bg-base-200/30"
     assert active_saved_meter_class =~ "md:col-span-2"
     assert active_saved_meter_segment_1_class =~ "bg-violet-500/80"
     assert active_saved_meter_segment_2_class =~ "bg-violet-500/80"
@@ -1090,15 +1007,132 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     refute active_saved_meter_segment_1_class =~ "bg-success"
     refute active_saved_meter_segment_2_class =~ "bg-success"
 
+    active_pools_trigger_class =
+      html_element_class(
+        active_card,
+        "upstream-account-#{active_identity.id}-pools-panel-trigger"
+      )
+
+    assert active_pools_trigger_class =~ "absolute"
+    assert active_pools_trigger_class =~ "border-transparent"
+    assert active_pools_trigger_class =~ "hover:border-primary/25"
+
     assert upstream_header_badge_order(active_card) == [
              active_badge_id,
              "upstream-account-#{active_identity.id}-plan-label"
            ]
 
+    view |> element(active_pools_trigger_selector) |> render_click()
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-panel-switcher[data-panel-view='pools']"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel[aria-hidden='false']",
+             "1 routing lane"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel-trigger[aria-expanded='true'][aria-label='Show quota status']",
+             "Pools"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel #upstream-account-#{active_identity.id}-pools-routing-summary",
+             "Quota missing"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-assignment-pool']",
+             "Saved Reset Card"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-assignment-pool']",
+             "saved-reset-card"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-route'][role='meter'][aria-valuemin='0'][aria-valuemax='3'][aria-valuenow='2']"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-assignment-eligibility']",
+             "Eligible"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-assignment-eligibility'].rounded-full"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-route-segment'][title='Assignment active']",
+             "Assignment"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-route-segment'][title='Health active']",
+             "Health"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-route-segment'][title='Priming pending']",
+             "Quota"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-assignment-status']"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-pools-panel [data-role='upstream-account-pool-assignment-quota']"
+           )
+
+    active_card = view |> element("#upstream-account-#{active_identity.id}") |> render()
+
+    assert html_element_class(
+             active_card,
+             "upstream-account-#{active_identity.id}-pools-panel-trigger"
+           ) =~ "border-primary/35"
+
+    assert html_element_class(active_card, "upstream-account-#{active_identity.id}-pools-panel") =~
+             "max-h-[28rem]"
+
+    assert html_element_class(active_card, "upstream-account-#{active_identity.id}-usage-panel") =~
+             "max-h-0"
+
+    refute has_element?(view, "#upstream-account-#{active_identity.id}-saved-reset-panel")
+
+    view
+    |> element(
+      "#upstream-account-#{active_identity.id}-pools-panel-trigger[aria-expanded='true']"
+    )
+    |> render_click()
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{active_identity.id}-panel-switcher[data-panel-view='usage']"
+           )
+
     inactive_badge_id = "upstream-account-#{inactive_identity.id}-saved-reset-count"
 
     inactive_badge_selector =
-      "##{inactive_badge_id}[data-role='upstream-saved-reset-count-badge'][aria-label='Show saved reset bank: 1 saved reset'][aria-controls='upstream-account-#{inactive_identity.id}-saved-reset-panel'][aria-pressed='false']"
+      "##{inactive_badge_id}[data-role='upstream-saved-reset-count-badge'][aria-label='Open saved reset bank: 1 saved reset'][aria-controls='saved-reset-policy-dialog'][aria-haspopup='dialog'][phx-click='open_saved_reset_policy'][phx-value-id='#{inactive_identity.id}']"
 
     assert has_element?(view, inactive_badge_selector, "1")
 
@@ -1121,29 +1155,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              "#{inactive_badge_selector} .hero-battery-100.size-3.text-violet-600"
            )
 
-    assert has_element?(
-             view,
-             "#upstream-account-#{inactive_identity.id}-saved-reset-panel #upstream-account-#{inactive_identity.id}-saved-reset-policy-state.cursor-pointer[phx-click='open_saved_reset_policy'][phx-value-id='#{inactive_identity.id}']",
-             "Auto redeem inactive"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{inactive_identity.id}-saved-reset-panel #upstream-account-#{inactive_identity.id}-saved-reset-expiration-empty",
-             "Expiration dates not reported"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{legacy_identity.id}-saved-reset-panel #upstream-account-#{legacy_identity.id}-saved-reset-expiration-date-0",
-             legacy_expiration_label
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{legacy_identity.id}-saved-reset-panel #upstream-account-#{legacy_identity.id}-saved-reset-expiration-first-seen-0[data-role='saved-reset-expiration-first-seen']",
-             "not recorded"
-           )
+    refute has_element?(view, "#upstream-account-#{inactive_identity.id}-saved-reset-panel")
+    refute has_element?(view, "#upstream-account-#{legacy_identity.id}-saved-reset-panel")
 
     assert has_element?(
              view,
@@ -1176,76 +1189,57 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     view |> element(active_badge_selector) |> render_click()
 
-    assert has_element?(
-             view,
-             "##{active_badge_id}[aria-label='Show quota status'][aria-pressed='true']"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-panel-switcher[data-panel-view='saved_resets']"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-usage-panel[aria-hidden='true'][inert]"
-           )
-
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel[aria-hidden='false']",
-             "Saved reset bank"
-           )
-
-    refute has_element?(view, "#saved-reset-policy-dialog")
-
-    active_card = view |> element("#upstream-account-#{active_identity.id}") |> render()
-
-    assert html_element_class(active_card, "upstream-account-#{active_identity.id}-usage-panel") =~
-             "max-h-0"
-
-    assert html_element_class(
-             active_card,
-             "upstream-account-#{active_identity.id}-saved-reset-panel"
-           ) =~
-             "max-h-[28rem]"
+    assert has_element?(view, "#saved-reset-policy-dialog")
+    assert has_element?(view, "#saved-reset-policy-dialog", "Auto redeem")
+    assert has_element?(view, "#saved-reset-expiration-summary", "Banked reset expirations")
+    assert has_element?(view, "#saved-reset-expiration-table", "Expiration Date")
+    assert has_element?(view, "#saved-reset-expiration-date-0", first_expiration_label)
+    assert has_element?(view, "#saved-reset-expiration-date-1", second_expiration_label)
+    assert has_element?(view, "#saved-reset-expiration-first-seen-0", first_seen_label)
+    assert has_element?(view, "#saved-reset-expiration-first-seen-1", second_seen_label)
+    assert has_element?(view, "#saved-reset-expiration-time-left-0", "in ")
 
     send(view.pid, :reload_upstreams_from_events)
     _ = :sys.get_state(view.pid)
 
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel[aria-hidden='false']",
-             first_expiration_label
-           )
+    assert has_element?(view, "#saved-reset-policy-dialog")
+    assert has_element?(view, "#saved-reset-expiration-date-0", first_expiration_label)
 
     view
-    |> element("##{active_badge_id}[aria-pressed='true']")
+    |> element("#saved-reset-policy-cancel")
     |> render_click()
 
-    assert has_element?(
-             view,
-             "#upstream-account-#{active_identity.id}-panel-switcher[data-panel-view='usage']"
-           )
+    refute has_element?(view, "#saved-reset-policy-dialog")
 
     assert has_element?(
              view,
              "#upstream-account-#{active_identity.id}-usage-panel[aria-hidden='false']"
            )
 
-    view |> element(active_badge_selector) |> render_click()
+    legacy_badge_selector =
+      "#upstream-account-#{legacy_identity.id}-saved-reset-count[aria-label='Open saved reset bank: 1 saved reset'][phx-click='open_saved_reset_policy']"
+
+    assert has_element?(view, legacy_badge_selector, "1")
+
+    view |> element(legacy_badge_selector) |> render_click()
+
+    assert has_element?(view, "#saved-reset-policy-dialog")
+    assert has_element?(view, "#saved-reset-expiration-date-0", legacy_expiration_label)
+    assert has_element?(view, "#saved-reset-expiration-first-seen-0", "not recorded")
+
+    view
+    |> element("#saved-reset-policy-cancel")
+    |> render_click()
+
+    view |> element(inactive_badge_selector) |> render_click()
+
+    assert has_element?(view, "#saved-reset-policy-dialog")
 
     assert has_element?(
              view,
-             "#upstream-account-#{active_identity.id}-saved-reset-panel[aria-hidden='false']"
+             "#saved-reset-expiration-empty",
+             "No expiration dates reported for the available saved resets yet."
            )
-
-    view
-    |> element("#upstream-account-#{active_identity.id}-saved-reset-policy-state")
-    |> render_click()
-
-    assert has_element?(view, "#saved-reset-policy-dialog")
-    assert has_element?(view, "#saved-reset-policy-dialog", "Auto redeem")
   end
 
   test "edits saved reset policy from the upstream account dropdown without redeeming resets", %{
@@ -2051,7 +2045,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#upstream-account-#{identity.id}-assignment-#{assignment.id}",
-             "Admin Upstreams (admin-upstreams)"
+             "Admin Upstreams"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{identity.id}-assignment-#{assignment.id}",
+             "admin-upstreams"
            )
 
     assert has_element?(view, "#pause-upstream-account-#{identity.id}")
@@ -3699,13 +3699,25 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#upstream-account-#{identity.id}-assignment-#{source_assignment.id}",
-             "Shared Source (shared-source)"
+             "Shared Source"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{identity.id}-assignment-#{source_assignment.id}",
+             "shared-source"
            )
 
     assert has_element?(
              view,
              "#upstream-account-#{identity.id}-assignment-#{target_assignment.id}",
-             "Shared Target (shared-target)"
+             "Shared Target"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{identity.id}-assignment-#{target_assignment.id}",
+             "shared-target"
            )
 
     html = render(view)

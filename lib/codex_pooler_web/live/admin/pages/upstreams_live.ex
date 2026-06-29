@@ -245,8 +245,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     SavedResetWorkflow.maybe_confirm_redemption(socket, identity_id, params)
   end
 
-  def handle_event("toggle_saved_reset_panel", %{"id" => identity_id}, socket) do
-    {:noreply, update(socket, :account_panel_views, &toggle_account_panel_view(&1, identity_id))}
+  def handle_event("toggle_account_pools_panel", %{"id" => identity_id}, socket) do
+    {:noreply,
+     update(socket, :account_panel_views, &toggle_account_panel_view(&1, identity_id, :pools))}
   end
 
   def handle_event("cancel_saved_reset_redemption", _params, socket) do
@@ -466,12 +467,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
     Enum.find(accounts, &(&1.identity.id == identity_id))
   end
 
-  @spec toggle_account_panel_view(map(), String.t()) :: map()
-  defp toggle_account_panel_view(panel_views, identity_id)
+  @spec toggle_account_panel_view(map(), String.t(), :pools) :: map()
+  defp toggle_account_panel_view(panel_views, identity_id, target_view)
        when is_map(panel_views) and is_binary(identity_id) do
     case Map.get(panel_views, identity_id, :usage) do
-      :saved_resets -> Map.delete(panel_views, identity_id)
-      _view -> Map.put(panel_views, identity_id, :saved_resets)
+      ^target_view -> Map.delete(panel_views, identity_id)
+      _view -> Map.put(panel_views, identity_id, target_view)
     end
   end
 
@@ -480,8 +481,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
        when is_map(panel_views) and is_list(accounts) do
     visible_account_ids = MapSet.new(accounts, & &1.identity.id)
 
-    Map.filter(panel_views, fn {identity_id, _view} ->
-      MapSet.member?(visible_account_ids, identity_id)
+    Map.filter(panel_views, fn {identity_id, view} ->
+      MapSet.member?(visible_account_ids, identity_id) and view == :pools
     end)
   end
 

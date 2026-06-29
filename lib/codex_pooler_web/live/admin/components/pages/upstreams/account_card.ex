@@ -9,7 +9,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.Admin.PoolInviteForm
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting, as: ResetFormatting
-  alias CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents
   alias CodexPoolerWeb.DateTimeDisplay
 
   @reactivatable_statuses ~w(paused refresh_due refresh_failed)
@@ -18,7 +17,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
 
   attr :account, :map, required: true
   attr :account_index, :integer, required: true
-  attr :panel_view, :atom, default: :usage, values: [:usage, :saved_resets]
+  attr :panel_view, :atom, default: :usage, values: [:usage, :pools]
 
   attr :datetime_preferences, :map, default: nil
 
@@ -38,10 +37,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
       |> assign(:routing_readiness, routing_readiness(assigns.account))
       |> assign(:saved_resets, saved_resets)
       |> assign(:saved_reset_policy, saved_reset_policy)
-      |> assign(:panel_view, normalize_panel_view(assigns.panel_view, saved_resets))
       |> assign(
-        :saved_reset_policy_state_label,
-        saved_reset_policy_state_label(saved_reset_policy)
+        :panel_view,
+        normalize_panel_view(assigns.panel_view, saved_resets, assigns.account)
       )
 
     ~H"""
@@ -89,8 +87,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
             disabled={@account.identity.status == "deleted"}
             saved_resets={@saved_resets}
             saved_reset_policy={@saved_reset_policy}
-            panel_view={@panel_view}
-            datetime_preferences={@datetime_preferences}
           />
           <.upstream_plan_indicator account={@account} account_index={@account_index} />
           <.upstream_account_actions account={@account} />
@@ -159,61 +155,82 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
           </section>
 
           <section
-            :if={saved_reset_panel_available?(@saved_resets)}
-            id={"upstream-account-#{@account.identity.id}-saved-reset-panel"}
-            data-role="upstream-saved-reset-bank-panel"
-            aria-hidden={aria_bool(@panel_view != :saved_resets)}
-            inert={@panel_view != :saved_resets}
-            class={account_panel_class(@panel_view == :saved_resets)}
+            :if={pools_panel_available?(@account)}
+            id={"upstream-account-#{@account.identity.id}-pools-panel"}
+            data-role="upstream-account-pools-panel"
+            aria-hidden={aria_bool(@panel_view != :pools)}
+            inert={@panel_view != :pools}
+            class={account_panel_class(@panel_view == :pools)}
           >
             <div class="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
               <div class="min-w-0">
-                <p class="text-xs font-semibold uppercase text-primary">Saved reset bank</p>
-                <p class="truncate text-xs text-base-content/60">
-                  {@saved_resets.label} available for this account
+                <p class="text-xs font-semibold uppercase text-primary">Pools</p>
+                <p
+                  id={"upstream-account-#{@account.identity.id}-pools-summary"}
+                  class="truncate text-xs text-base-content/60"
+                >
+                  {pool_assignment_summary_label(@account.assignments)}
                 </p>
               </div>
               <div class="min-w-0 text-right">
-                <p class="text-xs font-semibold uppercase text-primary">Policy</p>
-                <div class="flex min-w-0 items-center justify-end gap-1.5">
-                  <button
-                    id={"upstream-account-#{@account.identity.id}-saved-reset-policy-state"}
-                    type="button"
-                    data-role="upstream-saved-reset-policy-state"
-                    class="inline-flex max-w-full cursor-pointer items-center justify-end gap-1 rounded px-1 text-xs text-base-content/70 transition-colors hover:bg-base-300/60 hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-default disabled:opacity-60"
-                    phx-click="open_saved_reset_policy"
-                    phx-value-id={@account.identity.id}
-                    disabled={@account.identity.status == "deleted"}
-                  >
-                    <.icon name="hero-cog-6-tooth" class="size-3.5 shrink-0" />
-                    <span class="truncate">{@saved_reset_policy_state_label}</span>
-                  </button>
-                </div>
+                <p class="text-xs font-semibold uppercase text-primary">Routing</p>
+                <p
+                  id={"upstream-account-#{@account.identity.id}-pools-routing-summary"}
+                  class="truncate text-xs text-base-content/60"
+                  title={@routing_readiness.reason}
+                >
+                  {@routing_readiness.label}
+                </p>
               </div>
             </div>
 
             <div
-              id={"upstream-account-#{@account.identity.id}-saved-reset-expiration-panel"}
-              data-role="upstream-saved-reset-expiration"
-              class="grid gap-1"
+              id={"upstream-account-#{@account.identity.id}-pool-assignments"}
+              data-role="upstream-account-pool-assignments"
+              class="grid gap-3"
             >
-              <div class="flex min-w-0 items-center justify-between gap-3">
-                <p class="truncate text-xs font-medium text-base-content">Expiration queue</p>
-                <p
-                  :if={@saved_resets.next_expires_label}
-                  class="shrink-0 truncate text-[11px] leading-4 text-base-content/55"
-                  title={@saved_resets.next_expires_title}
+              <div
+                :for={assignment <- @account.assignments}
+                id={"upstream-account-#{@account.identity.id}-pool-assignment-#{assignment.id}"}
+                data-role="upstream-account-pool-assignment"
+                class="grid gap-1.5"
+              >
+                <div class="flex min-w-0 items-center justify-between gap-3 text-xs">
+                  <span
+                    data-role="upstream-account-pool-assignment-pool"
+                    class="min-w-0 truncate font-medium text-base-content"
+                    title={assignment.pool_label}
+                  >
+                    {assignment.pool_label}
+                  </span>
+                  <span
+                    data-role="upstream-account-pool-assignment-eligibility"
+                    class={assignment_eligibility_class(assignment.eligibility_status)}
+                  >
+                    {assignment_eligibility_label(assignment.eligibility_status)}
+                  </span>
+                </div>
+                <div
+                  id={"upstream-account-#{@account.identity.id}-pool-assignment-#{assignment.id}-route"}
+                  data-role="upstream-account-pool-route"
+                  role="meter"
+                  aria-valuemin="0"
+                  aria-valuemax="3"
+                  aria-valuenow={pool_route_ready_count(assignment)}
+                  aria-label={pool_route_aria_label(assignment)}
+                  class="grid grid-cols-3 gap-1"
                 >
-                  {@saved_resets.next_expires_label}
-                </p>
+                  <span
+                    :for={segment <- pool_route_segments(assignment)}
+                    id={"upstream-account-#{@account.identity.id}-pool-assignment-#{assignment.id}-route-#{segment.key}"}
+                    data-role="upstream-account-pool-route-segment"
+                    title={segment.detail_label}
+                    class={pool_route_segment_class(segment)}
+                  >
+                    {segment.label}
+                  </span>
+                </div>
               </div>
-              <SavedResetComponents.saved_reset_expiration_table
-                id={"upstream-account-#{@account.identity.id}-saved-reset-expiration"}
-                saved_resets={@saved_resets}
-                datetime_preferences={@datetime_preferences}
-                compact={true}
-                empty_label="Expiration dates not reported"
-              />
             </div>
           </section>
         </div>
@@ -239,11 +256,25 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
               {@routing_readiness.label}
             </dd>
           </div>
-          <div class="min-w-0 pl-3" data-role="upstream-pool-count-cell">
-            <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
-              Pools
+          <div class="group relative isolate min-w-0 pl-3" data-role="upstream-pool-count-cell">
+            <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35 transition-colors group-hover:text-primary/70">
+              <button
+                id={"upstream-account-#{@account.identity.id}-pools-panel-trigger"}
+                type="button"
+                class={pools_footer_trigger_class(@panel_view == :pools)}
+                phx-click="toggle_account_pools_panel"
+                phx-value-id={@account.identity.id}
+                aria-controls={"upstream-account-#{@account.identity.id}-pools-panel"}
+                aria-expanded={aria_bool(@panel_view == :pools)}
+                aria-label={pools_panel_trigger_label(@panel_view, @account.assignments)}
+              >
+                <span class="sr-only">Pools</span>
+              </button>
+              <span class="pointer-events-none relative z-30 block max-w-full truncate text-left uppercase">
+                Pools
+              </span>
             </dt>
-            <dd class="truncate text-base-content/60">
+            <dd class="pointer-events-none relative z-30 truncate text-base-content/60 transition-colors group-hover:text-base-content/75">
               {assignment_count_label(@account.assignments)}
             </dd>
           </div>
@@ -270,17 +301,22 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   defp saved_reset_policy(%{saved_reset_policy: saved_reset_policy}), do: saved_reset_policy
   defp saved_reset_policy(%{identity: identity}), do: SavedResets.auto_policy(identity)
 
-  defp normalize_panel_view(:saved_resets, saved_resets) do
-    if saved_reset_panel_available?(saved_resets), do: :saved_resets, else: :usage
+  defp normalize_panel_view(:pools, _saved_resets, account) do
+    if pools_panel_available?(account), do: :pools, else: :usage
   end
 
-  defp normalize_panel_view(_panel_view, _saved_resets), do: :usage
+  defp normalize_panel_view(_panel_view, _saved_resets, _account), do: :usage
 
   defp saved_reset_panel_available?(%{reported?: true, available_count: count})
        when is_integer(count) and count > 0,
        do: true
 
   defp saved_reset_panel_available?(_saved_resets), do: false
+
+  defp pools_panel_available?(%{assignments: assignments}) when is_list(assignments),
+    do: assignments != []
+
+  defp pools_panel_available?(_account), do: false
 
   defp account_panel_class(true) do
     "grid min-w-0 max-h-[28rem] gap-3 overflow-hidden opacity-100 transition-opacity duration-150 ease-out motion-reduce:transition-none"
@@ -456,9 +492,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   attr :identity_id, :string, required: true
   attr :saved_resets, :map, required: true
   attr :saved_reset_policy, :map, required: true
-  attr :panel_view, :atom, required: true
   attr :disabled, :boolean, default: false
-  attr :datetime_preferences, :map, required: true
 
   defp saved_reset_count_badge(
          %{saved_resets: %{reported?: true, available_count: count}} = assigns
@@ -466,17 +500,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
        when is_integer(count) and count > 0 do
     assigns =
       assigns
-      |> assign(:active?, assigns.panel_view == :saved_resets)
-      |> assign(
-        :badge_class,
-        saved_reset_count_badge_class(assigns.saved_reset_policy, assigns.panel_view)
-      )
+      |> assign(:badge_class, saved_reset_count_badge_class(assigns.saved_reset_policy))
       |> assign(:badge_icon_class, saved_reset_count_badge_icon_class(assigns.saved_reset_policy))
-      |> assign(:panel_id, "upstream-account-#{assigns.identity_id}-saved-reset-panel")
-      |> assign(
-        :aria_label,
-        saved_reset_count_badge_aria_label(assigns.panel_view, assigns.saved_resets)
-      )
+      |> assign(:aria_label, saved_reset_count_badge_aria_label(assigns.saved_resets))
 
     ~H"""
     <button
@@ -485,9 +511,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
       data-role="upstream-saved-reset-count-badge"
       class={@badge_class}
       aria-label={@aria_label}
-      aria-controls={@panel_id}
-      aria-pressed={aria_bool(@active?)}
-      phx-click="toggle_saved_reset_panel"
+      aria-controls="saved-reset-policy-dialog"
+      aria-haspopup="dialog"
+      phx-click="open_saved_reset_policy"
       phx-value-id={@identity_id}
       disabled={@disabled}
     >
@@ -502,12 +528,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     """
   end
 
-  defp saved_reset_count_badge_class(policy, panel_view) do
-    [
-      saved_reset_count_badge_tone_class(policy),
-      panel_view == :saved_resets && "ring-2 ring-primary/35 ring-offset-1 ring-offset-base-100"
-    ]
-  end
+  defp saved_reset_count_badge_class(policy), do: saved_reset_count_badge_tone_class(policy)
 
   defp saved_reset_count_badge_tone_class(%{enabled?: true}) do
     [
@@ -535,14 +556,34 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     "size-3 shrink-0 text-violet-600 dark:text-violet-300"
   end
 
-  defp saved_reset_policy_state_label(%{enabled?: true}), do: "Auto redeem active"
-  defp saved_reset_policy_state_label(_policy), do: "Auto redeem inactive"
+  defp pool_assignment_summary_label([_assignment]), do: "1 routing lane"
+  defp pool_assignment_summary_label(assignments), do: "#{length(assignments)} routing lanes"
 
-  defp saved_reset_count_badge_aria_label(:saved_resets, _saved_resets), do: "Show quota status"
+  defp pools_panel_trigger_label(:pools, _assignments), do: "Show quota status"
 
-  defp saved_reset_count_badge_aria_label(_panel_view, saved_resets) do
-    "Show saved reset bank: #{saved_resets.label}"
+  defp pools_panel_trigger_label(_panel_view, assignments),
+    do: "Show Pool assignments: #{assignment_count_label(assignments)}"
+
+  defp pools_footer_trigger_class(true) do
+    [
+      pools_footer_trigger_base_class(),
+      "border-primary/35 bg-primary/5"
+    ]
   end
+
+  defp pools_footer_trigger_class(false) do
+    [
+      pools_footer_trigger_base_class(),
+      "border-transparent hover:border-primary/25 hover:bg-primary/5"
+    ]
+  end
+
+  defp pools_footer_trigger_base_class do
+    "absolute inset-x-1 inset-y-[-0.35rem] z-20 rounded border transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+  end
+
+  defp saved_reset_count_badge_aria_label(saved_resets),
+    do: "Open saved reset bank: #{saved_resets.label}"
 
   attr :id, :string, required: true
   attr :saved_resets, :map, required: true
@@ -1042,6 +1083,124 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   defp assignment_count_label([]), do: "No Pools"
   defp assignment_count_label([_assignment]), do: "1 Pool"
   defp assignment_count_label(assignments), do: "#{length(assignments)} Pools"
+
+  defp assignment_eligibility_label(value) when is_binary(value) do
+    value
+    |> String.replace("_", " ")
+    |> String.capitalize()
+  end
+
+  defp assignment_eligibility_label(_value), do: "Unknown"
+
+  defp assignment_eligibility_class("eligible") do
+    "shrink-0 text-[11px] font-medium leading-4 text-success"
+  end
+
+  defp assignment_eligibility_class("blocked") do
+    "shrink-0 text-[11px] font-medium leading-4 text-error"
+  end
+
+  defp assignment_eligibility_class("paused") do
+    "shrink-0 text-[11px] font-medium leading-4 text-warning"
+  end
+
+  defp assignment_eligibility_class(_status) do
+    "shrink-0 text-[11px] font-medium leading-4 text-base-content/60"
+  end
+
+  defp pool_route_segments(assignment) do
+    [
+      %{
+        key: "assignment",
+        label: "Assignment",
+        detail_label: assignment_state_label(Map.get(assignment, :status)),
+        ready?: Map.get(assignment, :status) == "active",
+        tone: assignment_state_tone(Map.get(assignment, :status))
+      },
+      %{
+        key: "health",
+        label: "Health",
+        detail_label: assignment_health_label(Map.get(assignment, :health_status)),
+        ready?: Map.get(assignment, :health_status) == "active",
+        tone: assignment_health_tone(Map.get(assignment, :health_status))
+      },
+      %{
+        key: "quota",
+        label: "Quota",
+        detail_label: Map.get(assignment, :quota_priming_label) || "Quota unknown",
+        ready?: quota_priming_ready?(Map.get(assignment, :quota_priming_status)),
+        tone: quota_priming_tone(Map.get(assignment, :quota_priming_status))
+      }
+    ]
+  end
+
+  defp pool_route_ready_count(assignment) do
+    assignment
+    |> pool_route_segments()
+    |> Enum.count(& &1.ready?)
+  end
+
+  defp pool_route_aria_label(assignment) do
+    segment_labels =
+      assignment
+      |> pool_route_segments()
+      |> Enum.map_join(", ", & &1.detail_label)
+
+    "#{Map.get(assignment, :pool_label, "Pool")} route path: #{segment_labels}"
+  end
+
+  defp pool_route_segment_class(%{tone: :success}),
+    do: [pool_route_segment_base_class(), "bg-success/80 text-success-content"]
+
+  defp pool_route_segment_class(%{tone: :warning}),
+    do: [pool_route_segment_base_class(), "bg-warning/80 text-warning-content"]
+
+  defp pool_route_segment_class(%{tone: :error}),
+    do: [pool_route_segment_base_class(), "bg-error/80 text-error-content"]
+
+  defp pool_route_segment_class(_segment) do
+    [pool_route_segment_base_class(), "bg-base-300/70 text-base-content/55"]
+  end
+
+  defp pool_route_segment_base_class do
+    "inline-flex h-4 min-w-0 items-center justify-center truncate rounded-full px-1 text-center text-[0.55rem] font-semibold uppercase leading-none tracking-[0.04em]"
+  end
+
+  defp assignment_state_label("active"), do: "Assignment active"
+  defp assignment_state_label("paused"), do: "Assignment paused"
+  defp assignment_state_label("disabled"), do: "Assignment disabled"
+  defp assignment_state_label("deleted"), do: "Assignment deleted"
+  defp assignment_state_label(status), do: "Assignment #{human_status_label(status)}"
+
+  defp assignment_health_label("active"), do: "Health active"
+  defp assignment_health_label("degraded"), do: "Health degraded"
+  defp assignment_health_label("errored"), do: "Health errored"
+  defp assignment_health_label(status), do: "Health #{human_status_label(status)}"
+
+  defp assignment_state_tone("active"), do: :success
+  defp assignment_state_tone("paused"), do: :warning
+  defp assignment_state_tone("deleted"), do: :error
+  defp assignment_state_tone("disabled"), do: :error
+  defp assignment_state_tone(_status), do: :warning
+
+  defp assignment_health_tone("active"), do: :success
+  defp assignment_health_tone("degraded"), do: :warning
+  defp assignment_health_tone("errored"), do: :error
+  defp assignment_health_tone(_status), do: :warning
+
+  defp quota_priming_ready?(status), do: status in ["known", "weekly_only_probe"]
+
+  defp quota_priming_tone(status) when status in ["known", "weekly_only_probe"], do: :success
+  defp quota_priming_tone(status) when status in ["failed", "blocked", "expired"], do: :error
+  defp quota_priming_tone(_status), do: :warning
+
+  defp human_status_label(value) when is_binary(value) and value != "" do
+    value
+    |> String.replace("_", " ")
+    |> String.downcase()
+  end
+
+  defp human_status_label(_value), do: "unknown"
 
   defp recent_token_count_label(%{token_burn: %{recent_tokens: tokens}})
        when is_integer(tokens) and tokens >= 0 do

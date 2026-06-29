@@ -457,5 +457,5 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   defp refresh_job_state(_job), do: nil
 
   defp pool_label(nil), do: "Unknown Pool"
-  defp pool_label(pool), do: "#{pool.name} (#{pool.slug})"
+  defp pool_label(pool), do: pool.name
 end
