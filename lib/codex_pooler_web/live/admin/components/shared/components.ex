@@ -8,7 +8,7 @@ defmodule CodexPoolerWeb.Admin.Components do
 
   def admin_shell(assigns), do: Shell.admin_shell(assigns)
 
-  @docs_url "https://docs.codex-pooler.com"
+  @docs_url "https://docs.codex-pooler.com/operators/admin-ui/"
 
   attr :id, :string, required: true
   attr :eyebrow, :string, default: "Admin"
@@ -205,12 +205,16 @@ defmodule CodexPoolerWeb.Admin.Components do
           target="_blank"
           rel="noopener noreferrer"
           aria-label="Open Codex Pooler documentation"
-          class="inline-flex w-fit items-center gap-1.5 text-xs font-semibold text-base-content/55 transition-colors hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+          class="inline-flex w-fit items-center gap-1.5 text-xs font-semibold leading-none text-base-content/55 transition-colors hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
         >
-          <span data-role={@docs_icon_role} aria-hidden="true">
+          <span
+            data-role={@docs_icon_role}
+            aria-hidden="true"
+            class="inline-flex size-3.5 items-center justify-center"
+          >
             <.icon name="hero-arrow-top-right-on-square" class="size-3.5" />
           </span>
-          <span>Docs</span>
+          <span class="leading-none">Docs</span>
         </a>
         <div class="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
           {render_slot(@actions)}

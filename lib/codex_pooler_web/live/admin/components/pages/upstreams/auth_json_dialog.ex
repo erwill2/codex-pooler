@@ -5,6 +5,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog do
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
 
+  @auth_json_docs_url "https://docs.codex-pooler.com/operators/upstreams/#import-authjson"
+
   attr :auth_json_form, :any, required: true
   attr :importing_auth_json, :boolean, required: true
   attr :pool_options, :list, required: true
@@ -12,6 +14,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog do
   attr :upload_limit_label, :string, required: true
 
   def auth_json_import_dialog(assigns) do
+    assigns = assign(assigns, :auth_json_docs_url, @auth_json_docs_url)
+
     ~H"""
     <dialog :if={@importing_auth_json} id="auth-json-import-dialog" class="modal" open>
       <div class="modal-box max-w-5xl border border-base-300 bg-base-100 p-0 shadow-2xl">
@@ -146,7 +150,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog do
           />
         </.form>
 
-        <AdminComponents.dialog_footer id="auth-json-import-dialog-footer">
+        <AdminComponents.dialog_footer
+          id="auth-json-import-dialog-footer"
+          docs_url={@auth_json_docs_url}
+        >
           <:actions>
             <AdminComponents.action_button
               id="auth-json-import-cancel"

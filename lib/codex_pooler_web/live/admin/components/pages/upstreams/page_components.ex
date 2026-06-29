@@ -9,8 +9,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents
+  alias Phoenix.HTML.Form
 
   @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"
+  @upstream_actions_docs_url "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
   @saved_reset_docs_url "https://docs.codex-pooler.com/operators/upstreams/#saved-resets"
 
   attr :pools, :list, required: true
@@ -497,6 +499,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
   attr :form, :any, default: nil
 
   defp rename_account_dialog(assigns) do
+    assigns = assign(assigns, :upstream_actions_docs_url, @upstream_actions_docs_url)
+
     ~H"""
     <dialog :if={@account && @form} id="rename-upstream-account-dialog" class="modal" open>
       <div class="modal-box max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
@@ -527,7 +531,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           />
         </.form>
 
-        <AdminComponents.dialog_footer id="rename-upstream-account-dialog-footer">
+        <AdminComponents.dialog_footer
+          id="rename-upstream-account-dialog-footer"
+          docs_url={@upstream_actions_docs_url}
+        >
           <:actions>
             <AdminComponents.action_button
               id="rename-upstream-account-cancel"
@@ -585,13 +592,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           <div class="grid gap-1">
             <h3 class="text-sm font-semibold text-base-content">Banked reset expirations</h3>
             <p class="text-xs leading-5 text-base-content/60">
-              {@account.saved_resets.label} currently available. Expiration dates are shown when the upstream source reports them.
+              Redeem a specific saved reset before it expires, or adjust how this account spends banked capacity automatically.
             </p>
           </div>
           <SavedResetComponents.saved_reset_expiration_table
             id="saved-reset-expiration"
             saved_resets={@account.saved_resets}
             datetime_preferences={@datetime_preferences}
+            redeem_identity_id={@account.identity.id}
+            redeem_action={@account.saved_reset_redemption_action}
+            confirming_redemption={@confirming_saved_reset_redemption}
             empty_label="No expiration dates reported for the available saved resets yet."
           />
         </div>
@@ -605,17 +615,35 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
             autocomplete="off"
             class="grid gap-4"
           >
-            <div class="grid gap-1">
-              <.input
-                field={@form[:auto_redeem_enabled]}
-                type="checkbox"
-                id="saved-reset-policy-auto-redeem-enabled"
-                name="saved_reset_policy[auto_redeem_enabled]"
-                label="Auto redeem saved resets"
-              />
+            <div
+              id="saved-reset-policy-auto-redeem-control"
+              class="grid gap-3 rounded-box border border-base-300 bg-base-200/30 p-4 md:grid-cols-[minmax(0,1fr)_17rem] md:items-start"
+            >
+              <div class="grid gap-1 self-start">
+                <p class="text-sm font-semibold text-base-content">Auto redeem policy</p>
+                <p class="text-xs leading-5 text-base-content/60">
+                  Let Codex Pooler spend saved resets automatically when this account is blocked, near the quota limit, or carrying a soon-expiring reset.
+                </p>
+              </div>
+              <label
+                id="saved-reset-policy-auto-redeem-card"
+                for="saved-reset-policy-auto-redeem-enabled"
+                class="flex min-h-14 w-full cursor-pointer items-center justify-between gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-2 transition-colors hover:border-primary/50 hover:bg-primary/5"
+              >
+                <span class="text-sm font-medium text-base-content">Auto redeem saved resets</span>
+                <input type="hidden" name="saved_reset_policy[auto_redeem_enabled]" value="false" />
+                <input
+                  id="saved-reset-policy-auto-redeem-enabled"
+                  type="checkbox"
+                  name="saved_reset_policy[auto_redeem_enabled]"
+                  value="true"
+                  checked={form_checkbox_checked?(@form[:auto_redeem_enabled])}
+                  class="toggle toggle-primary toggle-md shrink-0"
+                />
+              </label>
             </div>
 
-            <div class="grid gap-4 md:grid-cols-[minmax(0,1.1fr)_minmax(9rem,0.9fr)]">
+            <div class="grid items-start gap-4 md:grid-cols-[minmax(0,1.1fr)_minmax(9rem,0.9fr)]">
               <div class="grid gap-1">
                 <.input
                   field={@form[:trigger_mode]}
@@ -633,7 +661,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
                 </p>
               </div>
 
-              <div class="grid gap-1">
+              <div class="grid gap-1 self-start">
                 <.input
                   field={@form[:quota_threshold_percent]}
                   type="number"
@@ -650,94 +678,36 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
               </div>
             </div>
 
-            <div class="grid gap-1">
-              <.input
-                field={@form[:min_blocked_minutes]}
-                type="number"
-                id="saved-reset-policy-min-blocked-minutes"
-                name="saved_reset_policy[min_blocked_minutes]"
-                label="Natural reset buffer"
-                min="0"
-              />
-              <p class="text-xs leading-5 text-base-content/65">
-                Do not spend a saved reset when the weekly quota will reset naturally within this many minutes. Set 0 to allow automatic redemption even when the natural reset is close.
-              </p>
-            </div>
-
-            <div class="grid gap-1">
-              <.input
-                field={@form[:keep_credits]}
-                type="number"
-                id="saved-reset-policy-keep-credits"
-                name="saved_reset_policy[keep_credits]"
-                label="Resets to keep in bank"
-                min="0"
-              />
-              <p class="text-xs leading-5 text-base-content/65">
-                Automatic redemption stops when the available reset count is at or below this reserve.
-              </p>
-            </div>
-          </.form>
-
-          <section
-            id="saved-reset-manual-redemption"
-            class="grid gap-3 rounded-lg border border-base-300 bg-base-200/30 p-4"
-          >
-            <div class="grid gap-1">
-              <h3 class="text-sm font-semibold text-base-content">Redeem one banked reset now</h3>
-              <p class="text-sm leading-6 text-base-content/70">
-                Spend one saved reset now for this account. Policy changes only control future automatic redemption.
-              </p>
-            </div>
-
-            <div
-              :if={@confirming_saved_reset_redemption != @account}
-              class="flex flex-wrap items-center gap-3"
-            >
-              <AdminComponents.action_button
-                id="saved-reset-redemption-open-confirmation"
-                icon="hero-battery-100"
-                label="Redeem one saved reset"
-                phx-click="open_saved_reset_redemption_confirmation"
-                phx-value-id={@account.identity.id}
-                disabled={!@account.saved_reset_redemption_action.available?}
-                variant={:secondary}
-              />
-              <p
-                :if={!@account.saved_reset_redemption_action.available?}
-                id="saved-reset-redemption-disabled-reason"
-                class="text-xs leading-5 text-base-content/60"
-              >
-                {@account.saved_reset_redemption_action.reason}
-              </p>
-            </div>
-
-            <div
-              :if={@confirming_saved_reset_redemption == @account}
-              id="saved-reset-redemption-confirmation"
-              class="grid gap-3 rounded-lg border border-warning/30 bg-warning/10 p-3"
-            >
-              <p class="text-sm leading-6 text-base-content/80">
-                Confirm that this account should spend one saved reset now. The action is queued separately from the policy form.
-              </p>
-              <div class="flex flex-wrap items-center gap-2">
-                <AdminComponents.action_button
-                  id="saved-reset-redemption-confirm"
-                  icon="hero-check"
-                  label="Confirm redemption"
-                  phx-click="redeem_saved_reset"
-                  phx-value-id={@account.identity.id}
-                  variant={:primary}
+            <div class="grid gap-4 md:grid-cols-2">
+              <div class="grid gap-1">
+                <.input
+                  field={@form[:min_blocked_minutes]}
+                  type="number"
+                  id="saved-reset-policy-min-blocked-minutes"
+                  name="saved_reset_policy[min_blocked_minutes]"
+                  label="Natural reset buffer"
+                  min="0"
                 />
-                <AdminComponents.action_button
-                  id="saved-reset-redemption-cancel"
-                  icon="hero-x-mark"
-                  label="Keep reset in bank"
-                  phx-click="cancel_saved_reset_redemption"
+                <p class="text-xs leading-5 text-base-content/65">
+                  Do not spend a saved reset when the weekly quota will reset naturally within this many minutes.
+                </p>
+              </div>
+
+              <div class="grid gap-1">
+                <.input
+                  field={@form[:keep_credits]}
+                  type="number"
+                  id="saved-reset-policy-keep-credits"
+                  name="saved_reset_policy[keep_credits]"
+                  label="Resets to keep in bank"
+                  min="0"
                 />
+                <p class="text-xs leading-5 text-base-content/65">
+                  Automatic redemption stops when the available reset count is at or below this reserve.
+                </p>
               </div>
             </div>
-          </section>
+          </.form>
         </div>
 
         <AdminComponents.dialog_footer
@@ -834,6 +804,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
 
   defp oauth_relink_mode?(:relink), do: true
   defp oauth_relink_mode?(_mode), do: false
+
+  defp form_checkbox_checked?(field) do
+    Form.normalize_value("checkbox", field.value)
+  end
 
   defp oauth_target_label(%{label: label}) when is_binary(label) and label != "", do: label
 

@@ -6,6 +6,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
 
   @oauth_docs_url "https://docs.codex-pooler.com/operators/upstreams/#openai-oauth-upstream-linking"
+  @upstream_actions_docs_url "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
 
   def oauth_relink_dialog(assigns) do
     assigns = assign(assigns, :oauth_docs_url, @oauth_docs_url)
@@ -146,6 +147,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
   attr :form, :any, default: nil
 
   def rename_account_dialog(assigns) do
+    assigns = assign(assigns, :upstream_actions_docs_url, @upstream_actions_docs_url)
+
     ~H"""
     <dialog :if={@account && @form} id="cockpit-rename-upstream-account-dialog" class="modal" open>
       <div class="modal-box max-w-xl border border-base-300 bg-base-100 p-0 shadow-2xl">
@@ -167,7 +170,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
           <.input field={@form[:account_label]} type="text" label="Label" required />
         </.form>
 
-        <AdminComponents.dialog_footer id="cockpit-rename-upstream-account-dialog-footer">
+        <AdminComponents.dialog_footer
+          id="cockpit-rename-upstream-account-dialog-footer"
+          docs_url={@upstream_actions_docs_url}
+        >
           <:actions>
             <AdminComponents.action_button
               id="cockpit-rename-upstream-account-cancel"
@@ -197,6 +203,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
   attr :form, :any, required: true
 
   def delete_account_dialog(assigns) do
+    assigns = assign(assigns, :upstream_actions_docs_url, @upstream_actions_docs_url)
+
     ~H"""
     <dialog :if={@account} id="cockpit-delete-upstream-account-dialog" class="modal" open>
       <div class="modal-box max-w-xl border border-error/30 bg-base-100 p-0 shadow-2xl">
@@ -229,7 +237,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
           />
         </.form>
 
-        <AdminComponents.dialog_footer id="cockpit-delete-upstream-account-dialog-footer">
+        <AdminComponents.dialog_footer
+          id="cockpit-delete-upstream-account-dialog-footer"
+          docs_url={@upstream_actions_docs_url}
+        >
           <:actions>
             <AdminComponents.action_button
               id="cockpit-delete-upstream-account-cancel"

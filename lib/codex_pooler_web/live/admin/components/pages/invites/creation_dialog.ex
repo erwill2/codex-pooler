@@ -5,6 +5,8 @@ defmodule CodexPoolerWeb.Admin.InviteCreationDialog do
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
 
+  @invite_docs_url "https://docs.codex-pooler.com/operators/invites/#create-pool-invite"
+
   attr :creating_invite, :boolean, required: true
   attr :invite_form, :any, required: true
   attr :invite_form_valid?, :boolean, required: true
@@ -13,6 +15,8 @@ defmodule CodexPoolerWeb.Admin.InviteCreationDialog do
   attr :pool_options, :list, required: true
 
   def pool_invite_dialog(assigns) do
+    assigns = assign(assigns, :invite_docs_url, @invite_docs_url)
+
     ~H"""
     <dialog :if={@creating_invite} id="pool-invite-dialog" class="modal" open>
       <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
@@ -100,7 +104,11 @@ defmodule CodexPoolerWeb.Admin.InviteCreationDialog do
           </div>
         </div>
 
-        <AdminComponents.dialog_footer :if={@last_invite} id="pool-invite-ready-dialog-footer">
+        <AdminComponents.dialog_footer
+          :if={@last_invite}
+          id="pool-invite-ready-dialog-footer"
+          docs_url={@invite_docs_url}
+        >
           <:actions>
             <AdminComponents.action_button
               id="pool-invite-dialog-close"
@@ -153,7 +161,11 @@ defmodule CodexPoolerWeb.Admin.InviteCreationDialog do
           </div>
         </.form>
 
-        <AdminComponents.dialog_footer :if={!@last_invite} id="pool-invite-dialog-footer">
+        <AdminComponents.dialog_footer
+          :if={!@last_invite}
+          id="pool-invite-dialog-footer"
+          docs_url={@invite_docs_url}
+        >
           <:actions>
             <AdminComponents.action_button
               id="pool-invite-cancel"

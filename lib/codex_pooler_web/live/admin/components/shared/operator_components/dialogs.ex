@@ -8,12 +8,18 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
   alias CodexPoolerWeb.Admin.OperatorComponents.Identity
   alias CodexPoolerWeb.Admin.OperatorForm
 
+  @operator_docs_url "https://docs.codex-pooler.com/operators/operators/#create-operator"
+  @operator_actions_docs_url "https://docs.codex-pooler.com/operators/operators/#action-menu"
+  @operator_password_docs_url "https://docs.codex-pooler.com/operators/operators/#password-reset"
+
   attr :creating_operator, :boolean, required: true
   attr :create_form, Phoenix.HTML.Form, required: true
   attr :temporary_password_receipt, :map, default: nil
   attr :pool_options, :list, default: []
 
   def operator_create_dialog(assigns) do
+    assigns = assign(assigns, :operator_docs_url, @operator_docs_url)
+
     ~H"""
     <dialog :if={@creating_operator} id="operator-create-dialog" class="modal" open>
       <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
@@ -72,6 +78,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         <AdminComponents.dialog_footer
           :if={!@temporary_password_receipt}
           id="operator-create-dialog-footer"
+          docs_url={@operator_docs_url}
         >
           <:actions>
             <AdminComponents.action_button
@@ -103,6 +110,8 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
   attr :pool_options, :list, default: []
 
   def operator_edit_dialog(assigns) do
+    assigns = assign(assigns, :operator_actions_docs_url, @operator_actions_docs_url)
+
     ~H"""
     <dialog :if={@editing_operator} id="operator-edit-dialog" class="modal" open>
       <div class="modal-box max-w-2xl border border-base-300 bg-base-100 p-0 shadow-2xl">
@@ -140,7 +149,10 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
           </div>
         </.form>
 
-        <AdminComponents.dialog_footer id="operator-edit-dialog-footer">
+        <AdminComponents.dialog_footer
+          id="operator-edit-dialog-footer"
+          docs_url={@operator_actions_docs_url}
+        >
           <:actions>
             <AdminComponents.action_button
               id="operator-edit-cancel"
@@ -172,6 +184,8 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
   attr :reset_form, Phoenix.HTML.Form, required: true
 
   def operator_password_dialog(assigns) do
+    assigns = assign(assigns, :operator_password_docs_url, @operator_password_docs_url)
+
     ~H"""
     <dialog
       :if={@resetting_operator || @password_dialog_receipt}
@@ -227,6 +241,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         <AdminComponents.dialog_footer
           :if={@resetting_operator && !@password_dialog_receipt}
           id="operator-password-dialog-footer"
+          docs_url={@operator_password_docs_url}
         >
           <:actions>
             <AdminComponents.action_button
@@ -356,6 +371,8 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
   attr :email_error_copy, :string, default: nil
 
   defp temporary_password_receipt_card(assigns) do
+    assigns = assign(assigns, :operator_password_docs_url, @operator_password_docs_url)
+
     ~H"""
     <div class="grid gap-5 p-6">
       <div
@@ -407,7 +424,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
       </div>
     </div>
 
-    <AdminComponents.dialog_footer id={"#{@wrapper_id}-footer"}>
+    <AdminComponents.dialog_footer id={"#{@wrapper_id}-footer"} docs_url={@operator_password_docs_url}>
       <:actions>
         <AdminComponents.action_button
           id={@close_button_id}

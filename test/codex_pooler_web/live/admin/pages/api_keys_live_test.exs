@@ -117,7 +117,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
 
     assert has_element?(
              view,
-             "#api-key-footer [data-role='policy-editor-docs-link'][href='https://docs.codex-pooler.com'][target='_blank'][rel='noopener noreferrer'].text-xs",
+             "#api-key-footer [data-role='policy-editor-docs-link'][href='https://docs.codex-pooler.com/operators/api-keys/#create-api-key'][target='_blank'][rel='noopener noreferrer'].text-xs",
              "Docs"
            )
 

@@ -3698,9 +3698,21 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   end
 
   defp assert_admin_dialog_docs_link(view, footer_id) do
+    docs_url =
+      case footer_id do
+        "auth-json-import-dialog-footer" ->
+          "https://docs.codex-pooler.com/operators/upstreams/#import-authjson"
+
+        "cockpit-rename-upstream-account-dialog-footer" ->
+          "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
+
+        "cockpit-delete-upstream-account-dialog-footer" ->
+          "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
+      end
+
     assert has_element?(
              view,
-             "##{footer_id} [data-role='admin-dialog-docs-link'][href='https://docs.codex-pooler.com'][target='_blank'][rel='noopener noreferrer'].text-xs",
+             "##{footer_id} [data-role='admin-dialog-docs-link'][href='#{docs_url}'][target='_blank'][rel='noopener noreferrer'].text-xs",
              "Docs"
            )
 

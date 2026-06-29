@@ -16,6 +16,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
     %{id: :review, label: "Review", description: "Effective policy"}
   ]
   @step_ids Enum.map(@steps, &Atom.to_string(&1.id))
+  @api_key_docs_url "https://docs.codex-pooler.com/operators/api-keys/#create-api-key"
 
   @spec steps() :: [map()]
   def steps, do: @steps
@@ -272,6 +273,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
       |> assign(:cancel_event, cancel_event(assigns.mode))
       |> assign(:cancel_id, cancel_id(assigns.mode))
       |> assign(:submit_label, submit_label(assigns.mode))
+      |> assign(:api_key_docs_url, @api_key_docs_url)
 
     ~H"""
     <PolicyEditorComponents.policy_editor_dialog
@@ -284,6 +286,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
       sections_label="API key policy sections"
       step_event="api_key_wizard_step"
       backdrop_event={@cancel_event}
+      docs_url={@api_key_docs_url}
     >
       <.form
         id="api-key-form"

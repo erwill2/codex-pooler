@@ -625,9 +625,27 @@ defmodule CodexPoolerWeb.Admin.OperatorsLiveTest do
   end
 
   defp assert_admin_dialog_docs_link(view, footer_id) do
+    docs_url =
+      case footer_id do
+        "operator-create-dialog-footer" ->
+          "https://docs.codex-pooler.com/operators/operators/#create-operator"
+
+        "operator-create-temporary-password-receipt-footer" ->
+          "https://docs.codex-pooler.com/operators/operators/#password-reset"
+
+        "operator-edit-dialog-footer" ->
+          "https://docs.codex-pooler.com/operators/operators/#action-menu"
+
+        "operator-password-dialog-footer" ->
+          "https://docs.codex-pooler.com/operators/operators/#password-reset"
+
+        "operator-temporary-password-dialog-receipt-footer" ->
+          "https://docs.codex-pooler.com/operators/operators/#password-reset"
+      end
+
     assert has_element?(
              view,
-             "##{footer_id} [data-role='admin-dialog-docs-link'][href='https://docs.codex-pooler.com'][target='_blank'][rel='noopener noreferrer'].text-xs",
+             "##{footer_id} [data-role='admin-dialog-docs-link'][href='#{docs_url}'][target='_blank'][rel='noopener noreferrer'].text-xs",
              "Docs"
            )
 

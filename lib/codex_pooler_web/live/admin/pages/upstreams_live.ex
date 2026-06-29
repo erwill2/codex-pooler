@@ -237,8 +237,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
      )}
   end
 
-  def handle_event("open_saved_reset_redemption_confirmation", %{"id" => identity_id}, socket) do
-    SavedResetWorkflow.maybe_confirm_redemption(socket, identity_id)
+  def handle_event(
+        "open_saved_reset_redemption_confirmation",
+        %{"id" => identity_id} = params,
+        socket
+      ) do
+    SavedResetWorkflow.maybe_confirm_redemption(socket, identity_id, params)
   end
 
   def handle_event("toggle_saved_reset_panel", %{"id" => identity_id}, socket) do

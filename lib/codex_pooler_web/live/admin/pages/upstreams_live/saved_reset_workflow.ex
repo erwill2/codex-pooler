@@ -81,13 +81,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.SavedResetWorkflow do
     end
   end
 
-  @spec maybe_confirm_redemption(Phoenix.LiveView.Socket.t(), Ecto.UUID.t()) ::
+  @spec maybe_confirm_redemption(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), map()) ::
           {:noreply, Phoenix.LiveView.Socket.t()}
-  def maybe_confirm_redemption(socket, identity_id) do
+  def maybe_confirm_redemption(socket, identity_id, params \\ %{}) do
     case socket.assigns.editing_saved_reset_policy do
       %{identity: %UpstreamIdentity{id: ^identity_id}} = account ->
         if account.saved_reset_redemption_action.available? do
-          {:noreply, assign(socket, :confirming_saved_reset_redemption, account)}
+          {:noreply,
+           assign(
+             socket,
+             :confirming_saved_reset_redemption,
+             redemption_confirmation(account, params)
+           )}
         else
           {:noreply, put_flash(socket, :error, account.saved_reset_redemption_action.reason)}
         end
@@ -101,6 +106,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.SavedResetWorkflow do
           {:ok, map()} | {:error, String.t()}
   def confirmed_account(socket, identity_id) do
     case socket.assigns.confirming_saved_reset_redemption do
+      %{identity_id: ^identity_id, account: account} ->
+        if account.saved_reset_redemption_action.available? do
+          {:ok, account}
+        else
+          {:error, account.saved_reset_redemption_action.reason}
+        end
+
       %{identity: %UpstreamIdentity{id: ^identity_id}} = account ->
         if account.saved_reset_redemption_action.available? do
           {:ok, account}
@@ -111,6 +123,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.SavedResetWorkflow do
       _account ->
         {:error, "Confirm saved reset redemption before continuing"}
     end
+  end
+
+  defp redemption_confirmation(account, params) do
+    %{
+      identity_id: account.identity.id,
+      account: account,
+      expiration_index: Map.get(params, "expiration-index", "unreported"),
+      expiration_label: Map.get(params, "expiration-label", "unreported banked reset")
+    }
   end
 
   defp redemption_pool_id(%{assignments: [%{pool_id: pool_id} | _assignments]})

@@ -8,6 +8,8 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
   alias CodexPoolerWeb.DateTimeDisplay
   alias Phoenix.LiveView.JS
 
+  @invite_docs_url "https://docs.codex-pooler.com/operators/invites/#active-invite-actions"
+
   attr :id, :string, required: true
   attr :label, :string, required: true
   attr :field_name, :string, required: true
@@ -237,6 +239,8 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
   attr :invite, :map, default: nil
 
   def invite_revoke_dialog(assigns) do
+    assigns = assign(assigns, :invite_docs_url, @invite_docs_url)
+
     ~H"""
     <dialog :if={@invite} id="invite-revoke-dialog" class="modal" open>
       <div class="modal-box max-w-xl rounded-box border border-base-300 bg-base-100 p-0 shadow-2xl">
@@ -262,6 +266,7 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
         <AdminComponents.dialog_footer
           id="invite-revoke-dialog-footer"
           class="modal-action mt-0 w-full border-t border-base-300 bg-base-200/80 px-5 py-4"
+          docs_url={@invite_docs_url}
         >
           <:actions>
             <button

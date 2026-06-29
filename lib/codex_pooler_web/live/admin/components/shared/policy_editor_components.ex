@@ -16,7 +16,7 @@ defmodule CodexPoolerWeb.Admin.PolicyEditorComponents do
   attr :step_event, :string, default: nil
   attr :backdrop_event, :string, default: nil
   attr :backdrop_label, :string, default: "close"
-  attr :docs_url, :string, default: "https://docs.codex-pooler.com"
+  attr :docs_url, :string, default: "https://docs.codex-pooler.com/operators/admin-ui/"
   attr :rest, :global
 
   slot :inner_block, required: true

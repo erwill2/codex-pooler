@@ -1285,9 +1285,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, "#saved-reset-policy-quota-threshold-percent")
     assert has_element?(view, "#saved-reset-policy-min-blocked-minutes")
     assert has_element?(view, "#saved-reset-policy-keep-credits")
-    assert has_element?(view, "#saved-reset-manual-redemption")
+    assert has_element?(view, "#saved-reset-policy-auto-redeem-card")
+    assert has_element?(view, "#saved-reset-expiration-empty-action")
+    assert has_element?(view, "#saved-reset-expiration-redeem-unreported", "Redeem")
     assert has_element?(view, "#saved-reset-policy-submit")
-    assert has_element?(view, "#saved-reset-manual-redemption", "Spend one saved reset now")
 
     assert has_element?(
              view,
@@ -1358,6 +1359,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
     stale_started_at = now |> DateTime.add(-5, :minute) |> DateTime.to_iso8601()
+    reset_expires_at = now |> DateTime.add(13, :day) |> DateTime.to_iso8601()
+    reset_first_seen_at = now |> DateTime.add(-1, :day) |> DateTime.to_iso8601()
 
     %{identity: identity, assignment: assignment} =
       active_upstream_assignment_fixture(pool, %{
@@ -1374,7 +1377,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
             "source" => "codex_usage_api",
             "path_style" => "codex_api",
             "usage_path" => "/api/codex/usage",
-            "observed_at" => DateTime.to_iso8601(now)
+            "observed_at" => DateTime.to_iso8601(now),
+            "available_expirations" => [
+              %{"expires_at" => reset_expires_at, "first_seen_at" => reset_first_seen_at}
+            ],
+            "next_expires_at" => reset_expires_at
           },
           "saved_reset_redemption" => %{
             "status" => "redeeming",
@@ -1404,14 +1411,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     |> render_click()
 
     assert has_element?(view, "#saved-reset-policy-dialog")
-    assert has_element?(view, "#saved-reset-redemption-open-confirmation")
+    assert has_element?(view, "#saved-reset-expiration-redeem-0")
 
     view
-    |> element("#saved-reset-redemption-open-confirmation")
+    |> element("#saved-reset-expiration-redeem-0")
     |> render_click()
 
-    assert has_element?(view, "#saved-reset-redemption-confirmation")
-    assert has_element?(view, "#saved-reset-redemption-confirm", "Confirm redemption")
+    assert has_element?(view, "#saved-reset-expiration-redeem-0-confirmation")
+    assert has_element?(view, "#saved-reset-expiration-redeem-0-confirm", "Confirm")
 
     assert Repo.aggregate(
              from(job in Oban.Job,
@@ -1421,7 +1428,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
            ) == 0
 
     view
-    |> element("#saved-reset-redemption-confirm")
+    |> element("#saved-reset-expiration-redeem-0-confirm")
     |> render_click()
 
     assert [job] =
@@ -4521,9 +4528,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   end
 
   defp assert_admin_dialog_docs_link(view, footer_id) do
+    docs_url =
+      case footer_id do
+        "auth-json-import-dialog-footer" ->
+          "https://docs.codex-pooler.com/operators/upstreams/#import-authjson"
+
+        "rename-upstream-account-dialog-footer" ->
+          "https://docs.codex-pooler.com/operators/upstreams/#card-action-menu"
+      end
+
     assert has_element?(
              view,
-             "##{footer_id} [data-role='admin-dialog-docs-link'][href='https://docs.codex-pooler.com'][target='_blank'][rel='noopener noreferrer'].text-xs",
+             "##{footer_id} [data-role='admin-dialog-docs-link'][href='#{docs_url}'][target='_blank'][rel='noopener noreferrer'].text-xs",
              "Docs"
            )
 
