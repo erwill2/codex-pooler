@@ -823,7 +823,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     disabled_selector = "#upstream-assignment-#{disabled_assignment.id}"
 
     assert has_element?(view, primary_selector, "Primary assignment serving production traffic")
-    assert has_element?(view, primary_selector, "Status Primary (status-primary)")
+    assert has_element?(view, primary_selector, "Status Primary")
     assert has_element?(view, "#{primary_selector}-pool-link[href='/admin/pools']")
     assert has_element?(view, primary_selector, "Assignment active")
     assert has_element?(view, primary_selector, "Health active")
@@ -833,7 +833,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, primary_selector, "Active assignment")
 
     assert has_element?(view, disabled_selector, "Disabled failover assignment")
-    assert has_element?(view, disabled_selector, "Status Secondary (status-secondary)")
+    assert has_element?(view, disabled_selector, "Status Secondary")
     assert has_element?(view, "#{disabled_selector}-pool-link[href='/admin/pools']")
     assert has_element?(view, disabled_selector, "Assignment disabled")
     assert has_element?(view, disabled_selector, "Health disabled")
@@ -1233,7 +1233,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert cockpit.assignments.count == 1
 
-    assert [%{pool_id: pool_id, pool_label: "Rich Cockpit (rich-cockpit)"}] =
+    assert [%{pool_id: pool_id, pool_label: "Rich Cockpit"}] =
              cockpit.assignments.items
 
     assert pool_id == pool.id
