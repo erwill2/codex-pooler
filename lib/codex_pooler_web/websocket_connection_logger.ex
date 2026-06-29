@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.WebsocketConnectionLogger do
 
   @init_failed_message "websocket init failed before request reservation"
   @closed_message "websocket closed before request reservation"
+  @bandit_oversize_fragmented_message_reason "Received oversize fragmented message"
 
   @metadata_keys [
     :request_id,
@@ -18,6 +19,22 @@ defmodule CodexPoolerWeb.WebsocketConnectionLogger do
     :owner_instance_id,
     :proxy_instance_id,
     :downstream_epoch
+  ]
+
+  @id_prefix_length 8
+
+  @sensitive_value_patterns [
+    "auth.json",
+    "authorization",
+    "bearer",
+    "cookie",
+    "header",
+    "idempotency",
+    "payload",
+    "prompt",
+    "raw_request_body",
+    "upstream_body",
+    "websocket_frame"
   ]
 
   @type event_metadata :: keyword() | map()
@@ -47,8 +64,13 @@ defmodule CodexPoolerWeb.WebsocketConnectionLogger do
   def reason_class({:shutdown, _reason}), do: "shutdown"
   def reason_class({:error, reason}), do: reason_class(reason)
   def reason_class({:EXIT, _reason}), do: "exit"
+  def reason_class({:deserializing, reason}), do: reason_class(reason)
   def reason_class({reason, _details}) when is_atom(reason), do: Atom.to_string(reason)
   def reason_class(reason) when is_atom(reason), do: Atom.to_string(reason)
+
+  def reason_class(@bandit_oversize_fragmented_message_reason),
+    do: "max_fragmented_message_size_exceeded"
+
   def reason_class(reason) when is_binary(reason), do: "binary_reason"
   def reason_class(reason) when is_integer(reason), do: "numeric_reason"
   def reason_class(%module{}) when is_atom(module), do: safe_log_value(inspect(module))
@@ -60,7 +82,7 @@ defmodule CodexPoolerWeb.WebsocketConnectionLogger do
       |> normalize_metadata()
       |> Map.put(:reason_class, reason_class(reason))
       |> allowed_metadata()
-      |> Enum.map_join(" ", fn {key, value} -> "#{key}=#{safe_log_value(value)}" end)
+      |> Enum.map_join(" ", fn {key, value} -> "#{key}=#{safe_log_value(key, value)}" end)
 
     Logger.log(level, fn -> message <> metadata_suffix(log_metadata) end)
 
@@ -92,18 +114,52 @@ defmodule CodexPoolerWeb.WebsocketConnectionLogger do
     Map.get(metadata, key) || Map.get(metadata, Atom.to_string(key))
   end
 
-  defp safe_log_value(value) when is_atom(value), do: Atom.to_string(value)
+  defp safe_log_value(:codex_session_id, value), do: safe_id_prefix(value)
+  defp safe_log_value(_key, value), do: safe_log_value(value)
+
+  defp safe_log_value(value) when is_atom(value),
+    do: value |> Atom.to_string() |> safe_binary_value()
+
   defp safe_log_value(value) when is_integer(value), do: Integer.to_string(value)
 
   defp safe_log_value(value) when is_binary(value) do
-    value
-    |> String.replace(~r/[^a-zA-Z0-9_.:-]+/, "_")
-    |> String.slice(0, 120)
-    |> case do
-      "" -> "unknown"
-      sanitized -> sanitized
-    end
+    safe_binary_value(value)
   end
 
   defp safe_log_value(_value), do: "unknown"
+
+  defp safe_id_prefix(value) when is_binary(value) do
+    case safe_binary_value(value) do
+      "redacted" -> "redacted"
+      "unknown" -> "unknown"
+      sanitized -> String.slice(sanitized, 0, @id_prefix_length)
+    end
+  end
+
+  defp safe_id_prefix(_value), do: "unknown"
+
+  defp safe_binary_value(value) when is_binary(value) do
+    if sensitive_value?(value) do
+      "redacted"
+    else
+      value
+      |> sanitize_binary_value()
+      |> case do
+        "" -> "unknown"
+        sanitized -> sanitized
+      end
+    end
+  end
+
+  defp sanitize_binary_value(value) do
+    value
+    |> String.replace(~r/[^a-zA-Z0-9_.:-]+/, "_")
+    |> String.slice(0, 120)
+  end
+
+  defp sensitive_value?(value) do
+    normalized = String.downcase(value)
+
+    Enum.any?(@sensitive_value_patterns, &String.contains?(normalized, &1))
+  end
 end

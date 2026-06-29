@@ -3044,7 +3044,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     assert line =~ "endpoint=#{expected_endpoint}"
     assert line =~ "transport=websocket"
     assert line =~ "route_class=proxy_websocket"
-    assert line =~ "codex_session_id=#{session.id}"
+    assert line =~ "codex_session_id=#{String.slice(session.id, 0, 8)}"
+    refute line =~ session.id
     assert line =~ "owner_instance_id=#{expected_owner_instance_id}"
     assert line =~ "proxy_instance_id=#{expected_proxy_instance_id}"
 
