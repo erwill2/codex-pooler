@@ -1,9 +1,13 @@
 defmodule CodexPoolerWeb.Admin.SystemSettingsFormTest do
   use CodexPooler.DataCase, async: false
 
+  import Phoenix.Component
+  import Phoenix.LiveViewTest, only: [rendered_to_string: 1]
+
   alias CodexPooler.InstanceSettings
   alias CodexPooler.InstanceSettings.Settings
   alias CodexPooler.Repo
+  alias CodexPoolerWeb.Admin.SystemPageComponents.Gateway
   alias CodexPoolerWeb.Admin.SystemSettingsForm
 
   setup do
@@ -20,6 +24,26 @@ defmodule CodexPoolerWeb.Admin.SystemSettingsFormTest do
     params = SystemSettingsForm.params_from_settings(settings)
 
     assert %Phoenix.HTML.Form{} = SystemSettingsForm.forms(settings, params)["ingress"]
+    assert get_in(params, ["gateway", "websocket_idle_timeout_ms"]) == 1_800_000
+
+    forms = SystemSettingsForm.forms(settings, params)
+    card_statuses = SystemSettingsForm.initial_card_statuses()
+
+    assigns = %{forms: forms, params: params, settings: settings, card_statuses: card_statuses}
+
+    html =
+      rendered_to_string(~H"""
+      <Gateway.cards
+        selected_tab="gateway"
+        forms={@forms}
+        form_params={@params}
+        settings={@settings}
+        card_statuses={@card_statuses}
+      />
+      """)
+
+    assert html =~ ~s(id="instance-settings-websocket-idle-timeout-ms")
+    assert html =~ "Websocket idle timeout (ms)"
 
     submitted_params = %{
       "_group" => "ingress",

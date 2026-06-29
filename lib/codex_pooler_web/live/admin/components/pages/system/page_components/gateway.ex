@@ -261,6 +261,13 @@ defmodule CodexPoolerWeb.Admin.SystemPageComponents.Gateway do
       },
       %{
         type: :number,
+        id: "instance-settings-websocket-idle-timeout-ms",
+        field: :websocket_idle_timeout_ms,
+        label: "Websocket idle timeout (ms)",
+        hint: "Bounded downstream websocket idle window for new upgrades."
+      },
+      %{
+        type: :number,
         id: "instance-settings-upstream-connect-timeout-ms",
         field: :upstream_connect_timeout_ms,
         label: "Connect timeout (ms)",

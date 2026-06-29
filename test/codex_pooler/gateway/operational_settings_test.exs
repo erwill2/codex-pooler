@@ -70,6 +70,7 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     assert settings.upstream_connect_timeout_ms == 15_000
     assert settings.upstream_pool_timeout_ms == 15_000
     assert settings.upstream_receive_timeout_ms == 300_000
+    assert settings.websocket_idle_timeout_ms == 1_800_000
     assert settings.upstream_user_agent == "codex_cli_rs/0.0.0"
     assert settings.model_context_window_overrides == %{}
   end
@@ -103,6 +104,7 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
                  "upstream_connect_timeout_ms" => 111,
                  "upstream_pool_timeout_ms" => 222,
                  "upstream_receive_timeout_ms" => 333,
+                 "websocket_idle_timeout_ms" => 444_000,
                  "upstream_user_agent" => "codex_cli_rs/9.9.9",
                  "expired_alias_ttl_seconds" => 120,
                  "bridge_owner_lease_ttl_seconds" => 45,
@@ -149,6 +151,7 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     assert settings.upstream_connect_timeout_ms == 111
     assert settings.upstream_pool_timeout_ms == 222
     assert settings.upstream_receive_timeout_ms == 333
+    assert settings.websocket_idle_timeout_ms == 444_000
     assert settings.upstream_user_agent == "codex_cli_rs/9.9.9"
     assert settings.model_context_window_overrides == %{"gpt-test-model" => 131_072}
   end
@@ -162,7 +165,33 @@ defmodule CodexPooler.Gateway.OperationalSettingsTest do
     :sys.replace_state(Cache, fn state -> %{state | cached: stale_settings} end)
 
     assert OperationalSettings.current().upstream_user_agent == "codex_cli_rs/0.0.0"
+    assert OperationalSettings.current().websocket_idle_timeout_ms == 1_800_000
     assert InstanceSettings.current().gateway.upstream_user_agent == "codex_cli_rs/0.0.0"
+    assert InstanceSettings.current().gateway.websocket_idle_timeout_ms == 1_800_000
+  end
+
+  test "current/0 clamps legacy cached websocket idle timeout values above the safe maximum" do
+    stale_settings = %{
+      Settings.default()
+      | gateway: %{Settings.default().gateway | websocket_idle_timeout_ms: 9_000_000}
+    }
+
+    :sys.replace_state(Cache, fn state -> %{state | cached: stale_settings} end)
+
+    assert OperationalSettings.current().websocket_idle_timeout_ms == 3_600_000
+    assert InstanceSettings.current().gateway.websocket_idle_timeout_ms == 9_000_000
+  end
+
+  test "current/0 clamps legacy cached websocket idle timeout values below the safe minimum" do
+    stale_settings = %{
+      Settings.default()
+      | gateway: %{Settings.default().gateway | websocket_idle_timeout_ms: 0}
+    }
+
+    :sys.replace_state(Cache, fn state -> %{state | cached: stale_settings} end)
+
+    assert OperationalSettings.current().websocket_idle_timeout_ms == 60_000
+    assert InstanceSettings.current().gateway.websocket_idle_timeout_ms == 0
   end
 
   test "from_instance_settings/1 accepts atom-keyed bulkhead config maps" do

@@ -45,6 +45,7 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert settings.gateway.circuit_open_seconds == 60
     assert settings.gateway.circuit_half_open_probe_limit == 1
     assert settings.gateway.circuit_success_threshold == 1
+    assert settings.gateway.websocket_idle_timeout_ms == 1_800_000
     assert settings.gateway.upstream_user_agent == "codex_cli_rs/0.0.0"
     assert settings.files.max_size_bytes == 25 * 1024 * 1024
     assert settings.transcription.max_upload_bytes == 26_214_400
@@ -96,7 +97,7 @@ defmodule CodexPooler.InstanceSettingsTest do
 
   defp dynamic_term(term), do: term |> :erlang.term_to_binary() |> :erlang.binary_to_term()
 
-  test "changeset rejects invalid CIDR, negative TTL, invalid TLS, invalid user-agent, invalid model overrides, and malformed bulkheads" do
+  test "changeset rejects invalid CIDR, negative TTL, invalid TLS, invalid user-agent, invalid model overrides, malformed bulkheads, and invalid websocket idle timeout" do
     settings = InstanceSettings.ensure_singleton!()
 
     assert {:error, changeset} =
@@ -106,6 +107,7 @@ defmodule CodexPooler.InstanceSettingsTest do
                "smtp" => %{"tls" => "sometimes"},
                "gateway" => %{
                  "upstream_user_agent" => "codex\r\nleak: true",
+                 "websocket_idle_timeout_ms" => 0,
                  "model_context_window_overrides" => %{"gpt-example" => 0},
                  "bulkheads" => %{"proxy_http" => %{"max_concurrency" => 0}}
                }
@@ -115,6 +117,19 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert errors_on(changeset).ingress != []
     assert errors_on(changeset).smtp != []
     assert errors_on(changeset).gateway != []
+  end
+
+  test "changeset rejects websocket idle timeout values outside the bounded range" do
+    settings = InstanceSettings.ensure_singleton!()
+
+    for invalid <- [0, 59_999, 3_600_001, "not-a-number"] do
+      assert {:error, changeset} =
+               InstanceSettings.update_system_settings(settings, %{
+                 "gateway" => %{"websocket_idle_timeout_ms" => invalid}
+               })
+
+      assert errors_on(changeset).gateway.websocket_idle_timeout_ms != []
+    end
   end
 
   test "development helper setting is boolean-only and rejects stored script URLs" do
@@ -262,6 +277,23 @@ defmodule CodexPooler.InstanceSettingsTest do
 
     assert updated.files.upload_ttl_seconds == 600
     assert updated.gateway.upstream_user_agent == "codex_cli_rs/0.0.0"
+  end
+
+  test "legacy singleton settings rows backfill the websocket idle timeout without losing updates" do
+    legacy = InstanceSettings.ensure_singleton!()
+
+    Repo.query!("UPDATE instance_settings SET gateway = gateway - 'websocket_idle_timeout_ms'")
+    InstanceSettings.reset_cache_for_test()
+
+    assert InstanceSettings.current().gateway.websocket_idle_timeout_ms == 1_800_000
+
+    assert {:ok, updated} =
+             InstanceSettings.update_system_settings(Repo.reload!(legacy), %{
+               "files" => %{"upload_ttl_seconds" => 600}
+             })
+
+    assert updated.files.upload_ttl_seconds == 600
+    assert updated.gateway.websocket_idle_timeout_ms == 1_800_000
   end
 
   test "legacy singleton settings rows backfill development helper flags without losing updates" do

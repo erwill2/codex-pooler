@@ -285,6 +285,16 @@ defmodule CodexPooler.InstanceSettings.Classification do
       notes: "New streams can pick up heartbeat interval changes."
     },
     %{
+      key: :websocket_idle_timeout,
+      bucket: :db_runtime_live,
+      group: :gateway,
+      label: "Websocket idle timeout",
+      env_names: [@codex_env_prefix <> "WEBSOCKET_IDLE_TIMEOUT_MS"],
+      storage: :database,
+      reloadability: :live,
+      notes: "New downstream websocket upgrades can use the bounded idle timeout."
+    },
+    %{
       key: :upstream_timeouts,
       bucket: :db_runtime_live,
       group: :gateway,

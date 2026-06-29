@@ -12,6 +12,9 @@ defmodule CodexPooler.Gateway.OperationalSettings do
   @websocket_owner_forwarding_allowed_values "true,false,1,0,yes,no,on,off"
   @websocket_owner_forwarding_truthy ~w(true 1 yes on)
   @websocket_owner_forwarding_falsey ~w(false 0 no off)
+  @websocket_idle_timeout_default_ms 1_800_000
+  @websocket_idle_timeout_min_ms 60_000
+  @websocket_idle_timeout_max_ms 3_600_000
 
   @type bulkhead_settings :: %{
           max_concurrency: pos_integer(),
@@ -44,6 +47,7 @@ defmodule CodexPooler.Gateway.OperationalSettings do
           upstream_connect_timeout_ms: pos_integer(),
           upstream_pool_timeout_ms: pos_integer(),
           upstream_receive_timeout_ms: pos_integer(),
+          websocket_idle_timeout_ms: pos_integer(),
           upstream_user_agent: String.t(),
           model_context_window_overrides: %{String.t() => pos_integer()}
         }
@@ -72,6 +76,7 @@ defmodule CodexPooler.Gateway.OperationalSettings do
             upstream_connect_timeout_ms: :timer.seconds(15),
             upstream_pool_timeout_ms: :timer.seconds(15),
             upstream_receive_timeout_ms: :timer.minutes(5),
+            websocket_idle_timeout_ms: @websocket_idle_timeout_default_ms,
             upstream_user_agent: @default_upstream_user_agent,
             model_context_window_overrides: %{}
 
@@ -111,6 +116,8 @@ defmodule CodexPooler.Gateway.OperationalSettings do
       upstream_connect_timeout_ms: settings.gateway.upstream_connect_timeout_ms,
       upstream_pool_timeout_ms: settings.gateway.upstream_pool_timeout_ms,
       upstream_receive_timeout_ms: settings.gateway.upstream_receive_timeout_ms,
+      websocket_idle_timeout_ms:
+        clamp_websocket_idle_timeout(settings.gateway.websocket_idle_timeout_ms),
       upstream_user_agent: settings.gateway.upstream_user_agent,
       model_context_window_overrides: settings.gateway.model_context_window_overrides
     }
@@ -189,4 +196,12 @@ defmodule CodexPooler.Gateway.OperationalSettings do
       :error -> Map.fetch!(map, Atom.to_string(key))
     end
   end
+
+  defp clamp_websocket_idle_timeout(value) when is_integer(value) do
+    value
+    |> max(@websocket_idle_timeout_min_ms)
+    |> min(@websocket_idle_timeout_max_ms)
+  end
+
+  defp clamp_websocket_idle_timeout(_value), do: @websocket_idle_timeout_default_ms
 end

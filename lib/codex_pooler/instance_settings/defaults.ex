@@ -16,6 +16,7 @@ defmodule CodexPooler.InstanceSettings.Defaults do
     %{
       "gateway_debug" => settings.gateway_debug?,
       "sse_keepalive_interval_ms" => settings.sse_keepalive_interval_ms,
+      "websocket_idle_timeout_ms" => settings.websocket_idle_timeout_ms,
       "upstream_connect_timeout_ms" => settings.upstream_connect_timeout_ms,
       "upstream_pool_timeout_ms" => settings.upstream_pool_timeout_ms,
       "upstream_receive_timeout_ms" => settings.upstream_receive_timeout_ms,
