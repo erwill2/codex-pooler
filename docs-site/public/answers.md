@@ -72,6 +72,10 @@ No. Codex Pooler stores metadata for routing, accounting, audit, request logs, f
 
 Clone the repository, run `scripts/self-host/generate-env.sh`, run `docker compose pull`, start the stack with `docker compose up -d`, open `http://localhost:4000`, create the first owner, create a Pool, assign an upstream account, create a Pool API key, and point the first client at `/backend-api/codex` or `/v1`.
 
+## How do Docker Compose installs keep up with database migrations?
+
+Update the target release image, run `docker compose pull`, then run `docker compose up -d`. The Compose stack includes a one-shot `migrate` service that waits for Postgres, runs release migrations, imports the bundled pricing snapshot, and exits before the app starts. Normal app boot does not run migrations by itself.
+
 ## What deployment options are documented?
 
 The public docs cover Docker Compose for a small self-hosted install and Helm for Kubernetes. Compose is the quick local or single-node path. Helm separates app, worker, scheduler, and migration roles, and it includes guidance for secrets, ingress, metrics, and the websocket replica caveat.

@@ -1349,6 +1349,26 @@ docker compose logs -f app
 docker compose down
 ```
 
+To upgrade an existing Compose install, update `CODEX_POOLER_IMAGE_TAG` in
+`.env` when you pin releases, then run:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+The Compose stack has a one-shot `migrate` service. It waits for Postgres, runs
+release migrations, imports the bundled pricing snapshot, and exits before the
+web app starts. Normal app boot does not migrate the database by itself. If a
+failed migration needs to be rerun after fixing configuration or database
+access, run:
+
+```bash
+docker compose up -d db
+docker compose run --rm migrate
+docker compose up -d app
+```
+
 Use `http://localhost:4000` for the default Compose stack even if the Phoenix
 startup banner prints an endpoint URL such as `https://localhost`; the Compose
 port mapping is the local URL to open. The release image includes the OS

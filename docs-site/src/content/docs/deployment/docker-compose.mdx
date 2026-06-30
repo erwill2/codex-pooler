@@ -120,6 +120,39 @@ docker compose ps
 docker compose logs -f app
 ```
 
+## Upgrade and run migrations
+
+For an existing Compose install, update the release image first. If you pin
+releases, edit `CODEX_POOLER_IMAGE_TAG` in `.env` to the target release tag.
+Then pull and restart the stack:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+The Compose file includes a one-shot `migrate` service. It waits for Postgres,
+runs the release migrations, imports the bundled pricing snapshot, and exits
+before the `app` service starts. Normal app boot does not run migrations by
+itself, so keep upgrades on this Compose path instead of starting only the app
+container with `docker run`.
+
+If you need to run migrations manually after fixing an environment or database
+issue, start the database and run the migration service once:
+
+```bash
+docker compose up -d db
+docker compose run --rm migrate
+docker compose up -d app
+```
+
+When a migration fails, inspect the migration container logs before restarting
+traffic:
+
+```bash
+docker compose logs migrate
+```
+
 ## Stop or reset
 
 Stop the stack while keeping the database volume:
