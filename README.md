@@ -100,9 +100,9 @@ assigned Pools.
   Responses tool outputs before dispatch on supported request routes. The
   option is disabled by default, request-side only, and records safe aggregate
   savings without storing raw outputs.
-- 🏦 **Saved reset management:** surface reported saved or banked reset credits on
-  upstream accounts, show known expirations when available, and let operators
-  redeem manually or opt into guarded auto-redemption policy
+- 🏦 **Saved reset management:** surface reported saved reset capacity on upstream
+  accounts, show informational expirations when available, and let operators
+  queue account-level recovery or opt into guarded auto-redemption policy
 - 🖥️ **Operator dashboard:** manage Pool-scoped accounts, API keys, invites, saved
   resets, usage, request logs, audit logs, MCP access, and the owner-only jobs,
   operators, and system settings surfaces
