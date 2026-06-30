@@ -78,26 +78,30 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     with {:ok, assignment, identity} <- load_assignment_identity(assignment_or_id) do
       case normalize_gateway_auto_context(trigger_kind, Keyword.get(opts, :gateway_auto_context)) do
         {:ok, gateway_auto_context} ->
-          with {:ok, claim} <-
-                 claim_attempt(
-                   assignment,
-                   identity,
-                   trigger_kind,
-                   receive_timeout,
-                   started_at,
-                   gateway_auto_context
-                 ) do
-            case claim do
-              {:noop, result} -> {:ok, result}
-              claim -> do_redeem(claim, opts)
-            end
-          end
+          assignment
+          |> claim_attempt(
+            identity,
+            trigger_kind,
+            receive_timeout,
+            started_at,
+            gateway_auto_context
+          )
+          |> redeem_claim(opts)
 
         {:noop, code} ->
           {:ok, noop_result(identity, assignment, code)}
       end
     end
   end
+
+  @spec redeem_claim(
+          {:ok, claim() | {:noop, redeem_result()}}
+          | {:error, lifecycle_error() | :redemption_in_progress},
+          keyword()
+        ) :: {:ok, redeem_result()} | {:error, lifecycle_error() | :redemption_in_progress}
+  defp redeem_claim({:ok, {:noop, result}}, _opts), do: {:ok, result}
+  defp redeem_claim({:ok, claim}, opts), do: do_redeem(claim, opts)
+  defp redeem_claim({:error, reason}, _opts), do: {:error, reason}
 
   defp load_assignment_identity(assignment_or_id) do
     assignment_or_id

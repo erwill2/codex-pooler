@@ -34,6 +34,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPoolerWeb.CodexResponsesSocket
   alias CodexPoolerWeb.WebsocketConnectionLogger
   alias Ecto.Adapters.SQL.Sandbox
@@ -4590,7 +4591,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
 
     identity =
       setup.identity
-      |> CodexPooler.Upstreams.Schemas.UpstreamIdentity.changeset(%{
+      |> UpstreamIdentity.changeset(%{
         metadata: saved_reset_metadata(upstream, 1),
         saved_reset_auto_redeem_enabled: true,
         saved_reset_auto_redeem_min_blocked_minutes: 60,
