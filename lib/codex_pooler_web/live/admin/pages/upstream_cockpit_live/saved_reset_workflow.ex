@@ -81,11 +81,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive.SavedResetWorkflow do
       not confirmed?(socket, identity_id, pool_id) ->
         put_flash(socket, :error, "Confirm saved reset redemption before queueing it")
 
-      action_available?(socket, :redeem_saved_reset, identity_id) ->
-        enqueue_redemption(socket, identity_id, pool_id, reload_fun)
-
       true ->
-        put_unavailable_action_error(socket, :redeem_saved_reset)
+        socket = reload_fun.(socket)
+
+        cond do
+          identity_id != socket.assigns.cockpit.identity.id ->
+            put_flash(socket, :error, "Upstream account was not found")
+
+          action_available?(socket, :redeem_saved_reset, identity_id) ->
+            enqueue_redemption(socket, identity_id, pool_id, reload_fun)
+
+          true ->
+            put_unavailable_action_error(socket, :redeem_saved_reset)
+        end
     end
   end
 

@@ -49,12 +49,55 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.SavedResetWorkflow do
     end
   end
 
-  @spec redeem(Phoenix.LiveView.Socket.t(), map(), keyword()) ::
+  @spec redeem(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), keyword()) ::
           {:noreply, Phoenix.LiveView.Socket.t()}
-  def redeem(socket, account, opts) do
+  def redeem(socket, identity_id, opts) do
     reload_fun = Keyword.fetch!(opts, :reload)
     refresh_editing_fun = Keyword.fetch!(opts, :refresh_editing)
 
+    if confirmed?(socket, identity_id) do
+      socket = reload_fun.(socket)
+
+      case visible_account(socket, identity_id) do
+        nil ->
+          {:noreply, put_flash(socket, :error, "Upstream account was not found")}
+
+        %{saved_reset_redemption_action: %{available?: false, reason: reason}} ->
+          {:noreply,
+           socket
+           |> put_flash(:error, reason || "Saved reset redemption is not available")
+           |> then(&refresh_editing_fun.(&1, identity_id))}
+
+        account ->
+          enqueue_redemption(socket, account, reload_fun, refresh_editing_fun)
+      end
+    else
+      {:noreply, put_flash(socket, :error, "Confirm saved reset redemption before continuing")}
+    end
+  end
+
+  @spec maybe_confirm_redemption(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), map()) ::
+          {:noreply, Phoenix.LiveView.Socket.t()}
+  def maybe_confirm_redemption(socket, identity_id, _params \\ %{}) do
+    case socket.assigns.editing_saved_reset_policy do
+      %{identity: %UpstreamIdentity{id: ^identity_id}} = account ->
+        if account.saved_reset_redemption_action.available? do
+          {:noreply,
+           assign(
+             socket,
+             :confirming_saved_reset_redemption,
+             redemption_confirmation(account)
+           )}
+        else
+          {:noreply, put_flash(socket, :error, account.saved_reset_redemption_action.reason)}
+        end
+
+      _account ->
+        {:noreply, put_flash(socket, :error, "Upstream account was not found")}
+    end
+  end
+
+  defp enqueue_redemption(socket, account, reload_fun, refresh_editing_fun) do
     with {:ok, pool_id} <- redemption_pool_id(account),
          {:ok, %{job: job}} <-
            Upstreams.enqueue_saved_reset_redemption_for_scope(
@@ -81,56 +124,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.SavedResetWorkflow do
     end
   end
 
-  @spec maybe_confirm_redemption(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), map()) ::
-          {:noreply, Phoenix.LiveView.Socket.t()}
-  def maybe_confirm_redemption(socket, identity_id, params \\ %{}) do
-    case socket.assigns.editing_saved_reset_policy do
-      %{identity: %UpstreamIdentity{id: ^identity_id}} = account ->
-        if account.saved_reset_redemption_action.available? do
-          {:noreply,
-           assign(
-             socket,
-             :confirming_saved_reset_redemption,
-             redemption_confirmation(account, params)
-           )}
-        else
-          {:noreply, put_flash(socket, :error, account.saved_reset_redemption_action.reason)}
-        end
-
-      _account ->
-        {:noreply, put_flash(socket, :error, "Upstream account was not found")}
-    end
+  defp visible_account(socket, identity_id) do
+    Enum.find(socket.assigns.upstream_accounts, &(&1.identity.id == identity_id))
   end
 
-  @spec confirmed_account(Phoenix.LiveView.Socket.t(), Ecto.UUID.t()) ::
-          {:ok, map()} | {:error, String.t()}
-  def confirmed_account(socket, identity_id) do
+  defp confirmed?(socket, identity_id) do
     case socket.assigns.confirming_saved_reset_redemption do
-      %{identity_id: ^identity_id, account: account} ->
-        if account.saved_reset_redemption_action.available? do
-          {:ok, account}
-        else
-          {:error, account.saved_reset_redemption_action.reason}
-        end
-
-      %{identity: %UpstreamIdentity{id: ^identity_id}} = account ->
-        if account.saved_reset_redemption_action.available? do
-          {:ok, account}
-        else
-          {:error, account.saved_reset_redemption_action.reason}
-        end
-
-      _account ->
-        {:error, "Confirm saved reset redemption before continuing"}
+      %{identity_id: ^identity_id} -> true
+      _confirmation -> false
     end
   end
 
-  defp redemption_confirmation(account, params) do
+  defp redemption_confirmation(account) do
     %{
-      identity_id: account.identity.id,
-      account: account,
-      expiration_index: Map.get(params, "expiration-index", "unreported"),
-      expiration_label: Map.get(params, "expiration-label", "unreported banked reset")
+      identity_id: account.identity.id
     }
   end
 

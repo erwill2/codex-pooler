@@ -1351,14 +1351,24 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, "#saved-reset-policy-min-blocked-minutes")
     assert has_element?(view, "#saved-reset-policy-keep-credits")
     assert has_element?(view, "#saved-reset-policy-auto-redeem-card")
-    assert has_element?(view, "#saved-reset-expiration-empty-action")
-    assert has_element?(view, "#saved-reset-expiration-redeem-unreported", "Redeem")
+
+    assert has_element?(
+             view,
+             "#saved-reset-redemption-action[data-role='saved-reset-redemption-action']",
+             "Queue manual redemption"
+           )
+
+    html = render(view)
+    refute html =~ "phx-value-expiration-index"
+    refute html =~ "phx-value-expiration-label"
+    refute has_element?(view, "#saved-reset-expiration-empty-action")
+    refute has_element?(view, "#saved-reset-expiration-redeem-unreported")
     assert has_element?(view, "#saved-reset-policy-submit")
 
     assert has_element?(
              view,
              "#saved-reset-policy-dialog-panel > div:first-child",
-             "A saved reset is a banked reset credit for this account"
+             "A saved reset is account-level quota recovery capacity for this account"
            )
 
     refute render(view) =~ "Saved resets are earned reset credits reported by Codex"
@@ -1476,14 +1486,31 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     |> render_click()
 
     assert has_element?(view, "#saved-reset-policy-dialog")
-    assert has_element?(view, "#saved-reset-expiration-redeem-0")
+    assert has_element?(view, "#saved-reset-expiration-row-0")
+    refute has_element?(view, "#saved-reset-expiration-redeem-0")
+    refute has_element?(view, "#saved-reset-expiration-mobile-redeem-0")
+
+    assert has_element?(
+             view,
+             "#saved-reset-redemption-action[data-role='saved-reset-redemption-action']",
+             "Queue manual redemption"
+           )
+
+    action_html = view |> element("#saved-reset-redemption-action") |> render()
+    refute action_html =~ "phx-value-expiration-index"
+    refute action_html =~ "phx-value-expiration-label"
 
     view
-    |> element("#saved-reset-expiration-redeem-0")
+    |> element("#saved-reset-redemption-action")
     |> render_click()
 
-    assert has_element?(view, "#saved-reset-expiration-redeem-0-confirmation")
-    assert has_element?(view, "#saved-reset-expiration-redeem-0-confirm", "Confirm")
+    assert has_element?(
+             view,
+             "#saved-reset-redemption-confirmation[data-role='saved-reset-redemption-confirmation']"
+           )
+
+    assert has_element?(view, "#saved-reset-redemption-confirm", "Queue redemption")
+    assert has_element?(view, "#saved-reset-redemption-cancel", "Keep resets in bank")
 
     assert Repo.aggregate(
              from(job in Oban.Job,
@@ -1493,7 +1520,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
            ) == 0
 
     view
-    |> element("#saved-reset-expiration-redeem-0-confirm")
+    |> element("#saved-reset-redemption-confirm")
     |> render_click()
 
     assert [job] =
@@ -1506,6 +1533,74 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert job.args["trigger_kind"] == "admin_manual"
     refute Map.has_key?(job.args, "credit_id")
     refute Map.has_key?(job.args, "redeem_request_id")
+  end
+
+  test "stale saved reset confirmation reloads account state before enqueueing", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "saved-reset-dialog-stale-manual",
+        name: "Saved Reset Dialog Stale Manual"
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    reset_expires_at = now |> DateTime.add(13, :day) |> DateTime.to_iso8601()
+
+    %{identity: identity} =
+      active_upstream_assignment_fixture(pool, %{
+        account_label: "Stale Manual Saved Reset Dialog Codex",
+        metadata: %{
+          "access_token_expires_at" => DateTime.to_iso8601(DateTime.add(now, 2, :hour)),
+          "token_refresh" => %{
+            "status" => "succeeded",
+            "finished_at" => DateTime.to_iso8601(DateTime.add(now, -5, :minute))
+          },
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 1,
+            "source" => "codex_usage_api",
+            "path_style" => "codex_api",
+            "usage_path" => "/api/codex/usage",
+            "observed_at" => DateTime.to_iso8601(now),
+            "available_expirations" => [
+              %{"expires_at" => reset_expires_at, "first_seen_at" => nil}
+            ],
+            "next_expires_at" => reset_expires_at
+          }
+        }
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    view
+    |> element("#saved-reset-policy-upstream-account-#{identity.id}")
+    |> render_click()
+
+    view
+    |> element("#saved-reset-redemption-action")
+    |> render_click()
+
+    assert has_element?(view, "#saved-reset-redemption-confirmation")
+
+    update_identity_metadata!(identity, fn metadata ->
+      put_in(metadata, ["saved_resets", "available_count"], 0)
+    end)
+
+    view
+    |> element("#saved-reset-redemption-confirm")
+    |> render_click()
+
+    assert has_element?(view, "#saved-reset-policy-dialog", "no saved resets are available")
+    assert has_element?(view, "#saved-reset-redemption-confirmation")
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where: job.worker == ^worker_name(SavedResetRedemptionWorker)
+             ),
+             :count
+           ) == 0
   end
 
   @tag :upstream_filters
@@ -4693,6 +4788,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       workspace_id: workspace_id,
       workspace_label: "Shared workspace",
       chatgpt_user_id: raw_subject
+    })
+    |> Repo.update!()
+  end
+
+  defp update_identity_metadata!(identity, fun) when is_function(fun, 1) do
+    identity = Repo.get!(UpstreamIdentity, identity.id)
+
+    identity
+    |> UpstreamIdentity.changeset(%{
+      metadata: fun.(identity.metadata || %{}),
+      updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
     })
     |> Repo.update!()
   end

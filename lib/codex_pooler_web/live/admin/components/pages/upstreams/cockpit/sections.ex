@@ -293,7 +293,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
           <AdminComponents.action_button
             id="cockpit-saved-reset-redemption-cancel"
             icon="hero-x-mark"
-            label="Keep reset in bank"
+            label="Keep resets in bank"
             phx-click="cancel_saved_reset_redemption"
           />
         </div>
@@ -391,7 +391,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
               type="number"
               id="saved-reset-policy-keep-credits"
               name="saved_reset_policy[keep_credits]"
-              label="Keep credits"
+              label="Resets to keep"
               class="input input-bordered w-full"
               min="0"
             />

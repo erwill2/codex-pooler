@@ -580,7 +580,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           </p>
           <h2 class="mt-1 text-2xl font-bold text-base-content">Manage saved reset bank</h2>
           <p class="mt-2 text-sm leading-6 text-base-content/70">
-            A saved reset is a banked reset credit for this account. Choose when the account may spend saved resets and redeem one manually when needed.
+            A saved reset is account-level quota recovery capacity for this account. Choose when the account may spend saved resets and queue one manual recovery attempt when needed.
           </p>
         </div>
 
@@ -592,21 +592,92 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
           <div class="grid gap-1">
             <h3 class="text-sm font-semibold text-base-content">Banked reset expirations</h3>
             <p class="text-xs leading-5 text-base-content/60">
-              Redeem a specific saved reset before it expires, or adjust how this account spends banked capacity automatically.
+              Expiration rows are informational. Manual redemption queues one account-level recovery attempt and does not target a specific row.
             </p>
           </div>
           <SavedResetComponents.saved_reset_expiration_table
             id="saved-reset-expiration"
             saved_resets={@account.saved_resets}
             datetime_preferences={@datetime_preferences}
-            redeem_identity_id={@account.identity.id}
-            redeem_action={@account.saved_reset_redemption_action}
-            confirming_redemption={@confirming_saved_reset_redemption}
             empty_label="No expiration dates reported for the available saved resets yet."
           />
         </div>
 
         <div class="grid gap-5 p-6">
+          <div
+            id="saved-reset-redemption-control"
+            class="grid gap-3 rounded-box border border-base-300 bg-base-200/30 p-4 md:grid-cols-[minmax(0,1fr)_auto] md:items-center"
+          >
+            <div class="grid gap-1">
+              <p class="text-sm font-semibold text-base-content">Manual redemption</p>
+              <p class="text-xs leading-5 text-base-content/60">
+                Queue one account-level quota recovery attempt for this upstream account. Current account state is checked again before a job is queued.
+              </p>
+              <p
+                :if={
+                  !@account.saved_reset_redemption_action.available? &&
+                    @account.saved_reset_redemption_action.reason
+                }
+                id="saved-reset-redemption-unavailable-reason"
+                class="text-xs leading-5 text-base-content/60"
+              >
+                {@account.saved_reset_redemption_action.reason}
+              </p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 md:justify-end">
+              <div
+                :if={
+                  confirming_saved_reset_redemption?(
+                    @confirming_saved_reset_redemption,
+                    @account.identity.id
+                  )
+                }
+                id="saved-reset-redemption-confirmation"
+                data-role="saved-reset-redemption-confirmation"
+                class="flex flex-wrap items-center gap-2 rounded-box border border-warning/30 bg-warning/10 px-3 py-2"
+              >
+                <button
+                  id="saved-reset-redemption-confirm"
+                  type="button"
+                  class="btn btn-primary btn-sm gap-2"
+                  phx-click="redeem_saved_reset"
+                  phx-value-id={@account.identity.id}
+                >
+                  <.icon name="hero-check" class="size-4" />
+                  <span>Queue redemption</span>
+                </button>
+                <button
+                  id="saved-reset-redemption-cancel"
+                  type="button"
+                  class="btn btn-secondary btn-sm gap-2"
+                  phx-click="cancel_saved_reset_redemption"
+                >
+                  <.icon name="hero-x-mark" class="size-4" />
+                  <span>Keep resets in bank</span>
+                </button>
+              </div>
+              <button
+                :if={
+                  !confirming_saved_reset_redemption?(
+                    @confirming_saved_reset_redemption,
+                    @account.identity.id
+                  )
+                }
+                id="saved-reset-redemption-action"
+                data-role="saved-reset-redemption-action"
+                type="button"
+                class="btn btn-secondary btn-sm gap-2"
+                phx-click="open_saved_reset_redemption_confirmation"
+                phx-value-id={@account.identity.id}
+                disabled={!@account.saved_reset_redemption_action.available?}
+                title={saved_reset_redemption_title(@account.saved_reset_redemption_action)}
+              >
+                <.icon name="hero-bolt" class="size-4" />
+                <span>Queue manual redemption</span>
+              </button>
+            </div>
+          </div>
+
           <.form
             id="saved-reset-policy-form"
             for={@form}
@@ -738,6 +809,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
     </dialog>
     """
   end
+
+  defp confirming_saved_reset_redemption?(%{identity_id: identity_id}, identity_id), do: true
+  defp confirming_saved_reset_redemption?(_confirmation, _identity_id), do: false
+
+  defp saved_reset_redemption_title(%{available?: true}), do: "Queue manual redemption"
+
+  defp saved_reset_redemption_title(%{reason: reason}) when is_binary(reason),
+    do: reason
+
+  defp saved_reset_redemption_title(_action), do: "Saved reset redemption unavailable"
 
   attr :accounts, :list, required: true
   attr :account_panel_views, :map, required: true

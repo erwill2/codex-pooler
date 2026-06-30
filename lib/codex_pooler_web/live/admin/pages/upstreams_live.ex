@@ -255,16 +255,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   def handle_event("redeem_saved_reset", %{"id" => identity_id}, socket) do
-    case SavedResetWorkflow.confirmed_account(socket, identity_id) do
-      {:ok, account} ->
-        SavedResetWorkflow.redeem(socket, account,
-          reload: &reload_upstreams/1,
-          refresh_editing: &refresh_editing_saved_reset_policy/2
-        )
-
-      {:error, message} ->
-        {:noreply, put_flash(socket, :error, message)}
-    end
+    SavedResetWorkflow.redeem(socket, identity_id,
+      reload: &reload_upstreams/1,
+      refresh_editing: &refresh_editing_saved_reset_policy/2
+    )
   end
 
   def handle_event("save_saved_reset_policy", %{"saved_reset_policy" => params}, socket) do

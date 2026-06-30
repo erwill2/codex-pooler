@@ -1080,6 +1080,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert has_element?(view, "#cockpit-saved-reset-redemption-confirmation")
     assert has_element?(view, "#cockpit-saved-reset-redemption-confirm", "Confirm redemption")
+    assert has_element?(view, "#cockpit-saved-reset-redemption-cancel", "Keep resets in bank")
 
     assert Repo.aggregate(
              from(job in Oban.Job,
@@ -1100,6 +1101,76 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert job.args["trigger_kind"] == "admin_manual"
     refute Map.has_key?(job.args, "credit_id")
     refute Map.has_key?(job.args, "redeem_request_id")
+  end
+
+  @tag :saved_reset_cockpit
+  test "stale saved reset cockpit confirmation reloads before enqueueing", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "saved-reset-cockpit-stale",
+        name: "Saved Reset Cockpit Stale"
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    reset_expires_at = now |> DateTime.add(13, :day) |> DateTime.to_iso8601()
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Stale Saved Reset Cockpit Codex",
+        identity_metadata: %{
+          "access_token_expires_at" => DateTime.to_iso8601(DateTime.add(now, 2, :hour)),
+          "token_refresh" => %{
+            "status" => "succeeded",
+            "finished_at" => DateTime.to_iso8601(DateTime.add(now, -5, :minute))
+          },
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 1,
+            "source" => "codex_usage_api",
+            "path_style" => "codex",
+            "usage_path" => "/api/codex/usage",
+            "observed_at" => DateTime.to_iso8601(now),
+            "available_expirations" => [
+              %{"expires_at" => reset_expires_at, "first_seen_at" => nil}
+            ],
+            "next_expires_at" => reset_expires_at
+          }
+        }
+      })
+
+    {:ok, _secret} =
+      Upstreams.store_encrypted_secret(identity, %{
+        secret_kind: "access_token",
+        plaintext: runtime_secret("saved-reset-cockpit-stale-access")
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    action_selector = "#cockpit-redeem-saved-reset-upstream-account-#{identity.id}"
+    assert has_element?(view, action_selector, "Redeem saved reset")
+
+    view |> element(action_selector) |> render_click()
+    assert has_element?(view, "#cockpit-saved-reset-redemption-confirmation")
+
+    update_identity_metadata!(identity, fn metadata ->
+      put_in(metadata, ["saved_resets", "available_count"], 0)
+    end)
+
+    view |> element("#cockpit-saved-reset-redemption-confirm") |> render_click()
+
+    assert has_element?(view, "#cockpit-saved-reset-redemption-confirmation")
+    assert has_element?(view, "#upstream-actions", "no saved resets are available")
+    assert has_element?(view, "#upstream-actions", "not available")
+
+    assert Repo.aggregate(
+             from(job in Oban.Job,
+               where: job.worker == ^worker_name(SavedResetRedemptionWorker)
+             ),
+             :count
+           ) == 0
   end
 
   @tag :status_assignments_privacy
@@ -3801,6 +3872,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
       workspace_id: workspace_id,
       workspace_label: "Subject workspace",
       chatgpt_user_id: raw_subject
+    })
+    |> Repo.update!()
+  end
+
+  defp update_identity_metadata!(identity, fun) when is_function(fun, 1) do
+    identity = Repo.get!(UpstreamIdentity, identity.id)
+
+    identity
+    |> UpstreamIdentity.changeset(%{
+      metadata: fun.(identity.metadata || %{}),
+      updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
     })
     |> Repo.update!()
   end

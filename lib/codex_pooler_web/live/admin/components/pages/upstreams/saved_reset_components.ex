@@ -11,9 +11,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
   attr :datetime_preferences, :map, required: true
   attr :compact, :boolean, default: false
   attr :empty_label, :string, default: "Expiration dates not reported"
-  attr :redeem_identity_id, :string, default: nil
-  attr :redeem_action, :map, default: nil
-  attr :confirming_redemption, :map, default: nil
 
   def saved_reset_expiration_table(assigns) do
     assigns =
@@ -32,21 +29,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
     >
       {@empty_label}
     </p>
-    <div
-      :if={@rows == [] and redemption_enabled?(@redeem_identity_id, @redeem_action)}
-      id={"#{@id}-empty-action"}
-      class="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-box border border-base-300/70 bg-base-100/80 px-3 py-2"
-    >
-      <span class="text-xs text-base-content/60">Redeem an unreported banked reset.</span>
-      <.redemption_action
-        id={"#{@id}-redeem-unreported"}
-        identity_id={@redeem_identity_id}
-        row_index="unreported"
-        row_label="unreported banked reset"
-        action={@redeem_action}
-        confirming_redemption={@confirming_redemption}
-      />
-    </div>
     <div
       :if={@rows != [] and @compact}
       id={@id}
@@ -137,15 +119,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
                 {row.expiration_date_label}
               </p>
             </div>
-            <.redemption_action
-              :if={redemption_enabled?(@redeem_identity_id, @redeem_action)}
-              id={"#{@id}-mobile-redeem-#{row.index}"}
-              identity_id={@redeem_identity_id}
-              row_index={to_string(row.index)}
-              row_label={row.expiration_date_label}
-              action={@redeem_action}
-              confirming_redemption={@confirming_redemption}
-            />
           </div>
           <div class="grid grid-cols-2 gap-3">
             <div class="grid gap-1">
@@ -181,12 +154,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
               <th class="whitespace-nowrap px-3 py-2 text-right text-xs font-semibold text-base-content/55">
                 Time Left
               </th>
-              <th
-                :if={redemption_enabled?(@redeem_identity_id, @redeem_action)}
-                class="whitespace-nowrap px-3 py-2 text-right text-xs font-semibold text-base-content/55"
-              >
-                Action
-              </th>
             </tr>
           </thead>
           <tbody class="divide-y divide-base-300/60">
@@ -219,19 +186,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
               >
                 {row.time_left_label}
               </td>
-              <td
-                :if={redemption_enabled?(@redeem_identity_id, @redeem_action)}
-                class="whitespace-nowrap px-3 py-2 text-right"
-              >
-                <.redemption_action
-                  id={"#{@id}-redeem-#{row.index}"}
-                  identity_id={@redeem_identity_id}
-                  row_index={to_string(row.index)}
-                  row_label={row.expiration_date_label}
-                  action={@redeem_action}
-                  confirming_redemption={@confirming_redemption}
-                />
-              </td>
             </tr>
           </tbody>
         </table>
@@ -239,78 +193,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
     </div>
     """
   end
-
-  attr :id, :string, required: true
-  attr :identity_id, :string, required: true
-  attr :row_index, :string, required: true
-  attr :row_label, :string, required: true
-  attr :action, :map, required: true
-  attr :confirming_redemption, :map, default: nil
-
-  defp redemption_action(assigns) do
-    ~H"""
-    <div class="inline-flex items-center justify-end gap-1">
-      <div
-        :if={confirming_redemption?(@confirming_redemption, @identity_id, @row_index)}
-        id={"#{@id}-confirmation"}
-        data-role="saved-reset-redemption-confirmation"
-        class="inline-flex items-center gap-1"
-      >
-        <button
-          id={"#{@id}-confirm"}
-          type="button"
-          class="btn btn-primary btn-xs"
-          phx-click="redeem_saved_reset"
-          phx-value-id={@identity_id}
-        >
-          Confirm
-        </button>
-        <button
-          id={"#{@id}-cancel"}
-          type="button"
-          class="btn btn-ghost btn-xs"
-          phx-click="cancel_saved_reset_redemption"
-        >
-          Cancel
-        </button>
-      </div>
-      <button
-        :if={!confirming_redemption?(@confirming_redemption, @identity_id, @row_index)}
-        id={@id}
-        type="button"
-        class="btn btn-outline btn-xs border-violet-500/50 text-violet-700 hover:border-violet-500 hover:bg-violet-500/10 hover:text-violet-800 disabled:border-base-300 disabled:text-base-content/35 dark:border-violet-300/50 dark:text-violet-200"
-        phx-click="open_saved_reset_redemption_confirmation"
-        phx-value-id={@identity_id}
-        phx-value-expiration-index={@row_index}
-        phx-value-expiration-label={@row_label}
-        disabled={!@action.available?}
-        title={redemption_action_title(@action, @row_label)}
-      >
-        Redeem
-      </button>
-    </div>
-    """
-  end
-
-  defp redemption_enabled?(identity_id, action),
-    do: is_binary(identity_id) and is_map(action)
-
-  defp confirming_redemption?(
-         %{identity_id: identity_id, expiration_index: expiration_index},
-         identity_id,
-         expiration_index
-       ),
-       do: true
-
-  defp confirming_redemption?(_confirmation, _identity_id, _expiration_index), do: false
-
-  defp redemption_action_title(%{available?: true}, row_label),
-    do: "Redeem banked reset expiring #{row_label}"
-
-  defp redemption_action_title(%{reason: reason}, _row_label) when is_binary(reason),
-    do: reason
-
-  defp redemption_action_title(_action, _row_label), do: "Saved reset redemption unavailable"
 
   defp expiration_rows(saved_resets, datetime_preferences, now) do
     available_expiration_rows =
