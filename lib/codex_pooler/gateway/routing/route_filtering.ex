@@ -23,7 +23,10 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
     request_options = filter_input.request_options
     quota_mode = Keyword.get(opts, :quota_mode, :required)
 
-    with {:ok, candidates, quota_decision} <-
+    with {:ok, candidates} <-
+           CandidateEligibility.filter_circuit_eligible_candidates(filter_input),
+         filter_input = CandidateEligibility.FilterInput.put_candidates(filter_input, candidates),
+         {:ok, candidates, quota_decision} <-
            filter_quota_eligible_candidates(filter_input, quota_mode),
          request_options = put_quota_decision(request_options, quota_decision),
          filter_input =
@@ -53,7 +56,11 @@ defmodule CodexPooler.Gateway.Routing.RouteFiltering do
     request_options = filter_input.request_options
     quota_mode = Keyword.get(opts, :quota_mode, :required)
 
-    with {:ok, candidates, quota_decision, route_state} <-
+    with {:ok, candidates} <-
+           CandidateEligibility.filter_circuit_eligible_candidates(filter_input, route_state),
+         route_state = RouteState.put_candidates(route_state, candidates),
+         filter_input = CandidateEligibility.FilterInput.put_candidates(filter_input, candidates),
+         {:ok, candidates, quota_decision, route_state} <-
            filter_quota_eligible_candidates(filter_input, route_state, quota_mode),
          request_options = put_quota_decision(request_options, quota_decision),
          filter_input =

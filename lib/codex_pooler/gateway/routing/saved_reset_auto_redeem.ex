@@ -311,7 +311,8 @@ defmodule CodexPooler.Gateway.Routing.SavedResetAutoRedeem do
     timestamp = now()
 
     weekly_usable_window?(window, timestamp) and
-      used_percent_at_or_above?(window.used_percent, policy.quota_threshold_percent)
+      used_percent_at_or_above?(window.used_percent, policy.quota_threshold_percent) and
+      natural_reset_far_enough?(window.reset_at, policy.min_blocked_minutes)
   end
 
   defp weekly_used_window?(window, timestamp) do

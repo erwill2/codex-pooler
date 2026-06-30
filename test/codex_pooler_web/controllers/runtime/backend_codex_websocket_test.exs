@@ -4568,6 +4568,80 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
            ) == 1
   end
 
+  @tag :saved_reset_duplicate_turn
+  test "duplicate explicit websocket turn id does not auto redeem saved reset before rejection" do
+    upstream =
+      start_upstream(
+        {:path_json,
+         %{
+           "/backend-api/codex/responses" =>
+             {200,
+              %{
+                "id" => "resp_duplicate_turn_saved_reset",
+                "object" => "response",
+                "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+              }},
+           "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+           "/api/codex/usage" => {200, saved_reset_usage_payload(0)}
+         }}
+      )
+
+    setup = gateway_setup(upstream)
+
+    identity =
+      setup.identity
+      |> CodexPooler.Upstreams.Schemas.UpstreamIdentity.changeset(%{
+        metadata: saved_reset_metadata(upstream, 1),
+        saved_reset_auto_redeem_enabled: true,
+        saved_reset_auto_redeem_min_blocked_minutes: 60,
+        saved_reset_auto_redeem_keep_credits: 0,
+        updated_at: DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      })
+      |> Repo.update!()
+
+    setup = %{setup | identity: identity}
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, session} = Gateway.start_codex_session(auth, %{accepted_turn_state: "duplicate-reset"})
+
+    opts = %{request_id: "connection-request-id", codex_session: session}
+
+    payload =
+      Jason.encode!(%{
+        "model" => setup.model.exposed_model_id,
+        "turn_id" => "duplicate-reset-turn-id",
+        "input" => "dedupe me before reset"
+      })
+
+    assert :ok =
+             execute_websocket_response(auth, payload, opts, fn frame ->
+               send(self(), {:websocket_frame, :first, frame})
+             end)
+
+    assert_received {:websocket_frame, :first, _frame}
+    assert [%{path: "/backend-api/codex/responses"}] = FakeUpstream.requests(upstream)
+
+    prime_weekly_exhausted_quota!(identity)
+
+    assert {:error, %{code: "duplicate_turn"}} =
+             execute_websocket_response(auth, payload, opts, fn frame ->
+               send(self(), {:websocket_frame, :duplicate, frame})
+             end)
+
+    refute_received {:websocket_frame, :duplicate, _frame}
+
+    assert [%{path: "/backend-api/codex/responses"}] = FakeUpstream.requests(upstream)
+    assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 1
+    assert Repo.aggregate(from(a in Attempt), :count) == 1
+
+    assert Repo.aggregate(from(t in CodexTurn, where: t.codex_session_id == ^session.id), :count) ==
+             1
+
+    assert Repo.aggregate(
+             from(entry in LedgerEntry, where: entry.entry_kind == "settlement"),
+             :count
+           ) == 1
+  end
+
   @tag :task_6_duplicate_turn
   test "concurrent duplicate explicit websocket turn id is atomically rejected" do
     upstream =

@@ -503,6 +503,19 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
              ])
   end
 
+  def prime_weekly_exhausted_quota!(identity) do
+    reset_at = DateTime.add(DateTime.utc_now(), 2, :hour) |> DateTime.truncate(:second)
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               weekly_quota_window_attrs(%{
+                 reset_at: reset_at,
+                 used_percent: Decimal.new("100"),
+                 source: "codex_usage_api"
+               })
+             ])
+  end
+
   def prime_stale_routing_quota!(identity) do
     reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
 
@@ -611,6 +624,37 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
       },
       overrides
     )
+  end
+
+  def saved_reset_metadata(upstream, available_count) do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond) |> DateTime.to_iso8601()
+
+    %{
+      "usage_base_url" => FakeUpstream.url(upstream),
+      "saved_resets" => %{
+        "status" => "reported",
+        "available_count" => available_count,
+        "source" => "codex_usage_api",
+        "path_style" => "codex_api",
+        "observed_at" => observed_at,
+        "usage_path" => "/api/codex/usage",
+        "reason" => nil
+      }
+    }
+  end
+
+  def saved_reset_usage_payload(available_count) do
+    %{
+      "plan_type" => "pro",
+      "rate_limit_reset_credits" => %{"available_count" => available_count},
+      "rate_limit" => %{
+        "primary_window" => %{
+          "used_percent" => 10,
+          "limit_window_seconds" => 18_000,
+          "reset_after_seconds" => 900
+        }
+      }
+    }
   end
 
   def model_quota_window_attrs(model, window_kind, overrides)

@@ -177,7 +177,8 @@ defmodule CodexPooler.Gateway.Runtime.Service do
          candidates,
          %RouteState{} = route_state
        ) do
-    with {:ok, candidates, request_options, route_state} <-
+    with :ok <- SessionContinuity.ensure_unique_turn(request_options),
+         {:ok, candidates, request_options, route_state} <-
            route_filter_input(
              auth,
              model,
@@ -187,7 +188,6 @@ defmodule CodexPooler.Gateway.Runtime.Service do
              candidates
            )
            |> RouteFiltering.filter_candidates_with_route_state(route_state),
-         :ok <- SessionContinuity.ensure_unique_turn(request_options),
          {:ok, reserved} <-
            reserve_and_start_turn(auth, model, payload, endpoint, request_options, route_state) do
       dispatch_candidates(

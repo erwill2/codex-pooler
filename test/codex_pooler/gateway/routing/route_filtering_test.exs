@@ -6,9 +6,11 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
   alias CodexPooler.Catalog
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Persistence.RoutingCircuitState
   alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Gateway.Routing.CandidateEligibility.FilterInput
   alias CodexPooler.Gateway.Routing.RouteFiltering
+  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
@@ -236,6 +238,183 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
       refute metadata_json =~ "credit_id"
     end
 
+    test "does not redeem saved reset for a circuit-open candidate" do
+      {:ok, upstream} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      %{identity: identity, assignment: assignment} =
+        active_upstream_assignment_fixture(pool, %{metadata: saved_reset_metadata(upstream, 1)})
+
+      identity = enable_saved_reset_auto_redeem!(identity)
+      upsert_weekly_exhausted_quota!(identity)
+      filter_input = filter_input(pool, api_key, assignment, identity, "circuit-open-no-spend")
+      open_circuit!(pool, api_key, filter_input.model, assignment)
+
+      assert {:error,
+              %{
+                code: "no_eligible_backend",
+                candidate_exclusions: [
+                  %{
+                    pool_upstream_assignment_id: assignment_id,
+                    upstream_identity_id: identity_id,
+                    reasons: [%{"code" => "routing_circuit_open"}]
+                  }
+                ]
+              }} = RouteFiltering.filter_candidates(filter_input)
+
+      assert assignment_id == assignment.id
+      assert identity_id == identity.id
+      assert [] = FakeUpstream.requests(upstream)
+    end
+
+    test "route-state filtering does not redeem saved reset for a circuit-open candidate" do
+      {:ok, upstream} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      %{identity: identity, assignment: assignment} =
+        active_upstream_assignment_fixture(pool, %{metadata: saved_reset_metadata(upstream, 1)})
+
+      identity = enable_saved_reset_auto_redeem!(identity)
+      upsert_weekly_exhausted_quota!(identity)
+      filter_input = filter_input(pool, api_key, assignment, identity, "route-state-circuit-open")
+      open_circuit!(pool, api_key, filter_input.model, assignment)
+      route_state = route_state(filter_input)
+
+      assert {:error,
+              %{
+                code: "no_eligible_backend",
+                candidate_exclusions: [
+                  %{
+                    pool_upstream_assignment_id: assignment_id,
+                    upstream_identity_id: identity_id,
+                    reasons: [%{"code" => "routing_circuit_open"}]
+                  }
+                ]
+              }} = RouteFiltering.filter_candidates_with_route_state(filter_input, route_state)
+
+      assert assignment_id == assignment.id
+      assert identity_id == identity.id
+      assert [] = FakeUpstream.requests(upstream)
+    end
+
+    test "does not redeem saved reset for a circuit-open threshold candidate when another candidate can route" do
+      {:ok, circuit_open_upstream} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      circuit_open =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: saved_reset_metadata(circuit_open_upstream, 1)
+        })
+
+      routable = active_upstream_assignment_fixture(pool)
+
+      circuit_open_identity =
+        enable_saved_reset_auto_redeem!(circuit_open.identity, %{
+          saved_reset_auto_redeem_trigger_mode: "threshold",
+          saved_reset_auto_redeem_quota_threshold_percent: 95
+        })
+
+      upsert_weekly_pressure_quota!(circuit_open_identity, Decimal.new("96"))
+      upsert_weekly_pressure_quota!(routable.identity, Decimal.new("97"))
+
+      filter_input =
+        filter_input(
+          pool,
+          api_key,
+          [
+            {circuit_open.assignment, circuit_open_identity},
+            {routable.assignment, routable.identity}
+          ],
+          "threshold-circuit-open-no-spend"
+        )
+
+      open_circuit!(pool, api_key, filter_input.model, circuit_open.assignment)
+
+      assert {:ok, filtered_candidates, filtered_options} =
+               RouteFiltering.filter_candidates(filter_input)
+
+      assert candidate_ids(filtered_candidates) == [routable.assignment.id]
+      assert filtered_options.routing.quota_decision["allowed"] == true
+      assert filtered_options.routing.quota_decision["eligible_candidate_count"] == 1
+      assert [] = FakeUpstream.requests(circuit_open_upstream)
+    end
+
+    test "route-state filtering keeps only circuit survivors before threshold saved-reset redemption" do
+      {:ok, circuit_open_upstream} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      circuit_open =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: saved_reset_metadata(circuit_open_upstream, 1)
+        })
+
+      routable = active_upstream_assignment_fixture(pool)
+
+      circuit_open_identity =
+        enable_saved_reset_auto_redeem!(circuit_open.identity, %{
+          saved_reset_auto_redeem_trigger_mode: "threshold",
+          saved_reset_auto_redeem_quota_threshold_percent: 95
+        })
+
+      upsert_weekly_pressure_quota!(circuit_open_identity, Decimal.new("96"))
+      upsert_weekly_pressure_quota!(routable.identity, Decimal.new("97"))
+
+      filter_input =
+        filter_input(
+          pool,
+          api_key,
+          [
+            {circuit_open.assignment, circuit_open_identity},
+            {routable.assignment, routable.identity}
+          ],
+          "route-state-threshold-circuit-open"
+        )
+
+      open_circuit!(pool, api_key, filter_input.model, circuit_open.assignment)
+      route_state = route_state(filter_input)
+
+      assert {:ok, filtered_candidates, filtered_options, filtered_route_state} =
+               RouteFiltering.filter_candidates_with_route_state(filter_input, route_state)
+
+      assert candidate_ids(filtered_candidates) == [routable.assignment.id]
+      assert candidate_ids(filtered_route_state.candidates) == [routable.assignment.id]
+      assert filtered_options.routing.quota_decision["allowed"] == true
+      assert filtered_options.routing.quota_decision["eligible_candidate_count"] == 1
+      assert [] = FakeUpstream.requests(circuit_open_upstream)
+    end
+
     test "auto redeems saved reset before exhaustion when every candidate is near weekly limit" do
       {:ok, upstream} =
         FakeUpstream.start_link(
@@ -282,6 +461,45 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
       assert consume_request.method == "POST"
       assert consume_request.path == "/api/codex/rate-limit-reset-credits/consume"
       assert usage_request.path == "/api/codex/usage"
+    end
+
+    test "threshold auto redemption waits when natural weekly reset is inside the blocked buffer" do
+      {:ok, upstream} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      upstream_assignment =
+        active_upstream_assignment_fixture(pool, %{metadata: saved_reset_metadata(upstream, 2)})
+
+      identity =
+        enable_saved_reset_auto_redeem!(upstream_assignment.identity, %{
+          saved_reset_auto_redeem_trigger_mode: "threshold",
+          saved_reset_auto_redeem_quota_threshold_percent: 95,
+          saved_reset_auto_redeem_min_blocked_minutes: 60
+        })
+
+      reset_at =
+        DateTime.utc_now() |> DateTime.add(10, :minute) |> DateTime.truncate(:microsecond)
+
+      upsert_weekly_pressure_quota!(identity, Decimal.new("96"), reset_at: reset_at)
+
+      filter_input =
+        filter_input(pool, api_key, upstream_assignment.assignment, identity, "threshold-buffer")
+
+      assert {:ok, filtered_candidates, filtered_options} =
+               RouteFiltering.filter_candidates(filter_input)
+
+      assert candidate_ids(filtered_candidates) == [upstream_assignment.assignment.id]
+      assert filtered_options.routing.quota_decision["allowed"] == true
+      assert filtered_options.routing.quota_decision["eligible_candidate_count"] == 1
+      assert [] = FakeUpstream.requests(upstream)
     end
 
     test "auto redeems saved reset before exhaustion when a usable reset expires soon" do
@@ -470,6 +688,15 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
     filter_input(pool, api_key, [{assignment, identity}], suffix)
   end
 
+  defp route_state(%FilterInput{} = filter_input) do
+    %{auth: auth, model: model, request_options: request_options, candidates: candidates} =
+      filter_input
+
+    %{visible_model: model, candidates: candidates}
+    |> RouteState.new()
+    |> RouteState.preload_routing_snapshots(auth, model, request_options)
+  end
+
   defp candidate_ids(candidates),
     do: Enum.map(candidates, fn {assignment, _identity} -> assignment.id end)
 
@@ -635,6 +862,29 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
     weekly_exhausted_quota_attrs()
     |> Map.merge(%{used_percent: used_percent})
     |> Map.merge(Map.new(attrs))
+  end
+
+  defp open_circuit!(pool, _api_key, model, assignment) do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %RoutingCircuitState{}
+    |> RoutingCircuitState.changeset(%{
+      pool_id: pool.id,
+      pool_upstream_assignment_id: assignment.id,
+      upstream_identity_id: assignment.upstream_identity_id,
+      model_identifier: model.exposed_model_id,
+      route_class: "proxy_http",
+      status: "open",
+      reason_code: "test_circuit_open",
+      failure_count: 3,
+      success_count: 0,
+      opened_at: now,
+      next_probe_at: DateTime.add(now, 60, :second),
+      metadata: %{"source" => "route_filtering_test"},
+      created_at: now,
+      updated_at: now
+    })
+    |> Repo.insert!()
   end
 
   defp usage_payload(available_count) do
