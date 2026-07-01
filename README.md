@@ -483,6 +483,10 @@ image_gen:
   provider: openai
   model: gpt-image-2-medium
 
+auxiliary:
+  compression:
+    timeout: 900
+
 # Optional operator-only MCP metadata add-on. Omit for model/runtime use.
 mcp_servers:
   codex_pooler:
@@ -500,6 +504,11 @@ Hermes' automatic probes can resolve the Pooler window. For `gpt-5.5`, the raw
 Codex window remains 272000 and the effective advertised value is currently
 258400. Keep `context_length: 258400` in Hermes config as a safe explicit
 override for older Pooler deployments or stale model metadata.
+
+Hermes context compression uses its own auxiliary request timeout. Keep
+`auxiliary.compression.timeout: 900` so large retained contexts can finish
+instead of cycling through the older 120-second compression budget. This is
+independent from the optional MCP server `timeout`.
 
 Remote HTTP MCP servers require Hermes' `mcp` extra. If
 `hermes mcp test codex_pooler` reports `mcp.client.streamable_http is not
@@ -537,6 +546,10 @@ model:
 
 agent:
   image_input_mode: native
+
+auxiliary:
+  compression:
+    timeout: 900
 
 # Optional operator-only MCP metadata add-on. Omit for model/runtime use.
 mcp_servers:
