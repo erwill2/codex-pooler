@@ -17,7 +17,7 @@ defmodule CodexPooler.Jobs.ReadModel.Explorer do
     query =
       Oban.Job
       |> apply_explorer_filters(filters)
-      |> Query.maybe_filter_resolved_failure_visibility(filters)
+      |> Query.maybe_filter_resolved_failure_visibility(filters, opts)
 
     if filters.attention do
       attention_filtered_page(query, filters.attention, limit, offset, opts)

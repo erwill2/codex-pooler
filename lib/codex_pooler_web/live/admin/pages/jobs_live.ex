@@ -18,6 +18,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
 
   @jobs_reload_debounce_ms 1_000
   @jobs_fallback_refresh_ms 5_000
+  @worker_failure_marker_limit 3
   @worker_failure_job_id_param "failure_job_id"
 
   @impl true
@@ -209,6 +210,7 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
               <WorkerCards.job_worker_card
                 :for={card <- @worker_cards}
                 card={card}
+                current_params={@current_params}
                 datetime_preferences={@datetime_preferences}
                 selected_failure_job_id={@selected_worker_failure_job_id}
               />
@@ -297,8 +299,26 @@ defmodule CodexPoolerWeb.Admin.JobsLive do
     params = jobs_params(socket, params)
 
     socket.assigns.current_scope
-    |> JobsReadModel.load(params: params)
+    |> JobsReadModel.load(
+      params: params,
+      include_overview: false,
+      resolved_failure_resolution: resolved_failure_resolution(params),
+      unresolved_failure_limit: @worker_failure_marker_limit
+    )
     |> then(&assign_page_state(socket, &1, params))
+  end
+
+  defp resolved_failure_resolution(params) do
+    cond do
+      params["show_completed"] == "true" ->
+        :full
+
+      normalized_positive_integer(params[@worker_failure_job_id_param]) ->
+        :full
+
+      true ->
+        :exact
+    end
   end
 
   defp assign_page_state(socket, page_state, params) do

@@ -183,6 +183,25 @@ const ClipboardCopy = {
     window.clearTimeout(this.timeout)
   },
 }
+const WorkerFailureMarker = {
+  mounted() {
+    this.handleClick = event => {
+      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+        return
+      }
+
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      event.stopPropagation()
+      this.pushEvent("toggle_worker_failure", {"job-id": this.el.dataset.jobId})
+    }
+
+    this.el.addEventListener("click", this.handleClick)
+  },
+  destroyed() {
+    this.el.removeEventListener("click", this.handleClick)
+  },
+}
 const TotpSetupTools = {
   mounted() {
     this.renderQr()
@@ -829,6 +848,7 @@ const liveSocket = new LiveSocket("/live", Socket, {
     OtpInput,
     QuotaPressureChart,
     TotpSetupTools,
+    WorkerFailureMarker,
     WebSocketState,
   },
 })

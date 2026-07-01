@@ -142,24 +142,24 @@ defmodule CodexPooler.Jobs.ReadModel do
     |> Map.fetch!(@single_worker_summary_group_key)
   end
 
-  @spec worker_job_summaries_by_group(scope_ref(), [worker_group()]) ::
+  @spec worker_job_summaries_by_group(scope_ref(), [worker_group()], keyword()) ::
           worker_job_summaries_by_group()
-  def worker_job_summaries_by_group(scope, worker_groups)
+  def worker_job_summaries_by_group(scope, worker_groups, opts \\ [])
 
-  def worker_job_summaries_by_group(_scope, []), do: %{}
+  def worker_job_summaries_by_group(_scope, [], _opts), do: %{}
 
-  def worker_job_summaries_by_group(%Scope{} = scope, worker_groups) do
+  def worker_job_summaries_by_group(%Scope{} = scope, worker_groups, opts) do
     if Pools.owner?(scope) do
-      worker_job_summaries_by_group(:system, worker_groups)
+      worker_job_summaries_by_group(:system, worker_groups, opts)
     else
       WorkerSummaries.empty_by_group(worker_groups)
     end
   end
 
-  def worker_job_summaries_by_group(:system, worker_groups),
-    do: WorkerSummaries.load(worker_groups)
+  def worker_job_summaries_by_group(:system, worker_groups, opts),
+    do: WorkerSummaries.load(worker_groups, opts)
 
-  def worker_job_summaries_by_group(_scope, worker_groups) do
+  def worker_job_summaries_by_group(_scope, worker_groups, _opts) do
     WorkerSummaries.empty_by_group(worker_groups)
   end
 

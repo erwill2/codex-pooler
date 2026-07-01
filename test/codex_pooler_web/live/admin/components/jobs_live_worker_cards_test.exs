@@ -230,6 +230,46 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
            )
   end
 
+  test "opening an already rendered worker failure panel in completed view does not reload jobs",
+       %{
+         conn: conn
+       } do
+    job =
+      insert_job(
+        1,
+        worker: AccountReconciliationWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 1,
+        inserted_at: ~U[2026-05-04 10:00:00Z],
+        discarded_at: ~U[2026-05-04 10:00:30Z],
+        args: %{"pool_id" => Ecto.UUID.generate(), "trigger_kind" => "scheduled"},
+        errors: [
+          %{
+            "attempt" => 1,
+            "error" => "account reconciliation failed"
+          }
+        ]
+      )
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs?show_completed=true")
+    card = worker_card_selector(:account_reconciliation)
+
+    {_result, events} =
+      capture_repo_queries(fn ->
+        render_click(element(view, "#{card} #job-failure-#{job.id}"))
+        assert_patch(view, ~p"/admin/jobs?failure_job_id=#{job.id}&show_completed=true")
+      end)
+
+    assert oban_jobs_query_count(events) == 0
+
+    assert has_element?(
+             view,
+             "#{card} #{failure_panel_selector(job)}[data-open='true'][aria-hidden='false']",
+             "account reconciliation failed"
+           )
+  end
+
   test "opening an already rendered job detail drawer does not reload jobs", %{conn: conn} do
     job =
       insert_job(
@@ -715,6 +755,35 @@ defmodule CodexPoolerWeb.Admin.JobsLiveWorkerCardsTest do
     assert count_occurrences(rendered, "data-role=\"open-worker-marker\"") == 8
     assert has_element?(view, "#{card} [data-role='open-worker-overflow']", "+2")
     refute rendered =~ "Account fan-out slots are always visible"
+  end
+
+  test "account reconciliation card keeps completed view failure markers bounded", %{conn: conn} do
+    for index <- 1..10 do
+      insert_job(
+        index,
+        worker: AccountReconciliationWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 1,
+        inserted_at: DateTime.add(~U[2026-05-04 10:00:00Z], index, :second),
+        discarded_at: DateTime.add(~U[2026-05-04 10:00:30Z], index, :second),
+        args: %{"pool_id" => Ecto.UUID.generate(), "trigger_kind" => "scheduled"},
+        errors: [
+          %{
+            "attempt" => 1,
+            "error" => "sample reconciliation failure #{index}"
+          }
+        ]
+      )
+    end
+
+    {:ok, view, _html} = live(conn, ~p"/admin/jobs?show_completed=true")
+    card = worker_card_selector(:account_reconciliation)
+    rendered = render(view)
+
+    assert count_occurrences(rendered, "data-role=\"failed-worker-marker\"") == 3
+    refute has_element?(view, "#{card} [data-role='failed-worker-overflow']")
+    refute rendered =~ "+7"
   end
 
   test "renders redacted failure details for failed jobs", %{conn: conn} do

@@ -294,19 +294,22 @@ defmodule CodexPooler.Jobs.ReadModel.Query do
 
   def explorer_offset(page, limit), do: (page - 1) * limit
 
-  def maybe_filter_resolved_failure_visibility(queryable, %{attention: attention})
+  def maybe_filter_resolved_failure_visibility(queryable, filters, opts \\ [])
+
+  def maybe_filter_resolved_failure_visibility(queryable, %{attention: attention}, opts)
       when attention in ["active_failure", "retry_pressure", "cancelled"] do
-    exclude_resolved_failure_jobs_query(queryable)
+    exclude_resolved_failure_jobs_query(queryable, opts)
   end
 
-  def maybe_filter_resolved_failure_visibility(queryable, %{state: state})
+  def maybe_filter_resolved_failure_visibility(queryable, %{state: state}, _opts)
       when is_binary(state),
       do: queryable
 
-  def maybe_filter_resolved_failure_visibility(queryable, %{show_completed: true}), do: queryable
+  def maybe_filter_resolved_failure_visibility(queryable, %{show_completed: true}, _opts),
+    do: queryable
 
-  def maybe_filter_resolved_failure_visibility(queryable, _filters) do
-    exclude_resolved_failure_jobs_query(queryable)
+  def maybe_filter_resolved_failure_visibility(queryable, _filters, opts) do
+    exclude_resolved_failure_jobs_query(queryable, opts)
   end
 
   def maybe_filter_explorer_worker(queryable, nil), do: queryable
@@ -366,60 +369,93 @@ defmodule CodexPooler.Jobs.ReadModel.Query do
         """
         NOT EXISTS (
           SELECT 1
-          FROM oban_jobs resolved
-          LEFT JOIN pool_upstream_assignments resolved_assignment
-            ON resolved_assignment.id::text =
-              resolved.args->>'pool_upstream_assignment_id'
-          LEFT JOIN pool_upstream_assignments failed_assignment
-            ON failed_assignment.id::text =
-              ?->>'pool_upstream_assignment_id'
-          WHERE resolved.worker = ?
-            AND resolved.state = 'completed'
+          FROM oban_jobs resolved_exact
+          WHERE resolved_exact.worker = ?
+            AND resolved_exact.state = 'completed'
+            AND COALESCE(resolved_exact.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
+            AND COALESCE(resolved_exact.args->>'pool_upstream_assignment_id', '') = COALESCE(?->>'pool_upstream_assignment_id', '')
+            AND COALESCE(resolved_exact.args->>'upstream_identity_id', '') = COALESCE(?->>'upstream_identity_id', '')
+            AND COALESCE(resolved_exact.args->>'api_key_id', '') = COALESCE(?->>'api_key_id', '')
+            AND COALESCE(resolved_exact.args->>'rollup_date', '') = COALESCE(?->>'rollup_date', '')
             AND (
-              resolved.inserted_at > ?
-              OR (resolved.inserted_at = ? AND resolved.id > ?)
-            )
-            AND (
-              (
-                COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
-                AND COALESCE(resolved.args->>'pool_upstream_assignment_id', '') = COALESCE(?->>'pool_upstream_assignment_id', '')
-                AND COALESCE(resolved.args->>'upstream_identity_id', '') = COALESCE(?->>'upstream_identity_id', '')
-                AND COALESCE(resolved.args->>'api_key_id', '') = COALESCE(?->>'api_key_id', '')
-                AND COALESCE(resolved.args->>'rollup_date', '') = COALESCE(?->>'rollup_date', '')
-              )
-              OR (
-                ? = ?
-                AND COALESCE(resolved.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
-                AND COALESCE(
-                  resolved.args->>'upstream_identity_id',
-                  resolved_assignment.upstream_identity_id::text
-                ) = COALESCE(
-                  ?->>'upstream_identity_id',
-                  failed_assignment.upstream_identity_id::text
-                )
-                AND COALESCE(
-                  ?->>'upstream_identity_id',
-                  failed_assignment.upstream_identity_id::text
-                ) IS NOT NULL
-              )
-              OR (
-                ? = ?
-                AND ?::text ~ ?
-                AND COALESCE(
-                  resolved.args->>'upstream_identity_id',
-                  resolved_assignment.upstream_identity_id::text
-                ) = COALESCE(
-                  ?->>'upstream_identity_id',
-                  failed_assignment.upstream_identity_id::text
-                )
-                AND COALESCE(
-                  ?->>'upstream_identity_id',
-                  failed_assignment.upstream_identity_id::text
-                ) IS NOT NULL
-              )
+              resolved_exact.inserted_at > ?
+              OR (resolved_exact.inserted_at = ? AND resolved_exact.id > ?)
             )
         )
+        AND (
+          ? != ?
+          OR NOT EXISTS (
+            SELECT 1
+            FROM oban_jobs resolved_identity
+            LEFT JOIN pool_upstream_assignments resolved_assignment
+              ON resolved_assignment.id::text =
+                resolved_identity.args->>'pool_upstream_assignment_id'
+            LEFT JOIN pool_upstream_assignments failed_assignment
+              ON failed_assignment.id::text =
+                ?->>'pool_upstream_assignment_id'
+            WHERE resolved_identity.worker = ?
+              AND resolved_identity.state = 'completed'
+              AND (
+                resolved_identity.inserted_at > ?
+                OR (resolved_identity.inserted_at = ? AND resolved_identity.id > ?)
+              )
+              AND COALESCE(resolved_identity.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
+              AND COALESCE(
+                resolved_identity.args->>'upstream_identity_id',
+                resolved_assignment.upstream_identity_id::text
+              ) = COALESCE(
+                ?->>'upstream_identity_id',
+                failed_assignment.upstream_identity_id::text
+              )
+              AND COALESCE(
+                ?->>'upstream_identity_id',
+                failed_assignment.upstream_identity_id::text
+              ) IS NOT NULL
+          )
+        )
+        AND (
+          ? != ?
+          OR NOT (?::text ~ ?)
+          OR NOT EXISTS (
+            SELECT 1
+            FROM oban_jobs resolved_recovered
+            LEFT JOIN pool_upstream_assignments resolved_assignment
+              ON resolved_assignment.id::text =
+                resolved_recovered.args->>'pool_upstream_assignment_id'
+            LEFT JOIN pool_upstream_assignments failed_assignment
+              ON failed_assignment.id::text =
+                ?->>'pool_upstream_assignment_id'
+            WHERE resolved_recovered.worker = ?
+            AND resolved_recovered.state = 'completed'
+            AND (
+              resolved_recovered.inserted_at > ?
+              OR (resolved_recovered.inserted_at = ? AND resolved_recovered.id > ?)
+            )
+            AND COALESCE(
+              resolved_recovered.args->>'upstream_identity_id',
+              resolved_assignment.upstream_identity_id::text
+            ) = COALESCE(
+              ?->>'upstream_identity_id',
+              failed_assignment.upstream_identity_id::text
+            )
+            AND COALESCE(
+              ?->>'upstream_identity_id',
+              failed_assignment.upstream_identity_id::text
+            ) IS NOT NULL
+          )
+        )
         """,
+        unquote(job).worker,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).inserted_at,
+        unquote(job).inserted_at,
+        unquote(job).id,
+        unquote(job).worker,
+        unquote(account_reconciliation_worker),
         unquote(job).args,
         unquote(job).worker,
         unquote(job).inserted_at,
@@ -428,24 +464,73 @@ defmodule CodexPooler.Jobs.ReadModel.Query do
         unquote(job).args,
         unquote(job).args,
         unquote(job).args,
-        unquote(job).args,
-        unquote(job).args,
-        unquote(job).worker,
-        unquote(account_reconciliation_worker),
-        unquote(job).args,
-        unquote(job).args,
-        unquote(job).args,
         unquote(job).worker,
         unquote(account_reconciliation_worker),
         unquote(job).errors,
         unquote(identity_recovered_reconciliation_error_pattern),
+        unquote(job).args,
+        unquote(job).worker,
+        unquote(job).inserted_at,
+        unquote(job).inserted_at,
+        unquote(job).id,
         unquote(job).args,
         unquote(job).args
       )
     end
   end
 
-  def exclude_resolved_failure_jobs_query(queryable) do
+  defmacrop exact_resolved_failure_absent?(job) do
+    quote do
+      fragment(
+        """
+        NOT EXISTS (
+          SELECT 1
+          FROM oban_jobs resolved_exact
+          WHERE resolved_exact.worker = ?
+            AND resolved_exact.state = 'completed'
+            AND COALESCE(resolved_exact.args->>'pool_id', '') = COALESCE(?->>'pool_id', '')
+            AND COALESCE(resolved_exact.args->>'pool_upstream_assignment_id', '') = COALESCE(?->>'pool_upstream_assignment_id', '')
+            AND COALESCE(resolved_exact.args->>'upstream_identity_id', '') = COALESCE(?->>'upstream_identity_id', '')
+            AND COALESCE(resolved_exact.args->>'api_key_id', '') = COALESCE(?->>'api_key_id', '')
+            AND COALESCE(resolved_exact.args->>'rollup_date', '') = COALESCE(?->>'rollup_date', '')
+            AND (
+              resolved_exact.inserted_at > ?
+              OR (resolved_exact.inserted_at = ? AND resolved_exact.id > ?)
+            )
+        )
+        """,
+        unquote(job).worker,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).args,
+        unquote(job).inserted_at,
+        unquote(job).inserted_at,
+        unquote(job).id
+      )
+    end
+  end
+
+  def exclude_resolved_failure_jobs_query(queryable, opts \\ []) do
+    case resolved_failure_resolution(opts) do
+      :exact -> exclude_exact_resolved_failure_jobs_query(queryable)
+      :full -> exclude_full_resolved_failure_jobs_query(queryable)
+    end
+  end
+
+  defp exclude_exact_resolved_failure_jobs_query(queryable) do
+    queryable
+    |> exclude_terminal_reauth_reconciliation_failures()
+    |> then(fn queryable ->
+      from job in queryable,
+        where:
+          job.state not in ^failure_states() or
+            exact_resolved_failure_absent?(job)
+    end)
+  end
+
+  defp exclude_full_resolved_failure_jobs_query(queryable) do
     account_reconciliation_worker = worker_name(AccountReconciliationWorker)
 
     identity_recovered_reconciliation_error_pattern =
@@ -465,7 +550,19 @@ defmodule CodexPooler.Jobs.ReadModel.Query do
     end)
   end
 
-  def exclude_resolved_failure_matches(queryable) do
+  def exclude_resolved_failure_matches(queryable, opts \\ []) do
+    case resolved_failure_resolution(opts) do
+      :exact -> exclude_exact_resolved_failure_matches(queryable)
+      :full -> exclude_full_resolved_failure_matches(queryable)
+    end
+  end
+
+  defp exclude_exact_resolved_failure_matches(queryable) do
+    from job in queryable,
+      where: exact_resolved_failure_absent?(job)
+  end
+
+  defp exclude_full_resolved_failure_matches(queryable) do
     account_reconciliation_worker = worker_name(AccountReconciliationWorker)
 
     identity_recovered_reconciliation_error_pattern =
@@ -478,6 +575,13 @@ defmodule CodexPooler.Jobs.ReadModel.Query do
           ^account_reconciliation_worker,
           ^identity_recovered_reconciliation_error_pattern
         )
+  end
+
+  defp resolved_failure_resolution(opts) do
+    case Keyword.get(opts, :resolved_failure_resolution, :full) do
+      :exact -> :exact
+      _resolution -> :full
+    end
   end
 
   def exclude_terminal_reauth_reconciliation_failures(queryable) do

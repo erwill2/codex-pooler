@@ -664,6 +664,59 @@ defmodule CodexPoolerWeb.Admin.JobsReadModelTest do
     refute projected_job_id?(summaries, hidden_job.id)
   end
 
+  test "fast page projection skips legacy overview and caps worker failure markers" do
+    for index <- 1..6 do
+      insert_job(index,
+        worker: AccountReconciliationWorker,
+        state: "discarded",
+        attempt: 1,
+        max_attempts: 1,
+        inserted_at: DateTime.add(~U[2026-06-02 10:00:00Z], index, :minute),
+        discarded_at: DateTime.add(~U[2026-06-02 10:01:00Z], index, :minute),
+        errors: [
+          %{
+            "attempt" => 1,
+            "error" => "sample reconciliation failure #{index}"
+          }
+        ],
+        args: %{"pool_id" => Ecto.UUID.generate()}
+      )
+    end
+
+    fast_projection =
+      JobsReadModel.load(:system,
+        params: %{},
+        include_overview: false,
+        resolved_failure_resolution: :exact,
+        unresolved_failure_limit: 3
+      )
+
+    completed_projection =
+      JobsReadModel.load(:system,
+        params: %{"show_completed" => "true"},
+        include_overview: false,
+        resolved_failure_resolution: :full,
+        unresolved_failure_limit: 3
+      )
+
+    full_projection = JobsReadModel.load(:system, params: %{})
+
+    assert fast_projection.overview.total == 0
+    assert fast_projection.explorer.total == 6
+
+    assert length(fast_projection.worker_jobs_by_group.account_reconciliation.unresolved_failures) ==
+             3
+
+    assert length(
+             completed_projection.worker_jobs_by_group.account_reconciliation.unresolved_failures
+           ) == 3
+
+    assert full_projection.overview.total == 6
+
+    assert length(full_projection.worker_jobs_by_group.account_reconciliation.unresolved_failures) ==
+             6
+  end
+
   defp insert_job(index, attrs) do
     inserted_at = Keyword.fetch!(attrs, :inserted_at)
     args = Keyword.get(attrs, :args, %{}) |> Map.put_new("index", index)

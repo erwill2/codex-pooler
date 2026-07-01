@@ -7,8 +7,8 @@ defmodule CodexPooler.Jobs.ReadModel.WorkerSummaries do
   alias CodexPooler.Repo
 
   @completed_state "completed"
-
-  def load(worker_groups) do
+  @unresolved_failure_candidate_multiplier 50
+  def load(worker_groups, opts \\ []) do
     now = DateTime.utc_now()
     worker_groups = Query.normalize_worker_groups(worker_groups)
     latest_by_group = latest_worker_jobs_by_group(worker_groups)
@@ -19,7 +19,7 @@ defmodule CodexPooler.Jobs.ReadModel.WorkerSummaries do
 
     pending_by_group = next_pending_worker_jobs_by_group(worker_groups)
     open_by_group = open_worker_jobs_by_group(worker_groups)
-    unresolved_failures_by_group = unresolved_failure_worker_jobs_by_group(worker_groups)
+    unresolved_failures_by_group = unresolved_failure_worker_jobs_by_group(worker_groups, opts)
 
     Map.new(worker_groups, fn {group_key, _workers} ->
       summary = %{
@@ -188,14 +188,14 @@ defmodule CodexPooler.Jobs.ReadModel.WorkerSummaries do
       select: %{id: job.id, group_index: group_worker.group_index}
   end
 
-  defp unresolved_failure_worker_jobs_by_group(worker_groups) do
+  defp unresolved_failure_worker_jobs_by_group(worker_groups, opts) do
     {group_worker_rows, group_keys_by_index} = Query.group_worker_rows_by_index(worker_groups)
 
     if group_worker_rows == [] do
       %{}
     else
       group_worker_rows
-      |> grouped_unresolved_failure_worker_jobs_query()
+      |> grouped_unresolved_failure_worker_jobs_query(opts)
       |> Query.grouped_job_metadata_query(:inserted_desc)
       |> Repo.all()
       |> reject_reauth_required_grouped_reconciliation_failures()
@@ -203,7 +203,7 @@ defmodule CodexPooler.Jobs.ReadModel.WorkerSummaries do
     end
   end
 
-  defp grouped_unresolved_failure_worker_jobs_query(group_worker_rows) do
+  defp grouped_unresolved_failure_worker_jobs_query(group_worker_rows, opts) do
     group_worker_types = %{group_index: :integer, worker: :string}
 
     query =
@@ -212,13 +212,78 @@ defmodule CodexPooler.Jobs.ReadModel.WorkerSummaries do
         on: job.worker == group_worker.worker,
         where: job.state in ^Query.failure_states()
 
-    query
-    |> Query.exclude_terminal_reauth_reconciliation_failures()
-    |> Query.exclude_resolved_failure_matches()
-    |> then(fn queryable ->
-      from [job, group_worker_row] in queryable,
-        select: %{id: job.id, group_index: group_worker_row.group_index}
+    query =
+      query
+      |> Query.exclude_terminal_reauth_reconciliation_failures()
+
+    case unresolved_failure_limit(opts) do
+      nil ->
+        query
+        |> Query.exclude_resolved_failure_matches(opts)
+        |> then(fn queryable ->
+          from [job, group_worker_row] in queryable,
+            select: %{id: job.id, group_index: group_worker_row.group_index}
+        end)
+
+      limit ->
+        limited_unresolved_failure_query(query, limit, opts)
+    end
+  end
+
+  defp limited_unresolved_failure_query(query, limit, opts) do
+    candidate_limit = max(limit * @unresolved_failure_candidate_multiplier, limit)
+    ranked_candidates = ranked_unresolved_failure_candidates_query(query)
+
+    ranked_candidates
+    |> then(fn ranked ->
+      from job in Oban.Job,
+        join: ranked_job in subquery(ranked),
+        on: job.id == ranked_job.id,
+        where: ranked_job.row_number <= ^candidate_limit
     end)
+    |> Query.exclude_resolved_failure_matches(opts)
+    |> then(fn queryable ->
+      from [job, ranked_job] in queryable,
+        windows: [
+          group_partition: [
+            partition_by: ranked_job.group_index,
+            order_by: [desc: job.inserted_at, desc: job.id]
+          ]
+        ],
+        select: %{
+          id: job.id,
+          group_index: ranked_job.group_index,
+          row_number: over(row_number(), :group_partition)
+        }
+    end)
+    |> subquery()
+    |> then(fn ranked ->
+      from ranked_job in ranked,
+        where: ranked_job.row_number <= ^limit,
+        select: %{id: ranked_job.id, group_index: ranked_job.group_index}
+    end)
+  end
+
+  defp ranked_unresolved_failure_candidates_query(queryable) do
+    from [job, group_worker_row] in queryable,
+      windows: [
+        group_partition: [
+          partition_by: group_worker_row.group_index,
+          order_by: [desc: job.inserted_at, desc: job.id]
+        ]
+      ],
+      select: %{
+        id: job.id,
+        group_index: group_worker_row.group_index,
+        row_number: over(row_number(), :group_partition)
+      }
+  end
+
+  defp unresolved_failure_limit(opts) do
+    case Keyword.get(opts, :unresolved_failure_limit) do
+      limit when is_integer(limit) and limit >= 0 -> limit
+      _limit -> nil
+    end
   end
 
   defp reject_reauth_required_grouped_reconciliation_failures(grouped_jobs) do

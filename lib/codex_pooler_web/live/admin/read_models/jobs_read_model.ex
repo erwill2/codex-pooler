@@ -49,11 +49,11 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
   end
 
   @spec worker_jobs_by_group(ReadModel.scope_ref()) :: worker_jobs_by_group()
-  def worker_jobs_by_group(scope) do
+  def worker_jobs_by_group(scope, opts \\ []) do
     worker_groups = Schedule.worker_groups()
 
     if owner_projection_scope?(scope) do
-      Jobs.worker_job_summaries_by_group(scope, worker_groups)
+      Jobs.worker_job_summaries_by_group(scope, worker_groups, read_opts_from_load_opts(opts))
     else
       Jobs.worker_job_summaries_by_group(nil, worker_groups)
     end
@@ -67,16 +67,20 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
     read_opts = read_opts_from_load_opts(opts)
 
     overview =
-      scope
-      |> ReadModel.jobs_overview(explorer_filters, read_opts)
-      |> ReadModel.sanitize_projection()
+      if include_overview?(opts) do
+        scope
+        |> ReadModel.jobs_overview(explorer_filters, read_opts)
+        |> ReadModel.sanitize_projection()
+      else
+        ReadModel.jobs_overview(nil, explorer_filters)
+      end
 
     explorer =
       scope
       |> ReadModel.list_explorer_jobs(explorer_filters, read_opts)
       |> ReadModel.sanitize_projection()
 
-    grouped_jobs = scope |> worker_jobs_by_group() |> ReadModel.sanitize_projection()
+    grouped_jobs = scope |> worker_jobs_by_group(opts) |> ReadModel.sanitize_projection()
 
     %{
       overview: overview,
@@ -114,8 +118,13 @@ defmodule CodexPoolerWeb.Admin.JobsReadModel do
   defp params_from_load_opts(params) when is_map(params), do: params
   defp params_from_load_opts(_opts), do: %{}
 
-  defp read_opts_from_load_opts(opts) when is_list(opts), do: Keyword.take(opts, [:now])
+  defp read_opts_from_load_opts(opts) when is_list(opts),
+    do: Keyword.take(opts, [:now, :resolved_failure_resolution, :unresolved_failure_limit])
+
   defp read_opts_from_load_opts(_opts), do: []
+
+  defp include_overview?(opts) when is_list(opts), do: Keyword.get(opts, :include_overview, true)
+  defp include_overview?(_opts), do: true
 
   defp explorer_filters(filters), do: Map.take(filters, @explorer_filter_keys)
 

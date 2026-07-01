@@ -169,10 +169,14 @@ defmodule CodexPooler.Jobs do
   @spec worker_job_summary(ReadModel.scope_ref(), [String.t()]) :: worker_job_summary()
   def worker_job_summary(scope, workers), do: ReadModel.worker_job_summary(scope, workers)
 
-  @spec worker_job_summaries_by_group(ReadModel.scope_ref(), [ReadModel.worker_group()]) ::
+  @spec worker_job_summaries_by_group(
+          ReadModel.scope_ref(),
+          [ReadModel.worker_group()],
+          keyword()
+        ) ::
           worker_job_summaries_by_group()
-  def worker_job_summaries_by_group(scope, worker_groups) do
-    ReadModel.worker_job_summaries_by_group(scope, worker_groups)
+  def worker_job_summaries_by_group(scope, worker_groups, opts \\ []) do
+    ReadModel.worker_job_summaries_by_group(scope, worker_groups, opts)
   end
 
   @spec cleanup_runtime_state(DateTime.t()) :: orchestration_result()

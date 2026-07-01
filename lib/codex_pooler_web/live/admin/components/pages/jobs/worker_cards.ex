@@ -8,8 +8,10 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards do
   alias CodexPoolerWeb.Admin.AvatarComponents
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
+  alias CodexPoolerWeb.Admin.JobFilterForm
 
   attr :card, :map, required: true
+  attr :current_params, :map, required: true
   attr :datetime_preferences, :map, required: true
   attr :selected_failure_job_id, :integer, default: nil
 
@@ -21,7 +23,11 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards do
     >
       <.job_worker_card_header card={@card} />
 
-      <.worker_activity_strip card={@card} selected_failure_job_id={@selected_failure_job_id} />
+      <.worker_activity_strip
+        card={@card}
+        current_params={@current_params}
+        selected_failure_job_id={@selected_failure_job_id}
+      />
       <.worker_failure_panel
         :for={{marker, marker_index} <- Enum.with_index(@card.visible_failure_markers)}
         marker={marker}
@@ -163,18 +169,20 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards do
             +{@card.open_marker_overflow_count}
           </span>
 
-          <button
+          <a
             :for={marker <- @card.visible_failure_markers}
+            href={failure_marker_path(@current_params, @selected_failure_job_id, marker.id)}
             id={"job-failure-#{marker.id}"}
-            type="button"
             data-role="failed-worker-marker"
             aria-controls={"job-failure-panel-#{marker.id}"}
             aria-expanded={to_string(marker.id == @selected_failure_job_id)}
             aria-label={marker.title}
             title={marker.title}
+            data-job-id={marker.id}
             data-has-avatar={marker.avatar_email && "true"}
             data-selected={marker.id == @selected_failure_job_id && "true"}
             phx-click="toggle_worker_failure"
+            phx-hook="WorkerFailureMarker"
             phx-value-job-id={marker.id}
             class={[
               "avatar avatar-offline relative size-8 shrink-0 rounded-full text-[0.6875rem] font-semibold leading-none shadow-sm transition-opacity hover:opacity-80 focus:outline-none focus:ring-2 focus:ring-error/40",
@@ -200,7 +208,7 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards do
                 {marker.glyph}
               </span>
             </div>
-          </button>
+          </a>
           <span
             :if={@card.failure_marker_overflow_count > 0}
             data-role="failed-worker-overflow"
@@ -213,6 +221,19 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards do
       </div>
     </section>
     """
+  end
+
+  defp failure_marker_path(params, selected_failure_job_id, selected_failure_job_id) do
+    ~p"/admin/jobs?#{JobFilterForm.query_params(params)}"
+  end
+
+  defp failure_marker_path(params, _selected_failure_job_id, marker_id) do
+    params =
+      params
+      |> JobFilterForm.query_params()
+      |> Map.put("failure_job_id", Integer.to_string(marker_id))
+
+    ~p"/admin/jobs?#{params}"
   end
 
   attr :marker, :map, required: true
