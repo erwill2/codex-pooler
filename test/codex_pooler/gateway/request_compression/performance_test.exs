@@ -166,21 +166,25 @@ defmodule CodexPooler.Gateway.RequestCompression.PerformanceTest do
         compressed_body
         |> Jason.decode!()
         |> Map.fetch!("input")
-        |> Enum.filter(&(&1["type"] in ["local_shell_call_output", "function_call_output"]))
-        |> Enum.map(&Map.fetch!(&1, "output"))
+        |> Enum.filter(&Map.has_key?(&1, "output"))
+        |> Map.new(&{Map.fetch!(&1, "call_id"), Map.fetch!(&1, "output")})
 
-      assert length(compressed_outputs) == 2
-      assert Enum.all?(compressed_outputs, &(&1 =~ "[compressed log output: omitted"))
-      refute Enum.any?(compressed_outputs, &String.contains?(&1, shell_sentinel))
-      refute Enum.any?(compressed_outputs, &String.contains?(&1, function_sentinel))
+      assert Map.fetch!(compressed_outputs, "call_oversized_shell_output") == shell_output
+
+      function_compressed_output =
+        Map.fetch!(compressed_outputs, "call_oversized_function_output")
+
+      assert function_compressed_output =~ "[compressed log output: omitted"
+      refute function_compressed_output =~ function_sentinel
 
       assert %{
                "enabled" => true,
                "attempted" => true,
                "status" => "compressed",
                "candidate_count" => 2,
-               "compressed_count" => 2,
-               "skipped_count" => 0,
+               "compressed_count" => 1,
+               "skipped_count" => 1,
+               "lossy_unrecoverable_tool_output_skipped_count" => 1,
                "original_bytes" => original_bytes,
                "compressed_bytes" => compressed_bytes,
                "original_tokens_lower_bound" => original_tokens_lower_bound,
@@ -206,11 +210,18 @@ defmodule CodexPooler.Gateway.RequestCompression.PerformanceTest do
     end
 
     test "returns a large completed rewrite when a sibling candidate hits tokenizer input limit" do
-      rewrite_item = %{
-        "type" => "local_shell_call_output",
+      rewrite_call_item = %{
+        "type" => "function_call",
+        "call_id" => "call_near_limit_completed_rewrite",
+        "name" => "run_command",
+        "arguments" => "{}"
+      }
+
+      rewrite_output_item = %{
+        "type" => "function_call_output",
         "call_id" => "call_near_limit_completed_rewrite",
         "output" =>
-          oversized_log_fixture("near-limit shell", "SANITIZED_NEAR_LIMIT_REWRITE_SENTINEL")
+          oversized_log_fixture("near-limit function", "SANITIZED_NEAR_LIMIT_REWRITE_SENTINEL")
       }
 
       skipped_output =
@@ -226,7 +237,7 @@ defmodule CodexPooler.Gateway.RequestCompression.PerformanceTest do
         "output" => skipped_output
       }
 
-      base_items = [rewrite_item, skip_item]
+      base_items = [rewrite_call_item, rewrite_output_item, skip_item]
       body = encode_request(base_items ++ [near_limit_padding_item(@max_body_bytes, base_items)])
 
       assert byte_size(body) == @max_body_bytes
@@ -247,6 +258,7 @@ defmodule CodexPooler.Gateway.RequestCompression.PerformanceTest do
         compressed_body
         |> Jason.decode!()
         |> Map.fetch!("input")
+        |> Enum.filter(&Map.has_key?(&1, "output"))
         |> Map.new(&{&1["call_id"], &1["output"]})
 
       rewritten_output = Map.fetch!(decoded_outputs, "call_near_limit_completed_rewrite")

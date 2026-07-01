@@ -259,11 +259,11 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       )
     end
 
-    test "enabled pool compresses backend websocket tool output before upstream send" do
+    test "enabled pool skips lossy backend websocket shell output before upstream send" do
       upstream =
         start_upstream(
           FakeUpstream.json_response(%{
-            "id" => "resp_ws_backend_compressed",
+            "id" => "resp_ws_backend_skipped",
             "object" => "response",
             "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
           })
@@ -273,29 +273,36 @@ defmodule CodexPooler.Gateway.WebsocketTest do
       enable_request_compression!(setup.pool)
       {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
       {:ok, session} = Gateway.start_codex_session(auth, accepted_turn_state: "ws-backend")
-      omitted_sentinel = "backend websocket compressed omitted marker"
+      omitted_sentinel = "backend websocket skipped omitted marker"
       original_output = compression_log_fixture(omitted_sentinel)
 
       assert :ok =
                execute_websocket_response(
                  auth,
                  backend_tool_output_payload(setup, original_output, "call_ws_backend"),
-                 websocket_request_options(session, "ws-backend-compressed"),
+                 websocket_request_options(session, "ws-backend-skipped"),
                  fn frame -> send(self(), {:websocket_frame, frame}) end
                )
 
       assert_receive {:websocket_frame, frame}, @websocket_frame_timeout
-      assert %{"id" => "resp_ws_backend_compressed"} = Jason.decode!(frame)
+      assert %{"id" => "resp_ws_backend_skipped"} = Jason.decode!(frame)
 
       assert [captured] = FakeUpstream.requests(upstream)
-      assert_websocket_output_compressed!(captured, omitted_sentinel)
+      assert captured.method == "WEBSOCKET"
+      assert captured.path == "/backend-api/codex/responses"
+      assert_websocket_lossy_output_skipped!(captured, original_output)
 
       assert [request] = request_rows(setup.pool.id)
       assert request.transport == "websocket"
       assert request.status == "succeeded"
 
       assert [attempt] = attempt_rows(request)
-      assert_compressed_metadata!(attempt, "proxy_websocket", "websocket", "log_output")
+
+      assert_lossy_shell_skipped_metadata!(
+        attempt.response_metadata["payload_compression"],
+        "proxy_websocket",
+        "websocket"
+      )
 
       refute_payload_compression_leak!(
         attempt.response_metadata["payload_compression"],
@@ -496,35 +503,39 @@ defmodule CodexPooler.Gateway.WebsocketTest do
     |> Jason.encode!()
   end
 
-  defp assert_websocket_output_compressed!(captured, omitted_sentinel) do
-    output = captured.json["input"] |> List.first() |> Map.fetch!("output")
+  defp assert_websocket_lossy_output_skipped!(captured, original_output) do
+    item = captured.json["input"] |> List.first()
 
-    unless is_binary(output) and String.contains?(output, "[compressed log output: omitted") do
-      flunk("expected websocket upstream tool output to be compressed")
-    end
+    assert item["type"] == "local_shell_call_output"
 
-    if String.contains?(output, omitted_sentinel) do
-      flunk("compressed websocket upstream output retained omitted sentinel")
-    end
+    assert item
+           |> Map.fetch!("output")
+           |> payload_fingerprint() == payload_fingerprint(original_output)
   end
 
-  defp assert_compressed_metadata!(attempt, route_class, transport, strategy) do
+  defp assert_lossy_shell_skipped_metadata!(metadata, route_class, transport) do
     assert %{
              "enabled" => true,
              "attempted" => true,
-             "status" => "compressed",
+             "status" => "skipped",
+             "reason" => "lossy_unrecoverable_tool_output",
              "route_class" => ^route_class,
              "transport" => ^transport,
              "candidate_count" => 1,
-             "compressed_count" => 1,
-             "skipped_count" => 0
-           } = metadata = attempt.response_metadata["payload_compression"]
+             "compressed_count" => 0,
+             "skipped_count" => 1,
+             "lossy_unrecoverable_tool_output_skipped_count" => 1,
+             "original_bytes" => original_bytes,
+             "compressed_bytes" => compressed_bytes
+           } = metadata
 
-    assert strategy in metadata["strategies"]
-    assert metadata["original_bytes"] > metadata["compressed_bytes"]
-    assert metadata["saved_bytes"] > 0
-    assert metadata["original_tokens"] > metadata["compressed_tokens"]
-    assert metadata["saved_tokens"] > 0
+    assert original_bytes == compressed_bytes
+    refute Map.has_key?(metadata, "strategies")
+    refute Map.has_key?(metadata, "original_tokens")
+    refute Map.has_key?(metadata, "compressed_tokens")
+    refute Map.has_key?(metadata, "saved_tokens")
+    refute Map.has_key?(metadata, "token_savings_ratio")
+    refute Map.has_key?(metadata, "token_savings_percent")
   end
 
   defp supported_compression_model_opts do

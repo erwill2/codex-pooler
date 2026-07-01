@@ -964,7 +964,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert get_in(attempt.response_metadata, ["payload_compression", "reason"]) == "pool_disabled"
   end
 
-  test "POST /backend-api/codex/responses compresses eligible streaming tool output",
+  test "POST /backend-api/codex/responses skips lossy streaming local shell tool output",
        %{conn: conn} do
     upstream =
       start_upstream(
@@ -1005,16 +1005,21 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.path == "/backend-api/codex/responses"
 
-    compressed_output = captured.json["input"] |> List.first() |> Map.fetch!("output")
-    assert compressed_output != original_output
-    assert compressed_output =~ "[compressed log output: omitted"
-    refute compressed_output =~ omitted_sentinel
+    forwarded_output = captured.json["input"] |> List.first() |> Map.fetch!("output")
+    assert forwarded_output == original_output
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.transport == "http_sse"
 
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
-    assert_compressed_payload_metadata!(attempt, "proxy_stream", "http_sse", "log_output")
+
+    assert_skipped_payload_metadata!(
+      attempt,
+      "proxy_stream",
+      "http_sse",
+      "lossy_unrecoverable_tool_output"
+    )
+
     refute inspect(attempt.response_metadata["payload_compression"]) =~ omitted_sentinel
 
     refute inspect(attempt.response_metadata["payload_compression"]) =~
@@ -8537,6 +8542,26 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert metadata["saved_bytes"] > 0
     assert metadata["original_tokens"] > metadata["compressed_tokens"]
     assert metadata["saved_tokens"] > 0
+  end
+
+  defp assert_skipped_payload_metadata!(attempt, route_class, transport, reason) do
+    assert %{
+             "enabled" => true,
+             "attempted" => true,
+             "status" => "skipped",
+             "reason" => ^reason,
+             "route_class" => ^route_class,
+             "transport" => ^transport,
+             "candidate_count" => 1,
+             "compressed_count" => 0,
+             "skipped_count" => 1,
+             "lossy_unrecoverable_tool_output_skipped_count" => 1
+           } = metadata = attempt.response_metadata["payload_compression"]
+
+    refute Map.has_key?(metadata, "strategies")
+    refute Map.has_key?(metadata, "original_tokens")
+    refute Map.has_key?(metadata, "compressed_tokens")
+    refute Map.has_key?(metadata, "saved_tokens")
   end
 
   defp supported_compression_model_opts(opts \\ []) do

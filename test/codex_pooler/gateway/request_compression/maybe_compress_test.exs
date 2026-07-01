@@ -12,8 +12,8 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
   @supported_model "gpt-4o"
 
   describe "maybe_compress/3" do
-    test "rewrites eligible tool-output strings and records safe aggregate metadata" do
-      omitted_sentinel = "direct compression omitted sentinel"
+    test "preserves lossy local shell output with explicit skip reason" do
+      omitted_sentinel = "lossy local shell omitted sentinel"
       original_output = compression_log_fixture(omitted_sentinel)
 
       body =
@@ -22,7 +22,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
           "input" => [
             %{
               "type" => "local_shell_call_output",
-              "call_id" => "call_direct_compression",
+              "call_id" => "call_lossy_shell_output",
               "output" => original_output
             }
           ]
@@ -30,45 +30,41 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
 
       {context, request_options} = request_context(body)
 
-      assert {compressed_body, compressed_options} =
+      assert {^body, compressed_options} =
                RequestCompression.maybe_compress(body, context, request_options)
 
-      assert compressed_body != body
-
-      compressed_output =
-        compressed_body
-        |> Jason.decode!()
-        |> Map.fetch!("input")
-        |> List.first()
-        |> Map.fetch!("output")
-
-      assert compressed_output != original_output
-      assert compressed_output =~ "[compressed log output: omitted"
-      refute compressed_output =~ omitted_sentinel
+      assert first_output(body) == original_output
 
       assert %{
                "enabled" => true,
                "attempted" => true,
-               "status" => "compressed",
+               "status" => "skipped",
+               "reason" => "lossy_unrecoverable_tool_output",
                "route_class" => "proxy_http",
                "transport" => "http_json",
                "candidate_count" => 1,
-               "compressed_count" => 1,
-               "skipped_count" => 0
+               "compressed_count" => 0,
+               "skipped_count" => 1,
+               "lossy_unrecoverable_tool_output_skipped_count" => 1,
+               "original_bytes" => original_bytes,
+               "compressed_bytes" => compressed_bytes
              } = metadata = compressed_options.runtime.payload_compression
 
-      assert "log_output" in metadata["strategies"]
-      assert metadata["original_bytes"] > metadata["compressed_bytes"]
-      assert metadata["saved_bytes"] > 0
-      assert metadata["token_count_mode"] == "exact"
-      assert metadata["original_tokens"] > metadata["compressed_tokens"]
-      assert metadata["saved_tokens"] > 0
-      assert metadata["token_savings_ratio"] > 0
+      assert original_bytes == byte_size(body)
+      assert compressed_bytes == byte_size(body)
+      refute Map.has_key?(metadata, "strategies")
+      refute Map.has_key?(metadata, "original_tokens")
+      refute Map.has_key?(metadata, "compressed_tokens")
+      refute Map.has_key?(metadata, "saved_tokens")
+      refute Map.has_key?(metadata, "token_savings_ratio")
+      refute Map.has_key?(metadata, "token_savings_percent")
       refute inspect(metadata) =~ omitted_sentinel
-      refute inspect(metadata) =~ "call_direct_compression"
+      refute inspect(metadata) =~ "ordinary build line"
+      refute inspect(metadata) =~ "call_lossy_shell_output"
+      refute inspect(metadata) =~ "log_output"
     end
 
-    test "preserves indexed web search tools while rewriting eligible outputs" do
+    test "preserves indexed web search tools while rewriting eligible function outputs" do
       tool = %{
         "type" => "web_search",
         "external_web_access" => true,
@@ -83,7 +79,13 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
           "tools" => [tool],
           "input" => [
             %{
-              "type" => "local_shell_call_output",
+              "type" => "function_call",
+              "call_id" => "call_indexed_tool_compression",
+              "name" => "run_command",
+              "arguments" => "{}"
+            },
+            %{
+              "type" => "function_call_output",
               "call_id" => "call_indexed_tool_compression",
               "output" => original_output
             }
@@ -113,7 +115,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_indexed_tool_compression"
     end
 
-    test "preserves original output when failure summaries prove compression incomplete" do
+    test "preserves original function output when failure summaries prove compression incomplete" do
       omitted_sentinel = "incomplete failure detail omitted sentinel"
       original_output = incomplete_failure_log_fixture(omitted_sentinel)
 
@@ -122,7 +124,13 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
           "model" => @supported_model,
           "input" => [
             %{
-              "type" => "local_shell_call_output",
+              "type" => "function_call",
+              "call_id" => "call_incomplete_failure_details",
+              "name" => "run_command",
+              "arguments" => "{}"
+            },
+            %{
+              "type" => "function_call_output",
               "call_id" => "call_incomplete_failure_details",
               "output" => original_output
             }
@@ -338,7 +346,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_oversized_baseline"
     end
 
-    test "rewrites oversized shell output with bounded accounting" do
+    test "preserves oversized lossy local shell output without token accounting" do
       omitted_sentinel = "oversized shell bounded omitted sentinel"
       original_output = oversized_log_fixture("shell", omitted_sentinel)
 
@@ -358,33 +366,30 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
 
       {context, request_options} = request_context(body)
 
-      assert {compressed_body, compressed_options} =
+      assert {^body, compressed_options} =
                RequestCompression.maybe_compress(body, context, request_options)
 
-      assert compressed_body != body
-
-      compressed_output = first_output(compressed_body)
-
-      assert compressed_output =~ "[compressed log output: omitted"
-      refute compressed_output =~ omitted_sentinel
+      assert first_output(body) == original_output
 
       assert %{
                "enabled" => true,
                "attempted" => true,
-               "status" => "compressed",
+               "status" => "skipped",
+               "reason" => "lossy_unrecoverable_tool_output",
                "candidate_count" => 1,
-               "compressed_count" => 1,
-               "skipped_count" => 0,
-               "original_tokens_lower_bound" => original_tokens_lower_bound,
-               "compressed_tokens" => compressed_tokens
+               "compressed_count" => 0,
+               "skipped_count" => 1,
+               "lossy_unrecoverable_tool_output_skipped_count" => 1,
+               "original_bytes" => original_bytes,
+               "compressed_bytes" => compressed_bytes
              } = metadata = compressed_options.runtime.payload_compression
 
-      assert compressed_tokens < original_tokens_lower_bound
-      assert metadata["token_count_mode"] == "bounded_original"
+      assert original_bytes == byte_size(body)
+      assert compressed_bytes == byte_size(body)
+      refute Map.has_key?(metadata, "strategies")
       refute Map.has_key?(metadata, "original_tokens")
+      refute Map.has_key?(metadata, "compressed_tokens")
       refute Map.has_key?(metadata, "saved_tokens")
-      refute Map.has_key?(metadata, "token_savings_ratio")
-      refute Map.has_key?(metadata, "token_savings_percent")
       refute inspect(metadata) =~ omitted_sentinel
       refute inspect(metadata) =~ "call_oversized_shell_bounded"
     end
@@ -543,7 +548,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_json_document_compression"
     end
 
-    test "rewrites nul-delimited search-result tool-output strings" do
+    test "rewrites nul-delimited search-result function-output strings" do
       omitted_sentinel = "nul search omitted sentinel"
       original_output = compression_nul_search_fixture(omitted_sentinel)
 
@@ -552,7 +557,13 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
           "model" => @supported_model,
           "input" => [
             %{
-              "type" => "local_shell_call_output",
+              "type" => "function_call",
+              "call_id" => "call_nul_search_compression",
+              "name" => "run_command",
+              "arguments" => "{}"
+            },
+            %{
+              "type" => "function_call_output",
               "call_id" => "call_nul_search_compression",
               "output" => original_output
             }
@@ -565,13 +576,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
                RequestCompression.maybe_compress(body, context, request_options)
 
       assert compressed_body != body
-
-      compressed_output =
-        compressed_body
-        |> Jason.decode!()
-        |> Map.fetch!("input")
-        |> List.first()
-        |> Map.fetch!("output")
+      compressed_output = first_output(compressed_body)
 
       assert compressed_output =~ "[compressed search results:"
       assert compressed_output =~ "lib/nul_result.ex"
@@ -591,7 +596,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_nul_search_compression"
     end
 
-    test "rewrites grep context and column-bearing search outputs without leaking sentinels" do
+    test "rewrites grep context and column-bearing function outputs without leaking sentinels" do
       context_sentinel = "grep context omitted sentinel"
       column_sentinel = "column search omitted sentinel"
       context_output = compression_context_search_fixture(context_sentinel)
@@ -602,12 +607,24 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
           "model" => @supported_model,
           "input" => [
             %{
-              "type" => "local_shell_call_output",
+              "type" => "function_call",
+              "call_id" => "call_context_search_compression",
+              "name" => "run_command",
+              "arguments" => "{}"
+            },
+            %{
+              "type" => "function_call_output",
               "call_id" => "call_context_search_compression",
               "output" => context_output
             },
             %{
-              "type" => "local_shell_call_output",
+              "type" => "function_call",
+              "call_id" => "call_column_search_compression",
+              "name" => "run_command",
+              "arguments" => "{}"
+            },
+            %{
+              "type" => "function_call_output",
               "call_id" => "call_column_search_compression",
               "output" => column_output
             }
@@ -620,7 +637,6 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
                RequestCompression.maybe_compress(body, context, request_options)
 
       assert compressed_body != body
-
       outputs = outputs(compressed_body)
 
       assert Enum.any?(outputs, &(&1 =~ "  9- before context match 1"))
@@ -646,7 +662,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_column_search_compression"
     end
 
-    test "leaves grep-like shell output unchanged when engine evidence must stay exact" do
+    test "leaves grep-like function output unchanged when engine evidence must stay exact" do
       original_output = grep_engine_failure_fixture("grep engine omitted sentinel")
 
       body =
@@ -654,7 +670,13 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
           "model" => @supported_model,
           "input" => [
             %{
-              "type" => "local_shell_call_output",
+              "type" => "function_call",
+              "call_id" => "call_grep_engine_failure",
+              "name" => "run_command",
+              "arguments" => "{}"
+            },
+            %{
+              "type" => "function_call_output",
               "call_id" => "call_grep_engine_failure",
               "output" => original_output
             }
@@ -690,7 +712,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_grep_engine_failure"
     end
 
-    test "leaves unsupported grep shape-only outputs unchanged" do
+    test "leaves unsupported grep shape-only function outputs unchanged" do
       unsupported = [
         {:files_with_matches, unsupported_files_with_matches_fixture()},
         {:count_only, unsupported_count_only_fixture()},
@@ -698,13 +720,21 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       ]
 
       for {shape, original_output} <- unsupported do
+        call_id = "call_unsupported_#{shape}"
+
         body =
           Jason.encode!(%{
             "model" => @supported_model,
             "input" => [
               %{
-                "type" => "local_shell_call_output",
-                "call_id" => "call_unsupported_#{shape}",
+                "type" => "function_call",
+                "call_id" => call_id,
+                "name" => "run_command",
+                "arguments" => "{}"
+              },
+              %{
+                "type" => "function_call_output",
+                "call_id" => call_id,
                 "output" => original_output
               }
             ]
@@ -731,7 +761,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
         assert metadata["compressed_bytes"] == byte_size(body)
         refute Map.has_key?(metadata, "strategies")
         refute Map.has_key?(metadata, "original_tokens")
-        refute inspect(metadata) =~ "call_unsupported_#{shape}"
+        refute inspect(metadata) =~ call_id
       end
     end
 
@@ -980,6 +1010,7 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
     body
     |> Jason.decode!()
     |> Map.fetch!("input")
+    |> Enum.filter(&Map.has_key?(&1, "output"))
     |> Enum.map(&Map.fetch!(&1, "output"))
   end
 end

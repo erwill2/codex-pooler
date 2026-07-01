@@ -18,6 +18,7 @@ defmodule CodexPooler.Gateway.RequestCompression do
     log_output: Strategies.LogOutput,
     search_results: Strategies.SearchResults
   }
+  @lossy_strategies MapSet.new([:diff, :log_output, :search_results])
 
   # Compression is opportunistic: bodies above 1 MiB skip before JSON scanning.
   @max_body_bytes 1_048_576
@@ -263,7 +264,8 @@ defmodule CodexPooler.Gateway.RequestCompression do
          %{compressible: true, strategy: strategy} = candidate,
          opts
        ) do
-    with {:ok, module} <- strategy_module(strategy),
+    with false <- lossy_local_shell_candidate?(candidate),
+         {:ok, module} <- strategy_module(strategy),
          {:ok, output} <-
            JsonStringRanges.decode_string(upstream_payload, Map.from_struct(candidate)),
          {:ok, compressed_content, strategy_metadata} <-
@@ -276,6 +278,7 @@ defmodule CodexPooler.Gateway.RequestCompression do
 
       {:ok, replacement, strategy_metadata}
     else
+      true -> {:skip, :lossy_unrecoverable_tool_output}
       {:skip, reason} when is_atom(reason) -> {:skip, reason}
       :skip -> :skip
       {:error, :invalid_json} -> {:error, :scanner_error}
@@ -284,6 +287,12 @@ defmodule CodexPooler.Gateway.RequestCompression do
   end
 
   defp candidate_replacement(_upstream_payload, _candidate, _opts), do: :skip
+
+  defp lossy_local_shell_candidate?(%{item_type: "local_shell_call_output", strategy: strategy}) do
+    MapSet.member?(@lossy_strategies, strategy)
+  end
+
+  defp lossy_local_shell_candidate?(_candidate), do: false
 
   defp strategy_module(strategy) when is_atom(strategy) do
     case Map.fetch(@strategy_modules, strategy) do
@@ -360,8 +369,9 @@ defmodule CodexPooler.Gateway.RequestCompression do
     |> put_strategy_summary(strategy_metadata)
   end
 
-  defp increment_skip_reason(skip_reasons, :tokenizer_input_limit) do
-    Map.update(skip_reasons, :tokenizer_input_limit, 1, &(&1 + 1))
+  defp increment_skip_reason(skip_reasons, reason)
+       when reason in [:tokenizer_input_limit, :lossy_unrecoverable_tool_output] do
+    Map.update(skip_reasons, reason, 1, &(&1 + 1))
   end
 
   defp increment_skip_reason(skip_reasons, _reason), do: skip_reasons
@@ -373,15 +383,21 @@ defmodule CodexPooler.Gateway.RequestCompression do
   defp no_rewrite_reason([], _skip_reasons, _metadata), do: :no_candidates
 
   defp no_rewrite_reason(candidates, skip_reasons, _metadata) do
-    if Map.get(skip_reasons, :tokenizer_input_limit, 0) == length(candidates) do
-      :tokenizer_input_limit
-    else
-      :no_rewrites
+    cond do
+      Map.get(skip_reasons, :tokenizer_input_limit, 0) == length(candidates) ->
+        :tokenizer_input_limit
+
+      Map.get(skip_reasons, :lossy_unrecoverable_tool_output, 0) == length(candidates) ->
+        :lossy_unrecoverable_tool_output
+
+      true ->
+        :no_rewrites
     end
   end
 
   defp no_rewrite_status(:tokenizer_input_limit), do: :skipped
   defp no_rewrite_status(:protected_tool_outputs), do: :skipped
+  defp no_rewrite_status(:lossy_unrecoverable_tool_output), do: :skipped
   defp no_rewrite_status(_reason), do: :no_change
 
   defp put_protected_tool_output_skips(metadata, %{protected_tool_output_skipped_count: count})
@@ -392,12 +408,23 @@ defmodule CodexPooler.Gateway.RequestCompression do
   defp put_protected_tool_output_skips(metadata, _plan), do: metadata
 
   defp put_skip_summary(metadata, skip_reasons) do
-    case Map.get(skip_reasons, :tokenizer_input_limit, 0) do
-      count when is_integer(count) and count > 0 ->
-        Map.put(metadata, :tokenizer_input_skipped_count, count)
+    metadata
+    |> put_skip_reason_count(
+      skip_reasons,
+      :tokenizer_input_limit,
+      :tokenizer_input_skipped_count
+    )
+    |> put_skip_reason_count(
+      skip_reasons,
+      :lossy_unrecoverable_tool_output,
+      :lossy_unrecoverable_tool_output_skipped_count
+    )
+  end
 
-      _count ->
-        metadata
+  defp put_skip_reason_count(metadata, skip_reasons, reason, metadata_key) do
+    case Map.get(skip_reasons, reason, 0) do
+      count when is_integer(count) and count > 0 -> Map.put(metadata, metadata_key, count)
+      _count -> metadata
     end
   end
 
