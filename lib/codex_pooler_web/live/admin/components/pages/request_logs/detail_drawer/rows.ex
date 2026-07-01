@@ -35,7 +35,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Rows do
       detail(
         "request-log-detail-requested-reasoning",
         "Requested reasoning",
-        log.reasoning_effort, mono: true),
+        log.reasoning_effort,
+        mono: true
+      ),
       detail(
         "request-log-detail-applied-reasoning",
         "Applied reasoning",
