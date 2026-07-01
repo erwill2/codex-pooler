@@ -35,6 +35,22 @@ defmodule CodexPoolerWeb.AuthControllerTest do
     refute login_html =~ ~s(name="user[recovery_code]")
   end
 
+  test "public auth pages render specific document titles", %{conn: conn} do
+    conn = get(conn, ~p"/bootstrap")
+    assert extracted_page_title(html_response(conn, 200)) == "Bootstrap - Codex Pooler"
+
+    %{user: user, token: token} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
+
+    conn = get(build_conn(), ~p"/login")
+    assert extracted_page_title(html_response(conn, 200)) == "Sign in - Codex Pooler"
+
+    user = update_user(user, %{password_change_required: true})
+    conn = build_conn() |> log_in_user(user, token) |> get(~p"/password/change-required")
+
+    assert extracted_page_title(html_response(conn, 200)) ==
+             "Choose a private password - Codex Pooler"
+  end
+
   test "invalid login redirects back with the shared safe error alert", %{conn: conn} do
     bootstrap_owner_fixture(%{"email" => "owner@example.com"})
 
@@ -158,6 +174,7 @@ defmodule CodexPoolerWeb.AuthControllerTest do
     mfa_page = pending_mfa |> recycle() |> get(~p"/login?mfa=1")
     html = html_response(mfa_page, 200)
 
+    assert extracted_page_title(html) == "Second factor - Codex Pooler"
     assert html =~ ~s(id="login-mfa-form")
     assert html =~ ~s(id="login-totp-panel")
     assert html =~ ~s(id="user_totp_code_otp")
@@ -560,5 +577,13 @@ defmodule CodexPoolerWeb.AuthControllerTest do
     )
 
     on_exit(fn -> Application.put_env(:codex_pooler, OperationalSettings, previous) end)
+  end
+
+  defp extracted_page_title(html) do
+    [_, title] = Regex.run(~r/<title[^>]*>(.*?)<\/title>/s, html)
+
+    title
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
   end
 end

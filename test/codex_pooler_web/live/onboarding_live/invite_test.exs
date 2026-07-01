@@ -27,9 +27,10 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
         expires_at: DateTime.utc_now() |> DateTime.add(3600, :second)
       })
 
-    {:ok, view, _html} = live(build_conn(), ~p"/onboarding/invites/#{token}")
+    {:ok, view, initial_html} = live(build_conn(), ~p"/onboarding/invites/#{token}")
     html = render(view)
 
+    assert extracted_page_title(initial_html) == "Codex account onboarding - Codex Pooler"
     assert has_element?(view, "#invite-page")
     assert has_element?(view, "h1.uppercase.text-primary", "Connect your Codex account")
     assert_public_footer(view, "#invite-footer")
@@ -727,5 +728,13 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     assert has_element?(view, "#{selector} span.uppercase", "CODEX POOLER")
     refute has_element?(view, "#{selector} img")
     refute render(view) =~ ~s(/images/logo.svg)
+  end
+
+  defp extracted_page_title(html) do
+    [_, title] = Regex.run(~r/<title[^>]*>(.*?)<\/title>/s, html)
+
+    title
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
   end
 end

@@ -65,7 +65,9 @@ defmodule CodexPoolerWeb.AuthLive.Bootstrap do
   def mount(_params, _session, socket) do
     if Accounts.bootstrap_pending?() do
       email = Phoenix.Flash.get(socket.assigns.flash, :email)
-      {:ok, assign(socket, form: to_form(%{"email" => email}, as: "user"))}
+
+      {:ok,
+       assign(socket, page_title: "Bootstrap", form: to_form(%{"email" => email}, as: "user"))}
     else
       {:ok, push_navigate(socket, to: ~p"/login")}
     end

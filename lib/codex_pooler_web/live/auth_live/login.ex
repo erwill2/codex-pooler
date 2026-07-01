@@ -172,6 +172,7 @@ defmodule CodexPoolerWeb.AuthLive.Login do
 
         {:ok,
          assign(socket,
+           page_title: if(mfa?, do: "Second factor", else: "Sign in"),
            form: to_form(%{"email" => email}, as: "user"),
            mfa?: mfa?,
            mfa_method: mfa_method(params["method"]),

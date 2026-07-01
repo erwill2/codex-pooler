@@ -85,6 +85,7 @@ defmodule CodexPoolerWeb.AuthLive.ForcePasswordChange do
     if socket.assigns.current_scope.user.password_change_required do
       {:ok,
        assign(socket,
+         page_title: "Choose a private password",
          current_user_token: session["user_token"],
          form: to_form(%{}, as: :user)
        )}

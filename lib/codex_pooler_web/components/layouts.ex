@@ -12,6 +12,10 @@ defmodule CodexPoolerWeb.Layouts do
 
   embed_templates "layouts/*"
 
+  @spec live_title_suffix(String.t() | nil) :: String.t()
+  defp live_title_suffix(title) when title in [nil, "", "Codex Pooler"], do: ""
+  defp live_title_suffix(_title), do: " - Codex Pooler"
+
   @doc """
   `chrome` selects the default, admin, or invite shell so each surface keeps its
   own framing without separate layout modules.
