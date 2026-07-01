@@ -23,6 +23,7 @@ Primary public docs:
 - https://docs.codex-pooler.com/clients/openhands/
 - https://docs.codex-pooler.com/clients/omp/
 - https://docs.codex-pooler.com/clients/pi/
+- https://docs.codex-pooler.com/clients/trae/
 - https://docs.codex-pooler.com/clients/hermes/
 - https://docs.codex-pooler.com/clients/windmill/
 - https://docs.codex-pooler.com/reference/runtime-routes/
@@ -91,11 +92,12 @@ Agent guidance:
 - Use https://docs.codex-pooler.com/clients/kilo/ when configuring Kilo Code with ~/.config/kilo/kilo.jsonc, model=codex-pooler/gpt-5.5, provider options apiKey={env:CODEX_POOLER_API_KEY}, baseURL=https://codex-pooler.example.com/v1, and Kilo's chat-completions route shape.
 - Use https://docs.codex-pooler.com/clients/omp/ when configuring Oh My Pi (OMP) with ~/.omp/agent/models.yml, modelRoles in ~/.omp/agent/config.yml, api=openai-responses, authHeader=true, streamIdleTimeoutMs=300000, compaction reserve and mid-turn settings, and a Pool API key in CODEX_POOLER_API_KEY.
 - Use https://docs.codex-pooler.com/clients/pi/ when configuring Pi with ~/.pi/agent/models.json, ~/.pi/agent/settings.json, api=openai-responses, authHeader=true, and a Pool API key in CODEX_POOLER_API_KEY.
+- Use https://docs.codex-pooler.com/clients/trae/ when configuring Trae or Trae CN custom models with OpenAI Chat Completions, Custom Request URL https://codex-pooler.example.com/v1, Full URL off, model gpt-5.5, and a Pool API key.
 - Use https://docs.codex-pooler.com/discovery/self-hosted-codex-gateway/ for short answers about Codex Pooler as a self-hosted Codex gateway.
 - Use https://docs.codex-pooler.com/discovery/codex-account-pooling/ for short answers about Pools, upstream accounts, eligibility, and routing.
 - Use https://docs.codex-pooler.com/discovery/openai-compatible-codex-gateway/ for short answers about narrow /v1 SDK compatibility over Codex Pools.
 - Use https://docs.codex-pooler.com/discovery/codex-pooler-vs-direct-credentials/ for short answers comparing Pool API keys with direct account credentials.
-- Use the client-specific pages for Aider, Continue, Cline, Goose, Kilo, OpenCode, OpenClaw, OpenHands, OMP, Pi, Hermes, and Windmill setup snippets.
+- Use the client-specific pages for Aider, Continue, Cline, Goose, Kilo, OpenCode, OpenClaw, OpenHands, OMP, Pi, Hermes, Trae, and Windmill setup snippets.
 - Use https://docs.codex-pooler.com/reference/routing-strategies/ when configuring Pools and routing behavior.
 - Use https://docs.codex-pooler.com/answers.md for short, citable answers about scope, routes, credentials, privacy, setup, and deployment.
 - Keep examples on http://localhost:4000 for local setup or https://codex-pooler.example.com for deployed product examples.

@@ -10,6 +10,7 @@
   <a href="https://docs.codex-pooler.com/clients/pi/" title="Pi"><img src=".github/assets/pi-favicon.png" alt="Pi" width="24" height="24"></a>
   <a href="https://docs.codex-pooler.com/clients/omp/" title="OMP"><img src=".github/assets/omp-favicon.png" alt="OMP" width="24" height="24"></a>
   <a href="https://docs.codex-pooler.com/clients/kilo/" title="Kilo"><img src=".github/assets/kilo-favicon.png" alt="Kilo" width="24" height="24"></a>
+  <a href="https://docs.codex-pooler.com/clients/trae/" title="Trae"><img src=".github/assets/trae-favicon.png" alt="Trae" width="24" height="24"></a>
   <a href="https://docs.codex-pooler.com/clients/aider/" title="Aider"><img src=".github/assets/aider-favicon.png" alt="Aider" width="24" height="24"></a>
   <a href="https://docs.codex-pooler.com/clients/continue/" title="Continue"><img src=".github/assets/continue-favicon.png" alt="Continue" width="24" height="24"></a>
   <a href="https://docs.codex-pooler.com/clients/cline/" title="Cline"><img src=".github/assets/cline-favicon.png" alt="Cline" width="24" height="24"></a>
@@ -868,6 +869,83 @@ kilo run \
 isolated automation where Kilo may run approved tools without prompting. Codex
 Pooler model use does not require MCP. If you need operator metadata, use a
 separate MCP-capable host with an operator MCP token.
+
+</details>
+
+<details>
+<summary><img src=".github/assets/trae-favicon.png" alt="Trae logo" width="16" height="16"> Trae <code>Settings -> Models</code></summary>
+
+Trae and Trae CN are the same client family for this setup. Use Codex Pooler
+through a custom model configured for OpenAI Chat Completions. This is a
+chat-completions setup, not Codex backend compatibility and not full OpenAI API
+parity.
+
+Trae requires a Trae account session before the Models screen and agent chat
+surface are usable. Sign in to Trae first.
+
+Use a Pool API key for model requests. Do not reuse operator MCP tokens,
+browser sessions, upstream account tokens, or imported account material.
+
+```text
+Custom Request URL:
+https://codex-pooler.example.com/v1
+
+Full URL:
+off
+```
+
+Trae appends `/chat/completions` when Full URL is off. Do not end the custom
+request URL with a slash.
+
+In Trae, open Settings -> Models, add a custom model, and use these values:
+
+| Field | Value |
+| --- | --- |
+| API format | OpenAI Chat Completions |
+| Custom Request URL | `https://codex-pooler.example.com/v1` |
+| Full URL | Off |
+| Model ID | `gpt-5.5` or another model id served by the assigned Pool |
+| Multimodal | On when the Pool model supports image input |
+| API key | Pool API key |
+| Model Series | Default |
+| Display Name | `GPT-5.5 via Codex Pooler` |
+| Context Window input | `184000` |
+| Context Window output | `16000` |
+| Tool Call Rounds | `200` |
+
+In Trae CN, the same flow appears as Settings -> Models and custom
+configuration in the localized UI. Use the same URL, model id, Pool API key,
+and context values. If Full URL is enabled instead, use the full
+`https://codex-pooler.example.com/v1/chat/completions` endpoint.
+
+Check the Pool API key and model with a direct chat-completions request before
+saving the client model:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer $CODEX_POOLER_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "model": "gpt-5.5",
+    "messages": [
+      { "role": "user", "content": "Reply with exactly: trae ok" }
+    ],
+    "stream": false,
+    "max_completion_tokens": 16
+  }' \
+  https://codex-pooler.example.com/v1/chat/completions
+```
+
+For local setup, use `http://localhost:4000/v1` with Full URL off. Treat the
+setup as working only when Trae's model add/check step succeeds and a real chat
+can answer `trae ok` through the configured model.
+
+After saving the custom model, open the agent model picker and turn Auto Mode
+off. The model list is hidden behind Auto Mode by default; select the Codex
+Pooler model under Custom Models.
+
+Do not point Trae at `/backend-api/codex`, `/v1/responses`, `/mcp`, or a Codex
+Pooler admin URL. Codex Pooler model use does not require MCP.
 
 </details>
 
