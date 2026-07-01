@@ -23,6 +23,12 @@
 </p>
 
 <p align="center">
+  <strong>English</strong>
+  ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <a href="#quick-start-with-docker-compose">Quick start</a>
   ·
   <a href="#harness-configuration">Harness</a>
