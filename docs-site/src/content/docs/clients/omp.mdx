@@ -31,9 +31,42 @@ providers:
         thinking:
           mode: effort
           efforts:
+            - minimal
+            - low
+            - medium
+            - high
             - xhigh
           defaultLevel: xhigh
           effortMap:
+            minimal: minimal
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+        input:
+          - text
+          - image
+        compat:
+          streamIdleTimeoutMs: 300000
+        contextWindow: 272000
+        maxTokens: 128000
+      - id: gpt-5.4-mini
+        name: GPT-5.4 Mini via Codex Pooler
+        reasoning: true
+        thinking:
+          mode: effort
+          efforts:
+            - minimal
+            - low
+            - medium
+            - high
+            - xhigh
+          defaultLevel: low
+          effortMap:
+            minimal: minimal
+            low: low
+            medium: medium
+            high: high
             xhigh: xhigh
         input:
           - text
@@ -48,9 +81,9 @@ For local setup, change `baseUrl` to `http://localhost:4000/v1`.
 
 `apiKey: CODEX_POOLER_API_KEY` makes OMP resolve that environment variable at runtime. `authHeader: true` makes OMP send the Pool API key as `Authorization: Bearer ...`. Define only model ids your assigned Pool can serve.
 
-The `thinking` block exposes the `xhigh` effort level for the Codex Pooler model and makes the role defaults below resolve cleanly.
+The `thinking` blocks expose all OMP effort levels for both Codex models, so role defaults can pick cheaper reasoning for background work without falling back to a non-Codex provider.
 
-OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept `contextTokens`. Its Codex `gpt-5.5` catalog uses a 272k context window and 128k output budget. `compaction.reserveTokens: 128000` asks OMP to compact before a prompt plus a long completion can exceed that 272k window.
+OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept `contextTokens`. The examples keep both Codex models on a 272k context window and 128k output budget: `gpt-5.5` handles the default, slow, plan, vision, task, designer, and advisor paths, while `gpt-5.4-mini` handles `smol`, `tiny`, and `commit`. `compaction.reserveTokens: 128000` asks OMP to compact before a prompt plus a long completion can exceed that 272k window.
 
 For long tool-heavy OMP sessions, keep mid-turn compaction enabled and persist handoff material to disk. Those settings reduce context-overflow risk, but they cannot repair an OMP client bug that skips its own mid-run compaction check. If an OMP plan appears to restart work after a very large turn, upgrade OMP when a newer release is available and restart or resume the session before treating it as a Codex Pooler routing issue.
 
@@ -58,7 +91,7 @@ For long tool-heavy OMP sessions, keep mid-turn compaction enabled and persist h
 
 ## Default model roles
 
-If you want plain `omp`, `--smol`, `--slow`, `--plan`, task, and vision paths to start on Codex Pooler, add the defaults to `~/.omp/agent/config.yml`:
+If you want plain `omp`, `--smol`, `--slow`, `--plan`, task, vision, advisor, commit, designer, and lightweight background paths to start on Codex Pooler, add the defaults to `~/.omp/agent/config.yml`:
 
 ```yaml
 startup:
@@ -66,15 +99,20 @@ startup:
 defaultThinkingLevel: xhigh
 enabledModels:
   - codex-pooler/gpt-5.5
+  - codex-pooler/gpt-5.4-mini
 modelProviderOrder:
   - codex-pooler
 modelRoles:
   default: codex-pooler/gpt-5.5:xhigh
-  smol: codex-pooler/gpt-5.5:xhigh
+  smol: codex-pooler/gpt-5.4-mini:low
+  tiny: codex-pooler/gpt-5.4-mini:minimal
   slow: codex-pooler/gpt-5.5:xhigh
   plan: codex-pooler/gpt-5.5:xhigh
-  task: codex-pooler/gpt-5.5:xhigh
-  vision: codex-pooler/gpt-5.5:xhigh
+  task: codex-pooler/gpt-5.5:high
+  vision: codex-pooler/gpt-5.5:high
+  advisor: codex-pooler/gpt-5.5:medium
+  commit: codex-pooler/gpt-5.4-mini:minimal
+  designer: codex-pooler/gpt-5.5:high
 compaction:
   reserveTokens: 128000
   midTurnEnabled: true

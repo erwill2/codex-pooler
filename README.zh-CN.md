@@ -684,9 +684,42 @@ providers:
         thinking:
           mode: effort
           efforts:
+            - minimal
+            - low
+            - medium
+            - high
             - xhigh
           defaultLevel: xhigh
           effortMap:
+            minimal: minimal
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+        input:
+          - text
+          - image
+        compat:
+          streamIdleTimeoutMs: 300000
+        contextWindow: 272000
+        maxTokens: 128000
+      - id: gpt-5.4-mini
+        name: GPT-5.4 Mini via Codex Pooler
+        reasoning: true
+        thinking:
+          mode: effort
+          efforts:
+            - minimal
+            - low
+            - medium
+            - high
+            - xhigh
+          defaultLevel: low
+          effortMap:
+            minimal: minimal
+            low: low
+            medium: medium
+            high: high
             xhigh: xhigh
         input:
           - text
@@ -703,9 +736,11 @@ providers:
 `https://codex-pooler.example.com/v1`。
 
 OMP 在 `models.yml` 中接受 `contextWindow` 和 `maxTokens`；它不接受
-`contextTokens`。它的 Codex `gpt-5.5` catalog 使用 272k 上下文窗口和 128k
-输出预算。`compaction.reserveTokens: 128000` 要求 OMP 在提示词加长 completion
-可能超过 272k 窗口之前压缩。
+`contextTokens`。这些示例让两个 Codex 模型都使用 272k 上下文窗口和 128k
+输出预算：`gpt-5.5` 负责 default、slow、plan、vision、task、designer 和
+advisor 路径，`gpt-5.4-mini` 负责 `smol`、`tiny` 和 `commit`。
+`compaction.reserveTokens: 128000` 要求 OMP 在提示词加长 completion 可能超过
+272k 窗口之前压缩。
 
 对于大量使用工具的长 OMP 会话，保持 mid-turn compaction 开启并把 handoff
 材料持久化到磁盘。这些设置可以降低上下文溢出风险，但无法修复 OMP 客户端跳过
@@ -726,15 +761,20 @@ startup:
 defaultThinkingLevel: xhigh
 enabledModels:
   - codex-pooler/gpt-5.5
+  - codex-pooler/gpt-5.4-mini
 modelProviderOrder:
   - codex-pooler
 modelRoles:
   default: codex-pooler/gpt-5.5:xhigh
-  smol: codex-pooler/gpt-5.5:xhigh
+  smol: codex-pooler/gpt-5.4-mini:low
+  tiny: codex-pooler/gpt-5.4-mini:minimal
   slow: codex-pooler/gpt-5.5:xhigh
   plan: codex-pooler/gpt-5.5:xhigh
-  task: codex-pooler/gpt-5.5:xhigh
-  vision: codex-pooler/gpt-5.5:xhigh
+  task: codex-pooler/gpt-5.5:high
+  vision: codex-pooler/gpt-5.5:high
+  advisor: codex-pooler/gpt-5.5:medium
+  commit: codex-pooler/gpt-5.4-mini:minimal
+  designer: codex-pooler/gpt-5.5:high
 compaction:
   reserveTokens: 128000
   midTurnEnabled: true

@@ -718,9 +718,42 @@ providers:
         thinking:
           mode: effort
           efforts:
+            - minimal
+            - low
+            - medium
+            - high
             - xhigh
           defaultLevel: xhigh
           effortMap:
+            minimal: minimal
+            low: low
+            medium: medium
+            high: high
+            xhigh: xhigh
+        input:
+          - text
+          - image
+        compat:
+          streamIdleTimeoutMs: 300000
+        contextWindow: 272000
+        maxTokens: 128000
+      - id: gpt-5.4-mini
+        name: GPT-5.4 Mini via Codex Pooler
+        reasoning: true
+        thinking:
+          mode: effort
+          efforts:
+            - minimal
+            - low
+            - medium
+            - high
+            - xhigh
+          defaultLevel: low
+          effortMap:
+            minimal: minimal
+            low: low
+            medium: medium
+            high: high
             xhigh: xhigh
         input:
           - text
@@ -738,8 +771,10 @@ serve. For deployed instances, change `baseUrl` to
 `https://codex-pooler.example.com/v1`.
 
 OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept
-`contextTokens`. Its Codex `gpt-5.5` catalog uses a 272k context window and 128k
-output budget. `compaction.reserveTokens: 128000` asks OMP to compact before a
+`contextTokens`. The examples keep both Codex models on a 272k context window
+and 128k output budget: `gpt-5.5` handles the default, slow, plan, vision, task,
+designer, and advisor paths, while `gpt-5.4-mini` handles `smol`, `tiny`, and
+`commit`. `compaction.reserveTokens: 128000` asks OMP to compact before a
 prompt plus a long completion can exceed that 272k window.
 
 For long tool-heavy OMP sessions, keep mid-turn compaction enabled and persist
@@ -764,15 +799,20 @@ startup:
 defaultThinkingLevel: xhigh
 enabledModels:
   - codex-pooler/gpt-5.5
+  - codex-pooler/gpt-5.4-mini
 modelProviderOrder:
   - codex-pooler
 modelRoles:
   default: codex-pooler/gpt-5.5:xhigh
-  smol: codex-pooler/gpt-5.5:xhigh
+  smol: codex-pooler/gpt-5.4-mini:low
+  tiny: codex-pooler/gpt-5.4-mini:minimal
   slow: codex-pooler/gpt-5.5:xhigh
   plan: codex-pooler/gpt-5.5:xhigh
-  task: codex-pooler/gpt-5.5:xhigh
-  vision: codex-pooler/gpt-5.5:xhigh
+  task: codex-pooler/gpt-5.5:high
+  vision: codex-pooler/gpt-5.5:high
+  advisor: codex-pooler/gpt-5.5:medium
+  commit: codex-pooler/gpt-5.4-mini:minimal
+  designer: codex-pooler/gpt-5.5:high
 compaction:
   reserveTokens: 128000
   midTurnEnabled: true
