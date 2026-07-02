@@ -106,17 +106,40 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     do: {:reply, {:error, :upstream_websocket_not_connected}, state}
 
   @impl GenServer
+  def handle_info(
+        {:upstream_websocket_keepalive, token},
+        %{keepalive_token: token, keepalive_pong_token: _pong_token} = state
+      ) do
+    {:noreply, schedule_keepalive(state)}
+  end
+
   def handle_info({:upstream_websocket_keepalive, token}, %{keepalive_token: token} = state) do
+    payload = unique_keepalive_payload()
+
     state =
-      case send_frame(state, {:ping, "codex-pooler"}) do
-        {:ok, state} -> schedule_keepalive(state)
-        {:error, _reason, state} -> close_state(state)
+      case send_frame(state, {:ping, payload}) do
+        {:ok, state} ->
+          state
+          |> schedule_pong_deadline(payload)
+          |> schedule_keepalive()
+
+        {:error, _reason, state} ->
+          close_state(state)
       end
 
     {:noreply, state}
   end
 
   def handle_info({:upstream_websocket_keepalive, _token}, state), do: {:noreply, state}
+
+  def handle_info(
+        {:upstream_websocket_pong_deadline, token},
+        %{keepalive_pong_token: token} = state
+      ) do
+    {:noreply, close_state(state)}
+  end
+
+  def handle_info({:upstream_websocket_pong_deadline, _token}, state), do: {:noreply, state}
 
   def handle_info(message, %{conn: conn} = state) do
     case Mint.WebSocket.stream(conn, message) do
@@ -303,6 +326,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
       {:ssl_error, ^socket, _reason} = message ->
         handle_event_message(state, receive_state, message)
+
+      {:upstream_websocket_pong_deadline, token} ->
+        handle_pong_deadline_message(state, receive_state, token)
     after
       receive_state.timeouts.receive_timeout_ms ->
         {{:error,
@@ -342,6 +368,31 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
       :unknown ->
         receive_events(state, receive_state)
     end
+  end
+
+  defp handle_pong_deadline_message(
+         %{keepalive_pong_token: token} = state,
+         %ReceiveState{} = receive_state,
+         token
+       ) do
+    result =
+      {:error,
+       %{
+         body: receive_body(receive_state),
+         reason: :upstream_websocket_pong_deadline,
+         headers: state.headers,
+         websocket_frame_headers: receive_state.websocket_frame_headers,
+         transport_failure:
+           transport_failure_metadata(:upstream_websocket_pong_deadline, receive_state,
+             phase: :receive
+           )
+       }}
+
+    {result, close_state(state)}
+  end
+
+  defp handle_pong_deadline_message(state, %ReceiveState{} = receive_state, _token) do
+    receive_events(state, receive_state)
   end
 
   defp handle_parts(state, responses, %ReceiveState{} = receive_state) do
@@ -439,8 +490,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
           {:error, _reason, state} -> {:halt, close_state(state)}
         end
 
-      {:pong, _payload}, state ->
-        {:cont, state}
+      {:pong, payload}, state ->
+        {:cont, clear_matching_pong(state, payload)}
 
       {:close, _code, _reason}, state ->
         {:halt, close_state(state)}
@@ -472,8 +523,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
             {:halt, {:failure, state, receive_state, {:websocket_control_send_failed, reason}}}
         end
 
-      {:pong, _payload}, acc ->
-        {:cont, acc}
+      {:pong, payload}, {:continue, state, receive_state} ->
+        {:cont, {:continue, clear_matching_pong(state, payload), receive_state}}
 
       {:close, _code, _reason}, {:continue, state, receive_state} ->
         {:halt, {:failure, state, receive_state, :upstream_websocket_closed_before_terminal}}
@@ -672,6 +723,47 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
   defp cancel_keepalive(state), do: state
 
+  @spec unique_keepalive_payload() :: binary()
+  defp unique_keepalive_payload do
+    "codex-pooler:" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+  end
+
+  @spec schedule_pong_deadline(map(), binary()) :: map()
+  defp schedule_pong_deadline(state, payload) when is_binary(payload) do
+    state = cancel_pong_deadline(state)
+    token = make_ref()
+
+    ref =
+      Process.send_after(
+        self(),
+        {:upstream_websocket_pong_deadline, token},
+        keepalive_pong_timeout_ms()
+      )
+
+    state
+    |> Map.put(:keepalive_pong_ref, ref)
+    |> Map.put(:keepalive_pong_token, token)
+    |> Map.put(:keepalive_pong_payload, payload)
+  end
+
+  @spec cancel_pong_deadline(map()) :: map()
+  defp cancel_pong_deadline(%{keepalive_pong_ref: ref} = state) when is_reference(ref) do
+    Process.cancel_timer(ref)
+
+    state
+    |> Map.delete(:keepalive_pong_ref)
+    |> Map.delete(:keepalive_pong_token)
+    |> Map.delete(:keepalive_pong_payload)
+  end
+
+  defp cancel_pong_deadline(state), do: state
+
+  @spec clear_matching_pong(map(), binary()) :: map()
+  defp clear_matching_pong(%{keepalive_pong_payload: payload} = state, payload),
+    do: cancel_pong_deadline(state)
+
+  defp clear_matching_pong(state, _payload), do: state
+
   defp keepalive_interval_ms do
     :codex_pooler
     |> Application.get_env(__MODULE__, [])
@@ -682,10 +774,30 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
     end
   end
 
-  defp close_state(%{conn: conn} = state) do
-    Mint.HTTP.close(conn)
-    state |> cancel_keepalive() |> Map.take([])
+  @spec keepalive_pong_timeout_ms() :: pos_integer()
+  defp keepalive_pong_timeout_ms do
+    :codex_pooler
+    |> Application.get_env(__MODULE__, [])
+    |> Keyword.get(:keepalive_pong_timeout_ms, keepalive_interval_ms())
+    |> case do
+      timeout when is_integer(timeout) and timeout > 0 -> timeout
+      _timeout -> keepalive_interval_ms()
+    end
   end
 
-  defp close_state(state), do: state |> cancel_keepalive() |> Map.take([])
+  defp close_state(%{conn: conn} = state) do
+    Mint.HTTP.close(conn)
+
+    state
+    |> cancel_keepalive()
+    |> cancel_pong_deadline()
+    |> Map.take([])
+  end
+
+  defp close_state(state) do
+    state
+    |> cancel_keepalive()
+    |> cancel_pong_deadline()
+    |> Map.take([])
+  end
 end
