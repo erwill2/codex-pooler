@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
 
   require Logger
 
+  alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.TransportEnvelope
   alias CodexPooler.Gateway.Persistence.CodexSession
@@ -264,10 +265,16 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   end
 
   defp owner_request_forwarder_opts(forwarder_opts, %RequestOptions{} = request_options) do
+    timeout =
+      max(
+        request_options.timeout_config.receive_timeout_ms + 1_000,
+        OperationalSettings.current().websocket_idle_timeout_ms + 1_000
+      )
+
     Keyword.put_new(
       forwarder_opts,
       :timeout,
-      request_options.timeout_config.receive_timeout_ms + 1_000
+      timeout
     )
   end
 
