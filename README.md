@@ -646,10 +646,10 @@ Then add a provider to `~/.pi/agent/models.json`:
 For deployed instances, change `baseUrl` to
 `https://codex-pooler.example.com/v1`.
 
-The explicit `thinkingLevelMap` entry is required for Pi to expose `xhigh` in
-the model picker and footer. Without it, Pi treats `xhigh` as unsupported for a
-custom model and clamps `--thinking xhigh` or `defaultThinkingLevel: "xhigh"` to
-`high`.
+Current Pi source still requires the explicit `thinkingLevelMap` entry for Pi
+to expose `xhigh` in the model picker and footer. Without it, Pi treats `xhigh`
+as unsupported for a custom model and clamps `--thinking xhigh` or
+`defaultThinkingLevel: "xhigh"` to `high`.
 
 Pi accepts `contextWindow` and `maxTokens` for custom models; it has no
 `contextTokens` field. The bundled Pi `gpt-5.5` entries use a 272k context
@@ -715,21 +715,6 @@ providers:
       - id: gpt-5.5
         name: GPT-5.5 via Codex Pooler
         reasoning: true
-        thinking:
-          mode: effort
-          efforts:
-            - minimal
-            - low
-            - medium
-            - high
-            - xhigh
-          defaultLevel: xhigh
-          effortMap:
-            minimal: minimal
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
         input:
           - text
           - image
@@ -740,21 +725,6 @@ providers:
       - id: gpt-5.4-mini
         name: GPT-5.4 Mini via Codex Pooler
         reasoning: true
-        thinking:
-          mode: effort
-          efforts:
-            - minimal
-            - low
-            - medium
-            - high
-            - xhigh
-          defaultLevel: low
-          effortMap:
-            minimal: minimal
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
         input:
           - text
           - image
@@ -769,6 +739,11 @@ runtime. `authHeader: true` makes OMP send the Pool API key as
 `Authorization: Bearer ...`. Define only model ids your assigned Pool can
 serve. For deployed instances, change `baseUrl` to
 `https://codex-pooler.example.com/v1`.
+
+Current OMP source derives an effort thinking surface, including `xhigh`, for
+custom `openai-responses` models that set `reasoning: true`. You only need an
+explicit `thinking` block if you want to override the inferred effort list,
+wire mapping, or per-model default level.
 
 OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept
 `contextTokens`. The examples keep both Codex models on a 272k context window

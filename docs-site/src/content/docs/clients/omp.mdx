@@ -28,21 +28,6 @@ providers:
       - id: gpt-5.5
         name: GPT-5.5 via Codex Pooler
         reasoning: true
-        thinking:
-          mode: effort
-          efforts:
-            - minimal
-            - low
-            - medium
-            - high
-            - xhigh
-          defaultLevel: xhigh
-          effortMap:
-            minimal: minimal
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
         input:
           - text
           - image
@@ -53,21 +38,6 @@ providers:
       - id: gpt-5.4-mini
         name: GPT-5.4 Mini via Codex Pooler
         reasoning: true
-        thinking:
-          mode: effort
-          efforts:
-            - minimal
-            - low
-            - medium
-            - high
-            - xhigh
-          defaultLevel: low
-          effortMap:
-            minimal: minimal
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
         input:
           - text
           - image
@@ -81,7 +51,7 @@ For local setup, change `baseUrl` to `http://localhost:4000/v1`.
 
 `apiKey: CODEX_POOLER_API_KEY` makes OMP resolve that environment variable at runtime. `authHeader: true` makes OMP send the Pool API key as `Authorization: Bearer ...`. Define only model ids your assigned Pool can serve.
 
-The `thinking` blocks expose all OMP effort levels for both Codex models, so role defaults can pick cheaper reasoning for background work without falling back to a non-Codex provider.
+Current OMP derives an effort thinking surface, including `xhigh`, for custom `openai-responses` models that set `reasoning: true`. Add an explicit `thinking` block only when you want to override the inferred effort list, wire mapping, or per-model default level.
 
 OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept `contextTokens`. The examples keep both Codex models on a 272k context window and 128k output budget: `gpt-5.5` handles the default, slow, plan, vision, task, designer, and advisor paths, while `gpt-5.4-mini` handles `smol`, `tiny`, and `commit`. `compaction.reserveTokens: 128000` asks OMP to compact before a prompt plus a long completion can exceed that 272k window.
 

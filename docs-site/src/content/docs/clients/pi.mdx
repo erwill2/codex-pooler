@@ -64,7 +64,7 @@ For local setup, change `baseUrl` to `http://localhost:4000/v1`.
 
 `authHeader: true` makes Pi send the Pool API key as `Authorization: Bearer ...`. Define only model ids your assigned Pool can serve.
 
-`thinkingLevelMap.xhigh` is required for Pi to expose `xhigh` for this custom model. Without it, Pi clamps `--thinking xhigh` and `defaultThinkingLevel: "xhigh"` down to `high`.
+Current Pi source still requires `thinkingLevelMap.xhigh` for Pi to expose `xhigh` for this custom model. Without it, Pi clamps `--thinking xhigh` and `defaultThinkingLevel: "xhigh"` down to `high`.
 
 Pi accepts `contextWindow` and `maxTokens` for custom models; it has no `contextTokens` field. The bundled Pi `gpt-5.5` entries use a 272k context window and 128k output budget, so matching those values keeps Codex Pooler custom-provider behavior aligned with Pi's built-in metadata.
 

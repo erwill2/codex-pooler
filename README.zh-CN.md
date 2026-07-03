@@ -617,8 +617,8 @@ npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 只定义你分配到的 Pool 能服务的模型 id。对于已部署实例，把 `baseUrl` 改为
 `https://codex-pooler.example.com/v1`。
 
-显式 `thinkingLevelMap` 条目是 Pi 在模型选择器和页脚中暴露 `xhigh`
-所必需的。没有它，Pi 会把 `xhigh` 视为自定义模型不支持的选项，并把
+当前 Pi 源码仍然要求显式 `thinkingLevelMap` 条目，Pi 才会在模型选择器和页脚中
+暴露 `xhigh`。没有它，Pi 会把 `xhigh` 视为自定义模型不支持的选项，并把
 `--thinking xhigh` 或 `defaultThinkingLevel: "xhigh"` 降到 `high`。
 
 Pi 接受自定义模型的 `contextWindow` 和 `maxTokens`；它没有 `contextTokens`
@@ -681,21 +681,6 @@ providers:
       - id: gpt-5.5
         name: GPT-5.5 via Codex Pooler
         reasoning: true
-        thinking:
-          mode: effort
-          efforts:
-            - minimal
-            - low
-            - medium
-            - high
-            - xhigh
-          defaultLevel: xhigh
-          effortMap:
-            minimal: minimal
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
         input:
           - text
           - image
@@ -706,21 +691,6 @@ providers:
       - id: gpt-5.4-mini
         name: GPT-5.4 Mini via Codex Pooler
         reasoning: true
-        thinking:
-          mode: effort
-          efforts:
-            - minimal
-            - low
-            - medium
-            - high
-            - xhigh
-          defaultLevel: low
-          effortMap:
-            minimal: minimal
-            low: low
-            medium: medium
-            high: high
-            xhigh: xhigh
         input:
           - text
           - image
@@ -734,6 +704,10 @@ providers:
 `authHeader: true` 会让 OMP 以 `Authorization: Bearer ...` 发送 Pool API 密钥。
 只定义你分配到的 Pool 能服务的模型 id。对于已部署实例，把 `baseUrl` 改为
 `https://codex-pooler.example.com/v1`。
+
+当前 OMP 源码会为设置了 `reasoning: true` 的自定义 `openai-responses` 模型推导
+包含 `xhigh` 的 effort thinking 能力。只有在你要覆盖推导出的 effort 列表、wire
+映射或每个模型的默认级别时，才需要显式 `thinking` 块。
 
 OMP 在 `models.yml` 中接受 `contextWindow` 和 `maxTokens`；它不接受
 `contextTokens`。这些示例让两个 Codex 模型都使用 272k 上下文窗口和 128k
