@@ -7,7 +7,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.Format
-  alias CodexPoolerWeb.Admin.PoolInviteForm
 
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.{
     QuotaLimitRow,
@@ -16,6 +15,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     TokenBurnPopover
   }
 
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReinviteLink
   alias CodexPoolerWeb.DateTimeDisplay
 
   @reactivatable_statuses ~w(paused refresh_due refresh_failed)
@@ -353,7 +353,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
       assign(assigns,
         recovery_eligible?: recovery_eligible?(assigns.account),
         recovery_default_pool_id: recovery_default_pool_id(assigns.account),
-        recovery_reinvite_path: recovery_reinvite_path(assigns.account),
+        recovery_reinvite_path: ReinviteLink.path_for_account(assigns.account),
         oauth_relink_available?: oauth_relink_available?(assigns.account),
         oauth_relink_unavailable_reason: oauth_relink_unavailable_reason(assigns.account)
       )
@@ -819,14 +819,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
 
   defp recovery_default_pool_id(_account), do: nil
 
-  @spec recovery_reinvite_path(map()) :: String.t() | nil
-  defp recovery_reinvite_path(%{assignments: [assignment | _assignments]} = account) do
-    params = recovery_invite_params(account, assignment.pool_id)
-    ~p"/admin/invites?#{params}"
-  end
-
-  defp recovery_reinvite_path(_account), do: nil
-
   @spec oauth_relink_available?(map()) :: boolean()
   defp oauth_relink_available?(%{identity: %{status: status}, assignments: assignments})
        when is_list(assignments),
@@ -842,42 +834,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     do: "Assign this account to a visible Pool before relinking."
 
   defp oauth_relink_unavailable_reason(_account), do: nil
-
-  @spec recovery_invite_params(map(), String.t()) :: map()
-  defp recovery_invite_params(account, pool_id) do
-    params = %{"create" => "1", "pool_id" => pool_id}
-
-    case recovery_invite_email(account, pool_id) do
-      nil -> params
-      invited_email -> Map.put(params, "invited_email", invited_email)
-    end
-  end
-
-  @spec recovery_invite_email(map(), String.t()) :: String.t() | nil
-  defp recovery_invite_email(account, pool_id) do
-    [
-      account.identity.account_email,
-      account.identity.chatgpt_account_id,
-      account.label
-    ]
-    |> Enum.map(&present_string/1)
-    |> Enum.reject(&is_nil/1)
-    |> Enum.find(&valid_invite_email?(&1, pool_id))
-  end
-
-  @spec valid_invite_email?(String.t(), String.t()) :: boolean()
-  defp valid_invite_email?(candidate, pool_id) do
-    %{"pool_id" => pool_id, "invited_email" => candidate, "send_email" => "false"}
-    |> PoolInviteForm.changeset(%{id: pool_id})
-    |> Map.fetch!(:valid?)
-  end
-
-  defp present_string(value) when is_binary(value) do
-    value = String.trim(value)
-    if value == "", do: nil, else: value
-  end
-
-  defp present_string(_value), do: nil
 
   defp pausable?("active"), do: true
   defp pausable?("refresh_due"), do: true

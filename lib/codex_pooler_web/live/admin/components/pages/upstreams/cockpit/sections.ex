@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReinviteLink
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents
   alias Phoenix.HTML.Form
 
@@ -527,7 +528,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
   attr :cockpit, :map, required: true
 
   defp cockpit_reinvite_link(assigns) do
-    assigns = assign(assigns, :path, reinvite_path(assigns.cockpit))
+    assigns = assign(assigns, :path, ReinviteLink.path_for_cockpit(assigns.cockpit))
 
     ~H"""
     <div class="rounded-box border border-base-300 bg-base-200/60 p-3">
@@ -576,14 +577,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
        do: true
 
   defp confirming_saved_reset_redemption?(_confirmation, _cockpit), do: false
-
-  defp reinvite_path(cockpit) do
-    pool_id = default_pool_id(cockpit)
-
-    if cockpit.actions.reinvite.available? and is_binary(pool_id) do
-      ~p"/admin/invites?#{%{create: "1", pool_id: pool_id}}"
-    end
-  end
 
   defp recent_events_description(%{empty?: true}), do: "No recent upstream events"
 

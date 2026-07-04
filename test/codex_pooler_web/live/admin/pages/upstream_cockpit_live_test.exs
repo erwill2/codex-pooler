@@ -1405,7 +1405,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   end
 
   @tag :read_model_states
-  test "read model exposes reauth-required state and safe recovery actions", %{scope: scope} do
+  test "read model exposes reauth-required state and safe recovery actions", %{
+    conn: conn,
+    scope: scope
+  } do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "reauth-cockpit", name: "Reauth Cockpit"})
 
     %{identity: identity} =
@@ -1431,6 +1434,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert cockpit.actions.refresh_token.available? == false
     assert cockpit.actions.replace_auth_json.available? == true
     assert cockpit.actions.reinvite.available? == true
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    assert has_element?(
+             view,
+             "#cockpit-reinvite-upstream-account-#{identity.id}[href*='create=1'][href*='pool_id=#{pool.id}']",
+             "Reinvite account"
+           )
+
+    refute render(view) =~ "invited_email="
   end
 
   @tag :quota_health
