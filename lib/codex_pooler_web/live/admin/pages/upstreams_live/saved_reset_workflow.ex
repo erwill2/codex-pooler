@@ -19,7 +19,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.SavedResetWorkflow do
   end
 
   @spec save_policy(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), Ecto.Changeset.t(), keyword()) ::
-          {:noreply, Phoenix.LiveView.Socket.t()}
+          Phoenix.LiveView.Socket.t()
   def save_policy(socket, identity_id, changeset, opts) do
     close_fun = Keyword.fetch!(opts, :close)
     reload_fun = Keyword.fetch!(opts, :reload)
@@ -35,22 +35,21 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.SavedResetWorkflow do
            attrs
          ) do
       {:ok, _result} ->
-        {:noreply,
-         socket
-         |> put_flash(:info, "Saved reset policy updated")
-         |> close_fun.()
-         |> reload_fun.()}
+        socket
+        |> put_flash(:info, "Saved reset policy updated")
+        |> close_fun.()
+        |> reload_fun.()
 
       {:error, %Ecto.Changeset{} = changeset} ->
-        {:noreply, assign_form(socket, changeset)}
+        assign_form(socket, changeset)
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, WorkflowError.message(reason))}
+        put_flash(socket, :error, WorkflowError.message(reason))
     end
   end
 
   @spec redeem(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), keyword()) ::
-          {:noreply, Phoenix.LiveView.Socket.t()}
+          Phoenix.LiveView.Socket.t()
   def redeem(socket, identity_id, opts) do
     reload_fun = Keyword.fetch!(opts, :reload)
     refresh_editing_fun = Keyword.fetch!(opts, :refresh_editing)
@@ -60,40 +59,38 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.SavedResetWorkflow do
 
       case visible_account(socket, identity_id) do
         nil ->
-          {:noreply, put_flash(socket, :error, "Upstream account was not found")}
+          put_flash(socket, :error, "Upstream account was not found")
 
         %{saved_reset_redemption_action: %{available?: false, reason: reason}} ->
-          {:noreply,
-           socket
-           |> put_flash(:error, reason || "Saved reset redemption is not available")
-           |> then(&refresh_editing_fun.(&1, identity_id))}
+          socket
+          |> put_flash(:error, reason || "Saved reset redemption is not available")
+          |> then(&refresh_editing_fun.(&1, identity_id))
 
         account ->
           enqueue_redemption(socket, account, reload_fun, refresh_editing_fun)
       end
     else
-      {:noreply, put_flash(socket, :error, "Confirm saved reset redemption before continuing")}
+      put_flash(socket, :error, "Confirm saved reset redemption before continuing")
     end
   end
 
   @spec maybe_confirm_redemption(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), map()) ::
-          {:noreply, Phoenix.LiveView.Socket.t()}
+          Phoenix.LiveView.Socket.t()
   def maybe_confirm_redemption(socket, identity_id, _params \\ %{}) do
     case socket.assigns.editing_saved_reset_policy do
       %{identity: %UpstreamIdentity{id: ^identity_id}} = account ->
         if account.saved_reset_redemption_action.available? do
-          {:noreply,
-           assign(
-             socket,
-             :confirming_saved_reset_redemption,
-             redemption_confirmation(account)
-           )}
+          assign(
+            socket,
+            :confirming_saved_reset_redemption,
+            redemption_confirmation(account)
+          )
         else
-          {:noreply, put_flash(socket, :error, account.saved_reset_redemption_action.reason)}
+          put_flash(socket, :error, account.saved_reset_redemption_action.reason)
         end
 
       _account ->
-        {:noreply, put_flash(socket, :error, "Upstream account was not found")}
+        put_flash(socket, :error, "Upstream account was not found")
     end
   end
 
@@ -117,10 +114,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.SavedResetWorkflow do
         |> assign(:confirming_saved_reset_redemption, nil)
         |> reload_fun.()
 
-      {:noreply, refresh_editing_fun.(socket, account.identity.id)}
+      refresh_editing_fun.(socket, account.identity.id)
     else
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, WorkflowError.message(reason))}
+        put_flash(socket, :error, WorkflowError.message(reason))
     end
   end
 

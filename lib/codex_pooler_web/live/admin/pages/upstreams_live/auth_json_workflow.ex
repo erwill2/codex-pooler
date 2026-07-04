@@ -49,21 +49,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AuthJsonWorkflow do
 
   @spec import(Phoenix.LiveView.Socket.t(), map(), map() | nil, (Phoenix.LiveView.Socket.t() ->
                                                                    Phoenix.LiveView.Socket.t())) ::
-          {:noreply, Phoenix.LiveView.Socket.t()}
+          Phoenix.LiveView.Socket.t()
   def import(socket, auth_json_params, pool, reload_fun) when is_function(reload_fun, 1) do
     case content(socket, auth_json_params) do
       {:ok, content, socket} ->
         do_import(socket, pool, auth_json_params, content, reload_fun)
 
       {:error, message, socket} ->
-        {:noreply,
-         socket
-         |> put_flash(:error, "Codex auth.json could not be imported")
-         |> assign(
-           :auth_json_form,
-           UpstreamAuthJsonImport.form_with_error(auth_json_params["pool_id"], :content, message)
-         )
-         |> assign(:importing_auth_json, true)}
+        socket
+        |> put_flash(:error, "Codex auth.json could not be imported")
+        |> assign(
+          :auth_json_form,
+          UpstreamAuthJsonImport.form_with_error(auth_json_params["pool_id"], :content, message)
+        )
+        |> assign(:importing_auth_json, true)
     end
   end
 
@@ -77,32 +76,29 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AuthJsonWorkflow do
   defp do_import(socket, pool, auth_json_params, content, reload_fun) do
     case Upstreams.import_codex_auth_json(socket.assigns.current_scope, pool, content) do
       {:ok, %{status: :created}} ->
-        {:noreply, import_success(socket, "Codex auth.json imported", reload_fun)}
+        import_success(socket, "Codex auth.json imported", reload_fun)
 
       {:ok, %{status: :existing}} ->
-        {:noreply,
-         import_success(
-           socket,
-           "Codex auth.json matched an existing account; tokens updated",
-           reload_fun
-         )}
+        import_success(
+          socket,
+          "Codex auth.json matched an existing account; tokens updated",
+          reload_fun
+        )
 
       {:error, %Ecto.Changeset{} = changeset} ->
-        {:noreply,
-         socket
-         |> put_flash(:error, "Codex auth.json could not be imported")
-         |> assign(:importing_auth_json, true)
-         |> assign(:auth_json_form, to_form(changeset, as: :auth_json))}
+        socket
+        |> put_flash(:error, "Codex auth.json could not be imported")
+        |> assign(:importing_auth_json, true)
+        |> assign(:auth_json_form, to_form(changeset, as: :auth_json))
 
       {:error, reason} ->
-        {:noreply,
-         socket
-         |> put_flash(:error, WorkflowError.message(reason))
-         |> assign(:importing_auth_json, true)
-         |> assign(
-           :auth_json_form,
-           UpstreamAuthJsonImport.form_for_pool(auth_json_params["pool_id"])
-         )}
+        socket
+        |> put_flash(:error, WorkflowError.message(reason))
+        |> assign(:importing_auth_json, true)
+        |> assign(
+          :auth_json_form,
+          UpstreamAuthJsonImport.form_for_pool(auth_json_params["pool_id"])
+        )
     end
   end
 

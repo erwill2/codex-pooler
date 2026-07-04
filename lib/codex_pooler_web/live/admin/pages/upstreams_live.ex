@@ -100,7 +100,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
 
   @impl true
   def handle_info({:poll_oauth_device, flow_id}, socket) do
-    OAuthWorkflow.poll_device(socket, flow_id, &reload_upstreams/1)
+    {:noreply, OAuthWorkflow.poll_device(socket, flow_id, &reload_upstreams/1)}
   end
 
   @impl true
@@ -136,7 +136,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   def handle_event("import_auth_json", %{"auth_json" => auth_json_params}, socket) do
     pool = selected_pool(socket.assigns.pools, auth_json_params["pool_id"])
 
-    AuthJsonWorkflow.import(socket, auth_json_params, pool, &reload_upstreams/1)
+    {:noreply, AuthJsonWorkflow.import(socket, auth_json_params, pool, &reload_upstreams/1)}
   end
 
   def handle_event("open_import_auth_json", params, socket) do
@@ -154,31 +154,31 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   def handle_event("open_oauth_link", params, socket) do
-    OAuthWorkflow.open_link(socket, params, &close_account_workflow_dialogs/1)
+    {:noreply, OAuthWorkflow.open_link(socket, params, &close_account_workflow_dialogs/1)}
   end
 
   def handle_event("open_oauth_relink", %{"id" => identity_id}, socket) do
-    OAuthWorkflow.open_relink(socket, identity_id, &close_account_workflow_dialogs/1)
+    {:noreply, OAuthWorkflow.open_relink(socket, identity_id, &close_account_workflow_dialogs/1)}
   end
 
   def handle_event("validate_oauth_link_pool", %{"oauth_link" => oauth_params}, socket) do
-    OAuthWorkflow.validate_pool(socket, oauth_params)
+    {:noreply, OAuthWorkflow.validate_pool(socket, oauth_params)}
   end
 
   def handle_event("start_oauth_browser", params, socket) do
-    OAuthWorkflow.start_browser(socket, params)
+    {:noreply, OAuthWorkflow.start_browser(socket, params)}
   end
 
   def handle_event("start_oauth_device", params, socket) do
-    OAuthWorkflow.start_device(socket, params)
+    {:noreply, OAuthWorkflow.start_device(socket, params)}
   end
 
   def handle_event("submit_oauth_callback", %{"oauth_link" => oauth_params}, socket) do
-    OAuthWorkflow.submit_callback(socket, oauth_params, &reload_upstreams/1)
+    {:noreply, OAuthWorkflow.submit_callback(socket, oauth_params, &reload_upstreams/1)}
   end
 
   def handle_event("cancel_oauth_link", _params, socket) do
-    OAuthWorkflow.cancel(socket)
+    {:noreply, OAuthWorkflow.cancel(socket)}
   end
 
   def handle_event("validate_auth_json_import", %{"auth_json" => auth_json_params}, socket) do
@@ -221,7 +221,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   def handle_event("confirm_delete_account", %{"upstream_delete" => delete_params}, socket) do
-    AccountLifecycleWorkflow.confirm_delete(socket, delete_params, &reload_upstreams/1)
+    {:noreply,
+     AccountLifecycleWorkflow.confirm_delete(socket, delete_params, &reload_upstreams/1)}
   end
 
   def handle_event("open_saved_reset_policy", %{"id" => identity_id}, socket) do
@@ -259,7 +260,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
         %{"id" => identity_id} = params,
         socket
       ) do
-    SavedResetWorkflow.maybe_confirm_redemption(socket, identity_id, params)
+    {:noreply, SavedResetWorkflow.maybe_confirm_redemption(socket, identity_id, params)}
   end
 
   def handle_event("toggle_account_pools_panel", %{"id" => identity_id}, socket) do
@@ -272,10 +273,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   def handle_event("redeem_saved_reset", %{"id" => identity_id}, socket) do
-    SavedResetWorkflow.redeem(socket, identity_id,
-      reload: &reload_upstreams/1,
-      refresh_editing: &refresh_editing_saved_reset_policy/2
-    )
+    {:noreply,
+     SavedResetWorkflow.redeem(socket, identity_id,
+       reload: &reload_upstreams/1,
+       refresh_editing: &refresh_editing_saved_reset_policy/2
+     )}
   end
 
   def handle_event("save_saved_reset_policy", %{"saved_reset_policy" => params}, socket) do
@@ -285,10 +287,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
           saved_reset_policy_changeset(current_saved_reset_policy(socket), params, :validate)
 
         if changeset.valid? do
-          SavedResetWorkflow.save_policy(socket, identity_id, changeset,
-            close: &close_saved_reset_policy_dialog/1,
-            reload: &reload_upstreams/1
-          )
+          {:noreply,
+           SavedResetWorkflow.save_policy(socket, identity_id, changeset,
+             close: &close_saved_reset_policy_dialog/1,
+             reload: &reload_upstreams/1
+           )}
         else
           {:noreply, SavedResetWorkflow.assign_form(socket, changeset)}
         end
@@ -310,13 +313,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   def handle_event("rename_account", %{"rename" => rename_params}, socket) do
     case socket.assigns.renaming_account do
       %{identity: %UpstreamIdentity{} = identity} ->
-        AccountLifecycleWorkflow.rename(
-          socket,
-          identity,
-          rename_params,
-          &close_rename_account_dialog/1,
-          &reload_upstreams/1
-        )
+        {:noreply,
+         AccountLifecycleWorkflow.rename(
+           socket,
+           identity,
+           rename_params,
+           &close_rename_account_dialog/1,
+           &reload_upstreams/1
+         )}
 
       nil ->
         {:noreply, put_flash(socket, :error, "Upstream account was not found")}
@@ -324,15 +328,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive do
   end
 
   def handle_event("pause_account", %{"id" => identity_id}, socket) do
-    AccountLifecycleWorkflow.pause(socket, identity_id, &reload_upstreams/1)
+    {:noreply, AccountLifecycleWorkflow.pause(socket, identity_id, &reload_upstreams/1)}
   end
 
   def handle_event("reactivate_account", %{"id" => identity_id}, socket) do
-    AccountLifecycleWorkflow.reactivate(socket, identity_id, &reload_upstreams/1)
+    {:noreply, AccountLifecycleWorkflow.reactivate(socket, identity_id, &reload_upstreams/1)}
   end
 
   def handle_event("refresh_account", %{"id" => identity_id}, socket) do
-    AccountLifecycleWorkflow.refresh(socket, identity_id, &reload_upstreams/1)
+    {:noreply, AccountLifecycleWorkflow.refresh(socket, identity_id, &reload_upstreams/1)}
   end
 
   defp refresh_editing_saved_reset_policy(socket, identity_id) do

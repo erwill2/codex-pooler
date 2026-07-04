@@ -12,7 +12,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AccountLifecycleWorkflow do
 
   @spec pause(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), (Phoenix.LiveView.Socket.t() ->
                                                              Phoenix.LiveView.Socket.t())) ::
-          {:noreply, Phoenix.LiveView.Socket.t()}
+          Phoenix.LiveView.Socket.t()
   def pause(socket, identity_id, reload_fun),
     do:
       lifecycle_action(
@@ -25,7 +25,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AccountLifecycleWorkflow do
 
   @spec reactivate(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), (Phoenix.LiveView.Socket.t() ->
                                                                   Phoenix.LiveView.Socket.t())) ::
-          {:noreply, Phoenix.LiveView.Socket.t()}
+          Phoenix.LiveView.Socket.t()
   def reactivate(socket, identity_id, reload_fun),
     do:
       lifecycle_action(
@@ -38,7 +38,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AccountLifecycleWorkflow do
 
   @spec refresh(Phoenix.LiveView.Socket.t(), Ecto.UUID.t(), (Phoenix.LiveView.Socket.t() ->
                                                                Phoenix.LiveView.Socket.t())) ::
-          {:noreply, Phoenix.LiveView.Socket.t()}
+          Phoenix.LiveView.Socket.t()
   def refresh(socket, identity_id, reload_fun) do
     case Upstreams.enqueue_token_refresh_for_scope(socket.assigns.current_scope, identity_id,
            trigger_kind: "admin_upstreams_live"
@@ -47,13 +47,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AccountLifecycleWorkflow do
         message =
           if job.conflict?, do: "Token refresh is already queued", else: "Token refresh queued"
 
-        {:noreply,
-         socket
-         |> put_flash(:info, message)
-         |> reload_fun.()}
+        socket
+        |> put_flash(:info, message)
+        |> reload_fun.()
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, WorkflowError.message(reason))}
+        put_flash(socket, :error, WorkflowError.message(reason))
     end
   end
 
@@ -83,7 +82,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AccountLifecycleWorkflow do
           Phoenix.LiveView.Socket.t(),
           map(),
           (Phoenix.LiveView.Socket.t() -> Phoenix.LiveView.Socket.t())
-        ) :: {:noreply, Phoenix.LiveView.Socket.t()}
+        ) :: Phoenix.LiveView.Socket.t()
   def confirm_delete(socket, delete_params, reload_fun) do
     case validate_delete_confirmation(socket.assigns.deleting_account, delete_params) do
       :ok ->
@@ -102,7 +101,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AccountLifecycleWorkflow do
         )
 
       {:error, form} ->
-        {:noreply, assign(socket, :delete_account_form, form)}
+        assign(socket, :delete_account_form, form)
     end
   end
 
@@ -120,7 +119,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AccountLifecycleWorkflow do
           (Phoenix.LiveView.Socket.t() -> Phoenix.LiveView.Socket.t()),
           (Phoenix.LiveView.Socket.t() -> Phoenix.LiveView.Socket.t())
         ) ::
-          {:noreply, Phoenix.LiveView.Socket.t()}
+          Phoenix.LiveView.Socket.t()
   def rename(socket, %UpstreamIdentity{} = identity, rename_params, close_fun, reload_fun) do
     case Upstreams.rename_account_for_scope(
            socket.assigns.current_scope,
@@ -128,34 +127,31 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.AccountLifecycleWorkflow do
            rename_params
          ) do
       {:ok, _result} ->
-        {:noreply,
-         socket
-         |> put_flash(:info, "Upstream account renamed")
-         |> close_fun.()
-         |> reload_fun.()}
+        socket
+        |> put_flash(:info, "Upstream account renamed")
+        |> close_fun.()
+        |> reload_fun.()
 
       {:error, %Ecto.Changeset{} = changeset} ->
-        {:noreply,
-         assign(socket,
-           rename_account_form: to_form(changeset, as: :rename),
-           renaming_account: socket.assigns.renaming_account
-         )}
+        assign(socket,
+          rename_account_form: to_form(changeset, as: :rename),
+          renaming_account: socket.assigns.renaming_account
+        )
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, WorkflowError.message(reason))}
+        put_flash(socket, :error, WorkflowError.message(reason))
     end
   end
 
   defp lifecycle_action(socket, identity_id, operation, success_message, reload_fun) do
     case operation.(socket.assigns.current_scope, identity_id, %{reason: @reason}) do
       {:ok, _result} ->
-        {:noreply,
-         socket
-         |> put_flash(:info, success_message)
-         |> reload_fun.()}
+        socket
+        |> put_flash(:info, success_message)
+        |> reload_fun.()
 
       {:error, reason} ->
-        {:noreply, put_flash(socket, :error, WorkflowError.message(reason))}
+        put_flash(socket, :error, WorkflowError.message(reason))
     end
   end
 
