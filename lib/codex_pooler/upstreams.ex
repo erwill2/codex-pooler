@@ -11,17 +11,16 @@ defmodule CodexPooler.Upstreams do
   alias CodexPooler.Repo
 
   alias CodexPooler.Upstreams.{
+    Assignments,
     Import,
-    OAuthFlows,
     SavedResetPolicy,
     SavedResetRedemptionEnqueue,
-    Secrets,
+    OAuth,
+    SecretStore,
     TokenRefreshEnqueue
   }
 
-  alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Lifecycle.{AccountLifecycle, IdentityLifecycle}
-  alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
 
   alias CodexPooler.Upstreams.Schemas.{
     EncryptedSecret,
@@ -43,9 +42,9 @@ defmodule CodexPooler.Upstreams do
   @type secret_result ::
           {:ok, EncryptedSecret.t() | binary()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
   @type import_result :: {:ok, map()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
-  @type oauth_flow_start_result :: OAuthFlows.start_result()
-  @type oauth_flow_completion_result :: OAuthFlows.completion_result()
-  @type oauth_flow_summary :: OAuthFlows.safe_flow_summary()
+  @type oauth_flow_start_result :: OAuth.start_result()
+  @type oauth_flow_completion_result :: OAuth.completion_result()
+  @type oauth_flow_summary :: OAuth.safe_flow_summary()
 
   @spec list_upstream_identities(keyword()) :: [UpstreamIdentity.t()]
   def list_upstream_identities(opts \\ []) do
@@ -123,36 +122,36 @@ defmodule CodexPooler.Upstreams do
   defdelegate import_codex_auth_json(scope, pool, content), to: Import
 
   @spec start_browser_oauth(Scope.t(), Pool.t(), keyword()) :: oauth_flow_start_result()
-  defdelegate start_browser_oauth(scope, pool, opts \\ []), to: OAuthFlows
+  defdelegate start_browser_oauth(scope, pool, opts \\ []), to: OAuth
 
   @spec start_device_oauth(Scope.t(), Pool.t(), keyword()) :: oauth_flow_start_result()
-  defdelegate start_device_oauth(scope, pool, opts \\ []), to: OAuthFlows
+  defdelegate start_device_oauth(scope, pool, opts \\ []), to: OAuth
 
   @spec complete_browser_oauth(Scope.t(), Ecto.UUID.t(), String.t()) ::
           oauth_flow_completion_result()
-  defdelegate complete_browser_oauth(scope, flow_id, callback_url), to: OAuthFlows
+  defdelegate complete_browser_oauth(scope, flow_id, callback_url), to: OAuth
 
   @spec poll_device_oauth(Scope.t(), Ecto.UUID.t()) :: oauth_flow_completion_result()
-  defdelegate poll_device_oauth(scope, flow_id), to: OAuthFlows
+  defdelegate poll_device_oauth(scope, flow_id), to: OAuth
 
   @spec cancel_oauth_flow(Scope.t(), Ecto.UUID.t()) ::
           {:ok, OAuthFlow.t()} | {:error, Ecto.Changeset.t() | lifecycle_error()}
-  defdelegate cancel_oauth_flow(scope, flow_id), to: OAuthFlows
+  defdelegate cancel_oauth_flow(scope, flow_id), to: OAuth
 
   @spec expire_oauth_flows(DateTime.t()) :: %{
           expired: non_neg_integer(),
           deleted: non_neg_integer()
         }
-  defdelegate expire_oauth_flows(now), to: OAuthFlows
+  defdelegate expire_oauth_flows(now), to: OAuth
 
   @spec cleanup_oauth_flows(DateTime.t()) :: %{
           expired: non_neg_integer(),
           deleted: non_neg_integer()
         }
-  defdelegate cleanup_oauth_flows(now), to: OAuthFlows
+  defdelegate cleanup_oauth_flows(now), to: OAuth
 
   @spec list_visible_oauth_flow_summaries(Scope.t(), keyword()) :: [oauth_flow_summary()]
-  defdelegate list_visible_oauth_flow_summaries(scope, opts \\ []), to: OAuthFlows
+  defdelegate list_visible_oauth_flow_summaries(scope, opts \\ []), to: OAuth
 
   @spec rename_account_for_scope(Scope.t(), identity_ref(), map()) :: lifecycle_result()
   defdelegate rename_account_for_scope(scope, identity_or_id, attrs), to: AccountLifecycle
@@ -199,39 +198,39 @@ defmodule CodexPooler.Upstreams do
   @spec sync_pool_assignments_for_pool_edit(Pool.t(), [Ecto.UUID.t()], keyword()) ::
           :ok | {:error, term()}
   defdelegate sync_pool_assignments_for_pool_edit(pool, selected_ids, opts \\ []),
-    to: PoolAssignments
+    to: Assignments
 
   @spec put_assignment_cooldown(assignment_ref(), DateTime.t(), map()) :: assignment_result()
   defdelegate put_assignment_cooldown(assignment_or_id, cooldown_until, attrs \\ %{}),
-    to: PoolAssignments
+    to: Assignments
 
   @spec list_pool_assignments(Pool.t() | Ecto.UUID.t()) :: [PoolUpstreamAssignment.t()]
-  defdelegate list_pool_assignments(pool_or_id), to: PoolAssignments
+  defdelegate list_pool_assignments(pool_or_id), to: Assignments
 
   @spec count_pool_assignments_by_pool_ids([Ecto.UUID.t()]) ::
           %{optional(Ecto.UUID.t()) => non_neg_integer()}
   defdelegate count_pool_assignments_by_pool_ids(pool_ids),
-    to: PoolAssignments
+    to: Assignments
 
   @spec list_active_pool_assignments(Pool.t() | Ecto.UUID.t()) :: [PoolUpstreamAssignment.t()]
-  defdelegate list_active_pool_assignments(pool_or_id), to: PoolAssignments
+  defdelegate list_active_pool_assignments(pool_or_id), to: Assignments
 
   @spec list_pool_assignments_for_identity(identity_ref()) :: [PoolUpstreamAssignment.t()]
   defdelegate list_pool_assignments_for_identity(identity_or_id),
-    to: PoolAssignments
+    to: Assignments
 
   @spec list_eligible_pool_assignments(Pool.t() | Ecto.UUID.t(), keyword()) ::
           [PoolUpstreamAssignment.t()]
   defdelegate list_eligible_pool_assignments(pool_or_id, opts \\ []),
-    to: PoolAssignments
+    to: Assignments
 
   @spec upsert_encrypted_secret(identity_ref(), map()) :: secret_result()
   def upsert_encrypted_secret(identity_or_id, attrs) when is_map(attrs),
-    do: Secrets.upsert_encrypted_secret(identity_or_id, attrs)
+    do: SecretStore.upsert_encrypted_secret(identity_or_id, attrs)
 
   @spec store_encrypted_secret(identity_ref(), map()) :: secret_result()
   def store_encrypted_secret(identity_or_id, attrs) when is_map(attrs),
-    do: Secrets.store_encrypted_secret(identity_or_id, attrs)
+    do: SecretStore.store_encrypted_secret(identity_or_id, attrs)
 
   @spec reconcile_pool_account(
           Pool.t() | Ecto.UUID.t(),
@@ -240,7 +239,7 @@ defmodule CodexPooler.Upstreams do
         ) ::
           lifecycle_result()
   def reconcile_pool_account(pool_or_id, assignment_or_id, opts \\ []),
-    do: PoolReconciliation.reconcile_pool_account(pool_or_id, assignment_or_id, opts)
+    do: Assignments.reconcile_pool_account(pool_or_id, assignment_or_id, opts)
 
   @spec lifecycle_error(atom(), String.t()) :: lifecycle_error()
   def lifecycle_error(code, message), do: %{code: code, message: message}

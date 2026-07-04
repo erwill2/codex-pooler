@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   alias CodexPooler.Events
   alias CodexPooler.Pools
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.PoolEventSubscriptions
   alias CodexPoolerWeb.Admin.PoolFilterComponents
@@ -536,7 +537,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLive do
   defp upstream_filter_identities(visible_upstream_identities, selected_pool) do
     selected_pool_identity_ids =
       selected_pool
-      |> Upstreams.list_pool_assignments()
+      |> UpstreamAssignments.list_pool_assignments()
       |> Enum.reject(&(&1.status == "deleted"))
       |> Enum.map(& &1.upstream_identity_id)
       |> MapSet.new()

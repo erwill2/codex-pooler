@@ -13,7 +13,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
-  alias CodexPooler.Pools
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.RouteClass
 
   @type candidate :: CandidateEligibility.FilterInput.candidate()
@@ -83,7 +83,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
              visible_models: visible_models,
              candidate_snapshots: candidate_snapshots,
              candidates: candidate_snapshots,
-             routing_settings: Pools.routing_settings_with_defaults(auth.pool)
+             routing_settings: PoolRouting.routing_settings_with_defaults(auth.pool)
            }),
          {:ok, candidates} <-
            CandidateEligibility.filter_runtime_compatible_candidates(

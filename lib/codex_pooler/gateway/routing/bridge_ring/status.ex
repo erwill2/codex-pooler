@@ -5,7 +5,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Status do
 
   alias CodexPooler.Gateway.Persistence.{BridgeAffinity, BridgeDemotion, RoutingCircuitState}
   alias CodexPooler.Gateway.Routing.BridgeRing
-  alias CodexPooler.Pools
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.{Pool, RoutingSettings}
   alias CodexPooler.Repo
 
@@ -16,7 +16,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Status do
   def routing_status(%Pool{} = pool), do: routing_status(pool.id)
 
   def routing_status(pool_id) when is_binary(pool_id) do
-    settings = Pools.get_routing_settings(pool_id) || default_settings(pool_id)
+    settings = PoolRouting.get_routing_settings(pool_id) || default_settings(pool_id)
     active_affinity_status = BridgeAffinity.active_status()
     active_demotion_status = BridgeDemotion.active_status()
 

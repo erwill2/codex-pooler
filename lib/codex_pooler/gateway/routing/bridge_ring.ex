@@ -17,7 +17,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   alias CodexPooler.Gateway.Routing.BridgeRing.{Metadata, Status}
   alias CodexPooler.Gateway.Routing.RoutePlanInput
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
-  alias CodexPooler.Pools
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.{Pool, RoutingSettings}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
@@ -617,7 +617,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
     do: settings
 
   defp routing_settings(auth, _route_state),
-    do: Pools.routing_settings_with_defaults(auth.pool) || default_settings(auth.pool.id)
+    do: PoolRouting.routing_settings_with_defaults(auth.pool) || default_settings(auth.pool.id)
 
   defp quota_scope_opts(%Model{} = model) do
     [

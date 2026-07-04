@@ -4,6 +4,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   alias CodexPooler.Admin.{UpstreamQuotaReadiness, UpstreamRoutingReadiness}
   alias CodexPooler.Jobs
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPooler.Upstreams.Auth.TokenRefresh
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.SavedResets
@@ -110,7 +112,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
   def oauth_flow_state(scope, pools, _datetime_preferences, opts) when is_list(pools) do
     items =
-      Upstreams.list_visible_oauth_flow_summaries(
+      UpstreamOAuth.list_visible_oauth_flow_summaries(
         scope,
         opts
         |> Keyword.put(:pool_ids, pool_ids(pools))
@@ -148,7 +150,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
   defp active_assignment_snapshots(pools, pool_lookup) do
     pools
-    |> Enum.flat_map(&Upstreams.list_pool_assignments/1)
+    |> Enum.flat_map(&UpstreamAssignments.list_pool_assignments/1)
     |> Enum.reject(&(&1.status == "deleted"))
     |> Enum.map(&assignment_snapshot(&1, pool_lookup))
     |> Enum.group_by(& &1.upstream_identity_id)

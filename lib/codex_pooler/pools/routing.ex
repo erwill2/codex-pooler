@@ -1,5 +1,12 @@
 defmodule CodexPooler.Pools.Routing do
-  @moduledoc false
+  @moduledoc """
+  Pool routing settings and compatibility controls.
+
+  This is the focused public entry point for routing settings. The root
+  `CodexPooler.Pools` context keeps compatibility delegates for existing
+  callers, but production code that only needs routing settings should depend on
+  this module directly.
+  """
 
   import Ecto.Query
 

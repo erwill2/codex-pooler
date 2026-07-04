@@ -3,7 +3,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive.OAuthRelinkWorkflow do
 
   import Phoenix.Component, only: [assign: 2, assign: 3, to_form: 2]
 
-  alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
   alias CodexPooler.Upstreams.Auth.OAuthCallback
   alias CodexPooler.Upstreams.Schemas.OAuthFlow
 
@@ -41,7 +41,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive.OAuthRelinkWorkflow do
 
     case socket.assigns.oauth_relink_flow do
       %OAuthFlow{id: flow_id} ->
-        case Upstreams.complete_browser_oauth(
+        case UpstreamOAuth.complete_browser_oauth(
                socket.assigns.current_scope,
                flow_id,
                callback_url
@@ -74,7 +74,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive.OAuthRelinkWorkflow do
 
     case socket.assigns.oauth_relink_flow do
       %OAuthFlow{id: flow_id, status: "pending"} ->
-        case Upstreams.cancel_oauth_flow(socket.assigns.current_scope, flow_id) do
+        case UpstreamOAuth.cancel_oauth_flow(socket.assigns.current_scope, flow_id) do
           {:ok, _flow} ->
             socket |> close() |> refresh_fun.()
 
@@ -144,11 +144,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive.OAuthRelinkWorkflow do
   end
 
   defp do_start_oauth_relink(socket, pool, :browser) do
-    Upstreams.start_browser_oauth(socket.assigns.current_scope, pool, start_opts(socket))
+    UpstreamOAuth.start_browser_oauth(socket.assigns.current_scope, pool, start_opts(socket))
   end
 
   defp do_start_oauth_relink(socket, pool, :device) do
-    Upstreams.start_device_oauth(socket.assigns.current_scope, pool, start_opts(socket))
+    UpstreamOAuth.start_device_oauth(socket.assigns.current_scope, pool, start_opts(socket))
   end
 
   defp start_opts(socket) do
@@ -177,7 +177,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive.OAuthRelinkWorkflow do
   end
 
   defp do_poll_device(socket, flow_id, refresh_fun) do
-    case Upstreams.poll_device_oauth(socket.assigns.current_scope, flow_id) do
+    case UpstreamOAuth.poll_device_oauth(socket.assigns.current_scope, flow_id) do
       {:ok, %{status: :completed, flow: %OAuthFlow{} = flow}} ->
         complete(socket, flow, refresh_fun)
 

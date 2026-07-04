@@ -11,8 +11,9 @@ defmodule CodexPooler.Admin.PoolWorkflow do
   alias CodexPooler.Jobs
   alias CodexPooler.Pools
   alias CodexPooler.Pools.Pool
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Repo
-  alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
 
   @assignment_selection_keys ~w(upstream_identity_ids upstream_assignment_ids)
   @catalog_sync_trigger_kind "manual"
@@ -26,9 +27,11 @@ defmodule CodexPooler.Admin.PoolWorkflow do
     Repo.transaction(fn ->
       with {:ok, pool} <- Pools.create_pool(scope, pool_create_attrs(attrs), broadcast?: false),
            {:ok, _settings} <-
-             Pools.update_routing_settings(scope, pool, routing_attrs(attrs), broadcast?: false),
+             PoolRouting.update_routing_settings(scope, pool, routing_attrs(attrs),
+               broadcast?: false
+             ),
            :ok <-
-             Upstreams.sync_pool_assignments_for_pool_edit(
+             UpstreamAssignments.sync_pool_assignments_for_pool_edit(
                pool,
                selected_upstream_identity_ids(attrs),
                select_by: :upstream_identity_id,
@@ -89,9 +92,11 @@ defmodule CodexPooler.Admin.PoolWorkflow do
     with {:ok, pool} <-
            Pools.update_pool(scope, pool_or_id, pool_edit_attrs(attrs), broadcast?: false),
          {:ok, _settings} <-
-           Pools.update_routing_settings(scope, pool, routing_attrs(attrs), broadcast?: false),
+           PoolRouting.update_routing_settings(scope, pool, routing_attrs(attrs),
+             broadcast?: false
+           ),
          :ok <-
-           Upstreams.sync_pool_assignments_for_pool_edit(pool, assignment_ids,
+           UpstreamAssignments.sync_pool_assignments_for_pool_edit(pool, assignment_ids,
              select_by: select_by,
              skip_quota_priming: true
            ),
@@ -108,9 +113,11 @@ defmodule CodexPooler.Admin.PoolWorkflow do
     with %Pool{} = pool <- admin_pool_for_assignment(pool_or_id),
          :ok <- Access.assign_api_keys_to_pool(scope, pool, api_key_ids),
          {:ok, _settings} <-
-           Pools.update_routing_settings(scope, pool, routing_attrs(attrs), broadcast?: false),
+           PoolRouting.update_routing_settings(scope, pool, routing_attrs(attrs),
+             broadcast?: false
+           ),
          :ok <-
-           Upstreams.sync_pool_assignments_for_pool_edit(pool, assignment_ids,
+           UpstreamAssignments.sync_pool_assignments_for_pool_edit(pool, assignment_ids,
              select_by: select_by,
              skip_quota_priming: true
            ),

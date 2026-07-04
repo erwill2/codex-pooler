@@ -6,6 +6,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
   alias CodexPooler.Pools
   alias CodexPooler.Quotas.WindowClassifier
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
@@ -136,7 +137,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
   end
 
   defp assignment_summary(%UpstreamIdentity{} = identity, :all) do
-    assignments = Upstreams.list_pool_assignments_for_identity(identity)
+    assignments = UpstreamAssignments.list_pool_assignments_for_identity(identity)
 
     assignment_summary_from(identity, assignments)
   end
@@ -146,7 +147,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata.ReadModel do
 
     assignments =
       identity
-      |> Upstreams.list_pool_assignments_for_identity()
+      |> UpstreamAssignments.list_pool_assignments_for_identity()
       |> Enum.reject(&(&1.status == "deleted"))
       |> Enum.filter(&MapSet.member?(visible_pool_ids, &1.pool_id))
 

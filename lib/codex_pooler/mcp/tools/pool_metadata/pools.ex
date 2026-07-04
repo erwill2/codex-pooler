@@ -7,9 +7,9 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata.Pools do
   alias CodexPooler.MCP.Tools.DetailEnvelope
   alias CodexPooler.MCP.Tools.PoolMetadata.Common
   alias CodexPooler.MCP.Tools.ReadableText
-  alias CodexPooler.Pools
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.Pool
-  alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
 
   @spec tools() :: [map()]
   def tools, do: [list_tool(), get_tool()]
@@ -82,7 +82,7 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata.Pools do
 
     %{
       api_keys: Access.count_api_keys_by_pool_ids(pool_ids),
-      upstreams: Upstreams.count_pool_assignments_by_pool_ids(pool_ids)
+      upstreams: UpstreamAssignments.count_pool_assignments_by_pool_ids(pool_ids)
     }
   end
 
@@ -119,7 +119,7 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata.Pools do
   end
 
   defp routing_summary(pool) do
-    case Pools.get_routing_settings(pool) do
+    case PoolRouting.get_routing_settings(pool) do
       nil -> "routing settings unavailable"
       settings -> "strategy #{settings.routing_strategy}"
     end

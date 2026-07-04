@@ -6,7 +6,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   alias CodexPooler.Access
   alias CodexPooler.Gateway.Admission, as: GatewayAdmission
   alias CodexPooler.Gateway.OperationalSettings
-  alias CodexPooler.Pools
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPoolerWeb.Plugs.RuntimeIngress.{CompressedBody, Firewall}
   alias CodexPoolerWeb.V1.UnsupportedRoutes
   alias Plug.Conn.Query
@@ -307,7 +307,7 @@ defmodule CodexPoolerWeb.Plugs.RuntimeIngress do
   end
 
   defp ensure_v1_compatibility(%Plug.Conn{private: %{runtime_api_auth: %{pool: pool}}} = conn) do
-    if pool.status == "active" and Pools.v1_compatibility_enabled?(pool) do
+    if pool.status == "active" and PoolRouting.v1_compatibility_enabled?(pool) do
       conn
     else
       send_runtime_error(conn, %{

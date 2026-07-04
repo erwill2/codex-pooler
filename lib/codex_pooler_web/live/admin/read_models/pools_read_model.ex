@@ -4,7 +4,9 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
   alias CodexPooler.Access
   alias CodexPooler.Admin.Stats
   alias CodexPooler.Pools
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.Pool
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.Admin.PoolForm
@@ -108,8 +110,8 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
 
     pool_ids = Enum.map(pools, & &1.id)
     api_key_counts = Access.count_api_keys_by_pool_ids(pool_ids)
-    upstream_counts = CodexPooler.Upstreams.count_pool_assignments_by_pool_ids(pool_ids)
-    routing_settings = Pools.routing_settings_by_pool_ids(pool_ids)
+    upstream_counts = UpstreamAssignments.count_pool_assignments_by_pool_ids(pool_ids)
+    routing_settings = PoolRouting.routing_settings_by_pool_ids(pool_ids)
     usage_metrics = Stats.pool_usage_metrics_by_pool_ids(pool_ids, traffic_window: traffic_window)
     traffic_window_label = PoolForm.traffic_window_short_label(traffic_window)
 

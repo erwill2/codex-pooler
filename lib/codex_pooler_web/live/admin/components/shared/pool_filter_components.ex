@@ -3,7 +3,7 @@ defmodule CodexPoolerWeb.Admin.PoolFilterComponents do
 
   use CodexPoolerWeb, :html
 
-  alias CodexPooler.Pools
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.Pool
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
 
@@ -107,7 +107,7 @@ defmodule CodexPoolerWeb.Admin.PoolFilterComponents do
       pools
       |> Enum.map(&pool_id/1)
       |> Enum.reject(&is_nil/1)
-      |> Pools.routing_settings_by_pool_ids()
+      |> PoolRouting.routing_settings_by_pool_ids()
 
     pool_options =
       pools

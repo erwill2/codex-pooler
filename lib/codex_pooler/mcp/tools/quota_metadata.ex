@@ -11,6 +11,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
   alias CodexPooler.Pools
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
 
   @default_limit 50
   @max_limit 100
@@ -339,7 +340,7 @@ defmodule CodexPooler.MCP.Tools.QuotaMetadata do
 
       identity ->
         identity
-        |> Upstreams.list_pool_assignments_for_identity()
+        |> UpstreamAssignments.list_pool_assignments_for_identity()
         |> Enum.reject(&(&1.status == "deleted"))
         |> Enum.any?(&(&1.pool_id == pool_id))
     end

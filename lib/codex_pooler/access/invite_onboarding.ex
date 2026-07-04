@@ -9,6 +9,8 @@ defmodule CodexPooler.Access.InviteOnboarding do
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
+  alias CodexPooler.Upstreams.SecretStore, as: UpstreamSecretStore
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.CodexAuth
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
@@ -67,7 +69,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
            {:ok, identity, assignment} <- pending_account(invite, pool, label, method) do
         # Reason: secret write failure must rollback the pending invite account.
         # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-        case Upstreams.store_encrypted_secret(identity, %{
+        case UpstreamSecretStore.store_encrypted_secret(identity, %{
                secret_kind: "device_code",
                plaintext: Jason.encode!(auth_state)
              }) do
@@ -96,7 +98,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
 
   defp find_pending_account(invite, pool) do
     pool.id
-    |> Upstreams.list_pool_assignments()
+    |> UpstreamAssignments.list_pool_assignments()
     |> Enum.filter(&invite_bound?(&1.metadata, invite))
     |> Enum.find_value(:error, fn assignment ->
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
@@ -331,7 +333,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
 
   defp store_verified_tokens(identity, tokens) do
     with {:ok, secret} <-
-           Upstreams.store_encrypted_secret(identity, %{
+           UpstreamSecretStore.store_encrypted_secret(identity, %{
              secret_kind: "access_token",
              plaintext: tokens.access_token
            }),
@@ -381,7 +383,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
   defp maybe_store_refresh_token(_identity, nil), do: {:ok, nil}
 
   defp maybe_store_refresh_token(identity, refresh_token) do
-    Upstreams.store_encrypted_secret(identity, %{
+    UpstreamSecretStore.store_encrypted_secret(identity, %{
       secret_kind: "refresh_token",
       plaintext: refresh_token
     })
@@ -389,7 +391,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
 
   defp assignment_for(pool, identity) do
     pool.id
-    |> Upstreams.list_pool_assignments()
+    |> UpstreamAssignments.list_pool_assignments()
     |> Enum.find(&(&1.upstream_identity_id == identity.id))
   end
 

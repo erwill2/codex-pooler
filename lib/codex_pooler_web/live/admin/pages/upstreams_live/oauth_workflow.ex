@@ -4,7 +4,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.OAuthWorkflow do
   import Phoenix.Component, only: [assign: 2, assign: 3, to_form: 2]
   import Phoenix.LiveView, only: [put_flash: 3]
 
-  alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
   alias CodexPooler.Upstreams.Auth.OAuthCallback
   alias CodexPooler.Upstreams.Schemas.OAuthFlow
   alias CodexPoolerWeb.Admin.UpstreamsLive.WorkflowError
@@ -86,13 +86,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.OAuthWorkflow do
   @spec start_browser(Phoenix.LiveView.Socket.t(), map()) ::
           {:noreply, Phoenix.LiveView.Socket.t()}
   def start_browser(socket, params) do
-    begin_link(socket, params, &Upstreams.start_browser_oauth/3, &assign_browser_started/3)
+    begin_link(socket, params, &UpstreamOAuth.start_browser_oauth/3, &assign_browser_started/3)
   end
 
   @spec start_device(Phoenix.LiveView.Socket.t(), map()) ::
           {:noreply, Phoenix.LiveView.Socket.t()}
   def start_device(socket, params) do
-    begin_link(socket, params, &Upstreams.start_device_oauth/3, &assign_device_started/3)
+    begin_link(socket, params, &UpstreamOAuth.start_device_oauth/3, &assign_device_started/3)
   end
 
   @spec submit_callback(Phoenix.LiveView.Socket.t(), map(), (Phoenix.LiveView.Socket.t() ->
@@ -103,7 +103,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.OAuthWorkflow do
 
     case socket.assigns.oauth_link_flow do
       %OAuthFlow{id: flow_id} ->
-        case Upstreams.complete_browser_oauth(
+        case UpstreamOAuth.complete_browser_oauth(
                socket.assigns.current_scope,
                flow_id,
                callback_url
@@ -133,7 +133,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.OAuthWorkflow do
 
     case socket.assigns.oauth_link_flow do
       %OAuthFlow{id: flow_id, status: "pending"} ->
-        case Upstreams.cancel_oauth_flow(socket.assigns.current_scope, flow_id) do
+        case UpstreamOAuth.cancel_oauth_flow(socket.assigns.current_scope, flow_id) do
           {:ok, _flow} ->
             {:noreply, close(socket)}
 
@@ -209,7 +209,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.OAuthWorkflow do
   end
 
   defp do_poll_device(socket, flow_id, reload_fun) do
-    case Upstreams.poll_device_oauth(socket.assigns.current_scope, flow_id) do
+    case UpstreamOAuth.poll_device_oauth(socket.assigns.current_scope, flow_id) do
       {:ok, %{status: :completed, flow: %OAuthFlow{} = flow}} ->
         {:noreply, complete_link(socket, flow, reload_fun)}
 

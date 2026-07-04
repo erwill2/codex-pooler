@@ -5,8 +5,10 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
 
   alias CodexPooler.Access
   alias CodexPooler.Pools
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.RoutingSettings
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.OptionLoaderFallback
 
@@ -74,7 +76,7 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
 
   def edit_form(pool, attrs \\ %{}, errors \\ []) do
     attrs = Map.new(attrs)
-    settings = Pools.routing_settings_by_pool_ids([pool.id]) |> Map.fetch!(pool.id)
+    settings = PoolRouting.routing_settings_by_pool_ids([pool.id]) |> Map.fetch!(pool.id)
 
     %{
       "id" => pool.id,
@@ -129,7 +131,7 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
     options_by_value = Map.new(options, &{option_value(&1), &1})
 
     pool
-    |> Upstreams.list_pool_assignments()
+    |> UpstreamAssignments.list_pool_assignments()
     |> Enum.reject(&(&1.status == "deleted"))
     |> Enum.map(&Upstreams.get_upstream_identity(&1.upstream_identity_id))
     |> Enum.reject(&is_nil/1)
@@ -232,7 +234,7 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
 
   defp active_upstream_identity_ids(pool) do
     pool
-    |> Upstreams.list_pool_assignments()
+    |> UpstreamAssignments.list_pool_assignments()
     |> Enum.reject(&(&1.status == "deleted"))
     |> Enum.map(& &1.upstream_identity_id)
   end

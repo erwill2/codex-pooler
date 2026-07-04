@@ -8,6 +8,7 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata.Upstreams do
   alias CodexPooler.MCP.Tools.ReadableText
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @spec tools() :: [map()]
@@ -132,7 +133,7 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata.Upstreams do
     visible_pool_ids = pool_lookup |> Map.keys() |> MapSet.new()
 
     identity
-    |> Upstreams.list_pool_assignments_for_identity()
+    |> UpstreamAssignments.list_pool_assignments_for_identity()
     |> Enum.reject(&(&1.status == "deleted"))
     |> Enum.filter(&MapSet.member?(visible_pool_ids, &1.pool_id))
   end
@@ -162,7 +163,7 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata.Upstreams do
   defp filter_for_pool(upstreams, %Pool{id: pool_id}) do
     upstream_ids =
       pool_id
-      |> Upstreams.list_pool_assignments()
+      |> UpstreamAssignments.list_pool_assignments()
       |> Enum.reject(&(&1.status == "deleted"))
       |> MapSet.new(& &1.upstream_identity_id)
 
