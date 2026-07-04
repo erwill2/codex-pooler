@@ -17,6 +17,7 @@ defmodule CodexPooler.Gateway.Runtime.Service do
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
   alias CodexPooler.Gateway.Runtime.Dispatch.CandidateDispatch
+  alias CodexPooler.Gateway.Runtime.Dispatch.Context
   alias CodexPooler.Gateway.Runtime.Dispatch.FileDispatch
   alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
@@ -287,19 +288,19 @@ defmodule CodexPooler.Gateway.Runtime.Service do
          request_options,
          %RouteState{} = route_state
        ) do
-    CandidateDispatch.dispatch(
-      %{
-        auth: auth,
-        endpoint: endpoint,
-        payload: payload,
-        model: model,
-        reserved: reserved,
-        candidates: candidates,
-        request_options: request_options,
-        route_state: route_state
-      },
-      &dispatch_decrypted_candidate/1
-    )
+    with {:ok, context} <-
+           Context.new(%{
+             auth: auth,
+             endpoint: endpoint,
+             payload: payload,
+             model: model,
+             reserved: reserved,
+             candidates: candidates,
+             request_options: request_options,
+             route_state: route_state
+           }) do
+      CandidateDispatch.dispatch(context, &dispatch_decrypted_candidate/1)
+    end
   end
 
   defp dispatch_decrypted_candidate(prepared_context) do

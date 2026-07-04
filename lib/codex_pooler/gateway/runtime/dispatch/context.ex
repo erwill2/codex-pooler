@@ -2,9 +2,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.Context do
   @moduledoc false
 
   alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.FailureResponse
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Routing.BridgeRing
+  alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
 
   defstruct [
@@ -32,4 +33,57 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.Context do
           route_plan: BridgeRing.route_plan(),
           route_class: String.t()
         }
+
+  @type input :: %{
+          required(:auth) => CodexPooler.Access.auth_context(),
+          required(:endpoint) => String.t(),
+          required(:payload) => map(),
+          required(:model) => Model.t(),
+          required(:reserved) => Accounting.request_result_row(),
+          required(:candidates) => [BridgeRing.candidate()],
+          required(:request_options) => RequestOptions.t(),
+          required(:route_state) => RouteState.t()
+        }
+
+  @spec new(input()) :: {:ok, t()} | {:error, map()}
+  def new(input) when is_map(input) do
+    request_options = Map.fetch!(input, :request_options)
+
+    route_plan =
+      BridgeRing.plan_route(%{
+        auth: input.auth,
+        model: input.model,
+        candidates: input.candidates,
+        route_plan_input: RoutePlanInput.from_reserved(input.reserved),
+        request_options: request_options,
+        route_state: input.route_state
+      })
+
+    case Accounting.accumulate_request_metadata(input.reserved.request, %{
+           "routing" => route_plan.request_metadata
+         }) do
+      {:ok, request} ->
+        {:ok,
+         %__MODULE__{
+           auth: input.auth,
+           endpoint: input.endpoint,
+           payload: input.payload,
+           model: input.model,
+           reserved: %{input.reserved | request: request},
+           candidates: input.candidates,
+           request_options: request_options,
+           route_state: input.route_state,
+           route_plan: route_plan,
+           route_class: request_options.transport.route_class
+         }}
+
+      {:error, reason} ->
+        FailureResponse.accounting_failure(
+          :merge_route_plan_metadata,
+          input.reserved.request,
+          nil,
+          reason
+        )
+    end
+  end
 end

@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.CandidateDispatch do
   alias CodexPooler.Gateway.Payloads.PayloadNormalizer
   alias CodexPooler.Gateway.RequestCompression
   alias CodexPooler.Gateway.Runtime.Dispatch
+  alias CodexPooler.Gateway.Runtime.Dispatch.Context
   alias CodexPooler.Gateway.Runtime.Dispatch.PreparedContext
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization
@@ -16,9 +17,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.CandidateDispatch do
   @type dispatch_candidate_result :: Dispatch.dispatch_result()
   @type dispatch_result :: {:ok, GatewayContracts.gateway_result()} | {:error, map()}
 
-  @spec dispatch(map(), dispatch_candidate()) :: dispatch_result()
-  def dispatch(attrs, dispatch_fun) when is_function(dispatch_fun, 1) do
-    Dispatch.dispatch(attrs, &decrypt_and_dispatch_candidate(&1, dispatch_fun))
+  @spec dispatch(Context.t(), dispatch_candidate()) :: dispatch_result()
+  def dispatch(%Context{} = context, dispatch_fun) when is_function(dispatch_fun, 1) do
+    Dispatch.dispatch(context, &decrypt_and_dispatch_candidate(&1, dispatch_fun))
   end
 
   @spec dispatch_from(

@@ -16,16 +16,15 @@ defmodule CodexPooler.Gateway.Runtime.DispatchTest do
 
   @endpoint_path "/backend-api/codex/responses"
 
-  test "dispatch returns sanitized gateway error when route plan metadata cannot be recorded" do
+  test "context construction returns sanitized gateway error when route plan metadata cannot be recorded" do
     setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
     payload = payload(setup)
     request_options = request_options(auth, payload, setup)
-    parent = self()
 
     candidates = [{setup.assignment, setup.identity}]
 
-    input = %{
+    context_input = %{
       auth: auth,
       endpoint: @endpoint_path,
       payload: payload,
@@ -43,13 +42,12 @@ defmodule CodexPooler.Gateway.Runtime.DispatchTest do
                   status: 500,
                   code: "gateway_accounting_failed",
                   message: "gateway accounting finalization failed"
-                }} = Dispatch.dispatch(input, fn _context -> send(parent, :transport_called) end)
+                }} = Context.new(context_input)
       end)
 
     assert log =~ "gateway accounting finalization failed"
     assert log =~ "operation=merge_route_plan_metadata"
-    assert log =~ "request_id=#{input.reserved.request.id}"
-    refute_received :transport_called
+    assert log =~ "request_id=#{context_input.reserved.request.id}"
   end
 
   test "dispatch_from returns sanitized gateway error when selected route metadata cannot be recorded" do

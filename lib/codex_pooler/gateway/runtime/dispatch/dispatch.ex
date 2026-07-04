@@ -8,22 +8,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
   alias CodexPooler.Gateway.Contracts, as: GatewayContracts
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.RoutingCircuitState
-  alias CodexPooler.Gateway.Routing.{BridgeRing, ModelMetadata, RoutePlanInput, RoutingSelection}
+  alias CodexPooler.Gateway.Routing.{ModelMetadata, RoutingSelection}
   alias CodexPooler.Gateway.Runtime.Dispatch.Context
-  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
-
-  @type dispatch_input :: %{
-          required(:auth) => CodexPooler.Access.auth_context(),
-          required(:endpoint) => String.t(),
-          required(:payload) => map(),
-          required(:model) => CodexPooler.Catalog.Model.t(),
-          required(:reserved) => Accounting.request_result_row(),
-          required(:candidates) => [BridgeRing.candidate()],
-          required(:request_options) => RequestOptions.t(),
-          required(:route_state) => RouteState.t()
-        }
 
   @type dispatch_callback ::
           (SelectedCandidateContext.t() ->
@@ -32,15 +20,13 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
   @type dispatch_result ::
           {:ok, GatewayContracts.gateway_result()} | {:error, map()} | {:retry, term() | nil}
 
-  @spec dispatch(dispatch_input(), dispatch_callback()) ::
+  @spec dispatch(Context.t(), dispatch_callback()) ::
           {:ok, GatewayContracts.gateway_result()} | {:error, map()}
-  def dispatch(input, transport_dispatch)
-      when is_map(input) and is_function(transport_dispatch, 1) do
-    with {:ok, context} <- build_context(input) do
-      context
-      |> dispatch_from(0, transport_dispatch)
-      |> finalize_dispatch_result()
-    end
+  def dispatch(%Context{} = context, transport_dispatch)
+      when is_function(transport_dispatch, 1) do
+    context
+    |> dispatch_from(0, transport_dispatch)
+    |> finalize_dispatch_result()
   end
 
   @spec dispatch_from(dispatch_context(), non_neg_integer(), dispatch_callback()) ::
@@ -85,47 +71,6 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
 
   defp finalize_dispatch_result(result) do
     result
-  end
-
-  defp build_context(input) do
-    request_options = Map.fetch!(input, :request_options)
-
-    route_plan =
-      BridgeRing.plan_route(%{
-        auth: input.auth,
-        model: input.model,
-        candidates: input.candidates,
-        route_plan_input: RoutePlanInput.from_reserved(input.reserved),
-        request_options: request_options,
-        route_state: input.route_state
-      })
-
-    case Accounting.accumulate_request_metadata(input.reserved.request, %{
-           "routing" => route_plan.request_metadata
-         }) do
-      {:ok, request} ->
-        {:ok,
-         %Context{
-           auth: input.auth,
-           endpoint: input.endpoint,
-           payload: input.payload,
-           model: input.model,
-           reserved: %{input.reserved | request: request},
-           candidates: input.candidates,
-           request_options: request_options,
-           route_state: input.route_state,
-           route_plan: route_plan,
-           route_class: request_options.transport.route_class
-         }}
-
-      {:error, reason} ->
-        FailureResponse.accounting_failure(
-          :merge_route_plan_metadata,
-          input.reserved.request,
-          nil,
-          reason
-        )
-    end
   end
 
   @spec dispatch_candidate(
