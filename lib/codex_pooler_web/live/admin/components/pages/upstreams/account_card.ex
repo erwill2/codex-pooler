@@ -8,7 +8,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.Admin.PoolInviteForm
-  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting, as: ResetFormatting
+
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.{
+    QuotaLimitRow,
+    SavedResetMeter,
+    SelectorContracts,
+    TokenBurnPopover
+  }
+
   alias CodexPoolerWeb.DateTimeDisplay
 
   @reactivatable_statuses ~w(paused refresh_due refresh_failed)
@@ -91,7 +98,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
           id={"upstream-account-#{@account.identity.id}-header-actions"}
           class="flex shrink-0 items-center gap-2 self-center"
         >
-          <.saved_reset_count_badge
+          <SavedResetMeter.saved_reset_count_badge
             id={"upstream-account-#{@account.identity.id}-saved-reset-count"}
             identity_id={@account.identity.id}
             disabled={@account.identity.status == "deleted"}
@@ -138,10 +145,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
                 >
                   TOKEN BURN
                 </p>
-                <.token_burn_popover
+                <TokenBurnPopover.token_burn_popover
                   id={"upstream-account-#{@account.identity.id}-token-burn-value"}
                   content_id={"upstream-account-#{@account.identity.id}-token-burn-content"}
-                  token_burn={token_burn(@account)}
+                  account={@account}
                 />
               </div>
             </div>
@@ -149,12 +156,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
               id={"upstream-account-#{@account.identity.id}-limits"}
               class={quota_limits_grid_class(@reported_quota_limits)}
             >
-              <.quota_limit_row
+              <QuotaLimitRow.quota_limit_row
                 :for={limit <- @reported_quota_limits}
                 id={"upstream-account-#{@account.identity.id}-limit-#{limit.key}"}
                 limit={limit}
               />
-              <.saved_reset_meter
+              <SavedResetMeter.saved_reset_meter
                 :if={saved_reset_panel_available?(@saved_resets)}
                 id={"upstream-account-#{@account.identity.id}-saved-reset-meter"}
                 saved_resets={@saved_resets}
@@ -298,8 +305,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
           </div>
         </dl>
       </footer>
-      <.upstream_refresh_status account={@account} />
-      <.upstream_selector_contracts account={@account} routing_readiness={@routing_readiness} />
+      <SelectorContracts.refresh_status account={@account} />
+      <SelectorContracts.selector_contracts account={@account} routing_readiness={@routing_readiness} />
     </article>
     """
   end
@@ -498,74 +505,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     """
   end
 
-  attr :id, :string, required: true
-  attr :identity_id, :string, required: true
-  attr :saved_resets, :map, required: true
-  attr :saved_reset_policy, :map, required: true
-  attr :disabled, :boolean, default: false
-
-  defp saved_reset_count_badge(
-         %{saved_resets: %{reported?: true, available_count: count}} = assigns
-       )
-       when is_integer(count) and count > 0 do
-    assigns =
-      assigns
-      |> assign(:badge_class, saved_reset_count_badge_class(assigns.saved_reset_policy))
-      |> assign(:badge_icon_class, saved_reset_count_badge_icon_class(assigns.saved_reset_policy))
-      |> assign(:aria_label, saved_reset_count_badge_aria_label(assigns.saved_resets))
-
-    ~H"""
-    <button
-      id={@id}
-      type="button"
-      data-role="upstream-saved-reset-count-badge"
-      class={@badge_class}
-      aria-label={@aria_label}
-      aria-controls="saved-reset-policy-dialog"
-      aria-haspopup="dialog"
-      phx-click="open_saved_reset_policy"
-      phx-value-id={@identity_id}
-      disabled={@disabled}
-    >
-      <.icon name="hero-battery-100" class={@badge_icon_class} />
-      <span>{@saved_resets.available_count}</span>
-    </button>
-    """
-  end
-
-  defp saved_reset_count_badge(assigns) do
-    ~H"""
-    """
-  end
-
-  defp saved_reset_count_badge_class(policy), do: saved_reset_count_badge_tone_class(policy)
-
-  defp saved_reset_count_badge_tone_class(%{enabled?: true}) do
-    [
-      saved_reset_count_badge_base_class(),
-      "border-success/40 bg-success/15 text-success hover:bg-success/20 dark:border-success/60 dark:bg-success/20 dark:text-success"
-    ]
-  end
-
-  defp saved_reset_count_badge_tone_class(_policy) do
-    [
-      saved_reset_count_badge_base_class(),
-      "border-violet-500/50 bg-violet-500/10 text-violet-700 hover:bg-violet-500/15 dark:border-violet-300/50 dark:bg-violet-400/10 dark:text-violet-200"
-    ]
-  end
-
-  defp saved_reset_count_badge_base_class do
-    "inline-flex cursor-pointer items-center rounded-full border px-2.5 py-1 text-xs font-medium leading-none transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary disabled:cursor-default disabled:opacity-70 gap-1.5 self-center whitespace-nowrap tabular-nums"
-  end
-
-  defp saved_reset_count_badge_icon_class(%{enabled?: true}) do
-    "size-3 shrink-0 text-current"
-  end
-
-  defp saved_reset_count_badge_icon_class(_policy) do
-    "size-3 shrink-0 text-violet-600 dark:text-violet-300"
-  end
-
   defp pool_assignment_summary_label([_assignment]), do: "1 routing lane"
   defp pool_assignment_summary_label(assignments), do: "#{length(assignments)} routing lanes"
 
@@ -591,143 +530,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   defp pools_footer_trigger_base_class do
     "absolute inset-x-1 inset-y-[-0.35rem] z-20 cursor-pointer rounded border transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
   end
-
-  defp saved_reset_count_badge_aria_label(saved_resets),
-    do: "Open saved reset bank: #{saved_resets.label}"
-
-  attr :id, :string, required: true
-  attr :saved_resets, :map, required: true
-  attr :saved_reset_policy, :map, required: true
-  attr :class, :any, default: nil
-
-  defp saved_reset_meter(assigns) do
-    assigns =
-      assigns
-      |> assign(:segments, saved_reset_meter_segments(assigns.saved_resets))
-      |> assign(:meter_max, saved_reset_meter_max(assigns.saved_resets))
-      |> assign(:meter_value, saved_reset_meter_value(assigns.saved_resets))
-      |> assign(:meter_label, saved_reset_meter_label(assigns.saved_resets))
-      |> assign(:meter_count_label, saved_reset_meter_count_label(assigns.saved_resets))
-      |> assign(:meter_reset_label, saved_reset_meter_reset_label(assigns.saved_resets))
-      |> assign(:meter_policy_active, saved_reset_policy_active?(assigns.saved_reset_policy))
-
-    ~H"""
-    <div id={@id} data-role="upstream-saved-reset-meter" class={["grid gap-1.5", @class]}>
-      <div class="flex min-w-0 items-center justify-between gap-3 text-xs">
-        <span
-          data-role="upstream-saved-reset-meter-title"
-          class="min-w-0 truncate font-medium text-base-content"
-        >
-          Banked Resets
-        </span>
-        <span
-          data-role="upstream-saved-reset-meter-count"
-          class={saved_reset_meter_count_class(@saved_reset_policy)}
-        >
-          {@meter_count_label}
-        </span>
-      </div>
-      <div
-        id={"#{@id}-bar"}
-        role="meter"
-        aria-valuemin="0"
-        aria-valuemax={@meter_max}
-        aria-valuenow={@meter_value}
-        aria-label={@meter_label}
-        class="grid grid-cols-5 gap-1"
-      >
-        <span
-          :for={segment <- @segments}
-          id={"#{@id}-segment-#{segment.index}"}
-          data-role="upstream-saved-reset-meter-segment"
-          aria-hidden="true"
-          class={saved_reset_meter_segment_class(segment, @saved_reset_policy)}
-        ></span>
-      </div>
-      <div class="flex items-center justify-between gap-3 text-[11px] text-base-content/60">
-        <span
-          id={"#{@id}-policy"}
-          data-role="upstream-saved-reset-meter-policy"
-          class="min-w-0 truncate"
-        >
-          Auto redeem
-          <span :if={@meter_policy_active} class="font-medium text-violet-700 dark:text-violet-200">
-            active
-          </span>
-          <span :if={!@meter_policy_active}>inactive</span>
-        </span>
-        <span
-          :if={@meter_reset_label}
-          id={"#{@id}-reset"}
-          class="inline-flex shrink-0 items-center gap-1"
-          title={@saved_resets.next_expires_title}
-        >
-          <.icon name="hero-clock" class="size-3 shrink-0" />
-          <span class="truncate">{@meter_reset_label}</span>
-        </span>
-      </div>
-    </div>
-    """
-  end
-
-  defp saved_reset_meter_segments(saved_resets) do
-    filled_count = min(saved_reset_meter_value(saved_resets), 5)
-
-    Enum.map(1..5, fn index ->
-      %{index: index, filled?: index <= filled_count}
-    end)
-  end
-
-  defp saved_reset_meter_value(%{available_count: count}) when is_integer(count) and count >= 0,
-    do: count
-
-  defp saved_reset_meter_value(_saved_resets), do: 0
-
-  defp saved_reset_meter_max(saved_resets), do: max(saved_reset_meter_value(saved_resets), 5)
-
-  defp saved_reset_meter_label(%{label: label}) when is_binary(label) and label != "",
-    do: label
-
-  defp saved_reset_meter_label(saved_resets),
-    do: "#{saved_reset_meter_value(saved_resets)} saved resets"
-
-  defp saved_reset_meter_count_label(%{available_count: count})
-       when is_integer(count) and count >= 0,
-       do: "x#{count}"
-
-  defp saved_reset_meter_count_label(saved_resets),
-    do: "x#{saved_reset_meter_value(saved_resets)}"
-
-  defp saved_reset_meter_reset_label(%{next_expires_at: expires_at}) do
-    case ResetFormatting.parse_datetime(expires_at) do
-      %DateTime{} = expires_at -> reset_time_left_label(expires_at)
-      nil -> nil
-    end
-  end
-
-  defp saved_reset_meter_reset_label(_saved_resets), do: nil
-
-  defp reset_time_left_label(%DateTime{} = expires_at) do
-    seconds_until_expiration = DateTime.diff(expires_at, DateTime.utc_now(), :second)
-
-    if seconds_until_expiration > 0 do
-      "in #{ResetFormatting.format_reset_duration(seconds_until_expiration)}"
-    else
-      "expired"
-    end
-  end
-
-  defp saved_reset_policy_active?(%{enabled?: true}), do: true
-  defp saved_reset_policy_active?(_policy), do: false
-
-  defp saved_reset_meter_count_class(_policy),
-    do: "shrink-0 tabular-nums font-medium text-violet-700 dark:text-violet-200"
-
-  defp saved_reset_meter_segment_class(%{filled?: true}, _policy),
-    do: "h-1.5 rounded-full bg-violet-500/80 dark:bg-violet-300/80"
-
-  defp saved_reset_meter_segment_class(_segment, _policy),
-    do: "h-1.5 rounded-full bg-base-300/70"
 
   attr :account, :map, required: true
   attr :routing_readiness, :map, required: true
@@ -766,180 +568,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
       </div>
     </div>
     """
-  end
-
-  attr :account, :map, required: true
-
-  defp upstream_refresh_status(assigns) do
-    ~H"""
-    <div class="hidden">
-      <div id={"upstream-account-#{@account.identity.id}-refresh-status"}>
-        Refresh: {@account.refresh_status}
-        <span :if={@account.refresh_job_state}>
-          · job {@account.refresh_job_state}
-        </span>
-      </div>
-    </div>
-    """
-  end
-
-  attr :account, :map, required: true
-  attr :routing_readiness, :map, required: true
-
-  defp upstream_selector_contracts(assigns) do
-    ~H"""
-    <div class="hidden" data-role="upstream-account-selector-contracts">
-      <section id={"upstream-account-#{@account.identity.id}-routing-readiness-contract"}>
-        routing readiness
-        <span id={"upstream-account-#{@account.identity.id}-routing-readiness-state"}>
-          {@routing_readiness.state}
-        </span>
-        <span id={"upstream-account-#{@account.identity.id}-routing-readiness-label"}>
-          {@routing_readiness.label}
-        </span>
-        <span id={"upstream-account-#{@account.identity.id}-routing-readiness-reason"}>
-          {@routing_readiness.reason}
-        </span>
-      </section>
-
-      <section id={"upstream-account-#{@account.identity.id}-quota-readiness-contract"}>
-        quota readiness
-        <span id={"upstream-account-#{@account.identity.id}-quota-readiness-state"}>
-          {@account.quota_readiness.state}
-        </span>
-        <span id={"upstream-account-#{@account.identity.id}-quota-readiness-label"}>
-          {@account.quota_readiness.label}
-        </span>
-      </section>
-
-      <section id={"upstream-account-#{@account.identity.id}-auth-health"}>
-        Auth health
-        <span id={"upstream-account-#{@account.identity.id}-auth-fresh"}>
-          {@account.auth_fresh_label}
-        </span>
-        <span id={"upstream-account-#{@account.identity.id}-auth-verified"}>
-          {@account.auth_verified_label}
-        </span>
-        <span id={"upstream-account-#{@account.identity.id}-access-token"}>
-          {@account.access_token_label}
-        </span>
-        <span id={"upstream-account-#{@account.identity.id}-token-refresh"}>
-          {@account.token_refresh_label}
-        </span>
-      </section>
-
-      <section>
-        quota refresh {@account.quota_refresh_status}
-      </section>
-
-      <section>
-        <div
-          :for={assignment <- @account.assignments}
-          id={"upstream-account-#{@account.identity.id}-assignment-#{assignment.id}"}
-        >
-          <span>{assignment.pool_label}</span>
-          <span>{assignment.assignment_label}</span>
-          <span>{assignment.status}</span>
-          <span>{assignment.eligibility_status}</span>
-          <span id={"upstream-account-#{@account.identity.id}-assignment-#{assignment.id}-quota-priming"}>
-            {assignment.quota_priming_label}
-          </span>
-        </div>
-        <p :if={@account.assignments == []}>No active Pool assignments</p>
-      </section>
-    </div>
-    """
-  end
-
-  attr :id, :string, required: true
-  attr :content_id, :string, required: true
-  attr :token_burn, :map, required: true
-
-  defp token_burn_popover(assigns) do
-    ~H"""
-    <span
-      id={"#{@id}-popover"}
-      data-role="upstream-token-burn-popover"
-      class="dropdown dropdown-end dropdown-bottom inline-flex justify-end"
-    >
-      <button
-        id={@id}
-        type="button"
-        class="inline-flex cursor-pointer items-center justify-end gap-1 rounded px-1 text-xs font-medium text-base-content/70 transition-colors hover:bg-base-300/60 hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
-        tabindex="0"
-        aria-label="Token burn calculation"
-        aria-haspopup="true"
-        aria-describedby={@content_id}
-      >
-        <.icon name="hero-fire" class={token_burn_icon_class(@token_burn)} />
-        <span>{@token_burn.label}</span>
-      </button>
-      <span
-        id={@content_id}
-        role="tooltip"
-        tabindex="0"
-        class="dropdown-content z-50 mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-3 text-left text-xs font-normal leading-5 text-base-content/70 shadow-xl sm:w-72"
-      >
-        <span class="block">
-          Compares settled tokens from the last 5 minutes with the previous 1 hour baseline.
-        </span>
-        <span class="mt-2 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1">
-          <span class="font-medium text-base-content/55">Last 5 minutes</span>
-          <span class="text-base-content">{token_burn_recent_token_label(@token_burn)}</span>
-          <span class="font-medium text-base-content/55">Previous 1 hour</span>
-          <span class="text-base-content">{token_burn_baseline_token_label(@token_burn)}</span>
-        </span>
-      </span>
-    </span>
-    """
-  end
-
-  attr :id, :string, required: true
-  attr :limit, :map, required: true
-
-  defp quota_limit_row(assigns) do
-    ~H"""
-    <div id={@id} data-role="upstream-limit-chart" class="grid min-w-0 gap-1.5">
-      <div class="flex min-w-0 items-center justify-between gap-3 text-xs">
-        <span data-role="upstream-limit-title" class="min-w-0 truncate font-medium text-base-content">
-          {@limit.label}
-        </span>
-        <span class={[quota_limit_percent_class(@limit), "shrink-0"]}>{@limit.percent_label}</span>
-      </div>
-      <progress
-        id={"#{@id}-progress"}
-        data-role="upstream-limit-progress"
-        aria-label={"#{@limit.label} remaining #{@limit.percent_label}"}
-        class={quota_limit_progress_class(@limit)}
-        value={@limit.percent_value}
-        max="100"
-      >
-        {@limit.percent_label}
-      </progress>
-      <div
-        :if={quota_limit_details?(@limit)}
-        class="flex items-center justify-between gap-3 text-[11px] text-base-content/60"
-      >
-        <span :if={@limit.count_label} id={"#{@id}-count"} class="tabular-nums">
-          {@limit.count_label}
-        </span>
-        <span :if={is_nil(@limit.count_label)} aria-hidden="true"></span>
-        <span
-          :if={@limit.reset_label}
-          id={"#{@id}-reset"}
-          class="inline-flex items-center gap-1"
-          title={@limit.reset_title}
-        >
-          <.icon name="hero-clock" class="size-3" />
-          <span>{@limit.reset_label}</span>
-        </span>
-      </div>
-    </div>
-    """
-  end
-
-  defp quota_limit_details?(%{count_label: count_label, reset_label: reset_label}) do
-    present_string?(count_label) or present_string?(reset_label)
   end
 
   @spec routing_readiness(map()) :: map()
@@ -988,65 +616,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   end
 
   defp lifecycle_blocker_warning(_account, _routing_readiness), do: nil
-
-  defp present_string?(value) when is_binary(value), do: String.trim(value) != ""
-  defp present_string?(_value), do: false
-
-  defp quota_limit_percent_class(%{percent: %Decimal{} = percent}) do
-    cond do
-      Decimal.compare(percent, Decimal.new(70)) != :lt -> "tabular-nums font-medium text-success"
-      Decimal.compare(percent, Decimal.new(30)) != :lt -> "tabular-nums font-medium text-warning"
-      true -> "tabular-nums font-medium text-error"
-    end
-  end
-
-  defp quota_limit_percent_class(_limit), do: "tabular-nums font-medium text-base-content/50"
-
-  defp quota_limit_progress_class(%{percent: %Decimal{} = percent}) do
-    tone_class =
-      cond do
-        Decimal.compare(percent, Decimal.new(70)) != :lt -> "progress-success"
-        Decimal.compare(percent, Decimal.new(30)) != :lt -> "progress-warning"
-        true -> "progress-error"
-      end
-
-    "progress admin-live-progress #{tone_class} h-1.5 w-full"
-  end
-
-  defp quota_limit_progress_class(_limit),
-    do: "progress admin-live-progress progress-neutral h-1.5 w-full"
-
-  defp token_burn(%{token_burn: token_burn}) when is_map(token_burn), do: token_burn
-
-  defp token_burn(_account) do
-    %{
-      level: 0,
-      label: "x0",
-      title: "last 5m: 0 tokens; previous 1h: 0 tokens",
-      recent_tokens: 0,
-      baseline_tokens: 0
-    }
-  end
-
-  defp token_burn_recent_token_label(%{recent_tokens: tokens})
-       when is_integer(tokens) and tokens >= 0 do
-    "#{Format.token_count(tokens)} tokens"
-  end
-
-  defp token_burn_recent_token_label(_token_burn), do: "0 tokens"
-
-  defp token_burn_baseline_token_label(%{baseline_tokens: tokens})
-       when is_integer(tokens) and tokens >= 0 do
-    "#{Format.token_count(tokens)} tokens"
-  end
-
-  defp token_burn_baseline_token_label(_token_burn), do: "0 tokens"
-
-  defp token_burn_icon_class(%{level: 0}), do: "size-3.5 text-base-content/35"
-  defp token_burn_icon_class(%{level: level}) when level in 1..2, do: "size-3.5 text-warning/70"
-  defp token_burn_icon_class(%{level: level}) when level in 3..4, do: "size-3.5 text-warning"
-  defp token_burn_icon_class(%{level: 5}), do: "size-3.5 text-error"
-  defp token_burn_icon_class(_token_burn), do: "size-3.5 text-base-content/35"
 
   @spec workspace_context_label(map()) :: String.t()
   defp workspace_context_label(%{workspace_label: label}) when is_binary(label) and label != "",
