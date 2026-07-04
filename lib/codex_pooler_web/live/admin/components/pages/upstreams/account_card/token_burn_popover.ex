@@ -7,11 +7,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.TokenBurnPopov
 
   attr :id, :string, required: true
   attr :content_id, :string, required: true
-  attr :account, :map, required: true
+  attr :token_burn, :map, required: true
 
   def token_burn_popover(assigns) do
-    assigns = assign(assigns, :token_burn, token_burn(assigns.account))
-
     ~H"""
     <span
       id={"#{@id}-popover"}
@@ -48,18 +46,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.TokenBurnPopov
       </span>
     </span>
     """
-  end
-
-  defp token_burn(%{token_burn: token_burn}) when is_map(token_burn), do: token_burn
-
-  defp token_burn(_account) do
-    %{
-      level: 0,
-      label: "x0",
-      title: "last 5m: 0 tokens; previous 1h: 0 tokens",
-      recent_tokens: 0,
-      baseline_tokens: 0
-    }
   end
 
   defp token_burn_recent_token_label(%{recent_tokens: tokens})

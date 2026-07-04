@@ -148,7 +148,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
                 <TokenBurnPopover.token_burn_popover
                   id={"upstream-account-#{@account.identity.id}-token-burn-value"}
                   content_id={"upstream-account-#{@account.identity.id}-token-burn-content"}
-                  account={@account}
+                  token_burn={@account.token_burn}
                 />
               </div>
             </div>

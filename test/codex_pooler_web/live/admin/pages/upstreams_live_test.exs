@@ -4437,6 +4437,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       reauth_required?: status == "reauth_required",
       reauth_reason_code: nil,
       reauth_reason_message: nil,
+      token_burn: %{
+        level: 0,
+        label: "x0",
+        title: "last 5m: 0 tokens; previous 1h: 0 tokens",
+        recent_tokens: 0,
+        baseline_tokens: 0
+      },
       assignments: assignments,
       quota_readiness: %{
         state: "missing_evidence",
