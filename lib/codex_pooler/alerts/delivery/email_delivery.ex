@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.EmailDelivery do
+defmodule CodexPooler.Alerts.Delivery.EmailDelivery do
   @moduledoc false
 
   import Ecto.Query

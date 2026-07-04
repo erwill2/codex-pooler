@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.SavedResetFirstSeenEvaluatorTest do
+defmodule CodexPooler.Alerts.Evaluation.SavedResetFirstSeenEvaluatorTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.PoolerFixtures

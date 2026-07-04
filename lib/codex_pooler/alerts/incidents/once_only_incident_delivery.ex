@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.OnceOnlyIncidentDelivery do
+defmodule CodexPooler.Alerts.Incidents.OnceOnlyIncidentDelivery do
   @moduledoc false
 
   import Ecto.Query

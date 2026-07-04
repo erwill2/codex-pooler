@@ -15,7 +15,7 @@ defmodule CodexPooler.Jobs.AlertEvaluationWorker do
     ]
 
   alias CodexPooler.Alerts
-  alias CodexPooler.Alerts.Evaluator
+  alias CodexPooler.Alerts.Evaluation.Evaluator
   alias CodexPooler.Alerts.Schemas.AlertIncident
 
   @saved_reset_first_seen_rule_kind "upstream_saved_reset_banked_first_seen"

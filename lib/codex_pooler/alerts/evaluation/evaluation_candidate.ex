@@ -1,9 +1,9 @@
-defmodule CodexPooler.Alerts.EvaluationCandidate do
+defmodule CodexPooler.Alerts.Evaluation.EvaluationCandidate do
   @moduledoc """
   Builds generic alert evaluation match/clear candidates and stable dedupe keys.
   """
 
-  alias CodexPooler.Alerts.IncidentLifecycle
+  alias CodexPooler.Alerts.Incidents.IncidentLifecycle
   alias CodexPooler.Alerts.Schemas.AlertRule
   alias CodexPooler.Upstreams.Quota
 

@@ -1,8 +1,8 @@
-defmodule CodexPooler.Alerts.WebhookPayloadTest do
+defmodule CodexPooler.Alerts.Delivery.WebhookPayloadTest do
   use ExUnit.Case, async: true
 
   alias CodexPooler.Alerts.Schemas.{AlertChannel, AlertDeliveryAttempt, AlertIncident}
-  alias CodexPooler.Alerts.WebhookPayload
+  alias CodexPooler.Alerts.Delivery.WebhookPayload
 
   @raw_forbidden_values [
     "raw prompt sentinel",

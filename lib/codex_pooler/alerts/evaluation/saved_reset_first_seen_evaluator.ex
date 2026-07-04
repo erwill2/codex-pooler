@@ -1,10 +1,10 @@
-defmodule CodexPooler.Alerts.SavedResetFirstSeenEvaluator do
+defmodule CodexPooler.Alerts.Evaluation.SavedResetFirstSeenEvaluator do
   @moduledoc """
   Builds metadata-only alert candidates for first-seen banked saved reset evidence.
   """
 
-  alias CodexPooler.Alerts.EvaluationCandidate
-  alias CodexPooler.Alerts.IncidentLifecycle
+  alias CodexPooler.Alerts.Evaluation.EvaluationCandidate
+  alias CodexPooler.Alerts.Incidents.IncidentLifecycle
   alias CodexPooler.Alerts.Schemas.AlertRule
   alias CodexPooler.Upstreams.SavedResets
 

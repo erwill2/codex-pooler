@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.WebhookPayload do
+defmodule CodexPooler.Alerts.Delivery.WebhookPayload do
   @moduledoc false
 
   alias CodexPooler.Accounting

@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.IncidentNotifications do
+defmodule CodexPooler.Alerts.Incidents.IncidentNotifications do
   @moduledoc false
 
   import Ecto.Query
@@ -7,7 +7,7 @@ defmodule CodexPooler.Alerts.IncidentNotifications do
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Alerts.AuditLog, as: AlertAudit
   alias CodexPooler.Alerts.Authorization
-  alias CodexPooler.Alerts.NotificationEvents
+  alias CodexPooler.Alerts.Incidents.NotificationEvents
 
   alias CodexPooler.Alerts.Schemas.{
     AlertIncident,

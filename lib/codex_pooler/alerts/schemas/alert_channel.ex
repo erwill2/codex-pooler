@@ -4,7 +4,7 @@ defmodule CodexPooler.Alerts.Schemas.AlertChannel do
 
   import Ecto.Changeset
 
-  alias CodexPooler.Alerts.ChannelEndpoint
+  alias CodexPooler.Alerts.Delivery.ChannelEndpoint
   alias CodexPooler.InstanceSettings.AppSecretCrypto
 
   @derive {Inspect,

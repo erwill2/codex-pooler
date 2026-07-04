@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.NotificationEvents do
+defmodule CodexPooler.Alerts.Incidents.NotificationEvents do
   @moduledoc false
 
   import Ecto.Query

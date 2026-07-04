@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.WebhookSigning do
+defmodule CodexPooler.Alerts.Delivery.WebhookSigning do
   @moduledoc false
 
   @type signature :: String.t()

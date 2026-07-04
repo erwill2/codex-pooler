@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.OnceOnlyIncidentTargets do
+defmodule CodexPooler.Alerts.Incidents.OnceOnlyIncidentTargets do
   @moduledoc false
 
   import Ecto.Query
@@ -6,7 +6,7 @@ defmodule CodexPooler.Alerts.OnceOnlyIncidentTargets do
   alias CodexPooler.Alerts.Schemas.{AlertIncident, AlertIncidentTarget}
   alias CodexPooler.Repo
 
-  @type target_input :: CodexPooler.Alerts.IncidentMatchInput.target_input()
+  @type target_input :: CodexPooler.Alerts.Incidents.IncidentMatchInput.target_input()
 
   @spec insert_missing(AlertIncident.t(), [target_input()], DateTime.t()) ::
           {:ok, [AlertIncidentTarget.t()]} | {:error, Ecto.Changeset.t()}

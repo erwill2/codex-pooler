@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.EvaluatorProjectionReuseTest do
+defmodule CodexPooler.Alerts.Evaluation.EvaluatorProjectionReuseTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.PoolerFixtures

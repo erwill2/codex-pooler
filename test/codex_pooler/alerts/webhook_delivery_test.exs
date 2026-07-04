@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.WebhookDeliveryTest do
+defmodule CodexPooler.Alerts.Delivery.WebhookDeliveryTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.AccountsFixtures
@@ -7,7 +7,7 @@ defmodule CodexPooler.Alerts.WebhookDeliveryTest do
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Alerts
   alias CodexPooler.Alerts.Schemas.{AlertChannel, AlertDeliveryAttempt, AlertRuleChannel}
-  alias CodexPooler.Alerts.WebhookDelivery
+  alias CodexPooler.Alerts.Delivery.WebhookDelivery
   alias CodexPooler.Repo
 
   setup do

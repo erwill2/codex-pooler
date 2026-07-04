@@ -1,9 +1,9 @@
-defmodule CodexPooler.Alerts.RuleEvaluation do
+defmodule CodexPooler.Alerts.Rules.RuleEvaluation do
   @moduledoc false
 
   import Ecto.Query
 
-  alias CodexPooler.Alerts.Evaluator
+  alias CodexPooler.Alerts.Evaluation.Evaluator
   alias CodexPooler.Alerts.Schemas.AlertRule
   alias CodexPooler.Repo
 

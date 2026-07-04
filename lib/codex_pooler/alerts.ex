@@ -5,14 +5,14 @@ defmodule CodexPooler.Alerts do
 
   alias CodexPooler.Alerts.Authorization
   alias CodexPooler.Alerts.ChannelManagement
-  alias CodexPooler.Alerts.DeliveryScheduling
-  alias CodexPooler.Alerts.EmailDelivery
-  alias CodexPooler.Alerts.Evaluator
-  alias CodexPooler.Alerts.IncidentLifecycle
-  alias CodexPooler.Alerts.IncidentNotifications
-  alias CodexPooler.Alerts.RuleEvaluation
-  alias CodexPooler.Alerts.RuleManagement
-  alias CodexPooler.Alerts.WebhookDelivery
+  alias CodexPooler.Alerts.Delivery.DeliveryScheduling
+  alias CodexPooler.Alerts.Delivery.EmailDelivery
+  alias CodexPooler.Alerts.Evaluation.Evaluator
+  alias CodexPooler.Alerts.Incidents.IncidentLifecycle
+  alias CodexPooler.Alerts.Incidents.IncidentNotifications
+  alias CodexPooler.Alerts.Rules.RuleEvaluation
+  alias CodexPooler.Alerts.Rules.RuleManagement
+  alias CodexPooler.Alerts.Delivery.WebhookDelivery
 
   alias CodexPooler.Alerts.Schemas.{
     AlertChannel,

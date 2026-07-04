@@ -10,7 +10,7 @@ defmodule CodexPoolerWeb.Admin.NotificationCenterHooks do
 
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Alerts
-  alias CodexPooler.Alerts.NotificationEvents
+  alias CodexPooler.Alerts.Incidents.NotificationEvents
   alias CodexPoolerWeb.Admin.AlertNotificationsReadModel
   alias Phoenix.LiveView.Socket
 

@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.IncidentLifecycleTest do
+defmodule CodexPooler.Alerts.Incidents.IncidentLifecycleTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.AccountsFixtures

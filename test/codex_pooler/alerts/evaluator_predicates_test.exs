@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.EvaluatorPredicatesTest do
+defmodule CodexPooler.Alerts.Evaluation.EvaluatorPredicatesTest do
   use CodexPooler.DataCase, async: false
 
   import CodexPooler.PoolerFixtures

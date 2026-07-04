@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.WebhookDelivery do
+defmodule CodexPooler.Alerts.Delivery.WebhookDelivery do
   @moduledoc false
 
   import Ecto.Query
@@ -14,7 +14,7 @@ defmodule CodexPooler.Alerts.WebhookDelivery do
     AlertRuleChannel
   }
 
-  alias CodexPooler.Alerts.{WebhookPayload, WebhookSigning}
+  alias CodexPooler.Alerts.Delivery.{WebhookPayload, WebhookSigning}
   alias CodexPooler.InstanceSettings.AppSecretCrypto
   alias CodexPooler.Repo
   alias CodexPooler.TransportFailureReason

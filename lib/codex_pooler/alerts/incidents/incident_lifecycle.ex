@@ -1,17 +1,17 @@
-defmodule CodexPooler.Alerts.IncidentLifecycle do
+defmodule CodexPooler.Alerts.Incidents.IncidentLifecycle do
   @moduledoc false
 
   import Ecto.Query
 
-  alias CodexPooler.Alerts.IncidentMatchInput
-  alias CodexPooler.Alerts.NotificationEvents
+  alias CodexPooler.Alerts.Incidents.IncidentMatchInput
+  alias CodexPooler.Alerts.Incidents.NotificationEvents
 
   alias CodexPooler.Alerts.Schemas.{
     AlertIncident,
     AlertIncidentTarget
   }
 
-  alias CodexPooler.Alerts.OnceOnlyIncidentLifecycle
+  alias CodexPooler.Alerts.Incidents.OnceOnlyIncidentLifecycle
   alias CodexPooler.Repo
 
   @unresolved_states [AlertIncident.open_state(), AlertIncident.acknowledged_state()]

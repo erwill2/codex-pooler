@@ -15,8 +15,8 @@ defmodule CodexPooler.Jobs.AlertDeliveryWorker do
     ]
 
   alias CodexPooler.Alerts
-  alias CodexPooler.Alerts.EmailDelivery
-  alias CodexPooler.Alerts.WebhookDelivery
+  alias CodexPooler.Alerts.Delivery.EmailDelivery
+  alias CodexPooler.Alerts.Delivery.WebhookDelivery
 
   @type delivery_error ::
           :invalid_alert_delivery_args

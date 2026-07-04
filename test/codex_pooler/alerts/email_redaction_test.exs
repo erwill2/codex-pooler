@@ -4,7 +4,7 @@ defmodule CodexPooler.Alerts.EmailRedactionTest do
   import CodexPooler.PoolerFixtures
   import Swoosh.TestAssertions
 
-  alias CodexPooler.Alerts.EmailDelivery
+  alias CodexPooler.Alerts.Delivery.EmailDelivery
 
   alias CodexPooler.Alerts.Schemas.{
     AlertChannel,

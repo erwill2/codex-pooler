@@ -7,7 +7,7 @@ defmodule CodexPooler.Jobs.AlertDeliveryJobTest do
 
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Alerts
-  alias CodexPooler.Alerts.WebhookSigning
+  alias CodexPooler.Alerts.Delivery.WebhookSigning
 
   alias CodexPooler.Alerts.Schemas.{
     AlertChannel,

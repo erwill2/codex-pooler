@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.IncidentMatchInput do
+defmodule CodexPooler.Alerts.Incidents.IncidentMatchInput do
   @moduledoc false
 
   alias CodexPooler.Accounting

@@ -1,10 +1,10 @@
-defmodule CodexPooler.Alerts.DeliveryScheduling do
+defmodule CodexPooler.Alerts.Delivery.DeliveryScheduling do
   @moduledoc false
 
   import Ecto.Query
 
-  alias CodexPooler.Alerts.EmailDelivery
-  alias CodexPooler.Alerts.WebhookDelivery
+  alias CodexPooler.Alerts.Delivery.EmailDelivery
+  alias CodexPooler.Alerts.Delivery.WebhookDelivery
 
   alias CodexPooler.Alerts.Schemas.{
     AlertChannel,

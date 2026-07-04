@@ -1,17 +1,17 @@
-defmodule CodexPooler.Alerts.Evaluator do
+defmodule CodexPooler.Alerts.Evaluation.Evaluator do
   @moduledoc """
   Metadata-only alert rule evaluator built from persisted pool, upstream, and quota evidence.
   """
 
   import Ecto.Query
 
-  alias CodexPooler.Alerts.{
+  alias CodexPooler.Alerts.Evaluation.{
     EvaluationCandidate,
     EvaluationProjection,
-    IncidentLifecycle,
     SavedResetFirstSeenEvaluator
   }
 
+  alias CodexPooler.Alerts.Incidents.IncidentLifecycle
   alias CodexPooler.Alerts.Schemas.AlertRule
   alias CodexPooler.Repo
 

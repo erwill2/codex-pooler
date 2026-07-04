@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.EvaluationProjection do
+defmodule CodexPooler.Alerts.Evaluation.EvaluationProjection do
   @moduledoc """
   Builds persisted-state alert evaluation projections for Pools and upstream assignments.
   """

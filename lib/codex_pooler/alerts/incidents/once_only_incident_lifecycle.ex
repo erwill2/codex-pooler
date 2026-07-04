@@ -1,9 +1,9 @@
-defmodule CodexPooler.Alerts.OnceOnlyIncidentLifecycle do
+defmodule CodexPooler.Alerts.Incidents.OnceOnlyIncidentLifecycle do
   @moduledoc false
 
   import Ecto.Query
 
-  alias CodexPooler.Alerts.{
+  alias CodexPooler.Alerts.Incidents.{
     IncidentMatchInput,
     NotificationEvents,
     OnceOnlyIncidentDelivery,

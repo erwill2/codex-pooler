@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.ChannelEndpoint do
+defmodule CodexPooler.Alerts.Delivery.ChannelEndpoint do
   @moduledoc false
 
   alias CodexPooler.InstanceSettings.AppSecretCrypto

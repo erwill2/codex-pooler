@@ -1,4 +1,4 @@
-defmodule CodexPooler.Alerts.RuleManagement do
+defmodule CodexPooler.Alerts.Rules.RuleManagement do
   @moduledoc false
 
   import Ecto.Query
