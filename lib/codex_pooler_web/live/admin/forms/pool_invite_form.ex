@@ -40,6 +40,17 @@ defmodule CodexPoolerWeb.Admin.PoolInviteForm do
     |> Map.put(:action, :validate)
   end
 
+  @spec reinvite_params(String.t(), [term()]) :: map()
+  def reinvite_params(pool_id, candidates \\ []) when is_binary(pool_id) do
+    pool_id = String.trim(pool_id)
+    params = %{"create" => "1", "pool_id" => pool_id}
+
+    case reinvite_email(candidates, pool_id) do
+      nil -> params
+      invited_email -> Map.put(params, "invited_email", invited_email)
+    end
+  end
+
   @spec send_email?(map(), boolean()) :: boolean()
   def send_email?(params, true), do: params["send_email"] in ["true", true]
   def send_email?(_params, false), do: false
@@ -63,4 +74,24 @@ defmodule CodexPoolerWeb.Admin.PoolInviteForm do
     do: Ecto.Changeset.add_error(changeset, :pool_id, "must be an active Pool")
 
   defp validate_selected_pool(changeset, _pool), do: changeset
+
+  defp reinvite_email(candidates, pool_id) do
+    candidates
+    |> Enum.map(&present_string/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.find(&valid_reinvite_email?(&1, pool_id))
+  end
+
+  defp valid_reinvite_email?(candidate, pool_id) do
+    %{"pool_id" => pool_id, "invited_email" => candidate, "send_email" => "false"}
+    |> changeset(%{id: pool_id})
+    |> Map.fetch!(:valid?)
+  end
+
+  defp present_string(value) when is_binary(value) do
+    value = String.trim(value)
+    if value == "", do: nil, else: value
+  end
+
+  defp present_string(_value), do: nil
 end
