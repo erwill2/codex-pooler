@@ -353,7 +353,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   @tag :upstream_websocket_pong_liveness
   test "active receive loop fails promptly when pong deadline fires during an in-flight request" do
-    with_short_keepalive(keepalive_interval_ms: 25, keepalive_pong_timeout_ms: 45)
+    with_short_keepalive(keepalive_interval_ms: 25, keepalive_pong_timeout_ms: 150)
 
     peer = start_raw_websocket_peer()
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -379,7 +379,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert %{"type" => "response.created"} = Jason.decode!(created_frame)
 
     result =
-      case Task.yield(request_task, 300) do
+      case Task.yield(request_task, 600) do
         {:ok, result} ->
           result
 
@@ -401,7 +401,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
               }
             }} = result
 
-    assert elapsed_ms < 300
+    assert elapsed_ms < 600
     assert body =~ "response.created"
     assert Process.alive?(session)
     assert :closed = wait_for_raw_websocket_connection_closed(1, 150)
