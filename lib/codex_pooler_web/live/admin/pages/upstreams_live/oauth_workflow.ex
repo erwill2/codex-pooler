@@ -4,8 +4,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLive.OAuthWorkflow do
   import Phoenix.Component, only: [assign: 2, assign: 3, to_form: 2]
   import Phoenix.LiveView, only: [put_flash: 3]
 
-  alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
   alias CodexPooler.Upstreams.Auth.OAuthCallback
+  alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
   alias CodexPooler.Upstreams.Schemas.OAuthFlow
   alias CodexPoolerWeb.Admin.UpstreamsLive.WorkflowError
 

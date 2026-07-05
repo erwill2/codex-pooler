@@ -17,8 +17,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   alias CodexPooler.Gateway.Routing.BridgeRing.{Metadata, Status}
   alias CodexPooler.Gateway.Routing.RoutePlanInput
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
-  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.{Pool, RoutingSettings}
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}

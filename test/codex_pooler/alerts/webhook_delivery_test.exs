@@ -6,8 +6,8 @@ defmodule CodexPooler.Alerts.Delivery.WebhookDeliveryTest do
 
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Alerts
-  alias CodexPooler.Alerts.Schemas.{AlertChannel, AlertDeliveryAttempt, AlertRuleChannel}
   alias CodexPooler.Alerts.Delivery.WebhookDelivery
+  alias CodexPooler.Alerts.Schemas.{AlertChannel, AlertDeliveryAttempt, AlertRuleChannel}
   alias CodexPooler.Repo
 
   setup do

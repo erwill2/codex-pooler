@@ -3,8 +3,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive.OAuthRelinkWorkflow do
 
   import Phoenix.Component, only: [assign: 2, assign: 3, to_form: 2]
 
-  alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
   alias CodexPooler.Upstreams.Auth.OAuthCallback
+  alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
   alias CodexPooler.Upstreams.Schemas.OAuthFlow
 
   @reason "admin_upstream_cockpit"

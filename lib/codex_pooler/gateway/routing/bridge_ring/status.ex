@@ -5,8 +5,8 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Status do
 
   alias CodexPooler.Gateway.Persistence.{BridgeAffinity, BridgeDemotion, RoutingCircuitState}
   alias CodexPooler.Gateway.Routing.BridgeRing
-  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.{Pool, RoutingSettings}
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Repo
 
   @default_strategy "bridge_ring"

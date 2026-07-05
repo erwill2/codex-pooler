@@ -4,8 +4,8 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
   alias CodexPooler.Access
   alias CodexPooler.Admin.Stats
   alias CodexPooler.Pools
-  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.Pool
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Format

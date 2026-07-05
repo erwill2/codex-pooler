@@ -10,7 +10,6 @@ defmodule CodexPooler.Access.InviteOnboarding do
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
-  alias CodexPooler.Upstreams.SecretStore, as: UpstreamSecretStore
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.CodexAuth
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
@@ -18,6 +17,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
   alias CodexPooler.Upstreams.Secrets
+  alias CodexPooler.Upstreams.SecretStore, as: UpstreamSecretStore
 
   @type invite_error :: {:error, term()}
   @type pending_account :: %{

@@ -13,9 +13,9 @@ defmodule CodexPooler.Upstreams do
   alias CodexPooler.Upstreams.{
     Assignments,
     Import,
+    OAuth,
     SavedResetPolicy,
     SavedResetRedemptionEnqueue,
-    OAuth,
     SecretStore,
     TokenRefreshEnqueue
   }

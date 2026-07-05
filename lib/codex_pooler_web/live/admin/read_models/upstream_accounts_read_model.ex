@@ -4,9 +4,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   alias CodexPooler.Admin.{UpstreamQuotaReadiness, UpstreamRoutingReadiness}
   alias CodexPooler.Jobs
   alias CodexPooler.Upstreams
-  alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
   alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPooler.Upstreams.Auth.TokenRefresh
+  alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}

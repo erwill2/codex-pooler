@@ -3,8 +3,8 @@ defmodule CodexPoolerWeb.Admin.PoolFilterComponents do
 
   use CodexPoolerWeb, :html
 
-  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPooler.Pools.Pool
+  alias CodexPooler.Pools.Routing, as: PoolRouting
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
 
   attr :id, :string, required: true
