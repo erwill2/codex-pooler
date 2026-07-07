@@ -596,6 +596,110 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_nul_search_compression"
     end
 
+    test "preserves cache-control metadata across repeated compression passes" do
+      cache_control = %{"type" => "ephemeral"}
+      sentinel = "cache-control omitted sentinel"
+      original_output = compression_nul_search_fixture(sentinel)
+
+      body =
+        Jason.encode!(%{
+          "model" => @supported_model,
+          "metadata" => %{"cache_control" => cache_control, "stable" => "prefix"},
+          "input" => [
+            %{
+              "type" => "function_call",
+              "call_id" => "call_cache_control_stability",
+              "name" => "run_command",
+              "arguments" => "{}",
+              "cache_control" => cache_control
+            },
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_cache_control_stability",
+              "output" => original_output,
+              "cache_control" => cache_control
+            },
+            %{
+              "type" => "message",
+              "role" => "user",
+              "content" => [
+                %{
+                  "type" => "input_text",
+                  "text" => "stable live-zone suffix",
+                  "cache_control" => cache_control
+                }
+              ],
+              "cache_control" => cache_control
+            }
+          ]
+        })
+
+      {context, request_options} = request_context(body)
+
+      assert {compressed_body, compressed_options} =
+               RequestCompression.maybe_compress(body, context, request_options)
+
+      assert compressed_body != body
+      compressed_output = first_output(compressed_body)
+
+      assert compressed_output =~ "[compressed search results:"
+      assert compressed_output =~ "lib/nul_result.ex"
+      refute compressed_output =~ sentinel
+      refute compressed_output =~ <<0>>
+
+      decoded = Jason.decode!(compressed_body)
+
+      assert decoded["metadata"]["cache_control"] == cache_control
+      assert decoded["input"] |> Enum.at(0) |> Map.fetch!("cache_control") == cache_control
+      assert decoded["input"] |> Enum.at(1) |> Map.fetch!("cache_control") == cache_control
+      assert decoded["input"] |> Enum.at(2) |> Map.fetch!("cache_control") == cache_control
+
+      assert decoded["input"]
+             |> Enum.at(2)
+             |> Map.fetch!("content")
+             |> List.first()
+             |> Map.fetch!("cache_control") == cache_control
+
+      assert [%{"call_id" => "call_cache_control_stability"}] =
+               Enum.filter(decoded["input"], &(&1["type"] == "function_call_output"))
+
+      assert %{
+               "status" => "compressed",
+               "candidate_count" => 1,
+               "compressed_count" => 1,
+               "skipped_count" => 0
+             } = metadata = compressed_options.runtime.payload_compression
+
+      assert "search_results" in metadata["strategies"]
+      refute inspect(metadata) =~ sentinel
+      refute inspect(metadata) =~ "call_cache_control_stability"
+
+      {second_context, second_request_options} = request_context(compressed_body)
+
+      assert {second_body, _second_options} =
+               RequestCompression.maybe_compress(
+                 compressed_body,
+                 second_context,
+                 second_request_options
+               )
+
+      assert second_body == compressed_body
+      assert first_output(second_body) == first_output(compressed_body)
+
+      second_decoded = Jason.decode!(second_body)
+
+      assert second_decoded["metadata"]["cache_control"] == cache_control
+      assert second_decoded["input"] |> Enum.at(0) |> Map.fetch!("cache_control") == cache_control
+      assert second_decoded["input"] |> Enum.at(1) |> Map.fetch!("cache_control") == cache_control
+      assert second_decoded["input"] |> Enum.at(2) |> Map.fetch!("cache_control") == cache_control
+
+      assert second_decoded["input"]
+             |> Enum.at(2)
+             |> Map.fetch!("content")
+             |> List.first()
+             |> Map.fetch!("cache_control") == cache_control
+    end
+
     test "rewrites grep context and column-bearing function outputs without leaking sentinels" do
       context_sentinel = "grep context omitted sentinel"
       column_sentinel = "column search omitted sentinel"

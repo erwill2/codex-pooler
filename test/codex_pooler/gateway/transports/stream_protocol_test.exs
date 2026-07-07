@@ -123,6 +123,39 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
              }
     end
 
+    test "passes keepalive events through without changing terminal state" do
+      state = StreamProtocol.public_openai_responses_stream_state()
+
+      event =
+        sse_event("keepalive", %{
+          "type" => "keepalive",
+          "sequence_number" => 1
+        })
+
+      assert {chunk, state} =
+               StreamProtocol.normalize_public_openai_responses_sse_data(event, state)
+
+      assert [
+               %{
+                 "event" => "keepalive",
+                 "data" => %{"type" => "keepalive", "sequence_number" => 1}
+               }
+             ] = public_sse_events(chunk)
+
+      refute chunk =~ "event: response.created\n"
+      refute chunk =~ "event: response.output_text.delta\n"
+      refute chunk =~ "event: response.completed\n"
+      refute chunk =~ "event: response.failed\n"
+
+      assert state.terminal_kind == nil
+      assert state.terminal_failure == nil
+      assert state.summary.terminal_seen == false
+      assert state.summary.terminal_kind == nil
+      assert state.summary.finish_class == nil
+      assert state.summary.visible_seen == false
+      assert state.summary.delta_count == 0
+    end
+
     test "synthesizes missing reasoning and message output item ids" do
       state = StreamProtocol.public_openai_responses_stream_state()
 
