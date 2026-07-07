@@ -343,6 +343,10 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert responses_chat.contract =~ "terminal compaction_trigger backend payloads bridge"
       assert responses_chat.contract =~ "/backend-api/codex/responses/compact"
       assert responses_chat.contract =~ "malformed trigger placement is rejected before dispatch"
+
+      assert responses_chat.contract =~
+               "public /v1 Responses accepts encrypted compaction output replay items"
+
       assert responses_chat.contract =~ "backend regular HTTP Responses and compact routes"
       assert responses_chat.contract =~ "request-scoped x-codex-turn-state"
       assert responses_chat.contract =~ "relay upstream x-codex-turn-state response headers"
@@ -389,6 +393,11 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                },
                context_overflow: %{
                  recovery_owner: "client_or_upstream",
+                 public_v1_compaction_replay_item: %{
+                   route: "/v1/responses",
+                   item: %{"type" => "compaction", "encrypted_content" => "encrypted_content"},
+                   upstream_dispatch: true
+                 },
                  server_side_compaction: false,
                  hidden_replay: false,
                  stores_prompt_bodies: false,

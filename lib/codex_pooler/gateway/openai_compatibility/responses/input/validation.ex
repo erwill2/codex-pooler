@@ -33,6 +33,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   defp validate_input_item(%{"type" => "reasoning"} = item, _payload),
     do: validate_reasoning_replay_item(item)
 
+  defp validate_input_item(%{"type" => "compaction"} = item, _payload),
+    do: validate_compaction_replay_item(item)
+
   defp validate_input_item(%{"type" => "function_call"} = item, _payload),
     do: validate_function_call_replay_item(item)
 
@@ -285,6 +288,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   end
 
   defp validate_reasoning_replay_summary_part(_part),
+    do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
+
+  defp validate_compaction_replay_item(%{"encrypted_content" => encrypted_content} = item)
+       when is_binary(encrypted_content) do
+    with :ok <- validate_exact_item_keys(item, ["type", "encrypted_content", "id"]),
+         :ok <- validate_nonblank(encrypted_content) do
+      validate_optional_id(item)
+    end
+  end
+
+  defp validate_compaction_replay_item(_item),
     do: {:error, Error.invalid_request("input item shape is not translatable", "input")}
 
   defp validate_function_call_replay_item(

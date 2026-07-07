@@ -159,6 +159,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
     {:ok, Map.drop(item, ["content"])}
   end
 
+  defp normalize_input_item(%{"type" => "compaction"} = item), do: {:ok, item}
+
   defp normalize_input_item(%{"type" => "function_call", "status" => status} = item)
        when status in ["completed", "incomplete"],
        do: {:ok, Map.delete(item, "status")}

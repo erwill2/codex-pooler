@@ -1071,6 +1071,55 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert captured.json["reasoning"] == %{"context" => "current_turn"}
   end
 
+  test "POST /v1/responses forwards encrypted compaction replay before dispatch", %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_compaction_replay",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 2, "output_tokens" => 3, "total_tokens" => 5}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    encrypted_compaction = "synthetic-encrypted-compaction"
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "store" => false,
+        "stream" => true,
+        "input" => [
+          %{"type" => "compaction", "encrypted_content" => encrypted_compaction},
+          %{
+            "role" => "user",
+            "content" => [
+              %{"type" => "input_text", "text" => "synthetic follow-up after compaction"}
+            ]
+          }
+        ]
+      })
+
+    assert response(conn, 200) == ""
+    assert get_resp_header(conn, "content-type") == ["text/event-stream"]
+
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["stream"] == true
+    assert captured.json["store"] == false
+
+    assert [
+             %{"type" => "compaction", "encrypted_content" => ^encrypted_compaction},
+             %{"type" => "message", "role" => "user"}
+           ] = captured.json["input"]
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    refute inspect(request.request_metadata) =~ encrypted_compaction
+  end
+
   test "POST /v1/responses forwards lowered non-strict function tool schemas", %{conn: conn} do
     upstream =
       start_upstream(

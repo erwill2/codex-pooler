@@ -1508,6 +1508,36 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       refute Map.has_key?(incomplete_call, "status")
     end
 
+    test "OMP post-compaction replay forwards encrypted compaction item" do
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "store" => false,
+        "stream" => true,
+        "input" => [
+          %{
+            "type" => "compaction",
+            "encrypted_content" => "synthetic-encrypted-compaction"
+          },
+          %{
+            "role" => "user",
+            "content" => [
+              %{"type" => "input_text", "text" => "synthetic follow-up after compaction"}
+            ]
+          }
+        ]
+      }
+
+      assert {:ok, %{payload: coerced}} = Responses.coerce(payload)
+
+      assert [
+               %{
+                 "type" => "compaction",
+                 "encrypted_content" => "synthetic-encrypted-compaction"
+               },
+               %{"type" => "message", "role" => "user"}
+             ] = coerced["input"]
+    end
+
     test "Hermes ordinary replay drops reasoning and preserves completed assistant metadata" do
       payload = %{
         "model" => "gpt-fixture-text",
