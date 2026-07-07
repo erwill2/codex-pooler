@@ -7,6 +7,7 @@ defmodule CodexPooler.Upstreams.OAuthRelinkTest do
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.CodexAuth
+  alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Secrets
 
   alias CodexPooler.Upstreams.Schemas.{
@@ -188,6 +189,782 @@ defmodule CodexPooler.Upstreams.OAuthRelinkTest do
     assert Repo.get!(UpstreamIdentity, identity.id).workspace_id == "ws_selected"
     assert {:ok, "old-workspace-access"} = Secrets.decrypt_active_secret(identity, "access_token")
     assert Repo.aggregate(EncryptedSecret, :count) == 1
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink preserves a selected concrete workspace when provider omits workspace claims" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_missing_workspace_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_selected_missing")
+      |> Map.merge(%{workspace_label: "Selected Workspace", seat_type: "team-seat"})
+      |> active_upstream_identity_fixture()
+
+    assert {:ok, identity} =
+             IdentityLifecycle.activate_upstream_identity_with_plan(identity, %{
+               plan_family: "team",
+               plan_label: "team"
+             })
+
+    assert {:ok, assignment} =
+             PoolAssignments.create_pool_assignment(pool, identity, %{
+               assignment_label: "Selected assignment"
+             })
+
+    assert {:ok, assignment} = PoolAssignments.activate_pool_assignment(assignment)
+
+    assert {:ok, old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-missing-workspace-access")
+             )
+
+    assert {:ok, old_refresh_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("refresh_token", "old-missing-workspace-refresh")
+             )
+
+    assert active_secret_count(identity) == 2
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "new-missing-workspace-access",
+           refresh_token: "new-missing-workspace-refresh",
+           id_token: relink_id_token(account_id, nil)
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:ok, %{status: :completed, identity: relinked, assignment: relinked_assignment}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(
+                 authorization_state(authorization_url),
+                 "missing-workspace-compatible-code"
+               )
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert relinked.id == identity.id
+    assert relinked_assignment.id == assignment.id
+    assert reloaded.workspace_id == "ws_selected_missing"
+    assert reloaded.workspace_label == "Selected Workspace"
+    assert reloaded.seat_type == "team-seat"
+    assert reloaded.plan_family == "team"
+    assert reloaded.plan_label == "team"
+    assert reloaded.account_label == "Existing operator label"
+    assert Repo.get!(EncryptedSecret, old_access_secret.id).status == "superseded"
+    assert Repo.get!(EncryptedSecret, old_refresh_secret.id).status == "superseded"
+
+    assert {:ok, "new-missing-workspace-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert {:ok, "new-missing-workspace-refresh"} =
+             Secrets.decrypt_active_secret(identity, "refresh_token")
+
+    assert Repo.aggregate(EncryptedSecret, :count) == 4
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink accepts omitted workspace fallback with matching stored subject proof" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_subject_proof_#{System.unique_integer([:positive])}"
+    target_subject = "user_subject_proof_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_subject_proof")
+      |> Map.merge(%{workspace_label: "Selected Workspace", seat_type: "team-seat"})
+      |> active_upstream_identity_fixture()
+
+    assert {:ok, identity} =
+             IdentityLifecycle.activate_upstream_identity_with_plan(identity, %{
+               plan_family: "team",
+               plan_label: "team"
+             })
+
+    identity =
+      identity
+      |> UpstreamIdentity.changeset(%{
+        chatgpt_account_id: nil,
+        account_email: nil,
+        chatgpt_user_id: target_subject
+      })
+      |> Repo.update!()
+
+    assert identity.chatgpt_account_id == nil
+    assert identity.account_email == nil
+    assert identity.chatgpt_user_id == target_subject
+    assert identity.workspace_id == "ws_subject_proof"
+    assert identity.workspace_label == "Selected Workspace"
+    assert identity.plan_family == "team"
+    assert identity.plan_label == "team"
+    assert identity.seat_type == "team-seat"
+
+    assert {:ok, assignment} =
+             PoolAssignments.create_pool_assignment(pool, identity, %{
+               assignment_label: "Selected assignment"
+             })
+
+    assert {:ok, assignment} = PoolAssignments.activate_pool_assignment(assignment)
+
+    assert {:ok, old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-subject-proof-access")
+             )
+
+    assert {:ok, old_refresh_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("refresh_token", "old-subject-proof-refresh")
+             )
+
+    assert active_secret_count(identity) == 2
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "new-subject-proof-access",
+           refresh_token: "new-subject-proof-refresh",
+           id_token: relink_id_token(account_id, nil, chatgpt_user_id: target_subject)
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:ok, %{status: :completed, identity: relinked, assignment: relinked_assignment}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "subject-proof-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert relinked.id == identity.id
+    assert relinked_assignment.id == assignment.id
+    assert reloaded.chatgpt_account_id == account_id
+    assert reloaded.account_email == "#{account_id}@example.com"
+    assert reloaded.chatgpt_user_id == target_subject
+    assert reloaded.workspace_id == "ws_subject_proof"
+    assert reloaded.workspace_label == "Selected Workspace"
+    assert reloaded.seat_type == "team-seat"
+    assert reloaded.plan_family == "team"
+    assert reloaded.plan_label == "team"
+    assert reloaded.account_label == "Existing operator label"
+    assert Repo.get!(OAuthFlow, flow.id).result_upstream_identity_id == identity.id
+    assert Repo.get!(EncryptedSecret, old_access_secret.id).status == "superseded"
+    assert Repo.get!(EncryptedSecret, old_refresh_secret.id).status == "superseded"
+
+    assert {:ok, "new-subject-proof-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert {:ok, "new-subject-proof-refresh"} =
+             Secrets.decrypt_active_secret(identity, "refresh_token")
+
+    assert active_secret_count(identity) == 2
+    assert Repo.aggregate(EncryptedSecret, :count) == 4
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink backfills missing plan and seat metadata on a selected concrete workspace" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_legacy_nil_slot_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_legacy_nil_slot")
+      |> Map.merge(%{workspace_label: "Imported Workspace"})
+      |> active_upstream_identity_fixture()
+
+    assert identity.workspace_id == "ws_legacy_nil_slot"
+    assert identity.workspace_label == "Imported Workspace"
+    assert identity.plan_family == nil
+    assert identity.plan_label == nil
+    assert identity.seat_type == nil
+
+    assert {:ok, assignment} =
+             PoolAssignments.create_pool_assignment(pool, identity, %{
+               assignment_label: "Imported assignment"
+             })
+
+    assert {:ok, assignment} = PoolAssignments.activate_pool_assignment(assignment)
+
+    assert {:ok, old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-legacy-nil-slot-access")
+             )
+
+    assert {:ok, old_refresh_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("refresh_token", "old-legacy-nil-slot-refresh")
+             )
+
+    assert active_secret_count(identity) == 2
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "new-legacy-nil-slot-access",
+           refresh_token: "new-legacy-nil-slot-refresh",
+           id_token: relink_id_token(account_id, nil)
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:ok, %{status: :completed, identity: relinked, assignment: relinked_assignment}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "legacy-nil-slot-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert relinked.id == identity.id
+    assert relinked_assignment.id == assignment.id
+    assert reloaded.workspace_id == "ws_legacy_nil_slot"
+    assert reloaded.workspace_label == "Imported Workspace"
+    assert reloaded.seat_type == "team-seat"
+    assert reloaded.plan_family == "team"
+    assert reloaded.plan_label == "team"
+    assert reloaded.account_label == "Existing operator label"
+    assert Repo.get!(EncryptedSecret, old_access_secret.id).status == "superseded"
+    assert Repo.get!(EncryptedSecret, old_refresh_secret.id).status == "superseded"
+
+    assert {:ok, "new-legacy-nil-slot-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert {:ok, "new-legacy-nil-slot-refresh"} =
+             Secrets.decrypt_active_secret(identity, "refresh_token")
+
+    assert active_secret_count(identity) == 2
+    assert Repo.aggregate(EncryptedSecret, :count) == 4
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink rejects legacy metadata slots without current plan or seat evidence" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_legacy_nil_evidence_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_legacy_nil_evidence")
+      |> Map.merge(%{workspace_label: "Imported Workspace"})
+      |> active_upstream_identity_fixture()
+
+    assert identity.workspace_id == "ws_legacy_nil_evidence"
+    assert identity.workspace_label == "Imported Workspace"
+    assert identity.plan_family == nil
+    assert identity.plan_label == nil
+    assert identity.seat_type == nil
+
+    assert {:ok, _assignment} = PoolAssignments.create_pool_assignment(pool, identity)
+
+    assert {:ok, _old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-legacy-nil-evidence-access")
+             )
+
+    assert active_secret_count(identity) == 1
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "rejected-legacy-nil-evidence-access",
+           refresh_token: "rejected-legacy-nil-evidence-refresh",
+           id_token: relink_id_token(account_id, nil, chatgpt_plan_type: nil, seat_type: nil)
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:error, %{code: :identity_mismatch}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "legacy-nil-evidence-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert Repo.get!(OAuthFlow, flow.id).error_code == "identity_mismatch"
+    assert reloaded.workspace_id == "ws_legacy_nil_evidence"
+    assert reloaded.workspace_label == "Imported Workspace"
+    assert reloaded.plan_family == nil
+    assert reloaded.plan_label == nil
+    assert reloaded.seat_type == nil
+
+    assert {:ok, "old-legacy-nil-evidence-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert active_secret_count(identity) == 1
+    assert Repo.aggregate(EncryptedSecret, :count) == 1
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink rejects blank plan evidence for an imported concrete workspace" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_blank_plan_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_blank_plan")
+      |> Map.merge(%{workspace_label: "Imported Workspace"})
+      |> active_upstream_identity_fixture()
+
+    assert identity.workspace_id == "ws_blank_plan"
+    assert identity.workspace_label == "Imported Workspace"
+    assert identity.plan_family == nil
+    assert identity.plan_label == nil
+    assert identity.seat_type == nil
+
+    assert {:ok, _assignment} = PoolAssignments.create_pool_assignment(pool, identity)
+
+    assert {:ok, _old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-blank-plan-access")
+             )
+
+    assert active_secret_count(identity) == 1
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "rejected-blank-plan-access",
+           refresh_token: "rejected-blank-plan-refresh",
+           id_token: relink_id_token(account_id, nil, chatgpt_plan_type: "")
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:error, %{code: :identity_mismatch}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "blank-plan-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert Repo.get!(OAuthFlow, flow.id).error_code == "identity_mismatch"
+    assert reloaded.workspace_id == "ws_blank_plan"
+    assert reloaded.workspace_label == "Imported Workspace"
+    assert reloaded.plan_family == nil
+    assert reloaded.plan_label == nil
+    assert reloaded.seat_type == nil
+
+    assert {:ok, "old-blank-plan-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert active_secret_count(identity) == 1
+    assert Repo.aggregate(EncryptedSecret, :count) == 1
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink rejects omitted workspace fallback without stored account or subject proof" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_missing_identity_proof_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_missing_identity_proof")
+      |> Map.merge(%{workspace_label: "Selected Workspace", seat_type: "team-seat"})
+      |> active_upstream_identity_fixture()
+
+    assert {:ok, identity} =
+             IdentityLifecycle.activate_upstream_identity_with_plan(identity, %{
+               plan_family: "team",
+               plan_label: "team"
+             })
+
+    identity =
+      identity
+      |> UpstreamIdentity.changeset(%{
+        chatgpt_account_id: nil,
+        account_email: nil,
+        chatgpt_user_id: nil
+      })
+      |> Repo.update!()
+
+    assert identity.chatgpt_account_id == nil
+    assert identity.account_email == nil
+    assert identity.chatgpt_user_id == nil
+    assert identity.workspace_id == "ws_missing_identity_proof"
+    assert identity.workspace_label == "Selected Workspace"
+    assert identity.plan_family == "team"
+    assert identity.plan_label == "team"
+    assert identity.seat_type == "team-seat"
+
+    assert {:ok, _assignment} = PoolAssignments.create_pool_assignment(pool, identity)
+
+    assert {:ok, _old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-missing-identity-proof-access")
+             )
+
+    assert active_secret_count(identity) == 1
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "rejected-missing-identity-proof-access",
+           refresh_token: "rejected-missing-identity-proof-refresh",
+           id_token: relink_id_token(account_id, nil)
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:error, %{code: :identity_mismatch}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "missing-identity-proof-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert Repo.get!(OAuthFlow, flow.id).error_code == "identity_mismatch"
+    assert reloaded.chatgpt_account_id == nil
+    assert reloaded.account_email == nil
+    assert reloaded.chatgpt_user_id == nil
+    assert reloaded.workspace_id == "ws_missing_identity_proof"
+    assert reloaded.workspace_label == "Selected Workspace"
+    assert reloaded.plan_family == "team"
+    assert reloaded.plan_label == "team"
+    assert reloaded.seat_type == "team-seat"
+
+    assert {:ok, "old-missing-identity-proof-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert active_secret_count(identity) == 1
+    assert Repo.aggregate(EncryptedSecret, :count) == 1
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink rejects missing-workspace callbacks without plan evidence" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_missing_plan_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_missing_plan")
+      |> Map.merge(%{workspace_label: "Selected Workspace", seat_type: "team-seat"})
+      |> active_upstream_identity_fixture()
+
+    assert {:ok, identity} =
+             IdentityLifecycle.activate_upstream_identity_with_plan(identity, %{
+               plan_family: "team",
+               plan_label: "team"
+             })
+
+    assert {:ok, _assignment} = PoolAssignments.create_pool_assignment(pool, identity)
+
+    assert {:ok, _old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-missing-plan-access")
+             )
+
+    assert {:ok, _old_refresh_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("refresh_token", "old-missing-plan-refresh")
+             )
+
+    assert active_secret_count(identity) == 2
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "rejected-missing-plan-access",
+           refresh_token: "rejected-missing-plan-refresh",
+           id_token: relink_id_token(account_id, nil, chatgpt_plan_type: nil)
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:error, %{code: :identity_mismatch}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "missing-plan-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert Repo.get!(OAuthFlow, flow.id).error_code == "identity_mismatch"
+    assert reloaded.workspace_id == "ws_missing_plan"
+    assert reloaded.workspace_label == "Selected Workspace"
+    assert reloaded.seat_type == "team-seat"
+    assert reloaded.plan_family == "team"
+    assert reloaded.plan_label == "team"
+
+    assert {:ok, "old-missing-plan-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert {:ok, "old-missing-plan-refresh"} =
+             Secrets.decrypt_active_secret(identity, "refresh_token")
+
+    assert active_secret_count(identity) == 2
+    assert Repo.aggregate(EncryptedSecret, :count) == 2
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink rejects missing-workspace callbacks with incompatible plan evidence" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_wrong_plan_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_wrong_plan")
+      |> Map.merge(%{workspace_label: "Selected Workspace", seat_type: "team-seat"})
+      |> active_upstream_identity_fixture()
+
+    assert {:ok, identity} =
+             IdentityLifecycle.activate_upstream_identity_with_plan(identity, %{
+               plan_family: "team",
+               plan_label: "team"
+             })
+
+    assert {:ok, _assignment} = PoolAssignments.create_pool_assignment(pool, identity)
+
+    assert {:ok, _old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-wrong-plan-access")
+             )
+
+    assert {:ok, _old_refresh_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("refresh_token", "old-wrong-plan-refresh")
+             )
+
+    assert active_secret_count(identity) == 2
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "rejected-wrong-plan-access",
+           refresh_token: "rejected-wrong-plan-refresh",
+           id_token: relink_id_token(account_id, nil, chatgpt_plan_type: "enterprise")
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:error, %{code: :identity_mismatch}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "wrong-plan-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert Repo.get!(OAuthFlow, flow.id).error_code == "identity_mismatch"
+    assert reloaded.workspace_id == "ws_wrong_plan"
+    assert reloaded.workspace_label == "Selected Workspace"
+    assert reloaded.seat_type == "team-seat"
+    assert reloaded.plan_family == "team"
+    assert reloaded.plan_label == "team"
+
+    assert {:ok, "old-wrong-plan-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert {:ok, "old-wrong-plan-refresh"} =
+             Secrets.decrypt_active_secret(identity, "refresh_token")
+
+    assert active_secret_count(identity) == 2
+    assert Repo.aggregate(EncryptedSecret, :count) == 2
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink rejects missing-workspace callbacks without seat evidence" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_missing_seat_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_missing_seat")
+      |> Map.merge(%{workspace_label: "Selected Workspace", seat_type: "team-seat"})
+      |> active_upstream_identity_fixture()
+
+    assert {:ok, identity} =
+             IdentityLifecycle.activate_upstream_identity_with_plan(identity, %{
+               plan_family: "team",
+               plan_label: "team"
+             })
+
+    assert {:ok, _assignment} = PoolAssignments.create_pool_assignment(pool, identity)
+
+    assert {:ok, _old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-missing-seat-access")
+             )
+
+    assert {:ok, _old_refresh_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("refresh_token", "old-missing-seat-refresh")
+             )
+
+    assert active_secret_count(identity) == 2
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "rejected-missing-seat-access",
+           refresh_token: "rejected-missing-seat-refresh",
+           id_token: relink_id_token(account_id, nil, seat_type: nil)
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:error, %{code: :identity_mismatch}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "missing-seat-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert Repo.get!(OAuthFlow, flow.id).error_code == "identity_mismatch"
+    assert reloaded.workspace_id == "ws_missing_seat"
+    assert reloaded.workspace_label == "Selected Workspace"
+    assert reloaded.seat_type == "team-seat"
+    assert reloaded.plan_family == "team"
+    assert reloaded.plan_label == "team"
+
+    assert {:ok, "old-missing-seat-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert {:ok, "old-missing-seat-refresh"} =
+             Secrets.decrypt_active_secret(identity, "refresh_token")
+
+    assert active_secret_count(identity) == 2
+    assert Repo.aggregate(EncryptedSecret, :count) == 2
+  end
+
+  @tag :targeted_missing_workspace_relink
+  test "browser relink rejects missing-workspace callbacks with incompatible seat evidence" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_wrong_seat_#{System.unique_integer([:positive])}"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_wrong_seat")
+      |> Map.merge(%{workspace_label: "Selected Workspace", seat_type: "team-seat"})
+      |> active_upstream_identity_fixture()
+
+    assert {:ok, identity} =
+             IdentityLifecycle.activate_upstream_identity_with_plan(identity, %{
+               plan_family: "team",
+               plan_label: "team"
+             })
+
+    assert {:ok, _assignment} = PoolAssignments.create_pool_assignment(pool, identity)
+
+    assert {:ok, _old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-wrong-seat-access")
+             )
+
+    assert {:ok, _old_refresh_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("refresh_token", "old-wrong-seat-refresh")
+             )
+
+    assert active_secret_count(identity) == 2
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "rejected-wrong-seat-access",
+           refresh_token: "rejected-wrong-seat-refresh",
+           id_token: relink_id_token(account_id, nil, seat_type: "enterprise-seat")
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:error, %{code: :identity_mismatch}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "wrong-seat-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert Repo.get!(OAuthFlow, flow.id).error_code == "identity_mismatch"
+    assert reloaded.workspace_id == "ws_wrong_seat"
+    assert reloaded.workspace_label == "Selected Workspace"
+    assert reloaded.seat_type == "team-seat"
+    assert reloaded.plan_family == "team"
+    assert reloaded.plan_label == "team"
+
+    assert {:ok, "old-wrong-seat-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert {:ok, "old-wrong-seat-refresh"} =
+             Secrets.decrypt_active_secret(identity, "refresh_token")
+
+    assert active_secret_count(identity) == 2
+    assert Repo.aggregate(EncryptedSecret, :count) == 2
   end
 
   @tag :subject_relink
@@ -631,17 +1408,15 @@ defmodule CodexPooler.Upstreams.OAuthRelinkTest do
 
   defp relink_id_token(account_id, workspace_id, opts \\ []) do
     auth_claims =
-      %{
-        "chatgpt_account_id" => account_id,
-        "chatgpt_plan_type" => "team"
-      }
+      %{"chatgpt_account_id" => account_id}
+      |> maybe_put_claim("chatgpt_plan_type", Keyword.get(opts, :chatgpt_plan_type, "team"))
       |> maybe_put_claim(
         "chatgpt_user_id",
         Keyword.get(opts, :chatgpt_user_id, "user_#{account_id}")
       )
       |> maybe_put_claim("workspace_id", workspace_id)
       |> maybe_put_claim("workspace_label", workspace_id && "OAuth Workspace")
-      |> maybe_put_claim("seat_type", "team-seat")
+      |> maybe_put_claim("seat_type", Keyword.get(opts, :seat_type, "team-seat"))
 
     FakeOpenAIAuthProvider.id_token(%{
       "email" => "#{account_id}@example.com",

@@ -183,6 +183,14 @@ the target identity before replacing encrypted credential material. When OpenAI
 returns a user subject, Codex Pooler also uses that subject to keep same-account,
 same-workspace upstream credentials distinct.
 
+If OpenAI omits workspace evidence during relink, Codex Pooler keeps the selected
+cockpit slot only when stored account, email, or sanitized subject proof matches,
+incoming plan and seat evidence are both present, and that evidence is compatible
+with known cockpit metadata. Older slots with missing plan or seat metadata can
+fill those empty fields from the accepted callback. Missing or incompatible
+evidence still returns `identity_mismatch`; use the intended provider session or browser
+profile before retrying.
+
 Browser account choice is controlled by the active OpenAI or Google browser
 session. Codex Pooler can start the authorization flow, but it cannot force the
 provider account chooser by itself. Sign in to the intended provider account, or
@@ -279,7 +287,7 @@ Safe OAuth troubleshooting codes:
     </tr>
     <tr>
       <td><code>identity_mismatch</code></td>
-      <td>Relink with the same OpenAI account, workspace, and sanitized subject reference shown in the cockpit. If a different person in the same workspace should be added, link or import that user lineage as a separate upstream identity.</td>
+      <td>Relink with the same OpenAI account, workspace, and sanitized subject reference shown in the cockpit. Missing provider workspace evidence is accepted only for the selected cockpit slot when stored account, email, or sanitized subject proof matches and incoming plan and seat evidence are present and compatible with known cockpit metadata; otherwise retry from the intended provider session. If a different person in the same workspace should be added, link or import that user lineage as a separate upstream identity.</td>
     </tr>
     <tr>
       <td><code>identity_conflict</code></td>

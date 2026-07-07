@@ -115,6 +115,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
             |> put_token_refresh_metadata(identity.metadata, timestamp, attrs)
             |> then(&Map.merge(identity.metadata || %{}, &1))
           end)
+          |> maybe_preserve_missing_workspace_slot(identity)
           |> Map.put(:account_label, identity.account_label)
 
         with {:ok, active_identity} <- activate_identity_with_plan(identity, attrs) do
@@ -481,13 +482,54 @@ defmodule CodexPooler.Upstreams.TokenLinking do
     incoming_workspace_id = identity_attrs |> Map.get(:workspace_id) |> present_string()
     incoming_account_id = identity_attrs |> Map.get(:chatgpt_account_id) |> present_string()
 
+    if is_binary(target_workspace_id) do
+      validate_concrete_target_workspace(
+        target_identity,
+        target_workspace_id,
+        incoming_workspace_id,
+        identity_attrs
+      )
+    else
+      validate_legacy_target_workspace(
+        target_identity,
+        incoming_account_id,
+        identity_attrs
+      )
+    end
+  end
+
+  @spec validate_concrete_target_workspace(
+          UpstreamIdentity.t(),
+          String.t(),
+          String.t() | nil,
+          map()
+        ) :: :ok | {:error, lifecycle_error()}
+  defp validate_concrete_target_workspace(
+         %UpstreamIdentity{} = target_identity,
+         target_workspace_id,
+         incoming_workspace_id,
+         identity_attrs
+       ) do
     cond do
-      is_binary(target_workspace_id) and incoming_workspace_id == target_workspace_id ->
+      incoming_workspace_id == target_workspace_id ->
         :ok
 
-      is_binary(target_workspace_id) ->
-        {:error, identity_mismatch_error()}
+      missing_workspace_claims_compatible?(target_identity, identity_attrs) ->
+        :ok
 
+      true ->
+        {:error, identity_mismatch_error()}
+    end
+  end
+
+  @spec validate_legacy_target_workspace(UpstreamIdentity.t(), String.t() | nil, map()) ::
+          :ok | {:error, lifecycle_error() | IdentityLifecycle.identity_conflict()}
+  defp validate_legacy_target_workspace(
+         %UpstreamIdentity{} = target_identity,
+         incoming_account_id,
+         identity_attrs
+       ) do
+    cond do
       exact_workspace_identity?(target_identity, identity_attrs) ->
         {:error, identity_mismatch_error()}
 
@@ -498,11 +540,38 @@ defmodule CodexPooler.Upstreams.TokenLinking do
            first_concrete_sibling(target_identity, incoming_account_id)
          )}
 
-      is_nil(incoming_workspace_id) ->
-        :ok
-
       true ->
         :ok
+    end
+  end
+
+  @spec missing_workspace_claims_compatible?(UpstreamIdentity.t(), map()) :: boolean()
+  defp missing_workspace_claims_compatible?(%UpstreamIdentity{} = identity, identity_attrs) do
+    target_workspace_id = present_string(identity.workspace_id)
+    incoming_workspace_id = identity_attrs |> Map.get(:workspace_id) |> present_string()
+    stored_plan_family = stored_plan_family(identity)
+    incoming_plan_family = incoming_plan_family(identity_attrs)
+    stored_seat_type = present_string(identity.seat_type)
+    incoming_seat_type = identity_attrs |> Map.get(:seat_type) |> present_string()
+
+    is_binary(target_workspace_id) and is_nil(incoming_workspace_id) and
+      stored_identity_proof?(identity, identity_attrs) and is_binary(incoming_plan_family) and
+      is_binary(incoming_seat_type) and
+      known_slot_metadata_compatible?(stored_plan_family, incoming_plan_family) and
+      known_slot_metadata_compatible?(stored_seat_type, incoming_seat_type)
+  end
+
+  @spec maybe_preserve_missing_workspace_slot(map(), UpstreamIdentity.t()) :: map()
+  defp maybe_preserve_missing_workspace_slot(identity_attrs, %UpstreamIdentity{} = identity) do
+    if missing_workspace_claims_compatible?(identity, identity_attrs) do
+      identity_attrs
+      |> Map.put(:workspace_id, identity.workspace_id)
+      |> Map.put(:workspace_label, identity.workspace_label)
+      |> preserve_known_slot_value(:seat_type, identity.seat_type)
+      |> preserve_known_slot_value(:plan_family, identity.plan_family)
+      |> preserve_known_slot_value(:plan_label, identity.plan_label)
+    else
+      identity_attrs
     end
   end
 
@@ -591,8 +660,45 @@ defmodule CodexPooler.Upstreams.TokenLinking do
   defp identity_conflict(attrs, _stored_identity),
     do: IdentityLifecycle.identity_conflict(attrs, nil)
 
+  @spec stored_identity_proof?(UpstreamIdentity.t(), map()) :: boolean()
+  defp stored_identity_proof?(%UpstreamIdentity{} = identity, identity_attrs) do
+    target_account_id = present_string(identity.chatgpt_account_id)
+    incoming_account_id = identity_attrs |> Map.get(:chatgpt_account_id) |> present_string()
+    target_email = normalize_email(identity.account_email)
+    incoming_email = identity_attrs |> Map.get(:account_email) |> normalize_email()
+    target_subject = present_string(identity.chatgpt_user_id)
+    incoming_subject = identity_attrs |> Map.get(:chatgpt_user_id) |> present_string()
+
+    (is_binary(target_account_id) and incoming_account_id == target_account_id) or
+      (is_binary(target_email) and incoming_email == target_email) or
+      (is_binary(target_subject) and incoming_subject == target_subject)
+  end
+
+  @spec stored_plan_family(UpstreamIdentity.t()) :: String.t() | nil
+  defp stored_plan_family(%UpstreamIdentity{} = identity) do
+    present_string(identity.plan_family) || plan_family(identity.plan_label)
+  end
+
+  @spec incoming_plan_family(map()) :: String.t() | nil
+  defp incoming_plan_family(identity_attrs) do
+    present_string(Map.get(identity_attrs, :plan_family)) ||
+      plan_family(Map.get(identity_attrs, :plan_label))
+  end
+
+  @spec known_slot_metadata_compatible?(String.t() | nil, String.t() | nil) :: boolean()
+  defp known_slot_metadata_compatible?(nil, _incoming), do: true
+  defp known_slot_metadata_compatible?(stored, incoming), do: stored == incoming
+
+  @spec preserve_known_slot_value(map(), atom(), term()) :: map()
+  defp preserve_known_slot_value(attrs, key, value) do
+    case present_string(value) do
+      nil -> attrs
+      stored -> Map.put(attrs, key, stored)
+    end
+  end
+
   defp plan_family(nil), do: nil
-  defp plan_family(label), do: normalize_plan(label)
+  defp plan_family(label), do: label |> normalize_plan() |> present_string()
 
   defp normalize_plan(plan) do
     plan
