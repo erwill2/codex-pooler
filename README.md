@@ -508,6 +508,22 @@ mcp_servers:
     connect_timeout: 15
 ```
 
+Image generation note: `image_gen.provider: openai` is the recommended image
+provider for this setup. Hermes exposes `gpt-image-2-low`,
+`gpt-image-2-medium`, and `gpt-image-2-high` as quality tiers; for example,
+`gpt-image-2-medium` sends `gpt-image-2` to the API with `quality: medium`.
+This provider uses the OpenAI SDK environment, so `OPENAI_API_KEY` and
+`OPENAI_BASE_URL` must be visible to the running Hermes process, not only to
+the shell where you edited the config. `model.base_url` configures Hermes'
+text/model provider path; the OpenAI image provider still needs the SDK
+environment so image requests go through Codex Pooler's `/v1` surface instead
+of OpenAI directly.
+
+If text requests work but image generation fails with `invalid_api_key`, check
+the environment of the long-running Hermes process or gateway service first.
+It may not have loaded `OPENAI_BASE_URL`, so the OpenAI SDK image client may be
+using OpenAI's default endpoint instead of Codex Pooler.
+
 Current Codex Pooler releases also expose an SDK-readable `context_length` value
 on `/v1/models`, derived from the effective Codex `context_window` metadata, so
 Hermes' automatic probes can resolve the Pooler window. For `gpt-5.5`, the raw
@@ -1709,4 +1725,3 @@ repository when Kubernetes deployment behavior or values change.
 `mix test` and `mix precommit` serialize database-backed test runs with a
 PostgreSQL advisory lock keyed by the configured test database, so concurrent
 local runs wait instead of deadlocking the shared sandbox database.
-

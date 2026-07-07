@@ -67,6 +67,22 @@ mcp_servers:
 
 Use `http://localhost:4000/v1` and `http://localhost:4000/mcp` for a local Codex Pooler instance.
 
+Image generation note: `image_gen.provider: openai` is the recommended image
+provider for this setup. Hermes exposes `gpt-image-2-low`,
+`gpt-image-2-medium`, and `gpt-image-2-high` as quality tiers; for example,
+`gpt-image-2-medium` sends `gpt-image-2` to the API with `quality: medium`.
+This provider uses the OpenAI SDK environment, so `OPENAI_API_KEY` and
+`OPENAI_BASE_URL` must be visible to the running Hermes process, not only to
+the shell where you edited the config. `model.base_url` configures Hermes'
+text/model provider path; the OpenAI image provider still needs the SDK
+environment so image requests go through Codex Pooler's `/v1` surface instead
+of OpenAI directly.
+
+If text requests work but image generation fails with `invalid_api_key`, check
+the environment of the long-running Hermes process or gateway service first.
+It may not have loaded `OPENAI_BASE_URL`, so the OpenAI SDK image client may be
+using OpenAI's default endpoint instead of Codex Pooler.
+
 Current Codex Pooler releases also expose an SDK-readable `context_length` value on `/v1/models`, derived from the effective Codex `context_window` metadata, so Hermes' automatic probes can resolve the Pooler window. For `gpt-5.5`, the raw Codex window remains 272000 and the effective advertised value is currently 258400. Keep `context_length: 258400` in Hermes config as a safe explicit override for older Pooler deployments or stale model metadata.
 
 Hermes context compression uses its own auxiliary request timeout. Keep `auxiliary.compression.timeout: 900` so large retained contexts can finish instead of cycling through the older 120-second compression budget. This is independent from the optional MCP server `timeout`.
