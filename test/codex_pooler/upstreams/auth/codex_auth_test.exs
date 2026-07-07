@@ -83,6 +83,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
       assert is_binary(id_token)
       assert [request] = FakeOpenAIAuthProvider.requests(provider)
       assert request.path == "/oauth/token"
+      assert_browser_auth_headers!(request)
 
       form = FakeOpenAIAuthProvider.decode_form_request(request)
       assert form["grant_type"] == "authorization_code"
@@ -175,6 +176,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
       assert verification_url == FakeOpenAIAuthProvider.url(provider) <> "/codex/device"
       assert [request] = FakeOpenAIAuthProvider.requests(provider)
       assert request.path == "/api/accounts/deviceauth/usercode"
+      assert_browser_auth_headers!(request)
       assert request.json == %{"client_id" => CodexAuth.client_id()}
     end
 
@@ -223,6 +225,9 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
       assert is_binary(id_token)
       assert [poll_request, token_request] = FakeOpenAIAuthProvider.requests(provider)
       assert poll_request.path == "/api/accounts/deviceauth/token"
+      assert_browser_auth_headers!(poll_request)
+      assert token_request.path == "/oauth/token"
+      assert_browser_auth_headers!(token_request)
 
       assert poll_request.json == %{
                "device_auth_id" => "device-auth-123",
@@ -292,11 +297,37 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuthTest do
               }} = CodexAuth.refresh_token("refresh-token-example")
 
       assert [request] = FakeOpenAIAuthProvider.requests(provider)
+      assert request.path == "/oauth/token"
+      assert_browser_auth_headers!(request)
       form = FakeOpenAIAuthProvider.decode_form_request(request)
       assert form["grant_type"] == "refresh_token"
       assert form["refresh_token"] == "refresh-token-example"
       assert form["client_id"] == CodexAuth.client_id()
     end
+  end
+
+  defp assert_browser_auth_headers!(request, issuer \\ CodexAuth.issuer()) do
+    headers = Map.new(request.headers)
+    origin = String.trim_trailing(issuer, "/")
+
+    assert headers["accept"] == "*/*"
+    assert headers["accept-language"] == "en-US,en;q=0.9"
+    assert headers["cache-control"] == "no-cache"
+    assert headers["origin"] == origin
+    assert headers["pragma"] == "no-cache"
+    assert headers["referer"] == origin <> "/"
+
+    assert headers["sec-ch-ua"] ==
+             "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\""
+
+    assert headers["sec-ch-ua-mobile"] == "?0"
+    assert headers["sec-ch-ua-platform"] == "\"Windows\""
+    assert headers["sec-fetch-dest"] == "empty"
+    assert headers["sec-fetch-mode"] == "cors"
+    assert headers["sec-fetch-site"] == "same-origin"
+
+    assert headers["user-agent"] ==
+             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   end
 
   defp start_provider!(routes) do

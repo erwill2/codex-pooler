@@ -85,6 +85,16 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefreshTest do
 
       assert [request] = FakeUpstream.requests(upstream)
       assert request.path == "/oauth/token"
+      headers = Map.new(request.headers)
+
+      assert headers["user-agent"] ==
+               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+      assert headers["sec-fetch-site"] == "same-origin"
+      assert headers["sec-fetch-mode"] == "cors"
+      assert headers["sec-fetch-dest"] == "empty"
+      assert headers["origin"] == CodexAuth.issuer()
+
       form = URI.decode_query(request.body)
       assert form["grant_type"] == "refresh_token"
       assert form["client_id"] == CodexAuth.client_id()

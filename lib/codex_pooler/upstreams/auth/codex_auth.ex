@@ -236,16 +236,44 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
 
     alias CodexPooler.Upstreams.Auth.CodexAuth
 
+    @browser_user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    @browser_sec_ch_ua ~S("Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99")
+
     @spec exchange_authorization_code(String.t(), String.t(), String.t()) ::
             CodexAuth.token_response()
     def exchange_authorization_code(code, verifier, redirect_uri) do
       request_tokens_for_authorization_code(code, verifier, redirect_uri)
     end
 
+    @spec browser_request_headers() :: [{String.t(), String.t()}]
+    defp browser_request_headers do
+      origin = browser_origin()
+
+      [
+        {"accept", "*/*"},
+        {"accept-language", "en-US,en;q=0.9"},
+        {"cache-control", "no-cache"},
+        {"origin", origin},
+        {"pragma", "no-cache"},
+        {"referer", origin <> "/"},
+        {"sec-ch-ua", @browser_sec_ch_ua},
+        {"sec-ch-ua-mobile", "?0"},
+        {"sec-ch-ua-platform", "\"Windows\""},
+        {"sec-fetch-dest", "empty"},
+        {"sec-fetch-mode", "cors"},
+        {"sec-fetch-site", "same-origin"},
+        {"user-agent", @browser_user_agent}
+      ]
+    end
+
+    @spec browser_origin() :: String.t()
+    defp browser_origin, do: CodexAuth.issuer() |> String.trim_trailing("/")
+
     @spec request_device_code() :: CodexAuth.device_code_response()
     def request_device_code do
       case Req.post(
              CodexAuth.issuer() <> "/api/accounts/deviceauth/usercode",
+             headers: browser_request_headers(),
              json: %{client_id: CodexAuth.client_id()},
              retry: false,
              receive_timeout: 30_000
@@ -273,6 +301,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
       body = %{device_auth_id: state["device_auth_id"], user_code: state["user_code"]}
 
       case Req.post(CodexAuth.issuer() <> "/api/accounts/deviceauth/token",
+             headers: browser_request_headers(),
              json: body,
              retry: false,
              receive_timeout: 30_000
@@ -308,6 +337,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
       ]
 
       case Req.post(CodexAuth.issuer() <> "/oauth/token",
+             headers: browser_request_headers(),
              form: form,
              retry: false,
              receive_timeout: 30_000
@@ -345,6 +375,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
       receive_timeout = refresh_receive_timeout(opts)
 
       case Req.post(token_url,
+             headers: browser_request_headers(),
              form: form,
              retry: false,
              receive_timeout: receive_timeout
