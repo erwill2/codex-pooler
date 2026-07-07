@@ -731,6 +731,8 @@ providers:
       enabled: true
       api: openai-codex-responses
       endpoint: http://localhost:4000/backend-api/codex/responses/compact
+      v2StreamingEnabled: true
+      v2Endpoint: http://localhost:4000/backend-api/codex/responses
     models:
       - id: gpt-5.5
         name: GPT-5.5 via Codex Pooler
@@ -759,7 +761,9 @@ runtime. `authHeader: true` makes OMP send the Pool API key as
 `Authorization: Bearer ...`. Define only model ids your assigned Pool can
 serve. For deployed instances, change `baseUrl` to
 `https://codex-pooler.example.com/v1` and change `remoteCompaction.endpoint` to
-`https://codex-pooler.example.com/backend-api/codex/responses/compact`.
+`https://codex-pooler.example.com/backend-api/codex/responses/compact`; change
+`remoteCompaction.v2Endpoint` to
+`https://codex-pooler.example.com/backend-api/codex/responses`.
 
 Keep `remoteCompaction` under the `codex-pooler` provider so `/compact remote`
 can use Codex Pooler's backend compact route while normal OMP model traffic stays
@@ -767,6 +771,11 @@ on the narrow OpenAI-compatible `/v1` Responses route. Do not use
 `compaction.remoteEndpoint` for this path: OMP reserves that setting for generic
 summary services that accept `{systemPrompt, prompt}` JSON, not provider-native
 Responses compact payloads.
+
+`remoteCompaction.v2StreamingEnabled: true` lets OMP use the Codex-style
+streaming compaction path. OMP sends a normal backend Responses request with a
+terminal `compaction_trigger` to `remoteCompaction.v2Endpoint`; Codex Pooler
+bridges that request to the backend compact route and returns Responses SSE.
 
 Current OMP source derives an effort thinking surface, including `xhigh`, for
 custom `openai-responses` models that set `reasoning: true`. You only need an
@@ -818,6 +827,8 @@ modelRoles:
   designer: codex-pooler/gpt-5.5:high
 compaction:
   reserveTokens: 128000
+  remoteEnabled: true
+  remoteStreamingV2Enabled: true
   midTurnEnabled: true
   handoffSaveToDisk: true
 ```
