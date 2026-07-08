@@ -7,6 +7,7 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Incidents do
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.PoolFilterComponents
+  alias Phoenix.LiveView.JS
 
   attr :selected_tab, :string, required: true
   attr :incident_filter_form, :any, required: true
@@ -31,6 +32,7 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Incidents do
       <AdminComponents.filter_form
         id="alerts-incidents-filter-form"
         for={@incident_filter_form}
+        phx-change="filter_incidents"
         phx-submit="filter_incidents"
         mobile_single_column
         single_row
@@ -39,59 +41,47 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Incidents do
         <PoolFilterComponents.pool_filter_dropdown
           id="alerts-incident-pool-filter"
           label="Impacted Pool"
-          hidden_id="alerts-incident-pool-id"
+          hidden_id="filters_pool_id"
           event="select_incident_pool_filter"
           selected_value={@incident_filter_values["pool_id"] || ""}
           options={@incident_pool_filter_options}
         />
-        <.input
+        <.incident_filter_dropdown
           id="alerts-incident-severity-filter"
-          field={@incident_filter_form[:severity]}
-          type="select"
           label="Severity"
-          options={option_tuples(@incident_severity_filter_options)}
-          class={incident_filter_select_class()}
+          field_name="severity"
+          hidden_id="filters_severity"
+          role="severity-filter"
+          selected_value={@incident_filter_values["severity"] || ""}
+          options={@incident_severity_filter_options}
         />
-        <.input
+        <.incident_filter_dropdown
           id="alerts-incident-state-filter"
-          field={@incident_filter_form[:state]}
-          type="select"
           label="State"
-          options={option_tuples(@incident_state_filter_options)}
-          class={incident_filter_select_class()}
+          field_name="state"
+          hidden_id="filters_state"
+          role="state-filter"
+          selected_value={@incident_filter_values["state"] || ""}
+          options={@incident_state_filter_options}
         />
-        <.input
+        <.incident_filter_dropdown
           id="alerts-incident-rule-filter"
-          field={@incident_filter_form[:rule_id]}
-          type="select"
           label="Rule"
-          options={option_tuples(@incident_rule_filter_options)}
-          class={incident_filter_select_class()}
+          field_name="rule_id"
+          hidden_id="filters_rule_id"
+          role="rule-filter"
+          selected_value={@incident_filter_values["rule_id"] || ""}
+          options={@incident_rule_filter_options}
         />
-        <.input
+        <.incident_filter_dropdown
           id="alerts-incident-channel-filter"
-          field={@incident_filter_form[:channel_id]}
-          type="select"
           label="Channel"
-          options={option_tuples(@incident_channel_filter_options)}
-          class={incident_filter_select_class()}
+          field_name="channel_id"
+          hidden_id="filters_channel_id"
+          role="channel-filter"
+          selected_value={@incident_filter_values["channel_id"] || ""}
+          options={@incident_channel_filter_options}
         />
-        <:actions>
-          <AdminComponents.action_button
-            id="alerts-incidents-filter-submit"
-            icon="hero-funnel"
-            label="Apply"
-            type="submit"
-            variant={:primary}
-          />
-          <.link
-            id="alerts-incidents-filter-clear"
-            patch={~p"/admin/alerts?#{%{"tab" => "incidents"}}"}
-            class="btn btn-secondary btn-sm"
-          >
-            Clear
-          </.link>
-        </:actions>
       </AdminComponents.filter_form>
 
       <div
@@ -304,8 +294,6 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Incidents do
     """
   end
 
-  defp option_tuples(options), do: Enum.map(options, &{&1.label, &1.value})
-
   defp incident_count_label(0, _page_size), do: "0 incidents"
   defp incident_count_label(1, _page_size), do: "1 incident"
 
@@ -451,8 +439,86 @@ defmodule CodexPoolerWeb.Admin.AlertsPageComponents.Incidents do
     """
   end
 
-  defp incident_filter_select_class,
-    do: "select select-bordered h-10 min-h-10 w-full text-sm font-normal"
+  attr :id, :string, required: true
+  attr :label, :string, required: true
+  attr :field_name, :string, required: true
+  attr :hidden_id, :string, required: true
+  attr :role, :string, required: true
+  attr :selected_value, :string, required: true
+  attr :options, :list, required: true
+
+  defp incident_filter_dropdown(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :selected,
+        selected_incident_filter_option(assigns.options, assigns.selected_value)
+      )
+
+    ~H"""
+    <div class="grid gap-2">
+      <input
+        type="hidden"
+        id={@hidden_id}
+        name={"filters[#{@field_name}]"}
+        value={@selected_value}
+      />
+      <details
+        id={@id}
+        class="dropdown w-full"
+        phx-click-away={JS.remove_attribute("open", to: "##{@id}")}
+      >
+        <summary
+          data-role={"#{@role}-trigger"}
+          aria-label={@label}
+          class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
+        >
+          <span data-role={"#{@role}-icon"} class="shrink-0">
+            <.icon name={@selected.icon} class={["size-4", incident_filter_icon_class(@selected)]} />
+          </span>
+          <span class="truncate">{@selected.label}</span>
+        </summary>
+        <ul
+          data-role={"#{@role}-menu"}
+          class="menu dropdown-content z-[60] mt-1 max-h-80 w-full flex-nowrap overflow-y-auto rounded-box border border-base-300 bg-base-100 p-1 !transition-none ![scale:100%] shadow-xl"
+        >
+          <li :for={option <- @options}>
+            <button
+              type="button"
+              phx-click="select_incident_filter"
+              phx-value-field={@field_name}
+              phx-value-filter-value={option.value}
+              data-role={"#{@role}-option"}
+              data-filter-value={option.value}
+              class={[
+                "flex items-center gap-2 text-sm",
+                option.value == (@selected_value || "") && "active"
+              ]}
+              aria-current={option.value == (@selected_value || "") && "true"}
+            >
+              <span data-role={"#{@role}-icon"} class="shrink-0">
+                <.icon name={option.icon} class={["size-4", incident_filter_icon_class(option)]} />
+              </span>
+              <span class="truncate">{option.label}</span>
+            </button>
+          </li>
+        </ul>
+      </details>
+    </div>
+    """
+  end
+
+  defp selected_incident_filter_option(options, selected_value) do
+    Enum.find(options, &(&1.value == (selected_value || ""))) || List.first(options)
+  end
+
+  defp incident_filter_icon_class(%{value: "critical"}), do: "text-error"
+  defp incident_filter_icon_class(%{value: "warning"}), do: "text-warning"
+  defp incident_filter_icon_class(%{value: "info"}), do: "text-info"
+  defp incident_filter_icon_class(%{value: "open"}), do: "text-error"
+  defp incident_filter_icon_class(%{value: "acknowledged"}), do: "text-warning"
+  defp incident_filter_icon_class(%{value: "resolved"}), do: "text-success"
+  defp incident_filter_icon_class(_option), do: "text-base-content/60"
 
   def severity_chip_class(severity), do: AdminBadges.alert_severity_chip_class(severity)
 

@@ -589,7 +589,7 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
 
     assert has_element?(
              view,
-             "#alerts-incidents-filter-form[phx-hook='AdminFilterDropdowns'].bg-transparent.p-0"
+             "#alerts-incidents-filter-form[phx-hook='AdminFilterDropdowns'][phx-change='filter_incidents'][phx-submit='filter_incidents'].bg-transparent.p-0"
            )
 
     assert has_element?(
@@ -602,11 +602,28 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
 
     refute has_element?(view, "#alerts-incidents-filters")
     refute has_element?(view, "#alerts-incidents-section", "Incident filters")
+    refute has_element?(view, "#alerts-incidents-filter-submit")
+    refute has_element?(view, "#alerts-incidents-filter-clear")
+    assert has_element?(view, "#filters_pool_id[type='hidden'][name='filters[pool_id]']")
+    assert has_element?(view, "#filters_severity[type='hidden'][name='filters[severity]']")
+    assert has_element?(view, "#filters_state[type='hidden'][name='filters[state]']")
+    assert has_element?(view, "#filters_rule_id[type='hidden'][name='filters[rule_id]']")
+    assert has_element?(view, "#filters_channel_id[type='hidden'][name='filters[channel_id]']")
     assert has_element?(view, "#alerts-incident-pool-filter [data-role='pool-filter-trigger']")
-    assert has_element?(view, "#alerts-incident-severity-filter.select-bordered.h-10.min-h-10")
-    assert has_element?(view, "#alerts-incident-state-filter.select-bordered.h-10.min-h-10")
-    assert has_element?(view, "#alerts-incident-rule-filter.select-bordered.h-10.min-h-10")
-    assert has_element?(view, "#alerts-incident-channel-filter.select-bordered.h-10.min-h-10")
+    assert has_element?(view, "#alerts-incident-severity-filter [aria-label='Severity']")
+    assert has_element?(view, "#alerts-incident-state-filter [aria-label='State']")
+    assert has_element?(view, "#alerts-incident-rule-filter [aria-label='Rule']")
+    assert has_element?(view, "#alerts-incident-channel-filter [aria-label='Channel']")
+
+    assert has_element?(
+             view,
+             "#alerts-incident-severity-filter [data-role='severity-filter-trigger'] [data-role='severity-filter-icon']"
+           )
+
+    assert has_element?(
+             view,
+             "#alerts-incident-state-filter [data-role='state-filter-trigger'] [data-role='state-filter-icon']"
+           )
 
     assert has_element?(view, "#alert-incident-#{incident.id}")
     assert has_element?(view, "#alert-incident-card-#{incident.id}")
@@ -632,6 +649,15 @@ defmodule CodexPoolerWeb.Admin.AlertsLiveTest do
     refute html =~ raw_dedupe_key
     refute html =~ raw_prompt
     refute html =~ raw_header
+
+    view
+    |> element(
+      "#alerts-incident-severity-filter [data-role='severity-filter-option'][data-filter-value='warning']"
+    )
+    |> render_click()
+
+    assert_patch(view, ~p"/admin/alerts?#{%{"tab" => "incidents", "severity" => "warning"}}")
+    assert has_element?(view, "#filters_severity[type='hidden'][value='warning']")
 
     {:ok, filtered_view, _filtered_html} =
       live(conn, ~p"/admin/alerts?tab=incidents&severity=warning")

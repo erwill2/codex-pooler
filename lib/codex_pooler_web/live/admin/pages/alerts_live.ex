@@ -55,6 +55,9 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
   def handle_event("select_incident_pool_filter", params, socket),
     do: {:noreply, select_incident_pool_filter(socket, params)}
 
+  def handle_event("select_incident_filter", params, socket),
+    do: {:noreply, select_incident_filter(socket, params)}
+
   def handle_event("acknowledge_incident", params, socket),
     do: {:noreply, acknowledge_incident(socket, params)}
 
@@ -267,6 +270,13 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
 
   defp select_incident_pool_filter(socket, %{"pool-id" => pool_id}) do
     params = Map.put(socket.assigns.incident_filter_values, "pool_id", pool_id)
+
+    push_patch(socket, to: ~p"/admin/alerts?#{AlertIncidentsReadModel.query_params(params)}")
+  end
+
+  defp select_incident_filter(socket, %{"field" => field, "filter-value" => value})
+       when field in ~w(severity state rule_id channel_id) do
+    params = Map.put(socket.assigns.incident_filter_values, field, value)
 
     push_patch(socket, to: ~p"/admin/alerts?#{AlertIncidentsReadModel.query_params(params)}")
   end
