@@ -31,25 +31,35 @@ providers:
       v2StreamingEnabled: true
       v2Endpoint: https://codex-pooler.example.com/backend-api/codex/responses
     models:
-      - id: gpt-5.5
-        name: GPT-5.5 via Codex Pooler
+      - id: gpt-5.6-terra
+        name: GPT-5.6 Terra via Codex Pooler
         reasoning: true
         input:
           - text
           - image
         compat:
           streamIdleTimeoutMs: 300000
-        contextWindow: 272000
+        contextWindow: 372000
         maxTokens: 128000
-      - id: gpt-5.4-mini
-        name: GPT-5.4 Mini via Codex Pooler
+      - id: gpt-5.6-luna
+        name: GPT-5.6 Luna via Codex Pooler
         reasoning: true
         input:
           - text
           - image
         compat:
           streamIdleTimeoutMs: 300000
-        contextWindow: 272000
+        contextWindow: 372000
+        maxTokens: 128000
+      - id: gpt-5.6-sol
+        name: GPT-5.6 Sol via Codex Pooler
+        reasoning: true
+        input:
+          - text
+          - image
+        compat:
+          streamIdleTimeoutMs: 300000
+        contextWindow: 372000
         maxTokens: 128000
 ```
 
@@ -63,7 +73,7 @@ Keep `remoteCompaction` under the `codex-pooler` provider so `/compact remote` c
 
 Current OMP derives an effort thinking surface, including `xhigh`, for custom `openai-responses` models that set `reasoning: true`. Add an explicit `thinking` block only when you want to override the inferred effort list, wire mapping, or per-model default level.
 
-OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept `contextTokens`. The examples keep both Codex models on a 272k context window and 128k output budget: `gpt-5.5` handles the default, slow, plan, vision, task, designer, and advisor paths, while `gpt-5.4-mini` handles `smol`, `tiny`, and `commit`. `compaction.reserveTokens: 128000` asks OMP to compact before a prompt plus a long completion can exceed that 272k window.
+OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept `contextTokens`. The examples keep the GPT-5.6 tiered models on a 372k context window and 128k output budget: `gpt-5.6-luna` handles lightweight roles, `gpt-5.6-terra` handles daily agent work, and `gpt-5.6-sol` is reserved for slow, planning, and design escalation. `compaction.reserveTokens: 128000` asks OMP to compact before a prompt plus a long completion can exceed that 372k window.
 
 For long tool-heavy OMP sessions, keep mid-turn compaction enabled and persist handoff material to disk. Those settings reduce context-overflow risk, but they cannot repair an OMP client bug that skips its own mid-run compaction check. If an OMP plan appears to restart work after a very large turn, upgrade OMP when a newer release is available and restart or resume the session before treating it as a Codex Pooler routing issue.
 
@@ -78,21 +88,22 @@ startup:
   setupWizard: false
 defaultThinkingLevel: xhigh
 enabledModels:
-  - codex-pooler/gpt-5.5
-  - codex-pooler/gpt-5.4-mini
+  - codex-pooler/gpt-5.6-luna
+  - codex-pooler/gpt-5.6-terra
+  - codex-pooler/gpt-5.6-sol
 modelProviderOrder:
   - codex-pooler
 modelRoles:
-  default: codex-pooler/gpt-5.5:xhigh
-  smol: codex-pooler/gpt-5.4-mini:low
-  tiny: codex-pooler/gpt-5.4-mini:minimal
-  slow: codex-pooler/gpt-5.5:xhigh
-  plan: codex-pooler/gpt-5.5:xhigh
-  task: codex-pooler/gpt-5.5:high
-  vision: codex-pooler/gpt-5.5:high
-  advisor: codex-pooler/gpt-5.5:medium
-  commit: codex-pooler/gpt-5.4-mini:minimal
-  designer: codex-pooler/gpt-5.5:high
+  default: codex-pooler/gpt-5.6-terra:xhigh
+  smol: codex-pooler/gpt-5.6-luna:low
+  tiny: codex-pooler/gpt-5.6-luna:minimal
+  slow: codex-pooler/gpt-5.6-sol:xhigh
+  plan: codex-pooler/gpt-5.6-sol:xhigh
+  task: codex-pooler/gpt-5.6-terra:high
+  vision: codex-pooler/gpt-5.6-terra:high
+  advisor: codex-pooler/gpt-5.6-terra:medium
+  commit: codex-pooler/gpt-5.6-luna:minimal
+  designer: codex-pooler/gpt-5.6-sol:high
 compaction:
   reserveTokens: 128000
   remoteEnabled: true
@@ -109,7 +120,7 @@ Run a one-shot prompt from the repository you want OMP to inspect:
 
 ```bash
 export CODEX_POOLER_API_KEY=<pool-api-key>
-omp --model codex-pooler/gpt-5.5:xhigh \
+omp --model codex-pooler/gpt-5.6-terra:xhigh \
   --no-session \
   --tools bash \
   -p 'Reply with exactly: omp ok'

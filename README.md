@@ -174,9 +174,9 @@ OpenAI Realtime SDK compatibility.
         "store": false
       },
       "models": {
-        "gpt-5.5": {
-          "id": "gpt-5.5",
-          "name": "GPT-5.5",
+        "gpt-5.6-terra": {
+          "id": "gpt-5.6-terra",
+          "name": "GPT-5.6 Terra",
           "family": "gpt",
           "attachment": true,
           "reasoning": true,
@@ -187,8 +187,8 @@ OpenAI Realtime SDK compatibility.
             "output": ["text"]
           },
           "limit": {
-            "context": 272000,
-            "input": 228000,
+            "context": 372000,
+            "input": 328000,
             "output": 64000
           }
         }
@@ -216,9 +216,9 @@ change `baseURL` to `https://codex-pooler.example.com/v1`; if you keep the optio
 operator MCP entry, change its `url` to `https://codex-pooler.example.com/mcp`.
 
 OpenCode subtracts its compaction reserve from `limit.input` before deciding a
-conversation is full. The `228000` value leaves 208k usable input tokens after
-OpenCode's default 20k reserve, so 208k input plus a 64k output cap stays inside
-Codex Pooler's 272k `gpt-5.5` window. OpenCode's request layer caps output at
+conversation is full. The `328000` value leaves 308k usable input tokens after
+OpenCode's default 20k reserve, so 308k input plus a 64k output cap stays inside
+Codex Pooler's 372k `gpt-5.6-terra` window. OpenCode's request layer caps output at
 32k by default; set `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=64000` only if you
 want OpenCode to request the full 64k cap.
 
@@ -288,9 +288,9 @@ For deployed instances, change `base_url` to
 `https://codex-pooler.example.com/backend-api/codex`.
 
 When Codex Pooler serves current model metadata, Codex does not need explicit
-client-side context overrides. If you must pin `gpt-5.5` for an older model
-catalog, use Codex's own fields: `model_context_window = 272000` and
-`model_auto_compact_token_limit = 244800`. Codex computes an effective 95%
+client-side context overrides. If you must pin `gpt-5.6-terra` for an older model
+catalog, use Codex's own fields: `model_context_window = 372000` and
+`model_auto_compact_token_limit = 334800`. Codex computes an effective 95%
 window for turn budgeting and does not send an OpenAI SDK-style output cap on
 normal `/responses` turns.
 
@@ -397,7 +397,15 @@ point the OpenAI provider at Codex Pooler and use the current OpenClaw runtime i
 {
   agents: {
     defaults: {
-      model: { primary: "openai/gpt-5.5" },
+      model: {
+        primary: "openai/gpt-5.6-terra",
+        list: [
+          {
+            id: "background",
+            model: "openai/gpt-5.6-luna",
+          },
+        ],
+      },
       compaction: { reserveTokens: 128000 },
     },
   },
@@ -412,12 +420,30 @@ point the OpenAI provider at Codex Pooler and use the current OpenClaw runtime i
         timeoutSeconds: 300,
         models: [
           {
-            id: "gpt-5.5",
-            name: "GPT-5.5 via Codex Pooler",
+            id: "gpt-5.6-luna",
+            name: "GPT-5.6 Luna via Codex Pooler",
             reasoning: true,
             input: ["text", "image"],
-            contextWindow: 1000000,
-            contextTokens: 272000,
+            contextWindow: 372000,
+            contextTokens: 372000,
+            maxTokens: 128000,
+          },
+          {
+            id: "gpt-5.6-terra",
+            name: "GPT-5.6 Terra via Codex Pooler",
+            reasoning: true,
+            input: ["text", "image"],
+            contextWindow: 372000,
+            contextTokens: 372000,
+            maxTokens: 128000,
+          },
+          {
+            id: "gpt-5.6-sol",
+            name: "GPT-5.6 Sol via Codex Pooler",
+            reasoning: true,
+            input: ["text", "image"],
+            contextWindow: 372000,
+            contextTokens: 372000,
             maxTokens: 128000,
           },
         ],
@@ -444,13 +470,15 @@ change `baseUrl` to `https://codex-pooler.example.com/v1`; if you keep the optio
 operator MCP add-on, change its `url` to `https://codex-pooler.example.com/mcp`.
 
 OpenClaw keeps `contextWindow` as the provider/native window and uses
-`contextTokens` as the effective runtime budget. The `gpt-5.5` OpenAI source
-catalog publishes a 1M native window, a 272k effective cap, and a 128k output
-budget; the explicit compaction reserve keeps local history under the remaining
-144k prompt budget before a long completion.
+`contextTokens` as the effective runtime budget. The `gpt-5.6-*` OpenAI source
+catalog uses a 372k native/effective window and a 128k output budget; the
+explicit compaction reserve keeps local history under the remaining 244k prompt
+budget before a long completion. Use `gpt-5.6-luna` for background routing,
+keep `gpt-5.6-terra` as the primary model, and switch a session to
+`gpt-5.6-sol` only for heavy reasoning.
 
 If you prefer to keep Codex Pooler separate from OpenClaw's built-in OpenAI
-provider behavior, use a custom provider id such as `codex-pooler/gpt-5.5`
+provider behavior, use a custom provider id such as `codex-pooler/gpt-5.6-terra`
 instead. That follows OpenClaw's generic custom-provider shape, but tools that
 look specifically for `openai/gpt-*` model refs will not see it as canonical
 OpenAI.
@@ -479,11 +507,11 @@ CODEX_POOLER_MCP_KEY=<operator-mcp-token>
 
 ```yaml
 model:
-  default: gpt-5.5
+  default: gpt-5.6-terra
   provider: openai-api
   base_url: http://localhost:4000/v1
   api_mode: codex_responses
-  context_length: 258400
+  context_length: 353400
   supports_vision: true
 
 agent:
@@ -526,9 +554,9 @@ using OpenAI's default endpoint instead of Codex Pooler.
 
 Current Codex Pooler releases also expose an SDK-readable `context_length` value
 on `/v1/models`, derived from the effective Codex `context_window` metadata, so
-Hermes' automatic probes can resolve the Pooler window. For `gpt-5.5`, the raw
-Codex window remains 272000 and the effective advertised value is currently
-258400. Keep `context_length: 258400` in Hermes config as a safe explicit
+Hermes' automatic probes can resolve the Pooler window. For `gpt-5.6-terra`, the raw
+Codex window remains 372000 and the effective advertised value is currently
+353400. Keep `context_length: 353400` in Hermes config as a safe explicit
 override for older Pooler deployments or stale model metadata.
 
 Hermes context compression uses its own auxiliary request timeout. Keep
@@ -564,10 +592,10 @@ CODEX_POOLER_MCP_KEY=<operator-mcp-token>
 
 ```yaml
 model:
-  default: gpt-5.5
+  default: gpt-5.6-terra
   provider: openai-codex
   base_url: http://localhost:4000/v1
-  context_length: 258400
+  context_length: 353400
   supports_vision: true
 
 agent:
@@ -641,14 +669,14 @@ Then add a provider to `~/.pi/agent/models.json`:
       "authHeader": true,
       "models": [
         {
-          "id": "gpt-5.5",
-          "name": "GPT-5.5 via Codex Pooler",
+          "id": "gpt-5.6-terra",
+          "name": "GPT-5.6 Terra via Codex Pooler",
           "reasoning": true,
           "thinkingLevelMap": {
             "xhigh": "xhigh"
           },
           "input": ["text", "image"],
-          "contextWindow": 272000,
+          "contextWindow": 372000,
           "maxTokens": 128000
         }
       ]
@@ -668,11 +696,11 @@ as unsupported for a custom model and clamps `--thinking xhigh` or
 `defaultThinkingLevel: "xhigh"` to `high`.
 
 Pi accepts `contextWindow` and `maxTokens` for custom models; it has no
-`contextTokens` field. The bundled Pi `gpt-5.5` entries use a 272k context
-window and 128k output budget, so matching those values keeps Codex Pooler
-custom-provider behavior aligned with Pi's built-in metadata. The explicit
+`contextTokens` field. Use a 372k context window and 128k output budget for the
+`gpt-5.6-terra` custom entry so Pi's local context accounting matches Codex
+Pooler's advertised model metadata. The explicit
 compaction reserve makes Pi compact before a prompt plus a long completion can
-exceed that 272k window.
+exceed that 372k window.
 
 Optionally set Codex Pooler as the default Pi model in
 `~/.pi/agent/settings.json`:
@@ -680,9 +708,9 @@ Optionally set Codex Pooler as the default Pi model in
 ```json
 {
   "defaultProvider": "codex-pooler",
-  "defaultModel": "gpt-5.5",
+  "defaultModel": "gpt-5.6-terra",
   "defaultThinkingLevel": "xhigh",
-  "enabledModels": ["codex-pooler/gpt-5.5"],
+  "enabledModels": ["codex-pooler/gpt-5.6-terra"],
   "compaction": {
     "reserveTokens": 128000
   }
@@ -694,7 +722,7 @@ Check the non-interactive path from a repository:
 ```bash
 export CODEX_POOLER_API_KEY=<pool-api-key>
 pi --provider codex-pooler \
-  --model gpt-5.5 \
+  --model gpt-5.6-terra \
   --no-session \
   --no-context-files \
   --tools bash \
@@ -734,25 +762,35 @@ providers:
       v2StreamingEnabled: true
       v2Endpoint: http://localhost:4000/backend-api/codex/responses
     models:
-      - id: gpt-5.5
-        name: GPT-5.5 via Codex Pooler
+      - id: gpt-5.6-terra
+        name: GPT-5.6 Terra via Codex Pooler
         reasoning: true
         input:
           - text
           - image
         compat:
           streamIdleTimeoutMs: 300000
-        contextWindow: 272000
+        contextWindow: 372000
         maxTokens: 128000
-      - id: gpt-5.4-mini
-        name: GPT-5.4 Mini via Codex Pooler
+      - id: gpt-5.6-luna
+        name: GPT-5.6 Luna via Codex Pooler
         reasoning: true
         input:
           - text
           - image
         compat:
           streamIdleTimeoutMs: 300000
-        contextWindow: 272000
+        contextWindow: 372000
+        maxTokens: 128000
+      - id: gpt-5.6-sol
+        name: GPT-5.6 Sol via Codex Pooler
+        reasoning: true
+        input:
+          - text
+          - image
+        compat:
+          streamIdleTimeoutMs: 300000
+        contextWindow: 372000
         maxTokens: 128000
 ```
 
@@ -787,11 +825,12 @@ explicit `thinking` block if you want to override the inferred effort list,
 wire mapping, or per-model default level.
 
 OMP accepts `contextWindow` and `maxTokens` in `models.yml`; it does not accept
-`contextTokens`. The examples keep both Codex models on a 272k context window
-and 128k output budget: `gpt-5.5` handles the default, slow, plan, vision, task,
-designer, and advisor paths, while `gpt-5.4-mini` handles `smol`, `tiny`, and
-`commit`. `compaction.reserveTokens: 128000` asks OMP to compact before a
-prompt plus a long completion can exceed that 272k window.
+`contextTokens`. The examples keep the GPT-5.6 tiered models on a 372k context
+window and 128k output budget: `gpt-5.6-luna` handles lightweight roles,
+`gpt-5.6-terra` handles daily agent work, and `gpt-5.6-sol` is reserved for
+slow, planning, and design escalation. `compaction.reserveTokens: 128000` asks
+OMP to compact before a prompt plus a long completion can exceed that 372k
+window.
 
 For long tool-heavy OMP sessions, keep mid-turn compaction enabled and persist
 handoff material to disk. Those settings reduce context-overflow risk, but they
@@ -814,21 +853,22 @@ startup:
   setupWizard: false
 defaultThinkingLevel: xhigh
 enabledModels:
-  - codex-pooler/gpt-5.5
-  - codex-pooler/gpt-5.4-mini
+  - codex-pooler/gpt-5.6-luna
+  - codex-pooler/gpt-5.6-terra
+  - codex-pooler/gpt-5.6-sol
 modelProviderOrder:
   - codex-pooler
 modelRoles:
-  default: codex-pooler/gpt-5.5:xhigh
-  smol: codex-pooler/gpt-5.4-mini:low
-  tiny: codex-pooler/gpt-5.4-mini:minimal
-  slow: codex-pooler/gpt-5.5:xhigh
-  plan: codex-pooler/gpt-5.5:xhigh
-  task: codex-pooler/gpt-5.5:high
-  vision: codex-pooler/gpt-5.5:high
-  advisor: codex-pooler/gpt-5.5:medium
-  commit: codex-pooler/gpt-5.4-mini:minimal
-  designer: codex-pooler/gpt-5.5:high
+  default: codex-pooler/gpt-5.6-terra:xhigh
+  smol: codex-pooler/gpt-5.6-luna:low
+  tiny: codex-pooler/gpt-5.6-luna:minimal
+  slow: codex-pooler/gpt-5.6-sol:xhigh
+  plan: codex-pooler/gpt-5.6-sol:xhigh
+  task: codex-pooler/gpt-5.6-terra:high
+  vision: codex-pooler/gpt-5.6-terra:high
+  advisor: codex-pooler/gpt-5.6-terra:medium
+  commit: codex-pooler/gpt-5.6-luna:minimal
+  designer: codex-pooler/gpt-5.6-sol:high
 compaction:
   reserveTokens: 128000
   remoteEnabled: true
@@ -841,7 +881,7 @@ Check the non-interactive path from a repository:
 
 ```bash
 export CODEX_POOLER_API_KEY=<pool-api-key>
-omp --model codex-pooler/gpt-5.5:xhigh \
+omp --model codex-pooler/gpt-5.6-terra:xhigh \
   --no-session \
   --tools bash \
   -p 'Reply with exactly: omp ok'
@@ -869,7 +909,7 @@ Then configure the provider in `~/.config/kilo/kilo.jsonc`:
 ```jsonc
 {
   "$schema": "https://app.kilo.ai/config.json",
-  "model": "codex-pooler/gpt-5.5",
+  "model": "codex-pooler/gpt-5.6-terra",
   "enabled_providers": ["codex-pooler"],
   "provider": {
     "codex-pooler": {
@@ -878,8 +918,8 @@ Then configure the provider in `~/.config/kilo/kilo.jsonc`:
         "baseURL": "http://localhost:4000/v1"
       },
       "models": {
-        "gpt-5.5": {
-          "name": "GPT-5.5 via Codex Pooler",
+        "gpt-5.6-terra": {
+          "name": "GPT-5.6 Terra via Codex Pooler",
           "tool_call": true,
           "reasoning": true,
           "temperature": false,
@@ -889,8 +929,8 @@ Then configure the provider in `~/.config/kilo/kilo.jsonc`:
             "output": ["text"]
           },
           "limit": {
-            "context": 272000,
-            "input": 228000,
+            "context": 372000,
+            "input": 328000,
             "output": 64000
           }
         }
@@ -905,7 +945,7 @@ Then configure the provider in `~/.config/kilo/kilo.jsonc`:
 
 Kilo uses OpenCode-style `limit.{context,input,output}` fields, but it includes
 reasoning tokens in overflow accounting and uses `compaction.threshold_percent`
-for preflight compaction. `limit.input: 228000` leaves 208k usable input tokens
+for preflight compaction. `limit.input: 328000` leaves 308k usable input tokens
 after the default 20k reserve; the 75% threshold asks Kilo to compact earlier.
 For GPT-5 OpenAI-compatible models, Kilo suppresses the outgoing max-token
 request field to avoid incompatible `max_tokens`, so `limit.output` is still
@@ -924,7 +964,7 @@ cd /tmp/codex-pooler-kilo-check
 
 export CODEX_POOLER_API_KEY=<pool-api-key>
 kilo run \
-  --model codex-pooler/gpt-5.5 \
+  --model codex-pooler/gpt-5.6-terra \
   --pure \
   --auto \
   --format json \
@@ -971,11 +1011,11 @@ In Trae, open Settings -> Models, add a custom model, and use these values:
 | API format | OpenAI Chat Completions |
 | Custom Request URL | `https://codex-pooler.example.com/v1` |
 | Full URL | Off |
-| Model ID | `gpt-5.5` or another model id served by the assigned Pool |
+| Model ID | `gpt-5.6-terra` or another model id served by the assigned Pool |
 | Multimodal | On when the Pool model supports image input |
 | API key | Pool API key |
 | Model Series | Default |
-| Display Name | `GPT-5.5 via Codex Pooler` |
+| Display Name | `GPT-5.6 Terra via Codex Pooler` |
 | Context Window input | `184000` |
 | Context Window output | `16000` |
 | Tool Call Rounds | `200` |
@@ -993,7 +1033,7 @@ curl -sS -X POST \
   -H "Authorization: Bearer $CODEX_POOLER_API_KEY" \
   -H "Content-Type: application/json" \
   --data '{
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-terra",
     "messages": [
       { "role": "user", "content": "Reply with exactly: trae ok" }
     ],
@@ -1026,15 +1066,11 @@ taking priority.
 
 ```yaml
 # ~/.aider.conf.yml or <repo>/.aider.conf.yml
-model: openai/gpt-5.5
+model: openai/gpt-5.6-terra
 openai-api-base: http://localhost:4000/v1
 ```
 
-Aider's bundled `gpt-5.5` settings define behavior flags such as diff editing,
-repo-map use, and `reasoning_effort`; they do not bundle context/output limits
-in `.aider.conf.yml`. If you need explicit unknown-model limits, use Aider's
-separate model metadata JSON file instead of adding unsupported context fields to
-the main config.
+Aider's `.aider.conf.yml` route settings do not carry context or output limits. If your installed Aider version does not recognize `gpt-5.6-terra`, use Aider's separate model metadata JSON file for model behavior and limits instead of adding unsupported context fields to the main config.
 
 Keep the Pool API key out of the YAML file. Export it in the shell, or put it in
 a gitignored `.env` file that Aider can load:
@@ -1086,12 +1122,12 @@ version: 1.0.0
 schema: v1
 
 models:
-  - name: GPT-5.5 via Codex Pooler
+  - name: GPT-5.6 Terra via Codex Pooler
     provider: openai
-    model: gpt-5.5
+    model: gpt-5.6-terra
     apiBase: http://localhost:4000/v1
     apiKey: "${{ secrets.CODEX_POOLER_API_KEY }}"
-    contextLength: 272000
+    contextLength: 372000
     defaultCompletionOptions:
       maxTokens: 128000
     roles:
@@ -1121,7 +1157,7 @@ if you keep the optional operator MCP add-on, change the MCP `url` to
 Continue uses `contextLength` for request pruning and
 `defaultCompletionOptions.maxTokens` for the completion budget. It prunes rather
 than summarizing/compacting locally, so keep the context length at Codex Pooler's
-272k `gpt-5.5` window instead of using direct-OpenAI 1M metadata.
+372k `gpt-5.6-terra` window instead of stale or generic provider metadata.
 
 Check the headless CLI path after saving the config:
 
@@ -1150,20 +1186,20 @@ cline auth \
   --provider openai \
   --apikey "$CODEX_POOLER_API_KEY" \
   --baseurl http://localhost:4000/v1 \
-  --modelid gpt-5.5
+  --modelid gpt-5.6-terra
 ```
 
 Cline's model metadata names are `contextWindow`, `maxInputTokens`, and
 `maxTokens`. If you add a manual Codex Pooler model entry in Cline settings, use
-`contextWindow: 272000`, `maxInputTokens: 144000`, and `maxTokens: 128000` so
-Cline's compaction trigger leaves room for a long completion inside the 272k
+`contextWindow: 372000`, `maxInputTokens: 244000`, and `maxTokens: 128000` so
+Cline's compaction trigger leaves room for a long completion inside the 372k
 Pooler window.
 
 Check the headless CLI path after saving auth:
 
 ```bash
 cline --provider openai \
-  --model gpt-5.5 \
+  --model gpt-5.6-terra \
   --json \
   --auto-approve false \
   'Reply with exactly: cline ok'
@@ -1217,18 +1253,18 @@ than the config file, so `OPENAI_API_KEY` can stay outside YAML.
 
 ```yaml
 GOOSE_PROVIDER: openai
-GOOSE_MODEL: gpt-5.5
+GOOSE_MODEL: gpt-5.6-terra
 OPENAI_HOST: http://localhost:4000
 OPENAI_BASE_PATH: v1/chat/completions
-GOOSE_CONTEXT_LIMIT: 272000
+GOOSE_CONTEXT_LIMIT: 372000
 GOOSE_MAX_TOKENS: 128000
-GOOSE_AUTO_COMPACT_THRESHOLD: 0.52
+GOOSE_AUTO_COMPACT_THRESHOLD: 0.65
 ```
 
 Goose reads `GOOSE_CONTEXT_LIMIT` and `GOOSE_MAX_TOKENS` into its model config.
 Its auto-compaction threshold is a ratio of the context limit, not an output
-reserve, so `0.52` compacts before prompt history can crowd out a 128k
-completion in Codex Pooler's 272k `gpt-5.5` window.
+reserve, so `0.65` compacts before prompt history can crowd out a 128k
+completion in Codex Pooler's 372k `gpt-5.6-terra` window.
 
 Check the headless CLI path with tool access enabled:
 
@@ -1237,7 +1273,7 @@ export OPENAI_API_KEY="$CODEX_POOLER_API_KEY"
 goose run \
   --no-session \
   --provider openai \
-  --model gpt-5.5 \
+  --model gpt-5.6-terra \
   --with-builtin developer \
   --text 'Use your developer tool to create goose-ok.txt containing exactly: goose ok. Then reply with exactly: goose ok'
 ```
@@ -1304,13 +1340,13 @@ providers:
   customai:
     resource_path: u/<owner>/codex_pooler_windmill_codegen
     models:
-      - gpt-5.5
+      - gpt-5.6-terra
 default_model:
   provider: customai
-  model: gpt-5.5
+  model: gpt-5.6-terra
 metadata_model:
   provider: customai
-  model: gpt-5.5
+  model: gpt-5.6-terra
 ```
 
 Windmill's agent request field is `max_completion_tokens`; provider adapters map
@@ -1349,7 +1385,7 @@ in the WSL user's home directory.
 ```bash
 export LLM_API_KEY=<pool-api-key>
 export LLM_BASE_URL=http://localhost:4000/v1
-export LLM_MODEL=openai/gpt-5.5
+export LLM_MODEL=openai/gpt-5.6-terra
 
 uvx --python 3.12 --from openhands openhands \
   --headless \
@@ -1359,7 +1395,7 @@ uvx --python 3.12 --from openhands openhands \
 
 For deployed instances, change `LLM_BASE_URL` to
 `https://codex-pooler.example.com/v1`. The model name should stay
-`openai/gpt-5.5` so OpenHands selects its OpenAI-compatible provider path while
+`openai/gpt-5.6-terra` so OpenHands selects its OpenAI-compatible provider path while
 Codex Pooler routes the request through the assigned Pool.
 
 </details>
@@ -1382,7 +1418,7 @@ client = OpenAI(
 )
 
 response = client.responses.create(
-    model="gpt-5.5",
+    model="gpt-5.6-terra",
     input="Write a one-sentence status update.",
 )
 
@@ -1409,7 +1445,7 @@ const client = new OpenAI({
 });
 
 const response = await client.responses.create({
-  model: "gpt-5.5",
+  model: "gpt-5.6-terra",
   input: "Write a one-sentence status update.",
 });
 
@@ -1438,7 +1474,7 @@ const pooler = createOpenAI({
 });
 
 const { text } = await generateText({
-  model: pooler.responses("gpt-5.5"),
+  model: pooler.responses("gpt-5.6-terra"),
   prompt: "Write a one-sentence status update.",
 });
 

@@ -72,13 +72,13 @@ providers:
   customai:
     resource_path: u/<owner>/codex_pooler_windmill_codegen
     models:
-      - gpt-5.5
+      - gpt-5.6-terra
 default_model:
   provider: customai
-  model: gpt-5.5
+  model: gpt-5.6-terra
 metadata_model:
   provider: customai
-  model: gpt-5.5
+  model: gpt-5.6-terra
 ```
 
 This enables Windmill AI chat, navigation chat, script and flow assistance,
@@ -123,7 +123,7 @@ curl -sS -X POST \
   -H "Content-Type: application/json" \
   -H "X-Provider: customai" \
   --data '{
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-terra",
     "messages": [
       { "role": "user", "content": "Reply with only: ok" }
     ],

@@ -44,14 +44,14 @@ For a deployed instance, add:
       "authHeader": true,
       "models": [
         {
-          "id": "gpt-5.5",
-          "name": "GPT-5.5 via Codex Pooler",
+          "id": "gpt-5.6-terra",
+          "name": "GPT-5.6 Terra via Codex Pooler",
           "reasoning": true,
           "thinkingLevelMap": {
             "xhigh": "xhigh"
           },
           "input": ["text", "image"],
-          "contextWindow": 272000,
+          "contextWindow": 372000,
           "maxTokens": 128000
         }
       ]
@@ -66,7 +66,7 @@ For local setup, change `baseUrl` to `http://localhost:4000/v1`.
 
 Current Pi source still requires `thinkingLevelMap.xhigh` for Pi to expose `xhigh` for this custom model. Without it, Pi clamps `--thinking xhigh` and `defaultThinkingLevel: "xhigh"` down to `high`.
 
-Pi accepts `contextWindow` and `maxTokens` for custom models; it has no `contextTokens` field. The bundled Pi `gpt-5.5` entries use a 272k context window and 128k output budget, so matching those values keeps Codex Pooler custom-provider behavior aligned with Pi's built-in metadata.
+Pi accepts `contextWindow` and `maxTokens` for custom models; it has no `contextTokens` field. Use a 372k context window and 128k output budget for the `gpt-5.6-terra` custom entry so Pi's local context accounting matches Codex Pooler's advertised model metadata.
 
 ## Default model
 
@@ -75,9 +75,9 @@ If you want plain `pi` or `pi -p ...` to start on Codex Pooler, add the defaults
 ```json
 {
   "defaultProvider": "codex-pooler",
-  "defaultModel": "gpt-5.5",
+  "defaultModel": "gpt-5.6-terra",
   "defaultThinkingLevel": "xhigh",
-  "enabledModels": ["codex-pooler/gpt-5.5"],
+  "enabledModels": ["codex-pooler/gpt-5.6-terra"],
   "compaction": {
     "reserveTokens": 128000
   }
@@ -91,7 +91,7 @@ Run a one-shot prompt from the repository you want Pi to inspect:
 ```bash
 export CODEX_POOLER_API_KEY=<pool-api-key>
 pi --provider codex-pooler \
-  --model gpt-5.5 \
+  --model gpt-5.6-terra \
   --no-session \
   --no-context-files \
   --tools bash \

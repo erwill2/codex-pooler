@@ -9,7 +9,7 @@ For a deployed instance, use:
 
 ```yaml
 # ~/.aider.conf.yml or <repo>/.aider.conf.yml
-model: openai/gpt-5.5
+model: openai/gpt-5.6-terra
 openai-api-base: https://codex-pooler.example.com/v1
 ```
 
@@ -17,11 +17,11 @@ For local setup, use:
 
 ```yaml
 # ~/.aider.conf.yml or <repo>/.aider.conf.yml
-model: openai/gpt-5.5
+model: openai/gpt-5.6-terra
 openai-api-base: http://localhost:4000/v1
 ```
 
-Aider's bundled `gpt-5.5` settings define behavior flags such as diff editing, repo-map use, and `reasoning_effort`; they do not bundle context/output limits in `.aider.conf.yml`. If you need explicit unknown-model limits, use Aider's separate model metadata JSON file instead of adding unsupported context fields to the main config.
+Aider's `.aider.conf.yml` route settings do not carry context or output limits. If your installed Aider version does not recognize `gpt-5.6-terra`, use Aider's separate model metadata JSON file for model behavior and limits instead of adding unsupported context fields to the main config.
 
 Keep the Pool API key out of the YAML file. Export it in the shell, or put it in a gitignored `.env` file that Aider can load:
 
