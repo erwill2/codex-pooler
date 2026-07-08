@@ -3332,6 +3332,49 @@ defmodule CodexPooler.UpstreamsTest do
       assert chart.used_percent == nil
     end
 
+    test "quota remaining charts keep zero percent-only evidence from looking fully available" do
+      now = ~U[2026-05-06 12:00:00Z]
+      weekly_reset_at = DateTime.add(now, 604_800, :second)
+      pool = pool_fixture(%{name: "Example Zero Percent Only Pool"})
+
+      %{identity: identity} =
+        upstream_assignment_fixture(pool, %{
+          chatgpt_account_id: "acct-example-zero-percent-only",
+          account_label: "Example Zero Percent Only Account",
+          assignment_label: "Example Zero Percent Only Account"
+        })
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   window_kind: "secondary",
+                   window_minutes: 10_080,
+                   used_percent: Decimal.new("0"),
+                   reset_at: weekly_reset_at,
+                   source: "codex_rate_limit_event",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: now
+                 }
+               ])
+
+      chart = Quota.Charts.quota_remaining_charts_by_pool_ids([pool.id], at: now)[pool.id].weekly
+
+      assert chart.state == "usable"
+      assert [item] = chart.items
+      assert item.label == "Example Zero Percent Only Account"
+      assert item.remaining == nil
+      assert item.capacity == nil
+      assert item.used == nil
+      assert_decimal_equal(item.used_percent, "0")
+      assert item.remaining_percent == nil
+      assert chart.lowest_remaining_percent == nil
+      assert chart.remaining_total == nil
+      assert chart.capacity_total == nil
+      assert chart.used_total == nil
+      assert chart.used_percent == nil
+    end
+
     test "quota remaining charts do not infer capacity from known plan for percent-only evidence" do
       now = ~U[2026-05-06 12:00:00Z]
       reset_at = DateTime.add(now, 900, :second)
@@ -5471,6 +5514,80 @@ defmodule CodexPooler.UpstreamsTest do
       assert merged_window.source == "codex_rate_limit_event"
       assert DateTime.compare(merged_window.reset_at, event_reset_at) == :eq
       assert Decimal.equal?(merged_window.used_percent, Decimal.new("100.0"))
+    end
+
+    test "usage evidence replaces zero percent-only rate-limit event evidence" do
+      identity = active_identity_fixture()
+      observed_at = ~U[2026-04-27 12:00:00Z]
+      event_reset_at = DateTime.add(observed_at, 604_800, :second)
+      usage_observed_at = DateTime.add(observed_at, 60, :second)
+      usage_reset_at = DateTime.add(usage_observed_at, 604_800, :second)
+      later_event_observed_at = DateTime.add(usage_observed_at, 60, :second)
+      later_event_reset_at = DateTime.add(later_event_observed_at, 604_800, :second)
+
+      assert {:ok, [event_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_rate_limit_event(
+                 identity,
+                 %{
+                   "type" => "codex.rate_limits",
+                   "rate_limits" => %{
+                     "secondary" => %{
+                       "used_percent" => 0,
+                       "window_minutes" => 10_080,
+                       "reset_at" => DateTime.to_unix(event_reset_at)
+                     }
+                   }
+                 },
+                 observed_at
+               )
+
+      assert event_window.source == "codex_rate_limit_event"
+
+      assert {:ok, [usage_window]} =
+               QuotaWindows.upsert_quota_windows(
+                 identity,
+                 [
+                   %{
+                     quota_key: "account",
+                     window_kind: "secondary",
+                     window_minutes: 10_080,
+                     used_percent: Decimal.new("12"),
+                     reset_at: usage_reset_at,
+                     source: "codex_usage_api",
+                     source_precision: "observed",
+                     quota_scope: "account",
+                     quota_family: "account",
+                     observed_at: usage_observed_at,
+                     freshness_state: "fresh"
+                   }
+                 ]
+               )
+
+      assert usage_window.id == event_window.id
+      assert usage_window.source == "codex_usage_api"
+      assert DateTime.compare(usage_window.reset_at, usage_reset_at) == :eq
+      assert Decimal.equal?(usage_window.used_percent, Decimal.new("12"))
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_rate_limit_event(
+                 identity,
+                 %{
+                   "type" => "codex.rate_limits",
+                   "rate_limits" => %{
+                     "secondary" => %{
+                       "used_percent" => 0,
+                       "window_minutes" => 10_080,
+                       "reset_at" => DateTime.to_unix(later_event_reset_at)
+                     }
+                   }
+                 },
+                 later_event_observed_at
+               )
+
+      assert merged_window.id == event_window.id
+      assert merged_window.source == "codex_usage_api"
+      assert DateTime.compare(merged_window.reset_at, usage_reset_at) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("12"))
     end
 
     test "headers cannot roll back a reset advanced by usage evidence" do

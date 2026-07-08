@@ -148,6 +148,33 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
          %Quota.AccountQuotaWindow{} = existing,
          timestamp
        ) do
+    case zero_percent_only_merge_decision(evidence, existing) do
+      {:ok, decision} ->
+        decision
+
+      :continue ->
+        quality_supersedes?(evidence, existing, timestamp)
+    end
+  end
+
+  defp zero_percent_only_merge_decision(%Evidence{} = evidence, existing) do
+    cond do
+      nonzero_usage_api?(evidence) and zero_percent_only_rate_limit_event?(existing) ->
+        {:ok, same_evidence_identity?(evidence, existing)}
+
+      zero_percent_only_rate_limit_event?(evidence) and nonzero_usage_api?(existing) ->
+        {:ok, false}
+
+      true ->
+        :continue
+    end
+  end
+
+  defp quality_supersedes?(
+         %Evidence{} = evidence,
+         %Quota.AccountQuotaWindow{} = existing,
+         timestamp
+       ) do
     incoming_quality = quality_key(evidence, timestamp)
     existing_quality = quality_key(existing, timestamp)
 
@@ -227,6 +254,44 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       lower_string(evidence.model) == lower_string(existing.model) and
       lower_string(evidence.upstream_model) == lower_string(existing.upstream_model)
   end
+
+  defp zero_percent_only_rate_limit_event?(
+         %Evidence{source: "codex_rate_limit_event"} = evidence
+       ),
+       do:
+         account_quota?(evidence) and zero_percent?(evidence.used_percent) and
+           unknown_capacity?(evidence)
+
+  defp zero_percent_only_rate_limit_event?(
+         %Quota.AccountQuotaWindow{source: "codex_rate_limit_event"} = window
+       ),
+       do:
+         account_quota?(window) and zero_percent?(window.used_percent) and
+           unknown_capacity?(window)
+
+  defp zero_percent_only_rate_limit_event?(_evidence_or_window), do: false
+
+  defp nonzero_usage_api?(%Evidence{source: "codex_usage_api"} = evidence),
+    do: account_quota?(evidence) and positive_percent?(evidence.used_percent)
+
+  defp nonzero_usage_api?(%Quota.AccountQuotaWindow{source: "codex_usage_api"} = window),
+    do: account_quota?(window) and positive_percent?(window.used_percent)
+
+  defp nonzero_usage_api?(_evidence_or_window), do: false
+
+  defp account_quota?(%{quota_scope: "account", quota_key: "account"}), do: true
+  defp account_quota?(_evidence_or_window), do: false
+
+  defp unknown_capacity?(%{active_limit: nil, credits: nil}), do: true
+  defp unknown_capacity?(_evidence_or_window), do: false
+
+  defp zero_percent?(%Decimal{} = percent), do: Decimal.compare(percent, Decimal.new(0)) == :eq
+  defp zero_percent?(_percent), do: false
+
+  defp positive_percent?(%Decimal{} = percent),
+    do: Decimal.compare(percent, Decimal.new(0)) == :gt
+
+  defp positive_percent?(_percent), do: false
 
   defp quality_key(evidence_or_window, timestamp) do
     {
