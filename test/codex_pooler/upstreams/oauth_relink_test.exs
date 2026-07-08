@@ -91,6 +91,79 @@ defmodule CodexPooler.Upstreams.OAuthRelinkTest do
     assert Repo.get!(OAuthFlow, flow.id).result_upstream_identity_id == identity.id
   end
 
+  test "browser relink rejects a selected identity assigned only to another pool without mutating state" do
+    scope = fixture_owner_scope()
+    requested_pool = pool_fixture()
+    foreign_pool = pool_fixture()
+
+    identity =
+      active_upstream_identity_fixture(
+        relink_identity_attrs("acct_relink_foreign_pool", "ws_foreign_pool")
+      )
+
+    assert {:ok, foreign_assignment} =
+             PoolAssignments.create_pool_assignment(foreign_pool, identity, %{
+               assignment_label: "Foreign pool slot"
+             })
+
+    assert {:ok, foreign_assignment} =
+             PoolAssignments.activate_pool_assignment(foreign_assignment)
+
+    assert {:ok, old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-foreign-pool-access")
+             )
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "rejected-foreign-pool-access",
+           refresh_token: "rejected-foreign-pool-refresh",
+           id_token: relink_id_token("acct_relink_foreign_pool", "ws_foreign_pool")
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, requested_pool, upstream_identity: identity)
+
+    assert flow.purpose == "relink"
+    assert flow.pool_id == requested_pool.id
+    assert flow.upstream_identity_id == identity.id
+
+    assert {:error, %{code: :identity_mismatch}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "foreign-pool-code")
+             )
+
+    reloaded_flow = Repo.get!(OAuthFlow, flow.id)
+    assert reloaded_flow.status == "failed"
+    assert reloaded_flow.error_code == "identity_mismatch"
+    assert reloaded_flow.result_upstream_identity_id == nil
+
+    assert PoolAssignments.list_pool_assignments(requested_pool) == []
+
+    assert [reloaded_foreign_assignment] =
+             PoolAssignments.list_pool_assignments_for_identity(identity)
+
+    assert reloaded_foreign_assignment.id == foreign_assignment.id
+    assert reloaded_foreign_assignment.pool_id == foreign_pool.id
+    assert reloaded_foreign_assignment.status == "active"
+    assert reloaded_foreign_assignment.assignment_label == "Foreign pool slot"
+
+    assert Repo.get!(EncryptedSecret, old_access_secret.id).status == "active"
+
+    assert {:ok, "old-foreign-pool-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert active_secret_count(identity) == 1
+    assert Repo.aggregate(PoolUpstreamAssignment, :count) == 1
+    assert Repo.aggregate(EncryptedSecret, :count) == 1
+  end
+
   test "browser relink rejects callbacks for a different ChatGPT account without mutating state" do
     scope = fixture_owner_scope()
     pool = pool_fixture()

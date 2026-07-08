@@ -17,6 +17,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
   @pending UpstreamIdentity.pending_status()
   @assignment_active PoolUpstreamAssignment.active_status()
   @eligible PoolUpstreamAssignment.eligible_status()
+  @assignment_deleted PoolUpstreamAssignment.deleted_status()
   @health_active PoolUpstreamAssignment.active_health_status()
   @identity_mismatch_message "OAuth account does not match the selected upstream account"
 
@@ -39,7 +40,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
       when is_map(attrs) and is_list(opts) do
     attrs = normalize_link_attrs(attrs, opts)
 
-    case validate_link_target(attrs) do
+    case validate_link_target(pool, attrs) do
       :ok -> link_tokens_transaction(scope, pool, attrs, opts)
       {:error, reason} -> {:error, reason}
     end
@@ -163,6 +164,10 @@ defmodule CodexPooler.Upstreams.TokenLinking do
     }
 
     case assignment_for_pool_identity(pool, identity) do
+      %PoolUpstreamAssignment{status: @assignment_deleted}
+      when is_binary(attrs.target_identity_id) ->
+        {:error, identity_mismatch_error()}
+
       %PoolUpstreamAssignment{} = assignment ->
         attrs =
           assignment_attrs
@@ -172,6 +177,9 @@ defmodule CodexPooler.Upstreams.TokenLinking do
         with {:ok, assignment} <- update_pool_assignment(assignment, attrs) do
           {:ok, :existing, assignment}
         end
+
+      nil when is_binary(attrs.target_identity_id) ->
+        {:error, identity_mismatch_error()}
 
       nil ->
         with {:ok, assignment} <- create_pool_assignment(pool, identity, assignment_attrs) do
@@ -393,23 +401,31 @@ defmodule CodexPooler.Upstreams.TokenLinking do
     |> Map.merge(trusted_plan_metadata(attrs))
   end
 
-  @spec validate_link_target(map()) ::
+  @spec validate_link_target(Pool.t(), map()) ::
           :ok | {:error, lifecycle_error() | IdentityLifecycle.identity_conflict()}
-  defp validate_link_target(%{target_identity_id: target_identity_id} = attrs)
+  defp validate_link_target(%Pool{} = pool, %{target_identity_id: target_identity_id} = attrs)
        when is_binary(target_identity_id) do
-    case select_link_identity(attrs, incoming_identity_attrs(attrs)) do
-      {:ok, _identity} -> :ok
-      {:error, reason} -> {:error, reason}
+    with :ok <- validate_target_pool_assignment(pool, target_identity_id),
+         {:ok, _identity} <- select_link_identity(attrs, incoming_identity_attrs(attrs)) do
+      :ok
     end
   end
 
-  defp validate_link_target(_attrs), do: :ok
+  defp validate_link_target(_pool, _attrs), do: :ok
 
   @spec select_link_identity(map(), map()) ::
           {:ok, UpstreamIdentity.t() | nil}
           | {:error, lifecycle_error() | IdentityLifecycle.identity_conflict()}
   defp select_link_identity(%{target_identity_id: target_identity_id}, identity_attrs)
        when is_binary(target_identity_id) do
+    select_target_link_identity(target_identity_id, identity_attrs)
+  end
+
+  defp select_link_identity(_attrs, identity_attrs) do
+    IdentityLifecycle.select_upsert_identity(identity_attrs)
+  end
+
+  defp select_target_link_identity(target_identity_id, identity_attrs) do
     case Repo.get(UpstreamIdentity, target_identity_id) do
       %UpstreamIdentity{} = target_identity ->
         validate_target_link_identity(target_identity, identity_attrs)
@@ -419,8 +435,28 @@ defmodule CodexPooler.Upstreams.TokenLinking do
     end
   end
 
-  defp select_link_identity(_attrs, identity_attrs) do
-    IdentityLifecycle.select_upsert_identity(identity_attrs)
+  @spec validate_target_pool_assignment(Pool.t(), Ecto.UUID.t()) ::
+          :ok | {:error, lifecycle_error()}
+  defp validate_target_pool_assignment(%Pool{id: pool_id}, target_identity_id)
+       when is_binary(pool_id) and is_binary(target_identity_id) do
+    if target_identity_assigned_to_pool?(pool_id, target_identity_id) do
+      :ok
+    else
+      {:error, identity_mismatch_error()}
+    end
+  end
+
+  defp validate_target_pool_assignment(_pool, _target_identity_id),
+    do: {:error, identity_mismatch_error()}
+
+  defp target_identity_assigned_to_pool?(pool_id, target_identity_id) do
+    Repo.exists?(
+      from assignment in PoolUpstreamAssignment,
+        where:
+          assignment.pool_id == ^pool_id and
+            assignment.upstream_identity_id == ^target_identity_id and
+            assignment.status != ^@assignment_deleted
+    )
   end
 
   @spec validate_target_link_identity(UpstreamIdentity.t(), map()) ::
