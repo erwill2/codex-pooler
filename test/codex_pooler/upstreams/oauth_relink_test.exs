@@ -91,6 +91,83 @@ defmodule CodexPooler.Upstreams.OAuthRelinkTest do
     assert Repo.get!(OAuthFlow, flow.id).result_upstream_identity_id == identity.id
   end
 
+  test "targeted browser relink locks selected assignment before rotating secrets" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_lock_#{System.unique_integer([:positive])}"
+
+    identity =
+      active_upstream_identity_fixture(relink_identity_attrs(account_id, "ws_lock"))
+
+    assert {:ok, old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-lock-access")
+             )
+
+    assert {:ok, old_refresh_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("refresh_token", "old-lock-refresh")
+             )
+
+    assert {:ok, assignment} =
+             PoolAssignments.create_pool_assignment(pool, identity, %{
+               assignment_label: "Locked pool slot"
+             })
+
+    assert {:ok, assignment} = PoolAssignments.activate_pool_assignment(assignment)
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "new-lock-access",
+           refresh_token: "new-lock-refresh",
+           id_token: relink_id_token(account_id, "ws_lock")
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    {{:ok, %{status: :completed, identity: relinked, assignment: relinked_assignment}}, queries} =
+      capture_repo_queries(fn ->
+        Upstreams.complete_browser_oauth(
+          scope,
+          flow.id,
+          callback_url(authorization_state(authorization_url), "lock-before-secrets-code")
+        )
+      end)
+
+    assignment_lock_index =
+      Enum.find_index(queries, fn query ->
+        query.source == "pool_upstream_assignments" and query.command == "SELECT" and
+          String.contains?(query.query, "FOR UPDATE")
+      end)
+
+    encrypted_secret_insert_index =
+      Enum.find_index(queries, fn query ->
+        query.source == "encrypted_secrets" and query.command == "INSERT"
+      end)
+
+    assert is_integer(assignment_lock_index),
+           "expected targeted relink completion to lock pool_upstream_assignments FOR UPDATE before writing secrets; captured queries: #{inspect(queries)}"
+
+    assert is_integer(encrypted_secret_insert_index),
+           "expected relink completion to insert rotated encrypted_secrets; captured queries: #{inspect(queries)}"
+
+    assert assignment_lock_index < encrypted_secret_insert_index
+    assert relinked.id == identity.id
+    assert relinked_assignment.id == assignment.id
+    assert relinked_assignment.assignment_label == "Locked pool slot"
+    assert Repo.get!(EncryptedSecret, old_access_secret.id).status == "superseded"
+    assert Repo.get!(EncryptedSecret, old_refresh_secret.id).status == "superseded"
+    assert {:ok, "new-lock-access"} = Secrets.decrypt_active_secret(identity, "access_token")
+    assert {:ok, "new-lock-refresh"} = Secrets.decrypt_active_secret(identity, "refresh_token")
+    assert Repo.get!(OAuthFlow, flow.id).result_upstream_identity_id == identity.id
+  end
+
   test "browser relink rejects a selected identity assigned only to another pool without mutating state" do
     scope = fixture_owner_scope()
     requested_pool = pool_fixture()
@@ -1568,6 +1645,54 @@ defmodule CodexPooler.Upstreams.OAuthRelinkTest do
     assert Repo.aggregate(UpstreamIdentity, :count) == 2
     assert Repo.aggregate(EncryptedSecret, :count) == 1
   end
+
+  defp capture_repo_queries(fun) do
+    parent = self()
+    handler_id = "oauth-relink-test-#{System.unique_integer([:positive])}"
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo do
+            send(
+              parent,
+              {handler_id, metadata[:source], command_name(metadata[:query]), metadata[:query]}
+            )
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_repo_queries(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_repo_queries(handler_id, queries) do
+    receive do
+      {^handler_id, source, command, query} ->
+        drain_repo_queries(handler_id, [
+          %{source: source, command: command, query: query} | queries
+        ])
+    after
+      0 -> Enum.reverse(queries)
+    end
+  end
+
+  defp command_name(query) when is_binary(query) do
+    query
+    |> String.trim_leading()
+    |> String.split(~r/\s+/, parts: 2)
+    |> List.first()
+    |> String.upcase()
+  end
+
+  defp command_name(_query), do: nil
 
   defp fixture_owner_scope do
     %{user: user} = bootstrap_owner_fixture(%{"email" => unique_user_email()})

@@ -63,7 +63,8 @@ defmodule CodexPooler.Upstreams.TokenLinking do
   end
 
   defp persist_link_tokens(%Scope{} = scope, %Pool{} = pool, attrs) do
-    with {:ok, identity_status, identity} <- upsert_link_identity(scope, attrs),
+    with {:ok, locked_assignment} <- lock_target_pool_assignment(pool, attrs),
+         {:ok, identity_status, identity} <- upsert_link_identity(scope, attrs),
          {:ok, _secret} <-
            Secrets.store_encrypted_secret(identity, %{
              secret_kind: "access_token",
@@ -71,7 +72,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
            }),
          {:ok, _refresh_secret} <- maybe_store_refresh_token(identity, attrs),
          {:ok, assignment_status, assignment} <-
-           upsert_link_assignment(scope, pool, identity, attrs) do
+           upsert_link_assignment(scope, pool, identity, attrs, locked_assignment) do
       %{
         status: link_result_status(identity_status, assignment_status),
         identity: Repo.reload!(identity),
@@ -141,7 +142,8 @@ defmodule CodexPooler.Upstreams.TokenLinking do
          %Scope{} = scope,
          %Pool{} = pool,
          %UpstreamIdentity{} = identity,
-         attrs
+         attrs,
+         locked_assignment
        ) do
     timestamp = now()
 
@@ -163,7 +165,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
       skip_quota_priming: true
     }
 
-    case assignment_for_pool_identity(pool, identity) do
+    case locked_assignment || assignment_for_pool_identity(pool, identity) do
       %PoolUpstreamAssignment{status: @assignment_deleted}
       when is_binary(attrs.target_identity_id) ->
         {:error, identity_mismatch_error()}
@@ -252,6 +254,26 @@ defmodule CodexPooler.Upstreams.TokenLinking do
         limit: 1
     )
   end
+
+  @spec lock_target_pool_assignment(Pool.t(), map()) ::
+          {:ok, PoolUpstreamAssignment.t() | nil} | {:error, lifecycle_error()}
+  defp lock_target_pool_assignment(%Pool{id: pool_id}, %{target_identity_id: target_identity_id})
+       when is_binary(pool_id) and is_binary(target_identity_id) do
+    case Repo.one(
+           from assignment in PoolUpstreamAssignment,
+             where:
+               assignment.pool_id == ^pool_id and
+                 assignment.upstream_identity_id == ^target_identity_id and
+                 assignment.status != ^@assignment_deleted,
+             lock: "FOR UPDATE",
+             limit: 1
+         ) do
+      %PoolUpstreamAssignment{} = assignment -> {:ok, assignment}
+      nil -> {:error, identity_mismatch_error()}
+    end
+  end
+
+  defp lock_target_pool_assignment(_pool, _attrs), do: {:ok, nil}
 
   defp link_result_status(:created, :created), do: :created
   defp link_result_status(_identity_status, _assignment_status), do: :existing
