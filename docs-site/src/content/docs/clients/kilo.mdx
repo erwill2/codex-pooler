@@ -31,8 +31,40 @@ For a deployed instance, add `~/.config/kilo/kilo.jsonc`:
         "baseURL": "https://codex-pooler.example.com/v1"
       },
       "models": {
+        "gpt-5.6-luna": {
+          "name": "GPT-5.6 Luna via Codex Pooler",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
         "gpt-5.6-terra": {
           "name": "GPT-5.6 Terra via Codex Pooler",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
+        "gpt-5.6-sol": {
+          "name": "GPT-5.6 Sol via Codex Pooler",
           "tool_call": true,
           "reasoning": true,
           "temperature": false,

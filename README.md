@@ -174,9 +174,45 @@ OpenAI Realtime SDK compatibility.
         "store": false
       },
       "models": {
+        "gpt-5.6-luna": {
+          "id": "gpt-5.6-luna",
+          "name": "GPT-5.6 Luna",
+          "family": "gpt",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": false,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
         "gpt-5.6-terra": {
           "id": "gpt-5.6-terra",
           "name": "GPT-5.6 Terra",
+          "family": "gpt",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": false,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
+        "gpt-5.6-sol": {
+          "id": "gpt-5.6-sol",
+          "name": "GPT-5.6 Sol",
           "family": "gpt",
           "attachment": true,
           "reasoning": true,
@@ -218,9 +254,9 @@ operator MCP entry, change its `url` to `https://codex-pooler.example.com/mcp`.
 OpenCode subtracts its compaction reserve from `limit.input` before deciding a
 conversation is full. The `328000` value leaves 308k usable input tokens after
 OpenCode's default 20k reserve, so 308k input plus a 64k output cap stays inside
-Codex Pooler's 372k `gpt-5.6-terra` window. OpenCode's request layer caps output at
-32k by default; set `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=64000` only if you
-want OpenCode to request the full 64k cap.
+Codex Pooler's 372k GPT-5.6 tier windows. OpenCode's request layer caps output
+at 32k by default; set `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=64000` only if
+you want OpenCode to request the full 64k cap.
 
 </details>
 
@@ -669,8 +705,30 @@ Then add a provider to `~/.pi/agent/models.json`:
       "authHeader": true,
       "models": [
         {
+          "id": "gpt-5.6-luna",
+          "name": "GPT-5.6 Luna via Codex Pooler",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh"
+          },
+          "input": ["text", "image"],
+          "contextWindow": 372000,
+          "maxTokens": 128000
+        },
+        {
           "id": "gpt-5.6-terra",
           "name": "GPT-5.6 Terra via Codex Pooler",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh"
+          },
+          "input": ["text", "image"],
+          "contextWindow": 372000,
+          "maxTokens": 128000
+        },
+        {
+          "id": "gpt-5.6-sol",
+          "name": "GPT-5.6 Sol via Codex Pooler",
           "reasoning": true,
           "thinkingLevelMap": {
             "xhigh": "xhigh"
@@ -697,7 +755,7 @@ as unsupported for a custom model and clamps `--thinking xhigh` or
 
 Pi accepts `contextWindow` and `maxTokens` for custom models; it has no
 `contextTokens` field. Use a 372k context window and 128k output budget for the
-`gpt-5.6-terra` custom entry so Pi's local context accounting matches Codex
+GPT-5.6 custom entries so Pi's local context accounting matches Codex
 Pooler's advertised model metadata. The explicit
 compaction reserve makes Pi compact before a prompt plus a long completion can
 exceed that 372k window.
@@ -710,7 +768,11 @@ Optionally set Codex Pooler as the default Pi model in
   "defaultProvider": "codex-pooler",
   "defaultModel": "gpt-5.6-terra",
   "defaultThinkingLevel": "xhigh",
-  "enabledModels": ["codex-pooler/gpt-5.6-terra"],
+  "enabledModels": [
+    "codex-pooler/gpt-5.6-luna",
+    "codex-pooler/gpt-5.6-terra",
+    "codex-pooler/gpt-5.6-sol"
+  ],
   "compaction": {
     "reserveTokens": 128000
   }
@@ -918,8 +980,40 @@ Then configure the provider in `~/.config/kilo/kilo.jsonc`:
         "baseURL": "http://localhost:4000/v1"
       },
       "models": {
+        "gpt-5.6-luna": {
+          "name": "GPT-5.6 Luna via Codex Pooler",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
         "gpt-5.6-terra": {
           "name": "GPT-5.6 Terra via Codex Pooler",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
+        "gpt-5.6-sol": {
+          "name": "GPT-5.6 Sol via Codex Pooler",
           "tool_call": true,
           "reasoning": true,
           "temperature": false,
@@ -1071,6 +1165,42 @@ openai-api-base: http://localhost:4000/v1
 ```
 
 Aider's `.aider.conf.yml` route settings do not carry context or output limits. If your installed Aider version does not recognize `gpt-5.6-terra`, use Aider's separate model metadata JSON file for model behavior and limits instead of adding unsupported context fields to the main config.
+
+```jsonc
+// .aider.model.metadata.json
+{
+  "openai/gpt-5.6-luna": {
+    "max_tokens": 372000,
+    "max_input_tokens": 372000,
+    "max_output_tokens": 128000,
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "supports_function_calling": true,
+    "supports_vision": true,
+    "supports_reasoning": true
+  },
+  "openai/gpt-5.6-terra": {
+    "max_tokens": 372000,
+    "max_input_tokens": 372000,
+    "max_output_tokens": 128000,
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "supports_function_calling": true,
+    "supports_vision": true,
+    "supports_reasoning": true
+  },
+  "openai/gpt-5.6-sol": {
+    "max_tokens": 372000,
+    "max_input_tokens": 372000,
+    "max_output_tokens": 128000,
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "supports_function_calling": true,
+    "supports_vision": true,
+    "supports_reasoning": true
+  }
+}
+```
 
 Keep the Pool API key out of the YAML file. Export it in the shell, or put it in
 a gitignored `.env` file that Aider can load:
@@ -1340,7 +1470,9 @@ providers:
   customai:
     resource_path: u/<owner>/codex_pooler_windmill_codegen
     models:
+      - gpt-5.6-luna
       - gpt-5.6-terra
+      - gpt-5.6-sol
 default_model:
   provider: customai
   model: gpt-5.6-terra

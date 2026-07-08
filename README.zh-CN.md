@@ -162,9 +162,45 @@ websocket 路由，不是 OpenAI Realtime SDK 兼容性。
         "store": false
       },
       "models": {
+        "gpt-5.6-luna": {
+          "id": "gpt-5.6-luna",
+          "name": "GPT-5.6 Luna",
+          "family": "gpt",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": false,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
         "gpt-5.6-terra": {
           "id": "gpt-5.6-terra",
           "name": "GPT-5.6 Terra",
+          "family": "gpt",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "temperature": false,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
+        "gpt-5.6-sol": {
+          "id": "gpt-5.6-sol",
+          "name": "GPT-5.6 Sol",
           "family": "gpt",
           "attachment": true,
           "reasoning": true,
@@ -205,8 +241,8 @@ websocket 路由，不是 OpenAI Realtime SDK 兼容性。
 
 OpenCode 会先从 `limit.input` 减去自己的压缩预留，再判断对话是否已满。
 `328000` 会在 OpenCode 默认 20k 预留之后留下 308k 可用输入 tokens，因此 308k
-输入加 64k 输出上限仍在 Codex Pooler 的 372k `gpt-5.6-terra` 窗口内。OpenCode 的
-请求层默认把输出限制在 32k；只有当你希望 OpenCode 请求完整 64k 上限时，才设置
+输入加 64k 输出上限仍在 Codex Pooler 的 372k GPT-5.6 分层窗口内。OpenCode 的请求层
+默认把输出限制在 32k；只有当你希望 OpenCode 请求完整 64k 上限时，才设置
 `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=64000`。
 
 </details>
@@ -624,8 +660,30 @@ npm install -g --ignore-scripts @earendil-works/pi-coding-agent
       "authHeader": true,
       "models": [
         {
+          "id": "gpt-5.6-luna",
+          "name": "GPT-5.6 Luna via Codex Pooler",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh"
+          },
+          "input": ["text", "image"],
+          "contextWindow": 372000,
+          "maxTokens": 128000
+        },
+        {
           "id": "gpt-5.6-terra",
           "name": "GPT-5.6 Terra via Codex Pooler",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "xhigh": "xhigh"
+          },
+          "input": ["text", "image"],
+          "contextWindow": 372000,
+          "maxTokens": 128000
+        },
+        {
+          "id": "gpt-5.6-sol",
+          "name": "GPT-5.6 Sol via Codex Pooler",
           "reasoning": true,
           "thinkingLevelMap": {
             "xhigh": "xhigh"
@@ -649,7 +707,7 @@ npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 `--thinking xhigh` 或 `defaultThinkingLevel: "xhigh"` 降到 `high`。
 
 Pi 接受自定义模型的 `contextWindow` 和 `maxTokens`；它没有 `contextTokens`
-字段。为 `gpt-5.6-terra` 自定义条目使用 372k 上下文窗口和 128k 输出预算，让
+字段。为 GPT-5.6 自定义条目使用 372k 上下文窗口和 128k 输出预算，让
 Pi 的本地上下文计算与 Codex Pooler 公布的模型 metadata 对齐。显式压缩预留会让
 Pi 在提示词加长 completion 可能超过 372k 窗口之前进行压缩。
 
@@ -660,7 +718,11 @@ Pi 在提示词加长 completion 可能超过 372k 窗口之前进行压缩。
   "defaultProvider": "codex-pooler",
   "defaultModel": "gpt-5.6-terra",
   "defaultThinkingLevel": "xhigh",
-  "enabledModels": ["codex-pooler/gpt-5.6-terra"],
+  "enabledModels": [
+    "codex-pooler/gpt-5.6-luna",
+    "codex-pooler/gpt-5.6-terra",
+    "codex-pooler/gpt-5.6-sol"
+  ],
   "compaction": {
     "reserveTokens": 128000
   }
@@ -833,8 +895,40 @@ npm install -g @kilocode/cli@latest
         "baseURL": "http://localhost:4000/v1"
       },
       "models": {
+        "gpt-5.6-luna": {
+          "name": "GPT-5.6 Luna via Codex Pooler",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
         "gpt-5.6-terra": {
           "name": "GPT-5.6 Terra via Codex Pooler",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": false,
+          "attachment": true,
+          "modalities": {
+            "input": ["text", "image"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 372000,
+            "input": 328000,
+            "output": 64000
+          }
+        },
+        "gpt-5.6-sol": {
+          "name": "GPT-5.6 Sol via Codex Pooler",
           "tool_call": true,
           "reasoning": true,
           "temperature": false,
@@ -980,6 +1074,42 @@ openai-api-base: http://localhost:4000/v1
 `.aider.conf.yml` 只保存 Aider 路由设置，不保存上下文或输出限制。如果当前
 Aider 版本不识别 `gpt-5.6-terra`，请用 Aider 独立的模型 metadata JSON 文件定义
 模型行为和限制，不要把不支持的上下文字段加到主配置中。
+
+```jsonc
+// .aider.model.metadata.json
+{
+  "openai/gpt-5.6-luna": {
+    "max_tokens": 372000,
+    "max_input_tokens": 372000,
+    "max_output_tokens": 128000,
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "supports_function_calling": true,
+    "supports_vision": true,
+    "supports_reasoning": true
+  },
+  "openai/gpt-5.6-terra": {
+    "max_tokens": 372000,
+    "max_input_tokens": 372000,
+    "max_output_tokens": 128000,
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "supports_function_calling": true,
+    "supports_vision": true,
+    "supports_reasoning": true
+  },
+  "openai/gpt-5.6-sol": {
+    "max_tokens": 372000,
+    "max_input_tokens": 372000,
+    "max_output_tokens": 128000,
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "supports_function_calling": true,
+    "supports_vision": true,
+    "supports_reasoning": true
+  }
+}
+```
 
 不要把 Pool API 密钥放进 YAML 文件。请在 shell 中 export，或放进 Aider 可加载的
 已被 git 忽略的 `.env` 文件：
@@ -1238,7 +1368,9 @@ providers:
   customai:
     resource_path: u/<owner>/codex_pooler_windmill_codegen
     models:
+      - gpt-5.6-luna
       - gpt-5.6-terra
+      - gpt-5.6-sol
 default_model:
   provider: customai
   model: gpt-5.6-terra
