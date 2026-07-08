@@ -276,6 +276,112 @@ defmodule CodexPooler.Upstreams.OAuthRelinkTest do
   end
 
   @tag :targeted_missing_workspace_relink
+  test "browser relink accepts omitted workspace fallback with matching stored email proof" do
+    scope = fixture_owner_scope()
+    pool = pool_fixture()
+    account_id = "acct_relink_email_proof_#{System.unique_integer([:positive])}"
+    incoming_subject = "user_email_proof_#{System.unique_integer([:positive])}"
+    stored_email = "#{account_id}@example.com"
+
+    identity =
+      account_id
+      |> relink_identity_attrs("ws_email_proof")
+      |> Map.merge(%{workspace_label: "Selected Workspace", seat_type: "team-seat"})
+      |> active_upstream_identity_fixture()
+
+    assert {:ok, identity} =
+             IdentityLifecycle.activate_upstream_identity_with_plan(identity, %{
+               plan_family: "team",
+               plan_label: "team"
+             })
+
+    identity =
+      identity
+      |> UpstreamIdentity.changeset(%{
+        chatgpt_account_id: nil,
+        account_email: stored_email,
+        chatgpt_user_id: nil
+      })
+      |> Repo.update!()
+
+    assert identity.chatgpt_account_id == nil
+    assert identity.account_email == stored_email
+    assert identity.chatgpt_user_id == nil
+    assert identity.workspace_id == "ws_email_proof"
+    assert identity.workspace_label == "Selected Workspace"
+    assert identity.plan_family == "team"
+    assert identity.plan_label == "team"
+    assert identity.seat_type == "team-seat"
+
+    assert {:ok, assignment} =
+             PoolAssignments.create_pool_assignment(pool, identity, %{
+               assignment_label: "Selected assignment"
+             })
+
+    assert {:ok, assignment} = PoolAssignments.activate_pool_assignment(assignment)
+
+    assert {:ok, old_access_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("access_token", "old-email-proof-access")
+             )
+
+    assert {:ok, old_refresh_secret} =
+             Upstreams.store_encrypted_secret(
+               identity,
+               secret_attrs("refresh_token", "old-email-proof-refresh")
+             )
+
+    assert active_secret_count(identity) == 2
+
+    start_provider!(%{
+      "/oauth/token" =>
+        {200,
+         FakeOpenAIAuthProvider.token_response(
+           access_token: "new-email-proof-access",
+           refresh_token: "new-email-proof-refresh",
+           id_token: relink_id_token(account_id, nil, chatgpt_user_id: incoming_subject)
+         )}
+    })
+
+    assert {:ok, %{flow: flow, authorization_url: authorization_url}} =
+             Upstreams.start_browser_oauth(scope, pool, upstream_identity: identity)
+
+    assert {:ok, %{status: :completed, identity: relinked, assignment: relinked_assignment}} =
+             Upstreams.complete_browser_oauth(
+               scope,
+               flow.id,
+               callback_url(authorization_state(authorization_url), "email-proof-code")
+             )
+
+    reloaded = Repo.get!(UpstreamIdentity, identity.id)
+
+    assert relinked.id == identity.id
+    assert relinked_assignment.id == assignment.id
+    assert reloaded.chatgpt_account_id == account_id
+    assert reloaded.account_email == stored_email
+    assert reloaded.chatgpt_user_id == incoming_subject
+    assert reloaded.workspace_id == "ws_email_proof"
+    assert reloaded.workspace_label == "Selected Workspace"
+    assert reloaded.seat_type == "team-seat"
+    assert reloaded.plan_family == "team"
+    assert reloaded.plan_label == "team"
+    assert reloaded.account_label == "Existing operator label"
+    assert Repo.get!(OAuthFlow, flow.id).result_upstream_identity_id == identity.id
+    assert Repo.get!(EncryptedSecret, old_access_secret.id).status == "superseded"
+    assert Repo.get!(EncryptedSecret, old_refresh_secret.id).status == "superseded"
+
+    assert {:ok, "new-email-proof-access"} =
+             Secrets.decrypt_active_secret(identity, "access_token")
+
+    assert {:ok, "new-email-proof-refresh"} =
+             Secrets.decrypt_active_secret(identity, "refresh_token")
+
+    assert active_secret_count(identity) == 2
+    assert Repo.aggregate(EncryptedSecret, :count) == 4
+  end
+
+  @tag :targeted_missing_workspace_relink
   test "browser relink accepts omitted workspace fallback with matching stored subject proof" do
     scope = fixture_owner_scope()
     pool = pool_fixture()
