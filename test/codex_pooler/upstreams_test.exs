@@ -6465,6 +6465,58 @@ defmodule CodexPooler.UpstreamsTest do
       assert Decimal.equal?(persisted.used_percent, Decimal.new("11"))
     end
 
+    @tag :upstream_quota_evidence_stability
+    test "model quota refresh preserves useful percent when usage API reports weak zero evidence" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      reset_at = DateTime.add(observed_at, 5, :hour)
+      weak_observed_at = DateTime.add(observed_at, 90, :second)
+      weak_reset_at = DateTime.add(weak_observed_at, 5, :hour)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "codex_spark",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "gpt-5.3-codex-spark",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   used_percent: Decimal.new("1"),
+                   reset_at: reset_at,
+                   source: "codex_response_headers",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, [_merged]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "codex_spark",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "gpt-5.3-codex-spark",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: nil,
+                   credits: nil,
+                   used_percent: Decimal.new("0"),
+                   reset_at: weak_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: weak_observed_at
+                 }
+               ])
+
+      assert [persisted] = QuotaWindows.list_quota_windows(identity)
+      assert Decimal.equal?(persisted.used_percent, Decimal.new("1"))
+      assert DateTime.compare(persisted.reset_at, weak_reset_at) == :eq
+      assert DateTime.compare(persisted.observed_at, weak_observed_at) == :eq
+    end
+
     test "routing quota eligibility rejects usable model evidence without account primary baseline" do
       identity = active_identity_fixture()
       now = ~U[2026-04-27 12:00:00Z]

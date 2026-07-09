@@ -137,11 +137,11 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       incoming_updates_usage_with_existing_capacity?(evidence, existing) ->
         merge_usage_with_existing_capacity_attrs(existing, attrs, timestamp)
 
-      incoming_supersedes?(evidence, existing, timestamp) ->
-        put_timestamps(attrs, existing)
-
       incoming_refreshes_existing?(evidence, existing, timestamp) ->
         refresh_existing_attrs(existing, attrs, timestamp)
+
+      incoming_supersedes?(evidence, existing, timestamp) ->
+        put_timestamps(attrs, existing)
 
       true ->
         existing
@@ -275,15 +275,16 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   end
 
   defp incoming_refreshes_existing?(
-         %Evidence{} = evidence,
+         %Evidence{source: "codex_usage_api"} = evidence,
          %Quota.AccountQuotaWindow{} = existing,
          timestamp
        ) do
-    same_evidence_identity?(evidence, existing) and evidence.source == existing.source and
-      weak_zero_percent_evidence?(evidence) and
+    same_evidence_identity?(evidence, existing) and weak_zero_percent_evidence?(evidence) and
       stronger_current_quota_information?(existing, timestamp) and
       not exhausted_by_used_percent?(existing)
   end
+
+  defp incoming_refreshes_existing?(_evidence, _existing, _timestamp), do: false
 
   defp incoming_updates_usage_with_existing_capacity?(
          %Evidence{used_percent: %Decimal{} = used_percent} = evidence,
