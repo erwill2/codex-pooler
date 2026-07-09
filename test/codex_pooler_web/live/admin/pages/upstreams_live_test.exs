@@ -2311,6 +2311,221 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
            )
   end
 
+  @tag :upstream_quota_dashboard_regression
+  test "upstream cards keep persisted account and model quota rows visible", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "regression-visible-quota-rows",
+        name: "Regression Visible Quota Rows"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Regression Visible Rows Codex",
+        assignment_label: "Regression Visible Rows assignment"
+      })
+
+    now = DateTime.utc_now()
+
+    assert {:ok, _windows} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 credits: 64,
+                 reset_at: DateTime.add(now, 5, :hour),
+                 source: "codex_rate_limit_event",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               },
+               %{
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 credits: 450,
+                 reset_at: DateTime.add(now, 6, :day),
+                 source: "codex_rate_limit_event",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               },
+               %{
+                 quota_key: "codex_spark",
+                 quota_scope: "model",
+                 quota_family: "codex_model",
+                 model: "gpt-5.3-codex-spark",
+                 display_label: "GPT-5.3-Codex-Spark",
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 used_percent: Decimal.new("0"),
+                 reset_at: DateTime.add(now, 5, :hour),
+                 source: "codex_rate_limit_event",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               },
+               %{
+                 quota_key: "provider_codex_spark",
+                 quota_scope: "upstream_model",
+                 quota_family: "codex_model",
+                 upstream_model: "provider-gpt-5.3-codex-spark",
+                 display_label: "Provider GPT-5.3-Codex-Spark",
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 used_percent: Decimal.new("0"),
+                 reset_at: DateTime.add(now, 5, :hour),
+                 source: "codex_rate_limit_event",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               }
+             ])
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    expectations = [
+      {
+        "#upstream-account-#{identity.id}-limit-primary_5h [data-role='upstream-limit-title']",
+        "5h",
+        "missing account primary_5h row even though persisted 5h evidence exists"
+      },
+      {
+        "#upstream-account-#{identity.id}-limit-primary_5h",
+        "not reported",
+        "account primary_5h row must show unknown percent as not reported, not disappear"
+      },
+      {
+        "#upstream-account-#{identity.id}-limit-weekly [data-role='upstream-limit-title']",
+        "Weekly",
+        "missing account weekly row even though persisted weekly evidence exists"
+      },
+      {
+        "#upstream-account-#{identity.id}-limit-weekly",
+        "not reported",
+        "account weekly row must show unknown percent as not reported, not disappear"
+      },
+      {
+        "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300",
+        "100%",
+        "model 0% used percent-only evidence must remain visible as 100% remaining"
+      },
+      {
+        "#upstream-account-#{identity.id}-limit-upstream_model-provider_codex_spark-primary-300",
+        "100%",
+        "upstream-model 0% used percent-only evidence must remain visible as 100% remaining"
+      }
+    ]
+
+    missing =
+      for {selector, text, message} <- expectations,
+          not has_element?(view, selector, text),
+          do: message
+
+    assert missing == [],
+           "expected quota card rows to preserve persisted evidence; missing: #{Enum.join(missing, "; ")}"
+  end
+
+  @tag :upstream_quota_dashboard_regression
+  test "usage API zero percent zero capacity evidence renders the account quota as not reported",
+       %{
+         conn: conn,
+         scope: scope
+       } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "regression-zero-zero-quota",
+        name: "Regression Zero Zero Quota"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Regression Zero Zero Codex",
+        assignment_label: "Regression Zero Zero assignment"
+      })
+
+    now = DateTime.utc_now()
+
+    assert {:ok, [_primary_window, _weekly_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("0"),
+                 reset_at: DateTime.add(now, 5, :hour),
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               },
+               %{
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("15"),
+                 reset_at: DateTime.add(now, 6, :day),
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               }
+             ])
+
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+    primary = Enum.find(account.quota_limits, &(&1.key == :primary_5h))
+    weekly = Enum.find(account.quota_limits, &(&1.key == :weekly))
+
+    assert primary.percent == nil
+    assert primary.percent_value == 0
+    assert primary.percent_label == "not reported"
+    assert weekly.percent == Decimal.new("85.000")
+    assert weekly.percent_value == 85
+    assert weekly.percent_label == "85%"
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    violations =
+      [
+        account.quota_readiness.state == "weekly_only_probe" ||
+          "expected zero/zero primary plus nonzero weekly evidence to project weekly_only_probe readiness",
+        account.quota_readiness.label == "Weekly quota probe" ||
+          "expected zero/zero primary plus nonzero weekly evidence to render Weekly quota probe",
+        account.quota_readiness.tone == :warning ||
+          "expected zero/zero primary plus nonzero weekly evidence to render warning tone",
+        account.quota_readiness.routing_ready_now? ||
+          "expected zero/zero primary plus nonzero weekly evidence to stay routing-eligible",
+        has_element?(
+          view,
+          "#upstream-account-#{identity.id}-limit-primary_5h [data-role='upstream-limit-title']",
+          "5h"
+        ) ||
+          "expected zero/zero usage API account evidence to keep the 5h quota row visible",
+        has_element?(
+          view,
+          "#upstream-account-#{identity.id}-limit-primary_5h",
+          "not reported"
+        ) ||
+          "expected zero/zero usage API account evidence to render the 5h percent as not reported",
+        has_element?(view, "#upstream-account-#{identity.id}-limit-weekly", "85%") ||
+          "expected nonzero weekly usage API account evidence to render 85% remaining",
+        not has_element?(
+          view,
+          "#upstream-account-#{identity.id}-routing-readiness [data-role='upstream-routing-cell']",
+          "Quota ready"
+        ) ||
+          "expected zero/zero primary plus nonzero weekly evidence not to render clean Quota ready"
+      ]
+      |> Enum.reject(&(&1 == true))
+
+    assert violations == [],
+           "expected zero/zero usage API card semantics to match task-4 contract; violations: #{Enum.join(violations, "; ")}"
+  end
+
   test "account quota rows keep zero percent-only capacity unknown evidence unreported", %{
     scope: scope
   } do
@@ -2349,7 +2564,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert weekly.percent_label == "not reported"
   end
 
+  @tag :upstream_quota_dashboard_regression
   test "account quota rows keep nonzero percent-only usage visible", %{
+    conn: conn,
     scope: scope
   } do
     {:ok, pool} =
@@ -2358,23 +2575,29 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
         name: "Nonzero Percent Pool"
       })
 
-    %{identity: identity} =
+    %{identity: first_identity} =
       upstream_assignment_fixture(pool, %{
-        account_label: "Nonzero Percent Codex",
-        assignment_label: "Nonzero Percent assignment"
+        account_label: "Nonzero Percent 17 Codex",
+        assignment_label: "Nonzero Percent 17 assignment"
+      })
+
+    %{identity: second_identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Nonzero Percent 15 Codex",
+        assignment_label: "Nonzero Percent 15 assignment"
       })
 
     now = DateTime.utc_now()
 
     assert {:ok, [_window]} =
-             QuotaWindows.upsert_quota_windows(identity, [
+             QuotaWindows.upsert_quota_windows(first_identity, [
                %{
-                 window_kind: "primary",
-                 window_minutes: 300,
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
                  active_limit: 0,
                  credits: 0,
-                 used_percent: Decimal.new("12"),
-                 reset_at: DateTime.add(now, 5, :hour),
+                 used_percent: Decimal.new("17"),
+                 reset_at: DateTime.add(now, 6, :day),
                  source: "codex_usage_api",
                  source_precision: "observed",
                  freshness_state: "fresh",
@@ -2382,12 +2605,42 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
                }
              ])
 
-    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
-    primary = Enum.find(account.quota_limits, &(&1.key == :primary_5h))
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(second_identity, [
+               %{
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("15"),
+                 reset_at: DateTime.add(now, 6, :day),
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               }
+             ])
 
-    assert primary.percent == Decimal.new("88.000")
-    assert primary.percent_value == 88
-    assert primary.percent_label == "88%"
+    accounts =
+      scope
+      |> UpstreamAccountsReadModel.list_visible_accounts([pool])
+      |> Map.new(&{&1.identity.id, &1})
+
+    first_weekly = accounts |> Map.fetch!(first_identity.id) |> quota_limit!(:weekly)
+    second_weekly = accounts |> Map.fetch!(second_identity.id) |> quota_limit!(:weekly)
+
+    assert first_weekly.percent == Decimal.new("83.000")
+    assert first_weekly.percent_value == 83
+    assert first_weekly.percent_label == "83%"
+
+    assert second_weekly.percent == Decimal.new("85.000")
+    assert second_weekly.percent_value == 85
+    assert second_weekly.percent_label == "85%"
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    assert has_element?(view, "#upstream-account-#{first_identity.id}-limit-weekly", "83%")
+    assert has_element?(view, "#upstream-account-#{second_identity.id}-limit-weekly", "85%")
   end
 
   test "model quota rows keep zero percent-only evidence visible as full remaining", %{
@@ -4660,6 +4913,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
   defp insert_routing_quota_windows(identity, status),
     do: maybe_insert_quota_window(identity, status)
+
+  defp quota_limit!(account, key) do
+    Enum.find(account.quota_limits, &(&1.key == key)) ||
+      flunk("expected quota limit #{inspect(key)} for upstream account #{account.identity.id}")
+  end
 
   defp assert_quota_readiness_snapshot(account, opts) do
     assert account.identity.status == "active"

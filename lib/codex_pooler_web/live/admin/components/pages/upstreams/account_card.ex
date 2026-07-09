@@ -635,10 +635,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   defp account_status_label(_account), do: "Unknown"
 
   defp reported_quota_limits(quota_limits) when is_list(quota_limits) do
-    Enum.filter(quota_limits, &match?(%{percent: %Decimal{}}, &1))
+    Enum.filter(quota_limits, &reported_quota_limit?/1)
   end
 
   defp reported_quota_limits(_quota_limits), do: []
+
+  defp reported_quota_limit?(%{percent: %Decimal{}}), do: true
+
+  defp reported_quota_limit?(%{reset_label: reset_label}) when is_binary(reset_label),
+    do: true
+
+  defp reported_quota_limit?(%{count_label: count_label}) when is_binary(count_label),
+    do: true
+
+  defp reported_quota_limit?(_limit), do: false
 
   defp quota_limits_grid_class([_single_limit]), do: "grid gap-3"
   defp quota_limits_grid_class(_limits), do: "grid gap-3 md:grid-cols-2"

@@ -5465,6 +5465,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert Decimal.equal?(merged_window.used_percent, Decimal.new("20.000"))
     end
 
+    @tag :upstream_quota_dashboard_regression
     test "usage evidence does not override higher-precedence rate-limit event evidence" do
       identity = active_identity_fixture()
       observed_at = ~U[2026-04-27 12:00:00Z]

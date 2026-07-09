@@ -27,15 +27,23 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadiness do
   @spec from_windows([window()], DateTime.t()) :: t()
   def from_windows(windows, as_of \\ DateTime.utc_now()) when is_list(windows) do
     account_windows = Enum.filter(windows, &account_window?/1)
+    routing_account_windows = Enum.reject(account_windows, &usage_zero_capacity_primary_window?/1)
 
     eligibility =
-      QuotaWindows.routing_quota_eligibility_from_windows(account_windows, at: as_of)
+      QuotaWindows.routing_quota_eligibility_from_windows(routing_account_windows, at: as_of)
 
     primary_window = get_in(eligibility, [:selection, :primary])
     primary_30d_window = primary_30d_window(primary_window)
     weekly_window = get_in(eligibility, [:selection, :secondary])
     reason_codes = reason_codes(eligibility, account_windows, as_of)
-    state = readiness_state(account_windows, eligibility, [primary_window, weekly_window], as_of)
+
+    state =
+      readiness_state(
+        routing_account_windows,
+        eligibility,
+        [primary_window, weekly_window],
+        as_of
+      )
 
     state
     |> state_projection()
@@ -234,4 +242,19 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadiness do
   end
 
   defp account_window?(_window), do: false
+
+  defp usage_zero_capacity_primary_window?(
+         %Quota.AccountQuotaWindow{
+           source: "codex_usage_api",
+           active_limit: active_limit,
+           credits: credits,
+           used_percent: %Decimal{} = used_percent
+         } = window
+       )
+       when active_limit in [nil, 0] and credits in [nil, 0] do
+    (WindowClassifier.primary_5h?(window) or WindowClassifier.monthly_primary?(window)) and
+      Decimal.equal?(used_percent, Decimal.new(0))
+  end
+
+  defp usage_zero_capacity_primary_window?(%Quota.AccountQuotaWindow{}), do: false
 end
