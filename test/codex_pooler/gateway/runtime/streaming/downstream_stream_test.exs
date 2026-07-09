@@ -138,6 +138,77 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
       assert DownstreamStream.keepalive_allowed?(state)
     end
 
+    test "preserves public OpenAI chat tool argument deltas after a parsable JSON prefix" do
+      opts =
+        RequestOptions.build(
+          %{
+            public_openai_chat_stream: true,
+            openai_chat_payload: %{"model" => "gpt-example"}
+          },
+          "/v1/chat/completions",
+          %{"stream" => true}
+        )
+
+      state = DownstreamStream.initial_state(:relay, opts)
+
+      prefix =
+        sse_event("response.output_item.added", %{
+          "type" => "response.output_item.added",
+          "output_index" => 0,
+          "item" => %{
+            "type" => "function_call",
+            "id" => "fc_prefix",
+            "call_id" => "call_prefix",
+            "name" => "search",
+            "arguments" => ~s({"query":"test"})
+          }
+        })
+
+      assert {prefix_chunk, state} =
+               DownstreamStream.normalize_data(prefix, "/v1/chat/completions", opts, state)
+
+      assert [prefix_delta] = chat_sse_chunks(prefix_chunk)
+      assert get_in(prefix_delta, ["choices", Access.at(0), "finish_reason"]) == nil
+
+      assert [prefix_tool_call] =
+               get_in(prefix_delta, ["choices", Access.at(0), "delta", "tool_calls"])
+
+      assert prefix_tool_call["id"] == "call_prefix"
+      assert prefix_tool_call["function"]["name"] == "search"
+      assert prefix_tool_call["function"]["arguments"] == ~s({"query":"test"})
+
+      suffix =
+        sse_event("response.function_call_arguments.delta", %{
+          "type" => "response.function_call_arguments.delta",
+          "output_index" => 0,
+          "delta" => ~s(, "limit": 10})
+        })
+
+      assert {suffix_chunk, state} =
+               DownstreamStream.normalize_data(suffix, "/v1/chat/completions", opts, state)
+
+      assert [suffix_delta] = chat_sse_chunks(suffix_chunk)
+      assert get_in(suffix_delta, ["choices", Access.at(0), "finish_reason"]) == nil
+
+      assert [suffix_tool_call] =
+               get_in(suffix_delta, ["choices", Access.at(0), "delta", "tool_calls"])
+
+      assert suffix_tool_call["function"]["arguments"] == ~s(, "limit": 10})
+
+      completed =
+        sse_event("response.completed", %{
+          "type" => "response.completed",
+          "response" => %{"id" => "resp_tool_prefix", "status" => "completed"}
+        })
+
+      assert {terminal_chunk, _state} =
+               DownstreamStream.normalize_data(completed, "/v1/chat/completions", opts, state)
+
+      assert terminal_chunk
+             |> chat_sse_chunks()
+             |> Enum.any?(&match?(%{"choices" => [%{"finish_reason" => "stop"}]}, &1))
+    end
+
     test "passes through non-SSE JSON bodies on backend codex responses stream relay" do
       opts = RequestOptions.build(%{}, "/backend-api/codex/responses", %{"stream" => true})
       state = DownstreamStream.initial_state(:relay, opts)
@@ -1072,6 +1143,16 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.DownstreamStreamTest do
 
   defp strip_sse_prefix(nil, _prefix), do: nil
   defp strip_sse_prefix(line, prefix), do: String.replace_prefix(line, prefix, "")
+
+  defp chat_sse_chunks(body) do
+    body
+    |> String.split("\n\n", trim: true)
+    |> Enum.flat_map(fn
+      "data: [DONE]" -> []
+      "data: " <> data -> [Jason.decode!(data)]
+      _block -> []
+    end)
+  end
 
   defp sse_event(event, payload) do
     "event: " <> event <> "\n" <> "data: " <> Jason.encode!(payload) <> "\n\n"
