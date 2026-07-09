@@ -12,7 +12,7 @@ defmodule CodexPooler.Dev.Seeds do
   import Ecto.Query
 
   alias CodexPooler.Accounts.{PlatformBootstrapState, User}
-  alias CodexPooler.Dev.Seeds.{Full, Perf}
+  alias CodexPooler.Dev.Seeds.{DocsScreenshots, Full, Perf}
   alias CodexPooler.Pools.Membership
   alias CodexPooler.Repo
 
@@ -57,6 +57,13 @@ defmodule CodexPooler.Dev.Seeds do
   def full do
     compact()
     |> Full.run()
+  end
+
+  @doc "Seeds deterministic public-safe data for operator documentation screenshots."
+  @spec docs_screenshots() :: map()
+  def docs_screenshots do
+    compact()
+    |> DocsScreenshots.run()
   end
 
   @doc "Seeds an isolated local fake dataset for gateway performance checks."

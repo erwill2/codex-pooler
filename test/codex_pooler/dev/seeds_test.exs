@@ -77,6 +77,10 @@ defmodule CodexPooler.Dev.SeedsTest do
       end
 
       assert_raise RuntimeError, "development seeds are disabled for this environment", fn ->
+        Seeds.docs_screenshots()
+      end
+
+      assert_raise RuntimeError, "development seeds are disabled for this environment", fn ->
         Seeds.perf()
       end
     after
@@ -347,6 +351,46 @@ defmodule CodexPooler.Dev.SeedsTest do
       end)
 
     assert future_scheduled_job
+  end
+
+  test "documentation screenshot seed is public-safe and idempotent" do
+    first = Seeds.docs_screenshots()
+    result = Seeds.docs_screenshots()
+
+    assert first.pools |> Enum.map(& &1.name) == ["Example Production", "Example Standby"]
+    assert result.pools |> Enum.map(& &1.name) == ["Example Production", "Example Standby"]
+
+    assert Enum.map(result.api_keys, &{&1.display_name, &1.key_prefix}) == [
+             {"Build automation", "sk-cxp-docs00000001"},
+             {"Release assistant", "sk-cxp-docs00000002"},
+             {"Paused client", "sk-cxp-docs00000003"},
+             {"Retired client", "sk-cxp-docs00000004"}
+           ]
+
+    assert Enum.all?(result.api_keys, fn api_key ->
+             api_key.metadata["operator_notes"] ==
+               "Generated for public documentation screenshots"
+           end)
+
+    assert Enum.map(result.upstream_identities, & &1.account_label) == [
+             "Example Primary Pro",
+             "Example Quota Ready",
+             "Example Quota Exhausted",
+             "Example Refresh Due",
+             "Example Reauthentication",
+             "Example Paused Account"
+           ]
+
+    assert Enum.all?(result.request_logs, fn request ->
+             is_nil(request.upstream_account_label) or
+               String.starts_with?(request.upstream_account_label, "Example ")
+           end)
+
+    api_key_audit_event = Enum.find(result.audit_events, &(&1.action == "api_key.create"))
+    assert api_key_audit_event.details["key_prefix"] == "sk-cxp-docs00000001"
+
+    assert Repo.aggregate(Pool, :count) == 2
+    assert Repo.aggregate(APIKey, :count) == 4
   end
 
   defp statuses_for(schema) do

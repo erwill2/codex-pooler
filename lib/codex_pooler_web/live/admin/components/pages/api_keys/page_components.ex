@@ -161,15 +161,12 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
       <div
         :if={@selected_pool}
         id="api-key-active-pool-filter"
-        class="flex flex-wrap items-center justify-between gap-3 rounded-box border border-base-300 bg-base-100 px-4 py-3 text-sm shadow-sm"
+        class="flex flex-wrap items-center justify-between gap-3 border-b border-base-300 pb-3 text-sm"
       >
-        <div class="flex items-center gap-2 text-base-content/70">
-          <.icon name="hero-funnel" class="size-4 text-primary" />
-          <span>
-            Showing API keys for
-            <span class="font-medium text-base-content">{@selected_pool.name}</span>
-          </span>
-        </div>
+        <span class="inline-flex min-w-0 items-center gap-2 text-base-content/70">
+          <.icon name="hero-funnel" class="size-4 shrink-0 text-primary" /> Showing
+          <span class="font-semibold text-base-content">{@selected_pool.name}</span>
+        </span>
         <.link
           id="api-key-clear-pool-filter"
           patch={api_key_filter_path(nil, @model_policy_filter)}
@@ -182,40 +179,34 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
       <div
         :if={@model_policy_filter == "unavailable"}
         id="api-key-active-model-policy-filter"
-        class="flex flex-wrap items-center justify-between gap-3 rounded-box border border-warning/25 bg-warning/10 px-4 py-3 text-sm shadow-sm"
+        class="flex flex-wrap items-center justify-between gap-3 border-b border-warning/30 pb-3 text-sm text-warning"
       >
-        <div class="flex items-center gap-2 text-base-content/75">
-          <.icon name="hero-exclamation-triangle" class="size-4 text-warning" />
-          <span>
-            Showing API keys with unavailable model references
-            <span class="font-medium text-base-content">
-              {ApiKeysReadModel.unavailable_model_policy_count_label(@unavailable_model_policy_count)}
-            </span>
-          </span>
-        </div>
+        <span class="inline-flex items-center gap-2">
+          <.icon name="hero-exclamation-triangle" class="size-4" />
+          Unavailable model references: {ApiKeysReadModel.unavailable_model_policy_count_label(
+            @unavailable_model_policy_count
+          )}
+        </span>
         <.link
           id="api-key-clear-model-policy-filter"
           patch={api_key_filter_path(@selected_pool, nil)}
           class="btn btn-ghost btn-xs"
         >
-          Show all model policies
+          Clear filter
         </.link>
       </div>
 
       <div
         :if={@model_policy_filter != "unavailable" and @unavailable_model_policy_count > 0}
         id="api-key-model-policy-attention"
-        class="flex flex-wrap items-center justify-between gap-3 rounded-box border border-warning/25 bg-warning/10 px-4 py-3 text-sm shadow-sm"
+        class="flex flex-wrap items-center justify-between gap-3 border-b border-warning/30 pb-3 text-sm"
       >
-        <div class="grid gap-1 text-base-content/75 sm:flex sm:items-center sm:gap-2">
-          <span class="flex items-center gap-2 font-semibold text-base-content">
-            <.icon name="hero-exclamation-triangle" class="size-4 text-warning" />
-            Model policy attention
-          </span>
-          <span>
-            {ApiKeysReadModel.unavailable_model_policy_count_label(@unavailable_model_policy_count)} reference models that are not in the current routable catalog.
-          </span>
-        </div>
+        <span class="inline-flex items-center gap-2 text-warning">
+          <.icon name="hero-exclamation-triangle" class="size-4" />
+          Model policy attention: {ApiKeysReadModel.unavailable_model_policy_count_label(
+            @unavailable_model_policy_count
+          )}
+        </span>
         <.link
           id="api-key-filter-unavailable-model-policies"
           patch={api_key_filter_path(@selected_pool, "unavailable")}
@@ -261,10 +252,18 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
       <section
         :for={group <- @groups}
         id={"api-key-pool-group-#{group.dom_id}"}
-        class="min-w-0 overflow-visible rounded-box border border-base-300 bg-base-100 shadow-sm"
+        class="grid min-w-0 overflow-visible border border-base-300 bg-base-100 xl:grid-cols-[13rem_minmax(0,1fr)]"
       >
-        <header class="flex flex-wrap items-center justify-between gap-3 border-b border-base-300 px-4 py-3">
-          <h2 class="font-semibold leading-6 text-base-content">{group.name}</h2>
+        <header class="flex flex-wrap items-center justify-between gap-3 border-b border-base-300 bg-primary/5 p-4 xl:content-start xl:border-r xl:border-b-0">
+          <div class="grid min-w-0 gap-2">
+            <span class="grid size-9 place-items-center rounded-field border border-primary/30 bg-primary/15 text-primary">
+              <.icon name="hero-server-stack" class="size-4" />
+            </span>
+            <div class="min-w-0">
+              <p class="text-xs font-medium text-base-content/55">Pool registry</p>
+              <h2 class="break-words text-lg font-bold leading-6 text-base-content">{group.name}</h2>
+            </div>
+          </div>
           <span
             id={"api-key-pool-group-#{group.dom_id}-count"}
             class={AdminBadges.count_chip_class()}
@@ -275,79 +274,71 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
 
         <div
           id={"api-key-pool-group-#{group.dom_id}-table-scroll-region"}
-          class="overflow-x-auto md:overflow-visible"
+          class="min-w-0 divide-y divide-base-300"
         >
-          <table class="table min-w-[56rem]">
-            <thead>
-              <tr>
-                <th>Key</th>
-                <th class="text-center">Status</th>
-                <th>Usage</th>
-                <th>Policy</th>
-                <th class="text-center">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                :for={api_key <- group.api_keys}
-                id={"api-key-row-#{api_key.id}"}
-                class="text-sm transition-colors hover:bg-base-200/80"
+          <article
+            :for={api_key <- group.api_keys}
+            id={"api-key-row-#{api_key.id}"}
+            class="relative grid min-w-0 gap-4 p-4 transition-colors hover:bg-base-200/60 focus-within:z-30 xl:grid-cols-[minmax(12rem,0.9fr)_minmax(11rem,0.8fr)_minmax(14rem,1fr)_auto] xl:items-start"
+          >
+            <div
+              id={"api-key-row-#{api_key.id}-key"}
+              class="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3"
+            >
+              <div class="grid min-w-0 gap-1.5">
+                <div class="flex min-w-0 items-center gap-2">
+                  <span class="truncate font-semibold text-base-content">{api_key.display_name}</span>
+                  <.api_key_notes_popover
+                    :if={ApiKeysReadModel.api_key_operator_notes(api_key)}
+                    id={"api-key-row-#{api_key.id}-notes"}
+                    notes={ApiKeysReadModel.api_key_operator_notes(api_key)}
+                  />
+                </div>
+                <span class="truncate text-xs text-base-content/55">
+                  <span class="font-medium text-base-content/70">Prefix</span>
+                  {api_key.key_prefix}
+                </span>
+              </div>
+              <span
+                id={"api-key-row-#{api_key.id}-status"}
+                class={[
+                  AdminBadges.lifecycle_chip_class(api_key.status),
+                  "w-fit shrink-0 justify-self-start"
+                ]}
               >
-                <td id={"api-key-row-#{api_key.id}-key"} class="min-w-64 align-middle">
-                  <div class="grid gap-1.5">
-                    <span class="flex items-center gap-1.5 font-medium leading-5 text-base-content">
-                      <span>{api_key.display_name}</span>
-                      <.api_key_notes_popover
-                        :if={ApiKeysReadModel.api_key_operator_notes(api_key)}
-                        id={"api-key-row-#{api_key.id}-notes"}
-                        notes={ApiKeysReadModel.api_key_operator_notes(api_key)}
-                      />
-                    </span>
-                    <span class="font-mono text-xs text-base-content/60">
-                      {api_key.key_prefix}
-                    </span>
-                  </div>
-                </td>
-                <td class="align-middle text-center">
-                  <span
-                    id={"api-key-row-#{api_key.id}-status"}
-                    class={AdminBadges.lifecycle_chip_class(api_key.status)}
-                  >
-                    {api_key.status}
-                  </span>
-                </td>
-                <td id={"api-key-row-#{api_key.id}-usage"} class="min-w-56 align-middle">
-                  <.api_key_row_usage usage={Map.get(@usage_summaries, api_key.id)} />
-                </td>
-                <td class="min-w-80 align-middle">
-                  <div class="grid gap-1 text-sm text-base-content/70">
-                    <span id={"api-key-row-#{api_key.id}-models"}>
-                      Models: {ApiKeysReadModel.model_policy_label(api_key.allowed_model_identifiers)}
-                    </span>
-                    <span
-                      :if={
-                        ApiKeysReadModel.model_policy_warning_label(
-                          Map.get(@model_policy_summaries, api_key.id)
-                        )
-                      }
-                      id={"api-key-row-#{api_key.id}-model-policy-warning"}
-                      class="inline-flex items-start gap-1.5 rounded-box border border-warning/25 bg-warning/10 px-2 py-1 text-xs font-medium leading-5 text-warning"
-                    >
-                      <.icon name="hero-exclamation-triangle" class="mt-0.5 size-3.5 shrink-0" />
-                      <span>
-                        {ApiKeysReadModel.model_policy_warning_label(
-                          Map.get(@model_policy_summaries, api_key.id)
-                        )}
-                      </span>
-                    </span>
-                  </div>
-                </td>
-                <td class="w-16 align-middle text-center">
-                  <.api_key_actions_menu api_key={api_key} />
-                </td>
-              </tr>
-            </tbody>
-          </table>
+                {api_key.status}
+              </span>
+            </div>
+            <div id={"api-key-row-#{api_key.id}-usage"} class="grid gap-1">
+              <span class="text-xs font-medium text-base-content/50">Recorded usage</span>
+              <.api_key_row_usage usage={Map.get(@usage_summaries, api_key.id)} />
+            </div>
+            <div class="grid min-w-0 gap-2 text-sm text-base-content/70">
+              <span class="text-xs font-medium text-base-content/50">Model access</span>
+              <span id={"api-key-row-#{api_key.id}-models"}>
+                {ApiKeysReadModel.model_policy_label(api_key.allowed_model_identifiers)}
+              </span>
+              <span
+                :if={
+                  ApiKeysReadModel.model_policy_warning_label(
+                    Map.get(@model_policy_summaries, api_key.id)
+                  )
+                }
+                id={"api-key-row-#{api_key.id}-model-policy-warning"}
+                class="inline-flex items-start gap-1.5 text-xs font-medium leading-5 text-warning"
+              >
+                <.icon name="hero-exclamation-triangle" class="mt-0.5 size-3.5 shrink-0" />
+                <span>
+                  {ApiKeysReadModel.model_policy_warning_label(
+                    Map.get(@model_policy_summaries, api_key.id)
+                  )}
+                </span>
+              </span>
+            </div>
+            <div class="relative z-10 justify-self-end">
+              <.api_key_actions_menu api_key={api_key} />
+            </div>
+          </article>
         </div>
       </section>
     </div>
@@ -381,7 +372,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
 
   defp api_key_actions_menu(assigns) do
     ~H"""
-    <div class="dropdown dropdown-end inline-block">
+    <div class="dropdown dropdown-end relative inline-block focus-within:z-50">
       <button
         id={"api-key-actions-menu-#{@api_key.id}"}
         type="button"
@@ -393,7 +384,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
       </button>
       <ul
         tabindex="0"
-        class="menu dropdown-content z-20 mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-2 shadow-xl"
+        class="menu dropdown-content z-50 mt-2 w-56 rounded-box border border-base-300 bg-base-100 p-2 shadow-xl"
       >
         <li>
           <AdminComponents.dropdown_action_item

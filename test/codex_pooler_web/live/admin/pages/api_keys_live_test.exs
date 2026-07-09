@@ -40,7 +40,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
     refute has_element?(view, "#api-key-empty-create-action")
   end
 
-  test "renders required form, grouped tables, row, and action selectors", %{
+  test "renders required form, grouped registries, row, and action selectors", %{
     conn: conn,
     scope: scope
   } do
@@ -86,15 +86,10 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
     assert has_element?(view, "#api-key-pool-group-backup-pool-count", "1 key")
 
     for group_id <- ["primary-pool", "backup-pool"] do
-      assert has_element?(view, "#api-key-pool-group-#{group_id} thead th", "Key")
-      assert has_element?(view, "#api-key-pool-group-#{group_id} thead th", "Status")
-      assert has_element?(view, "#api-key-pool-group-#{group_id} thead th", "Usage")
-      assert has_element?(view, "#api-key-pool-group-#{group_id} thead th", "Policy")
-      assert has_element?(view, "#api-key-pool-group-#{group_id} thead th", "Actions")
-
-      group_header_html = view |> element("#api-key-pool-group-#{group_id} thead") |> render()
-      refute group_header_html =~ ">Pool<"
-      refute group_header_html =~ "Notes"
+      assert has_element?(
+               view,
+               "#api-key-pool-group-#{group_id}-table-scroll-region > article[id^='api-key-row-']"
+             )
     end
 
     primary_group_html = view |> element("#api-key-pool-group-primary-pool") |> render()

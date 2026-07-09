@@ -7,11 +7,14 @@ defmodule Mix.Tasks.Dev.Seed do
       mix dev.seed
       mix dev.seed compact
       mix dev.seed full
+      mix dev.seed docs_screenshots
       mix dev.seed perf
 
    `compact` creates a small operator baseline. `full` recreates deterministic
-   fake data for exercising admin UI states. `perf` recreates an isolated local
-   gateway performance dataset and writes private bootstrap files under `tmp/`.
+   fake data for exercising admin UI states. `docs_screenshots` replaces visible
+   labels with public-safe documentation fixtures. `perf` recreates an isolated
+   local gateway performance dataset and writes private bootstrap files under
+   `tmp/`.
   """
 
   use Mix.Task
@@ -28,8 +31,9 @@ defmodule Mix.Tasks.Dev.Seed do
       [] -> seed_compact()
       ["compact"] -> seed_compact()
       ["full"] -> seed_full()
+      ["docs_screenshots"] -> seed_docs_screenshots()
       ["perf"] -> seed_perf()
-      _args -> Mix.raise("usage: mix dev.seed [compact|full|perf]")
+      _args -> Mix.raise("usage: mix dev.seed [compact|full|docs_screenshots|perf]")
     end
   end
 
@@ -46,6 +50,14 @@ defmodule Mix.Tasks.Dev.Seed do
 
     Mix.shell().info(
       "seeded full dev data owner=#{result.owner.email} operators=#{length(result.operators)} pools=#{length(result.pools)} api_keys=#{length(result.api_keys)} upstreams=#{length(result.upstream_identities)} password=#{result.password}"
+    )
+  end
+
+  defp seed_docs_screenshots do
+    result = Seeds.docs_screenshots()
+
+    Mix.shell().info(
+      "seeded documentation screenshot data owner=#{result.owner.email} operators=#{length(result.operators)} pools=#{length(result.pools)} api_keys=#{length(result.api_keys)} upstreams=#{length(result.upstream_identities)} password=#{result.password}"
     )
   end
 
