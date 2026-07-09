@@ -12,6 +12,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   @runtime_quota_sources ~w(codex_rate_limit_event codex_response_headers)
   @usage_reset_forward_tolerance_seconds 5 * 60
   @relative_reset_refresh_tolerance_seconds 5
+  @account_snapshot_reset_tolerance_seconds 5
 
   @type identity_ref :: UpstreamIdentity.t() | Ecto.UUID.t()
 
@@ -137,6 +138,14 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   defp merge_attrs(%Quota.AccountQuotaWindow{} = existing, attrs, %Evidence{} = evidence) do
     timestamp = now()
 
+    case account_usage_snapshot_decision(evidence, existing, timestamp) do
+      :incoming -> put_timestamps(attrs, existing)
+      :existing -> window_attrs(existing)
+      :continue -> merge_attrs_by_quality(existing, attrs, evidence, timestamp)
+    end
+  end
+
+  defp merge_attrs_by_quality(existing, attrs, evidence, timestamp) do
     cond do
       incoming_raises_usage_with_existing_reset?(evidence, existing, timestamp) ->
         merge_usage_with_existing_reset_attrs(existing, attrs, timestamp)
@@ -164,6 +173,112 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
         |> window_attrs()
         |> Map.put(:updated_at, timestamp)
     end
+  end
+
+  # ChatGPT usage replicas can return distinct percentage/reset pairs for the same
+  # account. Compare those observations as whole snapshots so persistence never
+  # fabricates a pair that the provider did not report.
+  @spec account_usage_snapshot_decision(
+          Evidence.t(),
+          Quota.AccountQuotaWindow.t(),
+          DateTime.t()
+        ) :: :incoming | :existing | :continue
+  defp account_usage_snapshot_decision(
+         %Evidence{
+           source: "codex_usage_api",
+           source_precision: incoming_precision,
+           quota_scope: "account",
+           quota_key: "account",
+           window_kind: "primary",
+           window_minutes: 300,
+           reset_at: %DateTime{},
+           used_percent: %Decimal{}
+         } = evidence,
+         %Quota.AccountQuotaWindow{
+           source: "codex_usage_api",
+           source_precision: existing_precision,
+           quota_scope: "account",
+           quota_key: "account",
+           window_kind: "primary",
+           window_minutes: 300,
+           reset_at: %DateTime{},
+           used_percent: %Decimal{}
+         } = existing,
+         timestamp
+       )
+       when incoming_precision in ["observed", "authoritative"] and
+              existing_precision in ["observed", "authoritative"] do
+    if comparable_account_usage_snapshots?(evidence, existing, timestamp) do
+      choose_account_usage_snapshot(evidence, existing, timestamp)
+    else
+      :continue
+    end
+  end
+
+  defp account_usage_snapshot_decision(_evidence, _existing, _timestamp), do: :continue
+
+  @spec comparable_account_usage_snapshots?(
+          Evidence.t(),
+          Quota.AccountQuotaWindow.t(),
+          DateTime.t()
+        ) :: boolean()
+  defp comparable_account_usage_snapshots?(evidence, existing, timestamp) do
+    same_evidence_identity?(evidence, existing) and weak_capacity?(evidence) and
+      weak_capacity?(existing) and
+      Evidence.current_freshness_state(existing, timestamp) == "fresh"
+  end
+
+  @spec choose_account_usage_snapshot(
+          Evidence.t(),
+          Quota.AccountQuotaWindow.t(),
+          DateTime.t()
+        ) :: :incoming | :existing
+  defp choose_account_usage_snapshot(evidence, existing, timestamp) do
+    if Evidence.current_freshness_state(evidence, timestamp) == "fresh" do
+      compare_account_usage_snapshots(evidence, existing)
+    else
+      :existing
+    end
+  end
+
+  @spec compare_account_usage_snapshots(Evidence.t(), Quota.AccountQuotaWindow.t()) ::
+          :incoming | :existing
+  defp compare_account_usage_snapshots(
+         %Evidence{used_percent: incoming_percent, reset_at: incoming_reset},
+         %Quota.AccountQuotaWindow{
+           used_percent: existing_percent,
+           reset_at: existing_reset
+         }
+       ) do
+    case Decimal.compare(incoming_percent, existing_percent) do
+      :gt ->
+        :incoming
+
+      :lt ->
+        :existing
+
+      :eq ->
+        equal_usage_snapshot_decision(incoming_percent, incoming_reset, existing_reset)
+    end
+  end
+
+  @spec equal_usage_snapshot_decision(Decimal.t(), DateTime.t(), DateTime.t()) ::
+          :incoming | :existing
+  defp equal_usage_snapshot_decision(used_percent, incoming_reset, existing_reset) do
+    cond do
+      reset_times_equivalent?(incoming_reset, existing_reset) ->
+        :incoming
+
+      positive_percent?(used_percent) and DateTime.compare(incoming_reset, existing_reset) == :gt ->
+        :incoming
+
+      true ->
+        :existing
+    end
+  end
+
+  defp reset_times_equivalent?(%DateTime{} = left, %DateTime{} = right) do
+    abs(DateTime.diff(left, right, :second)) <= @account_snapshot_reset_tolerance_seconds
   end
 
   defp incoming_supersedes?(

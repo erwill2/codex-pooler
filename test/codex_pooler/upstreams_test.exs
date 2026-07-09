@@ -6316,7 +6316,7 @@ defmodule CodexPooler.UpstreamsTest do
     end
 
     @tag :upstream_quota_evidence_stability
-    test "weak zero usage refresh keeps stronger account percent evidence while refreshing reset metadata" do
+    test "weak zero usage outlier keeps the stronger account snapshot unchanged" do
       identity = active_identity_fixture()
       observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       reset_at = DateTime.add(observed_at, 2, :hour)
@@ -6364,12 +6364,13 @@ defmodule CodexPooler.UpstreamsTest do
       assert merged_window.id == known_window.id
       assert merged_window.source == "codex_usage_api"
       assert DateTime.compare(merged_window.reset_at, reset_at) == :eq
-      assert DateTime.compare(merged_window.observed_at, weak_observed_at) == :eq
+      assert DateTime.compare(merged_window.observed_at, observed_at) == :eq
+      assert DateTime.compare(merged_window.last_sync_at, known_window.last_sync_at) == :eq
       assert Decimal.equal?(merged_window.used_percent, Decimal.new("11"))
     end
 
     @tag :upstream_quota_evidence_stability
-    test "weak later usage refresh raises percent without moving fresh account reset" do
+    test "stronger account usage snapshot replaces the earlier snapshot atomically" do
       identity = active_identity_fixture()
       observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       reset_at = DateTime.add(observed_at, 2, :hour)
@@ -6415,53 +6416,124 @@ defmodule CodexPooler.UpstreamsTest do
                ])
 
       assert merged_window.id == known_window.id
-      assert DateTime.compare(merged_window.reset_at, reset_at) == :eq
+      assert DateTime.compare(merged_window.reset_at, weak_reset_at) == :eq
       assert DateTime.compare(merged_window.observed_at, weak_observed_at) == :eq
       assert Decimal.equal?(merged_window.used_percent, Decimal.new("7"))
     end
 
     @tag :upstream_quota_evidence_stability
-    test "usage payload outlier reset does not replace fresh account reset before expiry" do
-      identity = active_identity_fixture()
+    test "provider 5h snapshots converge atomically regardless of arrival order" do
       observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
-      reset_at = DateTime.add(observed_at, 2, :hour)
-      outlier_observed_at = DateTime.add(observed_at, 60, :second)
-      outlier_reset_at = DateTime.add(outlier_observed_at, 5, :hour)
+      short_reset_at = DateTime.add(observed_at, 45, :minute)
+      long_reset_at = DateTime.add(observed_at, 4, :hour)
+      one_second_later = DateTime.add(observed_at, 1, :second)
 
-      assert {:ok, [known_window]} =
-               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
-                 identity,
+      snapshot = fn used_percent, reset_at, sample_at ->
+        {%{
+           "rate_limit" => %{
+             "primary_window" => %{
+               "used_percent" => used_percent,
+               "limit_window_seconds" => 18_000,
+               "reset_after_seconds" => DateTime.diff(reset_at, sample_at, :second),
+               "reset_at" => DateTime.to_unix(reset_at)
+             }
+           }
+         }, sample_at}
+      end
+
+      sequences = [
+        {[
+           snapshot.(1, short_reset_at, observed_at),
+           snapshot.(2, long_reset_at, one_second_later)
+         ], one_second_later},
+        {[
+           snapshot.(2, long_reset_at, observed_at),
+           snapshot.(1, short_reset_at, one_second_later)
+         ], observed_at},
+        {[
+           snapshot.(2, short_reset_at, observed_at),
+           snapshot.(2, long_reset_at, one_second_later)
+         ], one_second_later},
+        {[
+           snapshot.(2, long_reset_at, observed_at),
+           snapshot.(2, short_reset_at, one_second_later)
+         ], observed_at}
+      ]
+
+      for {samples, expected_observed_at} <- sequences do
+        identity = active_identity_fixture()
+
+        merged_window =
+          Enum.reduce(samples, nil, fn {payload, sample_at}, _previous ->
+            assert {:ok, [window]} =
+                     QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                       identity,
+                       payload,
+                       sample_at
+                     )
+
+            window
+          end)
+
+        assert DateTime.compare(merged_window.reset_at, long_reset_at) == :eq
+        assert DateTime.compare(merged_window.observed_at, expected_observed_at) == :eq
+        assert Decimal.equal?(merged_window.used_percent, Decimal.new("2.000"))
+
+        assert merged_window.metadata["reset_after_seconds"] ==
+                 DateTime.diff(long_reset_at, expected_observed_at, :second)
+      end
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "new account cycle replaces an expired stronger snapshot" do
+      identity = active_identity_fixture()
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      expired_observed_at = DateTime.add(now, -120, :second)
+      expired_reset_at = DateTime.add(now, -60, :second)
+      next_reset_at = DateTime.add(now, 5, :hour)
+
+      assert {:ok, [expired_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
                  %{
-                   "rate_limit" => %{
-                     "primary_window" => %{
-                       "used_percent" => 6,
-                       "limit_window_seconds" => 18_000,
-                       "reset_at" => DateTime.to_iso8601(reset_at)
-                     }
-                   }
-                 },
-                 observed_at
-               )
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("88"),
+                   reset_at: expired_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: expired_observed_at
+                 }
+               ])
 
-      assert {:ok, [merged_window]} =
-               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
-                 identity,
+      assert {:ok, [next_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
                  %{
-                   "rate_limit" => %{
-                     "primary_window" => %{
-                       "used_percent" => 7,
-                       "limit_window_seconds" => 18_000,
-                       "reset_at" => DateTime.to_iso8601(outlier_reset_at)
-                     }
-                   }
-                 },
-                 outlier_observed_at
-               )
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("0"),
+                   reset_at: next_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: now
+                 }
+               ])
 
-      assert merged_window.id == known_window.id
-      assert DateTime.compare(merged_window.reset_at, reset_at) == :eq
-      assert DateTime.compare(merged_window.observed_at, outlier_observed_at) == :eq
-      assert Decimal.equal?(merged_window.used_percent, Decimal.new("7.000"))
+      assert next_window.id == expired_window.id
+      assert DateTime.compare(next_window.reset_at, next_reset_at) == :eq
+      assert DateTime.compare(next_window.observed_at, now) == :eq
+      assert Decimal.equal?(next_window.used_percent, Decimal.new("0"))
     end
 
     @tag :upstream_quota_evidence_stability
