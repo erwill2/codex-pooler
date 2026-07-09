@@ -39,6 +39,21 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadataTest do
     end
   end
 
+  test "codex model payload preserves all advertised GPT-5.6 reasoning levels" do
+    efforts = ~w(low medium high xhigh max ultra)
+
+    payload =
+      model_payload(%{
+        "default_reasoning_level" => "low",
+        "supported_reasoning_levels" => efforts
+      })
+
+    assert payload["default_reasoning_level"] == "low"
+
+    assert payload["supported_reasoning_levels"] ==
+             Enum.map(efforts, &%{"effort" => &1, "description" => &1})
+  end
+
   defp model_payload(metadata) do
     %Model{
       upstream_model_id: "upstream-model",

@@ -471,20 +471,23 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
                 }}
     end
 
-    test "normalizes max thinking alias to reasoning effort" do
-      payload = %{"model" => "gpt-4.1", "input" => "hello", "thinking" => "max"}
-      request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+    test "normalizes max and ultra thinking aliases to backend reasoning effort" do
       model = %Model{upstream_model_id: "provider-model"}
 
-      assert {:ok, encoded} =
-               PayloadNormalizer.upstream_payload(
-                 payload,
-                 model,
-                 "/backend-api/codex/responses",
-                 request_options
-               )
+      for effort <- ["max", "ultra"] do
+        payload = %{"model" => "gpt-5.6-sol", "input" => "hello", "thinking" => effort}
+        request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
 
-      assert Jason.decode!(encoded)["reasoning"] == %{"effort" => "max"}
+        assert {:ok, encoded} =
+                 PayloadNormalizer.upstream_payload(
+                   payload,
+                   model,
+                   "/backend-api/codex/responses",
+                   request_options
+                 )
+
+        assert Jason.decode!(encoded)["reasoning"] == %{"effort" => "max"}
+      end
     end
 
     test "maps minimal reasoning effort to low before backend dispatch" do
