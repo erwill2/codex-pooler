@@ -3,6 +3,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
 
   alias CodexPooler.Jobs
   alias CodexPooler.Upstreams.Auth.TokenRefresh
+  alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.EndpointMetadata
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Reconciliation.SavedResetUsageEnrichment
@@ -162,26 +163,105 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
           timeout()
         ) :: usage_probe_result()
   defp probe_usage_url(url, identity, headers, observed_at, timeout) do
-    case Req.get(url, headers: headers, retry: false, receive_timeout: timeout) do
-      {:ok, %{status: status, body: body}} when status in 200..299 ->
-        usage_probe_success(body, identity, url, observed_at, timeout, headers)
+    probe_usage_url(url, identity, headers, observed_at, timeout, false)
+  end
 
-      {:ok, %{status: 404}} ->
-        :not_found
+  defp probe_usage_url(url, identity, headers, observed_at, timeout, retried_after_cookie?) do
+    url
+    |> request_usage_url(headers, timeout)
+    |> handle_usage_response(url, identity, headers, observed_at, timeout, retried_after_cookie?)
+  end
 
-      {:ok, %Req.Response{status: status} = response} when status in [401, 403] ->
-        auth_path_unavailable_response(status, response)
+  defp request_usage_url(url, headers, timeout) do
+    Req.get(url,
+      headers: CloudflareCookies.request_headers(url, headers),
+      retry: false,
+      receive_timeout: timeout
+    )
+  end
 
-      {:ok, %{status: 429}} ->
-        {:halt_error, {:upstream_status, 429}}
+  defp handle_usage_response(
+         {:ok, %Req.Response{status: status, body: body} = response},
+         url,
+         identity,
+         headers,
+         observed_at,
+         timeout,
+         _retried_after_cookie?
+       )
+       when status in 200..299 do
+    CloudflareCookies.store_from_response(url, response)
+    usage_probe_success(body, identity, url, observed_at, timeout, headers)
+  end
 
-      {:ok, %{status: status}} ->
-        {:halt_error, {:upstream_status, status}}
+  defp handle_usage_response(
+         {:ok, %Req.Response{status: 404} = response},
+         url,
+         _identity,
+         _headers,
+         _observed_at,
+         _timeout,
+         _retried_after_cookie?
+       ) do
+    CloudflareCookies.store_from_response(url, response)
+    :not_found
+  end
 
-      {:error, reason} ->
-        {:halt_error, reason}
+  defp handle_usage_response(
+         {:ok, %Req.Response{status: status} = response},
+         url,
+         identity,
+         headers,
+         observed_at,
+         timeout,
+         retried_after_cookie?
+       )
+       when status in [401, 403] do
+    stored_cookie? = CloudflareCookies.store_from_response(url, response)
+
+    if html_response?(response) and stored_cookie? and not retried_after_cookie? do
+      probe_usage_url(url, identity, headers, observed_at, timeout, true)
+    else
+      auth_path_unavailable_response(status, response)
     end
   end
+
+  defp handle_usage_response(
+         {:ok, %Req.Response{status: 429} = response},
+         url,
+         _identity,
+         _headers,
+         _observed_at,
+         _timeout,
+         _retried_after_cookie?
+       ) do
+    CloudflareCookies.store_from_response(url, response)
+    {:halt_error, {:upstream_status, 429}}
+  end
+
+  defp handle_usage_response(
+         {:ok, %Req.Response{status: status} = response},
+         url,
+         _identity,
+         _headers,
+         _observed_at,
+         _timeout,
+         _retried_after_cookie?
+       ) do
+    CloudflareCookies.store_from_response(url, response)
+    {:halt_error, {:upstream_status, status}}
+  end
+
+  defp handle_usage_response(
+         {:error, reason},
+         _url,
+         _identity,
+         _headers,
+         _observed_at,
+         _timeout,
+         _retried_after_cookie?
+       ),
+       do: {:halt_error, reason}
 
   @spec auth_path_unavailable_response(pos_integer(), Req.Response.t()) :: usage_probe_result()
   defp auth_path_unavailable_response(status, %Req.Response{} = response) do

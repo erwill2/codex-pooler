@@ -14,6 +14,7 @@ defmodule CodexPooler.UpstreamsTest do
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.{CodexAuth, CodexAuthJson, TokenRefresh}
+  alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.TokenLinking
 
@@ -4805,6 +4806,60 @@ defmodule CodexPooler.UpstreamsTest do
              ]
     end
 
+    test "does not reuse Cloudflare cookies from non-ChatGPT usage probe origins" do
+      html_403 = "<!doctype html><html><body>Forbidden</body></html>"
+
+      {:ok, upstream} =
+        FakeUpstream.start_link(
+          {:sequence,
+           [
+             FakeUpstream.raw_response(html_403,
+               status: 403,
+               headers: [
+                 {"content-type", "text/html; charset=utf-8"},
+                 {"set-cookie", "__cf_bm=cf-token; Path=/; HttpOnly; Secure"}
+               ]
+             ),
+             FakeUpstream.json_response(%{
+               "rate_limit" => %{
+                 "primary_window" => %{
+                   "used_percent" => 42,
+                   "limit_window_seconds" => 18_000,
+                   "reset_after_seconds" => 300
+                 },
+                 "secondary_window" => %{
+                   "used_percent" => 51,
+                   "limit_window_seconds" => 604_800,
+                   "reset_after_seconds" => 3_600
+                 }
+               }
+             })
+           ]}
+        )
+
+      on_exit(fn -> FakeUpstream.stop(upstream) end)
+
+      %{identity: identity, pool: pool, assignment: assignment} =
+        usage_assignment_fixture(upstream)
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :succeeded
+
+      windows = QuotaWindows.list_quota_windows(identity)
+      assert Enum.any?(windows, &(&1.quota_key == "account" and &1.window_kind == "primary"))
+
+      requests = FakeUpstream.requests(upstream)
+
+      assert Enum.map(requests, & &1.path) == [
+               "/api/codex/usage",
+               "/backend-api/codex/usage"
+             ]
+
+      [_first_request, second_request | _rest] = FakeUpstream.requests(upstream)
+      second_headers = Map.new(second_request.headers)
+      refute Map.has_key?(second_headers, "cookie")
+    end
+
     test "stores 5h and weekly quota windows from Codex response headers" do
       identity = active_identity_fixture()
       reset_at = DateTime.add(DateTime.utc_now(), 600, :second) |> DateTime.truncate(:second)
@@ -4848,6 +4903,133 @@ defmodule CodexPooler.UpstreamsTest do
       assert spark.raw_limit_name == "gpt-5.3-codex-spark"
       assert spark.raw_metered_feature == "codex_bengalfox"
       assert spark.observed_at
+    end
+
+    test "Cloudflare cookie jar stores only allowed cookie names per origin" do
+      url =
+        "https://cookie-test-#{System.unique_integer([:positive])}.chatgpt.com/backend-api/codex/usage"
+
+      other_url =
+        "https://cookie-other-#{System.unique_integer([:positive])}.chatgpt.com/backend-api/codex/usage"
+
+      assert CloudflareCookies.store_from_response(url, %Req.Response{
+               status: 403,
+               headers: %{
+                 "set-cookie" => [
+                   "__cf_bm=cf-token; Path=/; HttpOnly; Secure",
+                   "session=must-not-forward; Path=/; HttpOnly; Secure",
+                   "cf_chl_test=challenge-token; Path=/; HttpOnly; Secure"
+                 ]
+               }
+             })
+
+      headers = CloudflareCookies.request_headers(url, [{"accept", "application/json"}])
+      cookie = headers |> Map.new() |> Map.fetch!("cookie")
+
+      assert cookie =~ "__cf_bm=cf-token"
+      assert cookie =~ "cf_chl_test=challenge-token"
+      refute cookie =~ "session=must-not-forward"
+
+      refute CloudflareCookies.request_headers(other_url, [])
+             |> Map.new()
+             |> Map.has_key?("cookie")
+    end
+
+    test "Cloudflare cookie jar stores allowed cookies from raw response headers" do
+      url =
+        "https://cookie-headers-#{System.unique_integer([:positive])}.chatgpt.com/backend-api/codex/responses"
+
+      assert CloudflareCookies.store_from_headers(url, [
+               {"content-type", "text/html"},
+               {"set-cookie", "__cf_bm=header-token; Path=/; HttpOnly; Secure"},
+               {"set-cookie", "session=must-not-forward; Path=/; HttpOnly; Secure"}
+             ])
+
+      headers = CloudflareCookies.request_headers(url, [{"accept", "application/json"}])
+      cookie = headers |> Map.new() |> Map.fetch!("cookie")
+
+      assert cookie =~ "__cf_bm=header-token"
+      refute cookie =~ "session=must-not-forward"
+    end
+
+    test "Cloudflare cookie jar ignores non-ChatGPT and plain HTTP origins" do
+      assert CloudflareCookies.store_from_headers("https://example.com/backend-api/codex/usage", [
+               {"set-cookie", "__cf_bm=ignored; Path=/; HttpOnly; Secure"}
+             ]) == false
+
+      refute CloudflareCookies.request_headers(
+               "https://example.com/backend-api/codex/usage",
+               []
+             )
+             |> Map.new()
+             |> Map.has_key?("cookie")
+
+      assert CloudflareCookies.store_from_headers("http://chatgpt.com/backend-api/codex/usage", [
+               {"set-cookie", "__cf_bm=ignored; Path=/; HttpOnly"}
+             ]) == false
+
+      refute CloudflareCookies.request_headers(
+               "http://chatgpt.com/backend-api/codex/usage",
+               []
+             )
+             |> Map.new()
+             |> Map.has_key?("cookie")
+    end
+
+    test "Cloudflare cookie jar honors max-age clears and expired dates" do
+      url =
+        "https://cookie-expiry-#{System.unique_integer([:positive])}.chatgpt.com/backend-api/codex/usage"
+
+      assert CloudflareCookies.store_from_headers(url, [
+               {"set-cookie", "__cf_bm=live; Max-Age=1800; Path=/; HttpOnly; Secure"}
+             ])
+
+      assert CloudflareCookies.request_headers(url, []) |> Map.new() |> Map.fetch!("cookie") =~
+               "__cf_bm=live"
+
+      refute CloudflareCookies.store_from_headers(url, [
+               {"set-cookie", "__cf_bm=; Max-Age=0; Path=/; HttpOnly; Secure"}
+             ])
+
+      refute CloudflareCookies.request_headers(url, [])
+             |> Map.new()
+             |> Map.has_key?("cookie")
+
+      refute CloudflareCookies.store_from_headers(url, [
+               {"set-cookie",
+                "__cf_bm=expired; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/; HttpOnly; Secure"}
+             ])
+
+      refute CloudflareCookies.request_headers(url, [])
+             |> Map.new()
+             |> Map.has_key?("cookie")
+    end
+
+    test "Cloudflare cookie jar is owned by the supervised process" do
+      url =
+        "https://cookie-owner-#{System.unique_integer([:positive])}.chatgpt.com/backend-api/codex/usage"
+
+      task =
+        Task.async(fn ->
+          assert CloudflareCookies.store_from_response(url, %Req.Response{
+                   status: 403,
+                   headers: %{
+                     "set-cookie" => [
+                       "__cf_bm=cf-token; Path=/; HttpOnly; Secure"
+                     ]
+                   }
+                 })
+
+          :ets.info(CloudflareCookies, :owner)
+        end)
+
+      owner = Task.await(task)
+
+      assert owner == Process.whereis(CloudflareCookies)
+      assert Process.alive?(owner)
+
+      headers = CloudflareCookies.request_headers(url, [{"accept", "application/json"}])
+      assert headers |> Map.new() |> Map.fetch!("cookie") =~ "__cf_bm=cf-token"
     end
 
     test "stores reset-bearing 5h quota from Codex rate limit events" do

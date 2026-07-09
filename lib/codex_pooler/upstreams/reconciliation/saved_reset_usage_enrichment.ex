@@ -1,6 +1,7 @@
 defmodule CodexPooler.Upstreams.Reconciliation.SavedResetUsageEnrichment do
   @moduledoc false
 
+  alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
@@ -75,14 +76,21 @@ defmodule CodexPooler.Upstreams.Reconciliation.SavedResetUsageEnrichment do
     |> reset_credits_urls()
     |> Enum.reduce_while(:error, fn url, _last_result ->
       case Req.get(url,
-             headers: headers,
+             headers: CloudflareCookies.request_headers(url, headers),
              retry: false,
              receive_timeout: timeout
            ) do
-        {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
+        {:ok, %Req.Response{status: status, body: body} = response}
+        when status in 200..299 and is_map(body) ->
+          CloudflareCookies.store_from_response(url, response)
+
           {:halt, {:ok, Map.put(body, "expires_observed_at", DateTime.to_iso8601(observed_at))}}
 
-        _unavailable ->
+        {:ok, %Req.Response{} = response} ->
+          CloudflareCookies.store_from_response(url, response)
+          {:cont, :error}
+
+        {:error, _reason} ->
           {:cont, :error}
       end
     end)

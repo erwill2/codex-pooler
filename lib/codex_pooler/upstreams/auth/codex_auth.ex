@@ -235,6 +235,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
     @moduledoc false
 
     alias CodexPooler.Upstreams.Auth.CodexAuth
+    alias CodexPooler.Upstreams.CloudflareCookies
 
     @browser_user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     @browser_sec_ch_ua ~S("Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99")
@@ -374,8 +375,7 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
 
       receive_timeout = refresh_receive_timeout(opts)
 
-      case Req.post(token_url,
-             headers: browser_request_headers(),
+      case post_with_cloudflare(token_url,
              form: form,
              retry: false,
              receive_timeout: receive_timeout
@@ -401,6 +401,20 @@ defmodule CodexPooler.Upstreams.Auth.CodexAuth do
         {:error, reason} ->
           auth_error(:codex_auth_transient, Exception.message(reason), 502)
       end
+    end
+
+    defp post_with_cloudflare(url, opts) do
+      headers =
+        opts
+        |> Keyword.get(:headers, browser_request_headers())
+        |> then(&CloudflareCookies.request_headers(url, &1))
+
+      opts =
+        Keyword.put(opts, :headers, headers)
+
+      result = Req.post(url, opts)
+      CloudflareCookies.store_from_result(url, result)
+      result
     end
 
     defp refresh_receive_timeout(opts) do

@@ -11,6 +11,7 @@ defmodule CodexPooler.Application do
       CodexPoolerWeb.Telemetry,
       CodexPooler.Repo,
       CodexPooler.Access.APIKeys.TouchDebounce,
+      CodexPooler.Upstreams.CloudflareCookies,
       CodexPooler.Gateway.Transports.Admission,
       {Registry,
        keys: :unique,

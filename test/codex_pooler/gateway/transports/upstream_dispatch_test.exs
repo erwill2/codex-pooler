@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
   import CodexPooler.PoolerFixtures
   import ExUnit.CaptureLog
 
+  alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.CodexSession
@@ -118,6 +119,44 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
                       arity: 4,
                       timeout: 25
                     }}
+  end
+
+  test "http request does not reuse Cloudflare cookies for non-ChatGPT upstream origins" do
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        {:sequence,
+         [
+           FakeUpstream.json_response_with_headers(
+             %{"ok" => true},
+             [{"set-cookie", "__cf_bm=dispatch-token; Path=/; HttpOnly; Secure"}]
+           ),
+           FakeUpstream.json_response(%{"ok" => true})
+         ]}
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+
+    payload = %{"model" => "example-model"}
+    url = FakeUpstream.url(upstream) <> "/backend-api/codex/responses"
+
+    request = %UpstreamDispatch.Request{
+      url: url,
+      token: "redacted",
+      upstream_payload: Jason.encode!(payload),
+      original_payload: payload,
+      identity: upstream_identity(),
+      request_options: RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+    }
+
+    assert {:ok, _response} = UpstreamDispatch.http_request(request)
+    assert {:ok, _response} = UpstreamDispatch.http_request(request)
+
+    [first_request, second_request] = FakeUpstream.requests(upstream)
+    first_headers = Map.new(first_request.headers)
+    second_headers = Map.new(second_request.headers)
+
+    refute Map.has_key?(first_headers, "cookie")
+    refute Map.has_key?(second_headers, "cookie")
   end
 
   defp websocket_owner_request_options(session, lease_token, downstream, forwarder_opts) do

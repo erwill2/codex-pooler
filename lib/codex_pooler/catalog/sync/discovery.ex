@@ -4,6 +4,7 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
   """
 
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.EndpointMetadata
   alias CodexPooler.Upstreams.Secrets
 
@@ -36,8 +37,10 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
       case Req.get(url,
              retry: false,
              receive_timeout: 30_000,
-             headers: model_catalog_headers(identity, token)
-           ) do
+             headers:
+               CloudflareCookies.request_headers(url, model_catalog_headers(identity, token))
+           )
+           |> store_cloudflare_cookies(url) do
         {:ok, %{status: 200, body: %{"data" => models}}} when is_list(models) ->
           {:ok, models}
 
@@ -58,6 +61,11 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
           {:error, catalog_error(:upstream_model_list_failed, Exception.message(reason))}
       end
     end
+  end
+
+  defp store_cloudflare_cookies(result, url) do
+    CloudflareCookies.store_from_result(url, result)
+    result
   end
 
   defp model_catalog_url(identity, assignment) do

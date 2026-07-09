@@ -16,6 +16,7 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
   alias CodexPooler.RouteClass
+  alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @regular_runtime_metadata_endpoints [
@@ -148,14 +149,19 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         retry: false,
         into: BoundedResponseBody.collector(BoundedResponseBody.default_max_bytes()),
         headers:
-          upstream_headers(identity, token, [
-            {"accept", "application/json"}
-          ])
+          CloudflareCookies.request_headers(
+            url,
+            upstream_headers(identity, token, [
+              {"accept", "application/json"}
+            ])
+          )
       ]
       |> Keyword.merge(TransportEnvelope.req_timeout_options(timeouts))
 
-    url
-    |> Req.post(request_options)
+    result = Req.post(url, request_options)
+    CloudflareCookies.store_from_result(url, result)
+
+    result
     |> normalize_upstream_transport_result(identity, opts)
   rescue
     exception in [
@@ -186,11 +192,17 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         decode_body: false,
         retry: false,
         headers:
-          regular_runtime_headers(identity, token, opts, [
-            {"content-type", "application/json"},
-            {"accept",
-             if(RouteClass.streaming?(payload), do: "text/event-stream", else: "application/json")}
-          ])
+          CloudflareCookies.request_headers(
+            url,
+            regular_runtime_headers(identity, token, opts, [
+              {"content-type", "application/json"},
+              {"accept",
+               if(RouteClass.streaming?(payload),
+                 do: "text/event-stream",
+                 else: "application/json"
+               )}
+            ])
+          )
       ]
       |> Keyword.merge(TransportEnvelope.req_timeout_options(timeouts))
 
@@ -205,8 +217,10 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatch do
         )
       end
 
-    url
-    |> Req.post(request_options)
+    result = Req.post(url, request_options)
+    CloudflareCookies.store_from_result(url, result)
+
+    result
     |> normalize_upstream_transport_result(identity, opts)
   rescue
     exception in [

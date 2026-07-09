@@ -8,6 +8,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   alias CodexPooler.Events
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
+  alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.EndpointMetadata
   alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
   alias CodexPooler.Upstreams.SavedResets
@@ -451,10 +452,15 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
 
   defp list_chatgpt_credits(url, identity, access_token, receive_timeout) do
     case Req.get(url,
-           headers: request_headers(access_token, identity.chatgpt_account_id, :get),
+           headers:
+             CloudflareCookies.request_headers(
+               url,
+               request_headers(access_token, identity.chatgpt_account_id, :get)
+             ),
            retry: false,
            receive_timeout: receive_timeout
-         ) do
+         )
+         |> store_cloudflare_cookies(url) do
       {:ok, %{status: status, body: body}} when status in 200..299 and is_map(body) ->
         {:ok, parse_chatgpt_credit_list(body, status)}
 
@@ -504,11 +510,16 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          endpoint_kind
        ) do
     case Req.post(url,
-           headers: request_headers(access_token, identity.chatgpt_account_id, :post),
+           headers:
+             CloudflareCookies.request_headers(
+               url,
+               request_headers(access_token, identity.chatgpt_account_id, :post)
+             ),
            json: body,
            retry: false,
            receive_timeout: claim.receive_timeout
-         ) do
+         )
+         |> store_cloudflare_cookies(url) do
       {:ok, %{status: status, body: response_body}} ->
         response_code(response_body, status, endpoint_kind)
         |> result_from_response(status, available_count_before, identity, claim.assignment, claim)
@@ -516,6 +527,11 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       {:error, _reason} ->
         transport_failed_result()
     end
+  end
+
+  defp store_cloudflare_cookies(result, url) do
+    CloudflareCookies.store_from_result(url, result)
+    result
   end
 
   defp result_from_response(code, status, available_count_before, identity, assignment, claim) do
