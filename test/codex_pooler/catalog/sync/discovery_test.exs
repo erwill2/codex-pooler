@@ -56,6 +56,11 @@ defmodule CodexPooler.Catalog.Sync.DiscoveryTest do
     first_headers = Map.new(first_request.headers)
     second_headers = Map.new(second_request.headers)
 
+    assert first_request.path == "/backend-api/codex/models"
+    assert URI.decode_query(first_request.query_string)["client_version"] == "0.144.0"
+    assert second_request.path == "/backend-api/codex/models"
+    assert URI.decode_query(second_request.query_string)["client_version"] == "0.144.0"
+
     refute Map.has_key?(first_headers, "cookie")
     refute Map.has_key?(second_headers, "cookie")
   end

@@ -9,7 +9,7 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
   alias CodexPooler.Upstreams.Secrets
 
   @default_codex_upstream_base_url "https://chatgpt.com"
-  @default_codex_client_version "0.125.0"
+  @default_codex_client_version "0.144.0"
   @secret_kind "access_token"
 
   @type catalog_error :: %{required(:code) => atom(), required(:message) => String.t()}
