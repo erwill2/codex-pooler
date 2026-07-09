@@ -8,6 +8,13 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers.ResetTimes do
     |> reset_at_from(nil)
   end
 
+  @spec reset_source_precision(map(), DateTime.t() | nil) :: String.t()
+  def reset_source_precision(_attrs, nil), do: "inferred"
+
+  def reset_source_precision(%{} = attrs, %DateTime{}) do
+    if explicit_reset_at_from(attrs), do: "observed", else: "inferred"
+  end
+
   @spec reset_at_from(map(), DateTime.t() | nil) :: DateTime.t() | nil
   def reset_at_from(%{} = attrs, observed_at) do
     attrs

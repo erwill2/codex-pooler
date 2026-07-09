@@ -136,6 +136,9 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     timestamp = now()
 
     cond do
+      incoming_raises_usage_with_existing_reset?(evidence, existing, timestamp) ->
+        merge_usage_with_existing_reset_attrs(existing, attrs, timestamp)
+
       incoming_updates_usage_with_existing_capacity?(evidence, existing) ->
         merge_usage_with_existing_capacity_attrs(existing, attrs, timestamp)
 
@@ -158,10 +161,10 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
          timestamp
        ) do
     cond do
-      usage_api_account_supersedes_runtime_rollback?(evidence, existing, timestamp) ->
+      usage_api_supersedes_runtime_rollback?(evidence, existing, timestamp) ->
         true
 
-      runtime_account_percent_rollback?(evidence, existing, timestamp) ->
+      runtime_percent_rollback?(evidence, existing, timestamp) ->
         false
 
       true ->
@@ -191,7 +194,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     end
   end
 
-  defp usage_api_account_supersedes_runtime_rollback?(
+  defp usage_api_supersedes_runtime_rollback?(
          %Evidence{source: "codex_usage_api", used_percent: %Decimal{} = incoming_percent} =
            evidence,
          %Quota.AccountQuotaWindow{source: source, used_percent: %Decimal{} = existing_percent} =
@@ -199,15 +202,15 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
          timestamp
        )
        when source in @runtime_quota_sources do
-    account_quota_identity?(evidence) and same_evidence_identity?(evidence, existing) and
+    rollback_guarded_quota_identity?(evidence) and same_evidence_identity?(evidence, existing) and
       Evidence.current_freshness_state(evidence, timestamp) == "fresh" and
       Decimal.compare(incoming_percent, existing_percent) != :lt
   end
 
-  defp usage_api_account_supersedes_runtime_rollback?(_evidence, _existing, _timestamp),
+  defp usage_api_supersedes_runtime_rollback?(_evidence, _existing, _timestamp),
     do: false
 
-  defp runtime_account_percent_rollback?(
+  defp runtime_percent_rollback?(
          %Evidence{source: source, used_percent: %Decimal{} = incoming_percent} = evidence,
          %Quota.AccountQuotaWindow{
            source: "codex_usage_api",
@@ -217,13 +220,13 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
          timestamp
        )
        when source in @runtime_quota_sources do
-    account_quota_identity?(evidence) and same_evidence_identity?(evidence, existing) and
+    rollback_guarded_quota_identity?(evidence) and same_evidence_identity?(evidence, existing) and
       weak_capacity?(evidence) and stronger_current_quota_information?(existing, timestamp) and
-      Decimal.compare(incoming_percent, existing_percent) == :lt and
+      Decimal.compare(incoming_percent, existing_percent) != :gt and
       not exhausted_by_used_percent?(evidence)
   end
 
-  defp runtime_account_percent_rollback?(_evidence, _existing, _timestamp), do: false
+  defp runtime_percent_rollback?(_evidence, _existing, _timestamp), do: false
 
   defp quality_supersedes?(
          %Evidence{} = evidence,
@@ -258,10 +261,29 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     same_evidence_identity?(evidence, existing) and
       Evidence.current_freshness_state(existing, timestamp) == "fresh" and
       DateTime.compare(reset_at, existing_reset_at) == :lt and
-      not same_source_weak_zero_to_stronger_evidence?(evidence, existing)
+      not same_source_weak_zero_to_stronger_evidence?(evidence, existing) and
+      not explicit_reset_corrects_relative_existing?(evidence, existing)
   end
 
   defp reset_bearing_rollback?(_evidence, _existing, _timestamp), do: false
+
+  defp explicit_reset_corrects_relative_existing?(
+         %Evidence{source_precision: precision},
+         %Quota.AccountQuotaWindow{metadata: metadata}
+       )
+       when precision in ["observed", "authoritative"] do
+    relative_reset_metadata?(metadata)
+  end
+
+  defp explicit_reset_corrects_relative_existing?(_evidence, _existing), do: false
+
+  defp relative_reset_metadata?(%{} = metadata),
+    do:
+      not is_nil(
+        Map.get(metadata, "reset_after_seconds") || Map.get(metadata, :reset_after_seconds)
+      )
+
+  defp relative_reset_metadata?(_metadata), do: false
 
   defp same_source_weak_zero_to_stronger_evidence?(
          %Evidence{} = evidence,
@@ -319,8 +341,14 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       lower_string(evidence.upstream_model) == lower_string(existing.upstream_model)
   end
 
-  defp account_quota_identity?(%{quota_key: "account", quota_scope: "account"}), do: true
-  defp account_quota_identity?(_evidence_or_window), do: false
+  defp rollback_guarded_quota_identity?(%{quota_key: "account", quota_scope: "account"}),
+    do: true
+
+  defp rollback_guarded_quota_identity?(%{quota_scope: scope})
+       when scope in ["model", "upstream_model"],
+       do: true
+
+  defp rollback_guarded_quota_identity?(_evidence_or_window), do: false
 
   defp incoming_refreshes_existing?(
          %Evidence{source: "codex_usage_api"} = evidence,
@@ -345,6 +373,28 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
 
   defp incoming_updates_usage_with_existing_capacity?(_evidence, _existing), do: false
 
+  defp incoming_raises_usage_with_existing_reset?(
+         %Evidence{
+           source_precision: "inferred",
+           used_percent: %Decimal{} = incoming_percent
+         } = evidence,
+         %Quota.AccountQuotaWindow{
+           reset_at: %DateTime{},
+           source_precision: existing_precision,
+           used_percent: existing_percent
+         } = existing,
+         timestamp
+       )
+       when existing_precision in ["observed", "authoritative"] do
+    same_evidence_identity?(evidence, existing) and
+      Evidence.current_freshness_state(existing, timestamp) == "fresh" and
+      Evidence.current_freshness_state(evidence, timestamp) == "fresh" and
+      higher_used_percent?(incoming_percent, existing_percent)
+  end
+
+  defp incoming_raises_usage_with_existing_reset?(_evidence, _existing, _timestamp),
+    do: false
+
   defp merge_usage_with_existing_capacity_attrs(
          %Quota.AccountQuotaWindow{} = existing,
          attrs,
@@ -360,6 +410,28 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     |> maybe_put_used_percent_from_credits(active_limit, credits, Map.get(attrs, :credits))
     |> Map.put_new(:created_at, existing.created_at || timestamp)
     |> Map.put(:updated_at, timestamp)
+  end
+
+  defp merge_usage_with_existing_reset_attrs(
+         %Quota.AccountQuotaWindow{} = existing,
+         attrs,
+         timestamp
+       ) do
+    active_limit = preserved_active_limit(existing, Map.get(attrs, :active_limit))
+    credits = preserved_credits(existing, Map.get(attrs, :credits))
+
+    existing
+    |> window_attrs()
+    |> Map.merge(%{
+      active_limit: active_limit,
+      credits: credits,
+      used_percent: Map.get(attrs, :used_percent, existing.used_percent),
+      last_sync_at: latest_datetime(existing.last_sync_at, Map.get(attrs, :last_sync_at)),
+      observed_at: latest_datetime(existing.observed_at, Map.get(attrs, :observed_at)),
+      freshness_state: Map.get(attrs, :freshness_state, existing.freshness_state),
+      metadata: Map.merge(existing.metadata || %{}, Map.get(attrs, :metadata, %{})),
+      updated_at: timestamp
+    })
   end
 
   defp refresh_existing_attrs(%Quota.AccountQuotaWindow{} = existing, attrs, timestamp) do
@@ -451,6 +523,11 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
 
   defp positive_percent?(%Decimal{} = percent),
     do: Decimal.compare(percent, Decimal.new(0)) == :gt
+
+  defp higher_used_percent?(%Decimal{} = incoming, %Decimal{} = existing),
+    do: Decimal.compare(incoming, existing) == :gt
+
+  defp higher_used_percent?(%Decimal{} = incoming, _existing), do: positive_percent?(incoming)
 
   defp positive_credits?(%{credits: credits}) when is_integer(credits), do: credits > 0
   defp positive_credits?(_evidence_or_window), do: false

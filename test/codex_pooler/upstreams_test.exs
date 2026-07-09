@@ -3647,7 +3647,7 @@ defmodule CodexPooler.UpstreamsTest do
       refute window.window_minutes in [300, 10_080, 43_200]
       assert Decimal.equal?(window.used_percent, Decimal.from_float(37.25))
       assert window.source == "codex_usage_api"
-      assert window.source_precision == "observed"
+      assert window.source_precision == "inferred"
       assert window.freshness_state == "fresh"
       assert window.metadata["limit_window_seconds"] == unknown_window_seconds
       assert window.metadata["reset_after_seconds"] == reset_after_seconds
@@ -3812,7 +3812,7 @@ defmodule CodexPooler.UpstreamsTest do
         Enum.find(windows, &(&1.quota_key == "account" and &1.window_kind == "primary"))
 
       assert account_primary.source == "codex_usage_api"
-      assert account_primary.source_precision == "observed"
+      assert account_primary.source_precision == "inferred"
       assert account_primary.quota_scope == "account"
       assert account_primary.quota_family == "account"
       assert account_primary.observed_at == synced_at
@@ -4131,7 +4131,7 @@ defmodule CodexPooler.UpstreamsTest do
       refute QuotaWindows.usable_window?(refreshed, refresh_observed_at)
     end
 
-    test "preserves non-weekly usage reset_after_seconds countdowns" do
+    test "preserves non-weekly usage reset_after_seconds as inferred countdowns" do
       identity = active_identity_fixture()
       observed_at = ~U[2026-04-27 13:00:00Z]
 
@@ -4152,9 +4152,154 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert primary.window_kind == "primary"
       assert primary.window_minutes == 300
-      assert primary.source_precision == "observed"
+      assert primary.source_precision == "inferred"
       assert DateTime.compare(primary.reset_at, DateTime.add(observed_at, 900, :second)) == :eq
       assert QuotaWindows.usable_window?(primary, observed_at)
+    end
+
+    test "relative usage countdowns do not replace explicit usage reset timestamps" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      explicit_reset_at = DateTime.add(observed_at, 3 * 60 * 60, :second)
+
+      assert {:ok, [primary]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 96,
+                       "limit_window_seconds" => 18_000,
+                       "reset_at" => DateTime.to_iso8601(explicit_reset_at)
+                     }
+                   }
+                 },
+                 observed_at
+               )
+
+      assert primary.source_precision == "observed"
+      assert DateTime.compare(primary.reset_at, explicit_reset_at) == :eq
+
+      refresh_observed_at = DateTime.add(observed_at, 60, :second)
+
+      assert {:ok, [refreshed]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 95,
+                       "limit_window_seconds" => 18_000,
+                       "reset_after_seconds" => 18_000
+                     }
+                   }
+                 },
+                 refresh_observed_at
+               )
+
+      assert refreshed.source_precision == "observed"
+      assert Decimal.equal?(refreshed.used_percent, Decimal.new("96.000"))
+      assert DateTime.compare(refreshed.reset_at, explicit_reset_at) == :eq
+
+      assert [stored] = QuotaWindows.list_quota_windows(identity)
+      assert stored.source_precision == "observed"
+      assert Decimal.equal?(stored.used_percent, Decimal.new("96.000"))
+      assert DateTime.compare(stored.reset_at, explicit_reset_at) == :eq
+    end
+
+    test "higher relative usage evidence raises percent without moving explicit reset" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      explicit_reset_at = DateTime.add(observed_at, 3 * 60 * 60, :second)
+
+      assert {:ok, [_primary]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 95,
+                       "limit_window_seconds" => 18_000,
+                       "reset_at" => DateTime.to_iso8601(explicit_reset_at)
+                     }
+                   }
+                 },
+                 observed_at
+               )
+
+      assert {:ok, [refreshed]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 97,
+                       "limit_window_seconds" => 18_000,
+                       "reset_after_seconds" => 18_000
+                     }
+                   }
+                 },
+                 DateTime.add(observed_at, 60, :second)
+               )
+
+      assert refreshed.source_precision == "observed"
+      assert Decimal.equal?(refreshed.used_percent, Decimal.new("97.000"))
+      assert DateTime.compare(refreshed.reset_at, explicit_reset_at) == :eq
+    end
+
+    test "explicit usage reset corrects older rows derived from relative countdowns" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      bad_relative_reset_at = DateTime.add(observed_at, 5 * 60 * 60, :second)
+      explicit_reset_at = DateTime.add(observed_at, 3 * 60 * 60, :second)
+
+      assert {:ok, [_bad_primary]} =
+               QuotaWindows.upsert_quota_windows(
+                 identity,
+                 [
+                   %{
+                     quota_key: "account",
+                     quota_scope: "account",
+                     quota_family: "account",
+                     window_kind: "primary",
+                     window_minutes: 300,
+                     used_percent: Decimal.new("95"),
+                     reset_at: bad_relative_reset_at,
+                     source: "codex_usage_api",
+                     source_precision: "observed",
+                     freshness_state: "fresh",
+                     metadata: %{
+                       "limit_window_seconds" => 18_000,
+                       "reset_after_seconds" => 18_000
+                     },
+                     last_sync_at: observed_at,
+                     observed_at: observed_at
+                   }
+                 ],
+                 delete_missing?: false
+               )
+
+      assert {:ok, [corrected]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 96,
+                       "limit_window_seconds" => 18_000,
+                       "reset_at" => DateTime.to_iso8601(explicit_reset_at)
+                     }
+                   }
+                 },
+                 DateTime.add(observed_at, 60, :second)
+               )
+
+      assert corrected.source_precision == "observed"
+      assert Decimal.equal?(corrected.used_percent, Decimal.new("96.000"))
+      assert DateTime.compare(corrected.reset_at, explicit_reset_at) == :eq
+
+      assert [stored] = QuotaWindows.list_quota_windows(identity)
+      assert DateTime.compare(stored.reset_at, explicit_reset_at) == :eq
     end
 
     test "does not treat non-5h account primary evidence as precise routing evidence" do
@@ -4316,7 +4461,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       model_window = Enum.find(windows, &(&1.quota_key == "codex_spark"))
       assert model_window.source == "codex_usage_api"
-      assert model_window.source_precision == "observed"
+      assert model_window.source_precision == "inferred"
       assert model_window.quota_scope == "model"
       assert model_window.quota_family == "codex_model"
       assert model_window.model == "gpt-5.3-codex-spark"
@@ -4520,7 +4665,7 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert account_primary.window_minutes == 300
       assert account_primary.used_percent == Decimal.new("15.000")
-      assert account_primary.source_precision == "observed"
+      assert account_primary.source_precision == "inferred"
       assert QuotaWindows.usable_window?(account_primary)
 
       assert account_secondary.window_minutes == 10_080
@@ -4666,7 +4811,7 @@ defmodule CodexPooler.UpstreamsTest do
         QuotaWindows.list_quota_windows(identity)
 
       assert account_primary.source == "codex_usage_api"
-      assert account_primary.source_precision == "observed"
+      assert account_primary.source_precision == "inferred"
       assert account_primary.quota_scope == "account"
       assert account_primary.quota_family == "account"
       assert DateTime.compare(account_primary.reset_at, observed_start) == :gt
@@ -5227,6 +5372,186 @@ defmodule CodexPooler.UpstreamsTest do
       assert DateTime.compare(stored_weekly.reset_at, runtime_reset_at) == :eq
     end
 
+    test "runtime rate-limit events do not roll back fresh Spark usage API quota" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      usage_reset_at = DateTime.add(observed_at, 5 * 60 * 60, :second)
+      runtime_reset_at = DateTime.add(observed_at, 7 * 24 * 60 * 60, :second)
+
+      assert {:ok, _windows} =
+               QuotaWindows.upsert_quota_windows(
+                 identity,
+                 [
+                   %{
+                     quota_key: "codex_spark",
+                     quota_scope: "model",
+                     quota_family: "codex_model",
+                     model: "gpt-5.3-codex-spark",
+                     display_label: "GPT-5.3-Codex-Spark",
+                     raw_limit_id: "codex_bengalfox",
+                     raw_limit_name: "GPT-5.3-Codex-Spark",
+                     raw_metered_feature: "codex_bengalfox",
+                     window_kind: "primary",
+                     window_minutes: 300,
+                     used_percent: Decimal.new("10"),
+                     reset_at: usage_reset_at,
+                     source: "codex_usage_api",
+                     source_precision: "observed",
+                     freshness_state: "fresh",
+                     last_sync_at: observed_at,
+                     observed_at: observed_at
+                   }
+                 ],
+                 delete_missing?: false
+               )
+
+      assert {:ok, _windows} =
+               QuotaWindows.upsert_quota_windows_from_codex_rate_limit_event(
+                 identity,
+                 %{
+                   "type" => "codex.rate_limits",
+                   "metered_feature" => "codex_bengalfox",
+                   "rate_limits" => %{
+                     "primary" => %{
+                       "used_percent" => 1,
+                       "window_minutes" => 300,
+                       "reset_at" => DateTime.to_unix(runtime_reset_at)
+                     }
+                   }
+                 },
+                 DateTime.add(observed_at, 60, :second)
+               )
+
+      assert [stored_spark] =
+               identity
+               |> QuotaWindows.list_quota_windows()
+               |> Enum.filter(&(&1.quota_key == "codex_spark" and &1.window_kind == "primary"))
+
+      assert stored_spark.source == "codex_usage_api"
+      assert Decimal.equal?(stored_spark.used_percent, Decimal.new("10"))
+      assert DateTime.compare(stored_spark.reset_at, usage_reset_at) == :eq
+    end
+
+    test "fresh Spark usage API quota corrects lower runtime rate-limit evidence" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      runtime_reset_at = DateTime.add(observed_at, 7 * 24 * 60 * 60, :second)
+      usage_reset_at = DateTime.add(observed_at, 5 * 60 * 60, :second)
+
+      assert {:ok, _windows} =
+               QuotaWindows.upsert_quota_windows_from_codex_rate_limit_event(
+                 identity,
+                 %{
+                   "type" => "codex.rate_limits",
+                   "metered_feature" => "codex_bengalfox",
+                   "rate_limits" => %{
+                     "primary" => %{
+                       "used_percent" => 1,
+                       "window_minutes" => 300,
+                       "reset_at" => DateTime.to_unix(runtime_reset_at)
+                     }
+                   }
+                 },
+                 observed_at
+               )
+
+      assert {:ok, _windows} =
+               QuotaWindows.upsert_quota_windows(
+                 identity,
+                 [
+                   %{
+                     quota_key: "codex_spark",
+                     quota_scope: "model",
+                     quota_family: "codex_model",
+                     model: "gpt-5.3-codex-spark",
+                     display_label: "GPT-5.3-Codex-Spark",
+                     raw_limit_id: "codex_bengalfox",
+                     raw_limit_name: "GPT-5.3-Codex-Spark",
+                     raw_metered_feature: "codex_bengalfox",
+                     window_kind: "primary",
+                     window_minutes: 300,
+                     used_percent: Decimal.new("10"),
+                     reset_at: usage_reset_at,
+                     source: "codex_usage_api",
+                     source_precision: "observed",
+                     freshness_state: "fresh",
+                     last_sync_at: DateTime.add(observed_at, 60, :second),
+                     observed_at: DateTime.add(observed_at, 60, :second)
+                   }
+                 ],
+                 delete_missing?: false
+               )
+
+      assert [stored_spark] =
+               identity
+               |> QuotaWindows.list_quota_windows()
+               |> Enum.filter(&(&1.quota_key == "codex_spark" and &1.window_kind == "primary"))
+
+      assert stored_spark.source == "codex_usage_api"
+      assert Decimal.equal?(stored_spark.used_percent, Decimal.new("10"))
+      assert DateTime.compare(stored_spark.reset_at, usage_reset_at) == :eq
+    end
+
+    test "runtime rate-limit events still raise Spark usage pressure" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      usage_reset_at = DateTime.add(observed_at, 5 * 60 * 60, :second)
+      runtime_reset_at = DateTime.add(observed_at, 7 * 24 * 60 * 60, :second)
+
+      assert {:ok, _windows} =
+               QuotaWindows.upsert_quota_windows(
+                 identity,
+                 [
+                   %{
+                     quota_key: "codex_spark",
+                     quota_scope: "model",
+                     quota_family: "codex_model",
+                     model: "gpt-5.3-codex-spark",
+                     display_label: "GPT-5.3-Codex-Spark",
+                     raw_limit_id: "codex_bengalfox",
+                     raw_limit_name: "GPT-5.3-Codex-Spark",
+                     raw_metered_feature: "codex_bengalfox",
+                     window_kind: "primary",
+                     window_minutes: 300,
+                     used_percent: Decimal.new("10"),
+                     reset_at: usage_reset_at,
+                     source: "codex_usage_api",
+                     source_precision: "observed",
+                     freshness_state: "fresh",
+                     last_sync_at: observed_at,
+                     observed_at: observed_at
+                   }
+                 ],
+                 delete_missing?: false
+               )
+
+      assert {:ok, _windows} =
+               QuotaWindows.upsert_quota_windows_from_codex_rate_limit_event(
+                 identity,
+                 %{
+                   "type" => "codex.rate_limits",
+                   "metered_feature" => "codex_bengalfox",
+                   "rate_limits" => %{
+                     "primary" => %{
+                       "used_percent" => 91,
+                       "window_minutes" => 300,
+                       "reset_at" => DateTime.to_unix(runtime_reset_at)
+                     }
+                   }
+                 },
+                 DateTime.add(observed_at, 60, :second)
+               )
+
+      assert [stored_spark] =
+               identity
+               |> QuotaWindows.list_quota_windows()
+               |> Enum.filter(&(&1.quota_key == "codex_spark" and &1.window_kind == "primary"))
+
+      assert stored_spark.source == "codex_rate_limit_event"
+      assert Decimal.equal?(stored_spark.used_percent, Decimal.new("91.0"))
+      assert DateTime.compare(stored_spark.reset_at, runtime_reset_at) == :eq
+    end
+
     test "stores Spark rate-limit events without deriving rolling weekly resets" do
       identity = active_identity_fixture()
       observed_at = ~U[2026-04-27 12:00:00Z]
@@ -5257,7 +5582,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert primary.quota_key == "codex_spark"
       assert primary.window_kind == "primary"
       assert primary.source == "codex_rate_limit_event"
-      assert primary.source_precision == "observed"
+      assert primary.source_precision == "inferred"
       assert DateTime.compare(primary.reset_at, primary_reset_at) == :eq
 
       assert secondary.quota_key == "codex_spark"
@@ -5509,7 +5834,7 @@ defmodule CodexPooler.UpstreamsTest do
       assert unknown = Enum.find(windows, &(&1.quota_key == "future_limit"))
       assert unknown.window_kind == "primary"
       assert unknown.source == "codex_usage_api"
-      assert unknown.source_precision == "observed"
+      assert unknown.source_precision == "inferred"
       assert unknown.quota_scope == "feature"
       assert unknown.quota_family == "future_limit"
       assert unknown.display_label == "future-limit"

@@ -191,8 +191,8 @@ defmodule CodexPooler.Quotas.Evidence do
     base = Map.get(@source_precedence, source, 0)
 
     cond do
-      match?(%DateTime{}, reset_at) -> base
       source_precision == "authoritative" -> base
+      match?(%DateTime{}, reset_at) and source_precision != "inferred" -> base
       true -> max(base - @resetless_precedence_penalty, 0)
     end
   end

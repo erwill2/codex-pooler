@@ -175,7 +175,7 @@ defmodule CodexPooler.Quotas.Evidence.CodexParsers do
         reset_at: reset_at,
         used_percent: Decimal.from_float(used_percent),
         source: "codex_usage_api",
-        source_precision: if(is_nil(reset_at), do: "inferred", else: "observed"),
+        source_precision: ResetTimes.reset_source_precision(window, reset_at),
         freshness_state: "fresh",
         last_sync_at: observed_at,
         observed_at: observed_at,
