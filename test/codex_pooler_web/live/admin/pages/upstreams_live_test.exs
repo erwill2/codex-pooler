@@ -2313,7 +2313,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
   @tag :upstream_quota_dashboard_regression
   @tag :upstream_quota_evidence_stability
-  test "upstream cards keep persisted account and model quota rows visible", %{
+  test "upstream cards keep persisted account rows visible and hide weak model rows", %{
     conn: conn,
     scope: scope
   } do
@@ -2387,46 +2387,31 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 
-    expectations = [
-      {
-        "#upstream-account-#{identity.id}-limit-primary_5h [data-role='upstream-limit-title']",
-        "5h",
-        "missing account primary_5h row even though persisted 5h evidence exists"
-      },
-      {
-        "#upstream-account-#{identity.id}-limit-primary_5h",
-        "not reported",
-        "account primary_5h row must show unknown percent as not reported, not disappear"
-      },
-      {
-        "#upstream-account-#{identity.id}-limit-weekly [data-role='upstream-limit-title']",
-        "Weekly",
-        "missing account weekly row even though persisted weekly evidence exists"
-      },
-      {
-        "#upstream-account-#{identity.id}-limit-weekly",
-        "not reported",
-        "account weekly row must show unknown percent as not reported, not disappear"
-      },
-      {
-        "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300",
-        "not reported",
-        "model 0% used percent-only evidence must remain visible without inventing 100% remaining"
-      },
-      {
-        "#upstream-account-#{identity.id}-limit-upstream_model-provider_codex_spark-primary-300",
-        "not reported",
-        "upstream-model 0% used percent-only evidence must remain visible without inventing 100% remaining"
-      }
-    ]
+    assert has_element?(
+             view,
+             "#upstream-account-#{identity.id}-limit-primary_5h [data-role='upstream-limit-title']",
+             "5h"
+           )
 
-    missing =
-      for {selector, text, message} <- expectations,
-          not has_element?(view, selector, text),
-          do: message
+    assert has_element?(view, "#upstream-account-#{identity.id}-limit-primary_5h", "not reported")
 
-    assert missing == [],
-           "expected quota card rows to preserve persisted evidence; missing: #{Enum.join(missing, "; ")}"
+    assert has_element?(
+             view,
+             "#upstream-account-#{identity.id}-limit-weekly [data-role='upstream-limit-title']",
+             "Weekly"
+           )
+
+    assert has_element?(view, "#upstream-account-#{identity.id}-limit-weekly", "not reported")
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{identity.id}-limit-upstream_model-provider_codex_spark-primary-300"
+           )
   end
 
   @tag :upstream_quota_dashboard_regression
@@ -2645,7 +2630,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   end
 
   @tag :upstream_quota_evidence_stability
-  test "model quota rows keep zero percent-only unknown capacity evidence unreported", %{
+  test "model quota rows hide zero percent-only unknown capacity evidence", %{
     scope: scope
   } do
     {:ok, pool} =
@@ -2682,11 +2667,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              ])
 
     [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
-    primary_model = Enum.find(account.quota_limits, &(&1.key == "model-codex_spark-primary-300"))
-
-    assert primary_model.percent == nil
-    assert primary_model.percent_value == 0
-    assert primary_model.percent_label == "not reported"
+    refute Enum.any?(account.quota_limits, &(&1.key == "model-codex_spark-primary-300"))
   end
 
   @tag :upstream_quota_evidence_stability

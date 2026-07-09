@@ -88,6 +88,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
     additional_limits =
       windows
       |> Enum.reject(&account_quota_window?/1)
+      |> Enum.filter(&informative_additional_quota_window?/1)
       |> Enum.sort_by(&quota_limit_sort_key/1)
       |> Enum.with_index(1)
       |> Enum.map(fn {window, index} ->
@@ -134,6 +135,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
        do: true
 
   defp account_quota_window?(%Quota.AccountQuotaWindow{}), do: false
+
+  defp informative_additional_quota_window?(%Quota.AccountQuotaWindow{} = window) do
+    not is_nil(quota_remaining_percent(window)) or not is_nil(quota_count_label(window))
+  end
 
   defp quota_account_window(windows, descriptor) do
     Enum.find(windows, &(WindowClassifier.classify(&1) == descriptor))
