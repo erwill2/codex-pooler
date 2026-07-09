@@ -14,10 +14,10 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
   @account_quota_key "account"
   @usage_auth_refresh_skew_seconds 5 * 60
   @codex_usage_paths [
-    "/api/codex/usage",
-    "/backend-api/codex/usage",
+    "/backend-api/wham/usage",
     "/wham/usage",
-    "/backend-api/wham/usage"
+    "/api/codex/usage",
+    "/backend-api/codex/usage"
   ]
 
   @type usage_fetch_result :: {:ok, term(), String.t(), [map()]} | {:error, term()}

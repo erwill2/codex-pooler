@@ -10,6 +10,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @runtime_quota_sources ~w(codex_rate_limit_event codex_response_headers)
+  @usage_reset_forward_tolerance_seconds 5 * 60
 
   @type identity_ref :: UpstreamIdentity.t() | Ecto.UUID.t()
 
@@ -142,6 +143,12 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       incoming_updates_usage_with_existing_capacity?(evidence, existing) ->
         merge_usage_with_existing_capacity_attrs(existing, attrs, timestamp)
 
+      incoming_usage_advances_runtime_reset?(evidence, existing, timestamp) ->
+        merge_usage_reset_with_existing_percent_attrs(existing, attrs, timestamp)
+
+      incoming_weak_usage_extends_existing_reset?(evidence, existing, timestamp) ->
+        merge_weak_usage_with_existing_reset_attrs(existing, attrs, timestamp)
+
       incoming_refreshes_existing?(evidence, existing, timestamp) ->
         refresh_existing_attrs(existing, attrs, timestamp)
 
@@ -227,6 +234,37 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   end
 
   defp runtime_percent_rollback?(_evidence, _existing, _timestamp), do: false
+
+  defp incoming_usage_advances_runtime_reset?(
+         %Evidence{source: "codex_usage_api"} = evidence,
+         %Quota.AccountQuotaWindow{source: source} = existing,
+         timestamp
+       )
+       when source in @runtime_quota_sources do
+    same_evidence_identity?(evidence, existing) and weak_zero_percent_evidence?(evidence) and
+      stronger_current_quota_information?(existing, timestamp) and
+      newer_usage_reset_supersedes?(evidence, existing)
+  end
+
+  defp incoming_usage_advances_runtime_reset?(_evidence, _existing, _timestamp), do: false
+
+  defp incoming_weak_usage_extends_existing_reset?(
+         %Evidence{source: "codex_usage_api", reset_at: %DateTime{} = incoming_reset} =
+           evidence,
+         %Quota.AccountQuotaWindow{
+           source: "codex_usage_api",
+           reset_at: %DateTime{} = existing_reset
+         } = existing,
+         timestamp
+       ) do
+    rollback_guarded_quota_identity?(evidence) and same_evidence_identity?(evidence, existing) and
+      weak_capacity?(evidence) and stronger_current_quota_information?(existing, timestamp) and
+      DateTime.diff(incoming_reset, existing_reset, :second) >
+        @usage_reset_forward_tolerance_seconds
+  end
+
+  defp incoming_weak_usage_extends_existing_reset?(_evidence, _existing, _timestamp),
+    do: false
 
   defp quality_supersedes?(
          %Evidence{} = evidence,
@@ -352,7 +390,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
 
   defp incoming_refreshes_existing?(
          %Evidence{source: "codex_usage_api"} = evidence,
-         %Quota.AccountQuotaWindow{} = existing,
+         %Quota.AccountQuotaWindow{source: "codex_usage_api"} = existing,
          timestamp
        ) do
     same_evidence_identity?(evidence, existing) and weak_zero_percent_evidence?(evidence) and
@@ -434,13 +472,54 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     })
   end
 
+  defp merge_weak_usage_with_existing_reset_attrs(
+         %Quota.AccountQuotaWindow{} = existing,
+         attrs,
+         timestamp
+       ) do
+    active_limit = preserved_active_limit(existing, Map.get(attrs, :active_limit))
+    credits = preserved_credits(existing, Map.get(attrs, :credits))
+
+    existing
+    |> window_attrs()
+    |> Map.merge(%{
+      active_limit: active_limit,
+      credits: credits,
+      used_percent: highest_used_percent(existing.used_percent, Map.get(attrs, :used_percent)),
+      last_sync_at: latest_datetime(existing.last_sync_at, Map.get(attrs, :last_sync_at)),
+      observed_at: latest_datetime(existing.observed_at, Map.get(attrs, :observed_at)),
+      freshness_state: Map.get(attrs, :freshness_state, existing.freshness_state),
+      metadata: Map.merge(existing.metadata || %{}, Map.get(attrs, :metadata, %{})),
+      updated_at: timestamp
+    })
+  end
+
+  defp merge_usage_reset_with_existing_percent_attrs(
+         %Quota.AccountQuotaWindow{} = existing,
+         attrs,
+         timestamp
+       ) do
+    active_limit = preserved_active_limit(existing, Map.get(attrs, :active_limit))
+    credits = preserved_credits(existing, Map.get(attrs, :credits))
+
+    attrs
+    |> Map.put(:active_limit, active_limit)
+    |> Map.put(:credits, credits)
+    |> Map.put(
+      :used_percent,
+      runtime_usage_percent(existing, Map.get(attrs, :used_percent))
+    )
+    |> Map.put(:metadata, Map.merge(existing.metadata || %{}, Map.get(attrs, :metadata, %{})))
+    |> Map.put_new(:created_at, existing.created_at || timestamp)
+    |> Map.put(:updated_at, timestamp)
+  end
+
   defp refresh_existing_attrs(%Quota.AccountQuotaWindow{} = existing, attrs, timestamp) do
     existing
     |> window_attrs()
     |> Map.merge(%{
       last_sync_at: latest_datetime(existing.last_sync_at, Map.get(attrs, :last_sync_at)),
       observed_at: latest_datetime(existing.observed_at, Map.get(attrs, :observed_at)),
-      reset_at: latest_reset_at(existing.reset_at, Map.get(attrs, :reset_at)),
       freshness_state: Map.get(attrs, :freshness_state, existing.freshness_state),
       metadata: Map.merge(existing.metadata || %{}, Map.get(attrs, :metadata, %{})),
       updated_at: timestamp
@@ -528,6 +607,19 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     do: Decimal.compare(incoming, existing) == :gt
 
   defp higher_used_percent?(%Decimal{} = incoming, _existing), do: positive_percent?(incoming)
+
+  defp highest_used_percent(%Decimal{} = existing, %Decimal{} = incoming) do
+    if higher_used_percent?(incoming, existing), do: incoming, else: existing
+  end
+
+  defp highest_used_percent(nil, %Decimal{} = incoming), do: incoming
+  defp highest_used_percent(existing, _incoming), do: existing
+
+  defp runtime_usage_percent(%Quota.AccountQuotaWindow{quota_scope: scope} = existing, incoming)
+       when scope in ["model", "upstream_model"],
+       do: highest_used_percent(existing.used_percent, incoming)
+
+  defp runtime_usage_percent(_existing, incoming), do: incoming
 
   defp positive_credits?(%{credits: credits}) when is_integer(credits), do: credits > 0
   defp positive_credits?(_evidence_or_window), do: false

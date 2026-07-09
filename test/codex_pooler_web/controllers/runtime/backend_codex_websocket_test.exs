@@ -4313,8 +4313,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert [] = FakeUpstream.requests(first_stale_upstream)
     assert [] = FakeUpstream.requests(second_stale_upstream)
 
-    assert [usage_request, response_request] = FakeUpstream.requests(sticky_upstream)
-    assert usage_request.path == "/api/codex/usage"
+    {_usage_request, response_request} = assert_usage_probe_then_response(sticky_upstream)
     assert response_request.path == "/backend-api/codex/responses"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -4413,7 +4412,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     end
 
     refute_received {:websocket_frame, _frame}
-    assert [%{path: "/api/codex/usage"}] = FakeUpstream.requests(sticky_upstream)
+    assert_usage_probe_requests(sticky_upstream)
     assert FakeUpstream.requests(fallback_upstream) == []
     assert Repo.aggregate(Attempt, :count) == 0
 
@@ -7923,6 +7922,29 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
       nil -> flunk("missing header #{name}")
       value -> value
     end
+  end
+
+  defp assert_usage_probe_then_response(upstream) do
+    assert [
+             %{path: "/backend-api/wham/usage"},
+             %{path: "/wham/usage"},
+             usage_request,
+             response_request
+           ] = FakeUpstream.requests(upstream)
+
+    assert usage_request.path == "/api/codex/usage"
+    {usage_request, response_request}
+  end
+
+  defp assert_usage_probe_requests(upstream) do
+    assert [
+             %{path: "/backend-api/wham/usage"},
+             %{path: "/wham/usage"},
+             usage_request
+           ] = FakeUpstream.requests(upstream)
+
+    assert usage_request.path == "/api/codex/usage"
+    usage_request
   end
 
   defp execute_websocket_response(auth, raw_payload, opts, push_frame) do

@@ -99,9 +99,9 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
         FakeUpstream.start_link(
           {:sequence,
            [
-             {:path_json, %{"/api/codex/usage" => {401, %{"error" => "expired"}}}},
+             {:path_json, %{"/backend-api/wham/usage" => {401, %{"error" => "expired"}}}},
              {:path_json, %{"/oauth/token" => {200, %{"access_token" => new_access_token}}}},
-             {:path_json, %{"/api/codex/usage" => {200, usage_payload}}},
+             {:path_json, %{"/backend-api/wham/usage" => {200, usage_payload}}},
              {:path_json,
               %{"/backend-api/codex/models" => {200, %{"models" => [%{"id" => "gpt-refreshed"}]}}}}
            ]}
@@ -131,9 +131,9 @@ defmodule CodexPooler.Jobs.AccountPrimingJobsTest do
                Upstreams.Secrets.decrypt_active_secret(identity, "access_token")
 
       assert [usage_401, token_refresh, usage_retry, catalog] = FakeUpstream.requests(upstream)
-      assert usage_401.path == "/api/codex/usage"
+      assert usage_401.path == "/backend-api/wham/usage"
       assert token_refresh.path == "/oauth/token"
-      assert usage_retry.path == "/api/codex/usage"
+      assert usage_retry.path == "/backend-api/wham/usage"
       assert catalog.path == "/backend-api/codex/models"
     end
 

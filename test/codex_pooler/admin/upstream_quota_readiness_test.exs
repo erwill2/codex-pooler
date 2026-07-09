@@ -272,6 +272,31 @@ defmodule CodexPooler.Admin.UpstreamQuotaReadinessTest do
       assert_exact_keys(projection)
     end
 
+    test "selects measured account primary evidence over a zero-capacity usage outlier" do
+      outlier =
+        account_primary_window(
+          active_limit: 0,
+          credits: 0,
+          used_percent: Decimal.new("0"),
+          reset_at: DateTime.add(@as_of, 5, :hour),
+          observed_at: DateTime.add(@as_of, 60, :second)
+        )
+
+      measured =
+        account_primary_window(
+          active_limit: 0,
+          credits: 0,
+          used_percent: Decimal.new("6"),
+          reset_at: DateTime.add(@as_of, 2, :hour)
+        )
+
+      assert %{
+               state: "ready",
+               routing_ready_now?: true,
+               primary_window: ^measured
+             } = UpstreamQuotaReadiness.from_windows([outlier, measured], @as_of)
+    end
+
     test "weekly-only exhaustion uses the runtime weekly exhaustion exclusion" do
       weekly = account_weekly_window(used_percent: Decimal.new("100"))
 

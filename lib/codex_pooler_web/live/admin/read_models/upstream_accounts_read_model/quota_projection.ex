@@ -2,9 +2,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   @moduledoc false
 
   alias CodexPooler.Admin.UpstreamQuotaReadiness
-  alias CodexPooler.Quotas.WindowClassifier
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Quota.Charts.Measurements
+  alias CodexPooler.Upstreams.Quota.WindowSelector
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting
   alias CodexPoolerWeb.DateTimeDisplay
 
@@ -141,21 +141,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   end
 
   defp quota_account_window(windows, descriptor) do
-    Enum.find(windows, &(WindowClassifier.classify(&1) == descriptor))
+    WindowSelector.best_account_window(windows, descriptor)
   end
 
   defp quota_account_window(windows, "secondary", nil) do
-    Enum.find(windows, fn
-      %Quota.AccountQuotaWindow{
-        quota_key: "account",
-        quota_scope: "account",
-        window_kind: "secondary"
-      } ->
-        true
-
-      _window ->
-        false
-    end)
+    WindowSelector.best_account_window(windows, :weekly_secondary)
   end
 
   defp quota_limit_sort_key(%Quota.AccountQuotaWindow{} = window) do

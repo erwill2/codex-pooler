@@ -391,10 +391,10 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert Enum.all?(windows, &(&1.observed_at == observed_at))
 
       assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
-               "/api/codex/usage",
-               "/backend-api/codex/usage",
+               "/backend-api/wham/usage",
                "/wham/usage",
-               "/backend-api/wham/usage"
+               "/api/codex/usage",
+               "/backend-api/codex/usage"
              ]
     end
 
@@ -505,10 +505,10 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         assert window.observed_at == observed_at
 
         assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
-                 "/api/codex/usage",
-                 "/backend-api/codex/usage",
+                 "/backend-api/wham/usage",
                  "/wham/usage",
-                 "/backend-api/wham/usage"
+                 "/api/codex/usage",
+                 "/backend-api/codex/usage"
                ]
       end
     end
@@ -642,7 +642,12 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       [window] = QuotaWindows.list_quota_windows(identity)
       assert window.observed_at == observed_at
-      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == ["/api/codex/usage"]
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/wham/usage",
+               "/wham/usage",
+               "/api/codex/usage"
+             ]
     end
 
     test "scheduled worker does not reuse stale expired resetless exhausted or weekly-only persisted quota" do
@@ -742,7 +747,12 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
         [window] = QuotaWindows.list_quota_windows(identity)
         assert window.observed_at == observed_at
-        assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == ["/api/codex/usage"]
+
+        assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+                 "/backend-api/wham/usage",
+                 "/wham/usage",
+                 "/api/codex/usage"
+               ]
       end
     end
 
@@ -765,7 +775,12 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       [window] = QuotaWindows.list_quota_windows(identity)
       assert window.observed_at == observed_at
-      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == ["/api/codex/usage"]
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/wham/usage",
+               "/wham/usage",
+               "/api/codex/usage"
+             ]
     end
 
     test "does not refresh OAuth or disable routing when usage rejects a fresh access token" do
@@ -841,7 +856,11 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       assert [] = incomplete_token_refresh_jobs(identity.id)
 
-      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == ["/api/codex/usage"]
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/wham/usage",
+               "/wham/usage",
+               "/api/codex/usage"
+             ]
 
       safe_surfaces = [
         inspect(persisted_identity.metadata),

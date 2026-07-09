@@ -85,6 +85,8 @@ defmodule CodexPooler.Upstreams.SavedResetReconciliationTest do
            } = SavedResets.snapshot(Repo.reload!(updated_identity))
 
     assert Enum.map(FakeUpstream.requests(fake), & &1.path) == [
+             "/backend-api/wham/usage",
+             "/wham/usage",
              "/api/codex/usage",
              "/backend-api/wham/rate-limit-reset-credits"
            ]
@@ -140,6 +142,8 @@ defmodule CodexPooler.Upstreams.SavedResetReconciliationTest do
     refute Jason.encode!(saved_resets) =~ "not-a-date"
 
     assert Enum.map(FakeUpstream.requests(fake), & &1.path) == [
+             "/backend-api/wham/usage",
+             "/wham/usage",
              "/api/codex/usage",
              "/backend-api/wham/rate-limit-reset-credits"
            ]
@@ -171,7 +175,11 @@ defmodule CodexPooler.Upstreams.SavedResetReconciliationTest do
              next_expires_at: "2026-07-18T00:40:11.968726Z"
            } = SavedResets.snapshot(Repo.reload!(updated_identity))
 
-    assert Enum.map(FakeUpstream.requests(fake), & &1.path) == ["/api/codex/usage"]
+    assert Enum.map(FakeUpstream.requests(fake), & &1.path) == [
+             "/backend-api/wham/usage",
+             "/wham/usage",
+             "/api/codex/usage"
+           ]
   end
 
   test "refresh_quota_from_usage stores unreported snapshot when usage omits reset credits" do

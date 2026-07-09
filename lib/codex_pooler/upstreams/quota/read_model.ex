@@ -5,9 +5,9 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
 
   import Ecto.Query
 
-  alias CodexPooler.Quotas.WindowClassifier
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Quota.WindowSelector
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
   @spec account_summaries_for_pool_ids([Ecto.UUID.t()], DateTime.t()) :: [map()]
@@ -23,9 +23,9 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
 
     Enum.map(assignments, fn assignment ->
       windows = Map.get(windows_by_identity_id, assignment.upstream_identity_id, [])
-      primary = find_primary_5h_window(windows)
-      monthly_primary = find_primary_30d_window(windows)
-      secondary = find_secondary_window(windows)
+      primary = find_primary_5h_window(windows, as_of)
+      monthly_primary = find_primary_30d_window(windows, as_of)
+      secondary = find_secondary_window(windows, as_of)
       state = quota_state(primary || monthly_primary, secondary, windows, as_of)
 
       %{
@@ -102,18 +102,16 @@ defmodule CodexPooler.Upstreams.Quota.ReadModel do
     |> Enum.group_by(& &1.upstream_identity_id)
   end
 
-  defp find_primary_5h_window(windows) do
-    Enum.find(windows, &WindowClassifier.primary_5h?/1)
+  defp find_primary_5h_window(windows, as_of) do
+    WindowSelector.best_account_window(windows, :primary_5h, as_of)
   end
 
-  defp find_primary_30d_window(windows) do
-    Enum.find(windows, &WindowClassifier.monthly_primary?/1)
+  defp find_primary_30d_window(windows, as_of) do
+    WindowSelector.best_account_window(windows, :monthly_primary, as_of)
   end
 
-  defp find_secondary_window(windows) do
-    Enum.find(windows, fn window ->
-      window.quota_key == "account" and window.window_kind == "secondary"
-    end)
+  defp find_secondary_window(windows, as_of) do
+    WindowSelector.best_account_window(windows, :weekly_secondary, as_of)
   end
 
   defp quota_state(%Quota.AccountQuotaWindow{} = primary, _secondary, _windows, as_of) do

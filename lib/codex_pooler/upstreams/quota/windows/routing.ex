@@ -3,6 +3,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
 
   alias CodexPooler.Quotas.{Evidence, WindowClassifier}
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Quota.WindowSelector
 
   @fresh "fresh"
   @account_quota_key "account"
@@ -19,16 +20,9 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     %{
       windows: windows,
       routing_windows: routing_windows,
-      primary:
-        Enum.find(
-          routing_windows,
-          &account_primary_window?/1
-        ),
+      primary: WindowSelector.best_account_primary_variant(routing_windows, timestamp),
       secondary:
-        Enum.find(
-          routing_windows,
-          &(&1.quota_key == @account_quota_key and &1.window_kind == "secondary")
-        ),
+        WindowSelector.best_account_window(routing_windows, :weekly_secondary, timestamp),
       fresh_windows: Enum.filter(routing_windows, &fresh_window?(&1, timestamp)),
       blocked_windows: Enum.reject(routing_windows, &usable_window?(&1, timestamp)),
       usable?: Enum.any?(routing_windows, &usable_window?(&1, timestamp))
@@ -198,19 +192,11 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
 
       usable_primary_windows ->
         current_primary =
-          Enum.max_by(usable_primary_windows, &account_primary_variant_precedence/1)
+          WindowSelector.best_account_primary_variant(usable_primary_windows, timestamp)
 
         Enum.reject(routing_windows, fn window ->
           account_primary_window?(window) and window != current_primary
         end)
-    end
-  end
-
-  defp account_primary_variant_precedence(%Quota.AccountQuotaWindow{} = window) do
-    case WindowClassifier.classify(window) do
-      :monthly_primary -> 2
-      :primary_5h -> 1
-      _descriptor -> 0
     end
   end
 

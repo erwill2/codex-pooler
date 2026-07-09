@@ -4503,7 +4503,7 @@ defmodule CodexPooler.UpstreamsTest do
       refute QuotaWindows.quota_window_selection_data(identity).usable?
     end
 
-    test "refreshes 5h quota from API usage endpoint before weekly-only wham fallback" do
+    test "continues past weekly-only wham responses to refresh 5h quota from API usage fallback" do
       primary_payload = %{
         "rate_limit" => %{
           "primary_window" => %{
@@ -4556,8 +4556,11 @@ defmodule CodexPooler.UpstreamsTest do
                  {"secondary", Decimal.new("34.000")}
                ]
 
-      assert [request | _] = FakeUpstream.requests(upstream)
-      assert request.path == "/api/codex/usage"
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/wham/usage",
+               "/wham/usage",
+               "/api/codex/usage"
+             ]
     end
 
     test "provider usage refresh updates reported plan metadata" do
@@ -4688,6 +4691,8 @@ defmodule CodexPooler.UpstreamsTest do
              )
 
       assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/wham/usage",
+               "/wham/usage",
                "/api/codex/usage",
                "/backend-api/codex/usage"
              ]
@@ -4827,6 +4832,8 @@ defmodule CodexPooler.UpstreamsTest do
       assert QuotaWindows.usable_window?(model_primary)
 
       assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/wham/usage",
+               "/wham/usage",
                "/api/codex/usage",
                "/backend-api/codex/usage"
              ]
@@ -4885,10 +4892,10 @@ defmodule CodexPooler.UpstreamsTest do
       refute Enum.any?(windows, &(&1.window_kind == "primary"))
 
       assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
-               "/api/codex/usage",
-               "/backend-api/codex/usage",
+               "/backend-api/wham/usage",
                "/wham/usage",
-               "/backend-api/wham/usage"
+               "/api/codex/usage",
+               "/backend-api/codex/usage"
              ]
     end
 
@@ -4944,10 +4951,10 @@ defmodule CodexPooler.UpstreamsTest do
       refute Enum.any?(windows, &(&1.window_kind == "primary"))
 
       assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
-               "/api/codex/usage",
-               "/backend-api/codex/usage",
+               "/backend-api/wham/usage",
                "/wham/usage",
-               "/backend-api/wham/usage"
+               "/api/codex/usage",
+               "/backend-api/codex/usage"
              ]
     end
 
@@ -4996,8 +5003,8 @@ defmodule CodexPooler.UpstreamsTest do
       requests = FakeUpstream.requests(upstream)
 
       assert Enum.map(requests, & &1.path) == [
-               "/api/codex/usage",
-               "/backend-api/codex/usage"
+               "/backend-api/wham/usage",
+               "/wham/usage"
              ]
 
       [_first_request, second_request | _rest] = FakeUpstream.requests(upstream)
@@ -6305,9 +6312,105 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert merged_window.id == known_window.id
       assert merged_window.source == "codex_usage_api"
-      assert DateTime.compare(merged_window.reset_at, weak_reset_at) == :eq
+      assert DateTime.compare(merged_window.reset_at, reset_at) == :eq
       assert DateTime.compare(merged_window.observed_at, weak_observed_at) == :eq
       assert Decimal.equal?(merged_window.used_percent, Decimal.new("11"))
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "weak later usage refresh raises percent without moving fresh account reset" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      reset_at = DateTime.add(observed_at, 2, :hour)
+      weak_observed_at = DateTime.add(observed_at, 60, :second)
+      weak_reset_at = DateTime.add(weak_observed_at, 4, :hour)
+
+      assert {:ok, [known_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("6"),
+                   reset_at: reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("7"),
+                   reset_at: weak_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: weak_observed_at
+                 }
+               ])
+
+      assert merged_window.id == known_window.id
+      assert DateTime.compare(merged_window.reset_at, reset_at) == :eq
+      assert DateTime.compare(merged_window.observed_at, weak_observed_at) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("7"))
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "usage payload outlier reset does not replace fresh account reset before expiry" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      reset_at = DateTime.add(observed_at, 2, :hour)
+      outlier_observed_at = DateTime.add(observed_at, 60, :second)
+      outlier_reset_at = DateTime.add(outlier_observed_at, 5, :hour)
+
+      assert {:ok, [known_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 6,
+                       "limit_window_seconds" => 18_000,
+                       "reset_at" => DateTime.to_iso8601(reset_at)
+                     }
+                   }
+                 },
+                 observed_at
+               )
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 %{
+                   "rate_limit" => %{
+                     "primary_window" => %{
+                       "used_percent" => 7,
+                       "limit_window_seconds" => 18_000,
+                       "reset_at" => DateTime.to_iso8601(outlier_reset_at)
+                     }
+                   }
+                 },
+                 outlier_observed_at
+               )
+
+      assert merged_window.id == known_window.id
+      assert DateTime.compare(merged_window.reset_at, reset_at) == :eq
+      assert DateTime.compare(merged_window.observed_at, outlier_observed_at) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("7.000"))
     end
 
     @tag :upstream_quota_evidence_stability
@@ -6403,8 +6506,8 @@ defmodule CodexPooler.UpstreamsTest do
 
       assert primary_window.id == known_primary_window.id
       assert weekly_window.id == known_weekly_window.id
-      assert DateTime.compare(primary_window.reset_at, weak_primary_reset_at) == :eq
-      assert DateTime.compare(weekly_window.reset_at, weak_weekly_reset_at) == :eq
+      assert DateTime.compare(primary_window.reset_at, primary_reset_at) == :eq
+      assert DateTime.compare(weekly_window.reset_at, weekly_reset_at) == :eq
       assert DateTime.compare(primary_window.observed_at, weak_observed_at) == :eq
       assert DateTime.compare(weekly_window.observed_at, weak_observed_at) == :eq
       assert Decimal.equal?(primary_window.used_percent, Decimal.new("1"))
@@ -7127,7 +7230,7 @@ defmodule CodexPooler.UpstreamsTest do
                QuotaWindows.routing_quota_eligibility(identity, at: weak_observed_at)
 
       assert [persisted] = QuotaWindows.list_quota_windows(identity)
-      assert DateTime.compare(persisted.reset_at, weak_reset_at) == :eq
+      assert DateTime.compare(persisted.reset_at, reset_at) == :eq
       assert Decimal.equal?(persisted.used_percent, Decimal.new("11"))
     end
 

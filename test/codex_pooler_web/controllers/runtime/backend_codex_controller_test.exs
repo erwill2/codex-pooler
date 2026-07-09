@@ -7463,8 +7463,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     assert %{"id" => "resp_refreshed_stale_quota"} = json_response(conn, 200)
 
-    assert [usage_request, response_request] = FakeUpstream.requests(upstream)
-    assert usage_request.path == "/api/codex/usage"
+    {_usage_request, response_request} = assert_usage_probe_then_response(upstream)
     assert response_request.path == "/backend-api/codex/responses"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -7574,8 +7573,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     assert %{"id" => "resp_refreshed_expired_stale_quota"} = json_response(conn, 200)
 
-    assert [usage_request, response_request] = FakeUpstream.requests(upstream)
-    assert usage_request.path == "/api/codex/usage"
+    {_usage_request, response_request} = assert_usage_probe_then_response(upstream)
     assert response_request.path == "/backend-api/codex/responses"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -7652,8 +7650,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     assert %{"id" => "resp_refreshed_all_known_quota_windows"} = json_response(conn, 200)
 
-    assert [usage_request, response_request] = FakeUpstream.requests(upstream)
-    assert usage_request.path == "/api/codex/usage"
+    {_usage_request, response_request} = assert_usage_probe_then_response(upstream)
     assert response_request.path == "/backend-api/codex/responses"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -8009,7 +8006,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       })
 
     assert_pinned_unavailable_recovery_response!(conn)
-    assert [%{path: "/api/codex/usage"}] = FakeUpstream.requests(pinned_upstream)
+    assert_usage_probe_requests(pinned_upstream)
     assert FakeUpstream.requests(fallback_upstream) == []
     assert Repo.aggregate(Attempt, :count) == 0
 
@@ -8100,8 +8097,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert %{"id" => "resp_file_affinity_refreshed_quota"} = json_response(conn, 200)
     assert FakeUpstream.requests(fallback_upstream) == []
 
-    assert [usage_request, response_request] = FakeUpstream.requests(pinned_upstream)
-    assert usage_request.path == "/api/codex/usage"
+    {_usage_request, response_request} = assert_usage_probe_then_response(pinned_upstream)
     assert response_request.path == "/backend-api/codex/responses"
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -8976,6 +8972,29 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     session
     |> Ecto.Changeset.change(%{pool_upstream_assignment_id: assignment.id})
     |> Repo.update!()
+  end
+
+  defp assert_usage_probe_then_response(upstream) do
+    assert [
+             %{path: "/backend-api/wham/usage"},
+             %{path: "/wham/usage"},
+             usage_request,
+             response_request
+           ] = FakeUpstream.requests(upstream)
+
+    assert usage_request.path == "/api/codex/usage"
+    {usage_request, response_request}
+  end
+
+  defp assert_usage_probe_requests(upstream) do
+    assert [
+             %{path: "/backend-api/wham/usage"},
+             %{path: "/wham/usage"},
+             usage_request
+           ] = FakeUpstream.requests(upstream)
+
+    assert usage_request.path == "/api/codex/usage"
+    usage_request
   end
 
   defp mark_pinned_assignment_reauth_required!(setup) do
