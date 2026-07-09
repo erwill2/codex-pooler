@@ -2312,6 +2312,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   end
 
   @tag :upstream_quota_dashboard_regression
+  @tag :upstream_quota_evidence_stability
   test "upstream cards keep persisted account and model quota rows visible", %{
     conn: conn,
     scope: scope
@@ -2409,13 +2410,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       },
       {
         "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300",
-        "100%",
-        "model 0% used percent-only evidence must remain visible as 100% remaining"
+        "not reported",
+        "model 0% used percent-only evidence must remain visible without inventing 100% remaining"
       },
       {
         "#upstream-account-#{identity.id}-limit-upstream_model-provider_codex_spark-primary-300",
-        "100%",
-        "upstream-model 0% used percent-only evidence must remain visible as 100% remaining"
+        "not reported",
+        "upstream-model 0% used percent-only evidence must remain visible without inventing 100% remaining"
       }
     ]
 
@@ -2643,7 +2644,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, "#upstream-account-#{second_identity.id}-limit-weekly", "85%")
   end
 
-  test "model quota rows keep zero percent-only evidence visible as full remaining", %{
+  @tag :upstream_quota_evidence_stability
+  test "model quota rows keep zero percent-only unknown capacity evidence unreported", %{
     scope: scope
   } do
     {:ok, pool} =
@@ -2682,9 +2684,64 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
     primary_model = Enum.find(account.quota_limits, &(&1.key == "model-codex_spark-primary-300"))
 
-    assert primary_model.percent == Decimal.new("100.000")
-    assert primary_model.percent_value == 100
-    assert primary_model.percent_label == "100%"
+    assert primary_model.percent == nil
+    assert primary_model.percent_value == 0
+    assert primary_model.percent_label == "not reported"
+  end
+
+  @tag :upstream_quota_evidence_stability
+  test "monthly credit-only account quota shows known credits without fabricated capacity", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "credit-only-monthly-upstream",
+        name: "Credit Only Monthly Pool"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Credit Only Monthly Codex",
+        assignment_label: "Credit Only Monthly assignment"
+      })
+
+    now = DateTime.utc_now()
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 quota_key: "account",
+                 quota_scope: "account",
+                 quota_family: "account",
+                 window_kind: "primary",
+                 window_minutes: 43_200,
+                 credits: 3817,
+                 used_percent: Decimal.new("100"),
+                 reset_at: DateTime.add(now, 15, :day),
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               }
+             ])
+
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+    monthly = Enum.find(account.quota_limits, &(&1.key == :primary_30d))
+
+    assert monthly.percent_label == "0%"
+    assert monthly.count_label == "3,817 credits"
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    assert has_element?(view, "#upstream-account-#{identity.id}-limit-primary_30d", "30d")
+    assert has_element?(view, "#upstream-account-#{identity.id}-limit-primary_30d", "0%")
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{identity.id}-limit-primary_30d-count",
+             "3,817 credits"
+           )
   end
 
   test "renames upstream account labels from the account actions menu", %{
@@ -3578,6 +3635,197 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              view,
              "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300",
              "80%"
+           )
+  end
+
+  @tag :upstream_quota_evidence_stability
+  test "refresh keeps model limits visible when a weak zero quota update arrives", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "realtime-weak-zero-model-quota",
+        name: "Realtime Weak Zero Model Quota"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Realtime Weak Zero Model Codex",
+        assignment_label: "Realtime weak zero model assignment"
+      })
+
+    now = DateTime.utc_now()
+    primary_reset_at = DateTime.add(now, 2, :hour)
+    weekly_reset_at = DateTime.add(now, 5, :day)
+    weak_observed_at = DateTime.add(now, 60, :second)
+    weak_primary_reset_at = DateTime.add(weak_observed_at, 5, :hour)
+    weak_weekly_reset_at = DateTime.add(weak_observed_at, 7, :day)
+
+    assert {:ok, [_primary, _weekly]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 quota_key: "codex_spark",
+                 quota_scope: "model",
+                 quota_family: "codex_model",
+                 model: "gpt-5.3-codex-spark",
+                 display_label: "GPT-5.3-Codex-Spark",
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("1"),
+                 reset_at: primary_reset_at,
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               },
+               %{
+                 quota_key: "codex_spark",
+                 quota_scope: "model",
+                 quota_family: "codex_model",
+                 model: "gpt-5.3-codex-spark",
+                 display_label: "GPT-5.3-Codex-Spark",
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("15"),
+                 reset_at: weekly_reset_at,
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               }
+             ])
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    primary_selector = "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300"
+    weekly_selector = "#upstream-account-#{identity.id}-limit-model-codex_spark-secondary-10080"
+
+    assert has_element?(view, primary_selector, "99%")
+    assert has_element?(view, weekly_selector, "85%")
+
+    assert {:ok, [_primary, _weekly]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 quota_key: "codex_spark",
+                 quota_scope: "model",
+                 quota_family: "codex_model",
+                 model: "gpt-5.3-codex-spark",
+                 display_label: "GPT-5.3-Codex-Spark",
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("0"),
+                 reset_at: weak_primary_reset_at,
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: weak_observed_at
+               },
+               %{
+                 quota_key: "codex_spark",
+                 quota_scope: "model",
+                 quota_family: "codex_model",
+                 model: "gpt-5.3-codex-spark",
+                 display_label: "GPT-5.3-Codex-Spark",
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("0"),
+                 reset_at: weak_weekly_reset_at,
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: weak_observed_at
+               }
+             ])
+
+    execute_scheduled_upstreams_reload(view)
+
+    assert has_element?(view, primary_selector, "99%")
+    assert has_element?(view, weekly_selector, "85%")
+    refute has_element?(view, primary_selector, "not reported")
+    refute has_element?(view, weekly_selector, "not reported")
+  end
+
+  @tag :upstream_quota_evidence_stability
+  test "refresh keeps account limits visible when a weak zero quota update arrives", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "realtime-weak-zero-quota",
+        name: "Realtime Weak Zero Quota"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Realtime Weak Zero Codex",
+        assignment_label: "Realtime weak zero assignment"
+      })
+
+    now = DateTime.utc_now()
+    reset_at = DateTime.add(now, 2, :hour)
+    weak_observed_at = DateTime.add(now, 60, :second)
+    weak_reset_at = DateTime.add(weak_observed_at, 4, :hour)
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 quota_key: "account",
+                 quota_scope: "account",
+                 quota_family: "account",
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("11"),
+                 reset_at: reset_at,
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               }
+             ])
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    assert has_element?(view, "#upstream-account-#{identity.id}-limit-primary_5h", "89%")
+
+    assert {:ok, [_merged]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 quota_key: "account",
+                 quota_scope: "account",
+                 quota_family: "account",
+                 window_kind: "primary",
+                 window_minutes: 300,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("0"),
+                 reset_at: weak_reset_at,
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: weak_observed_at
+               }
+             ])
+
+    execute_scheduled_upstreams_reload(view)
+
+    assert has_element?(view, "#upstream-account-#{identity.id}-limit-primary_5h", "89%")
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{identity.id}-limit-primary_5h",
+             "not reported"
            )
   end
 

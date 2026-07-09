@@ -285,7 +285,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
        })
        when scope in ["model", "upstream_model"] and active_limit in [nil, 0] and
               credits in [nil, 0] do
-    used_percent |> remaining_percent_from_used() |> decimal_clamp_percent()
+    if Decimal.compare(used_percent, Decimal.new(0)) == :gt do
+      used_percent |> remaining_percent_from_used() |> decimal_clamp_percent()
+    end
   end
 
   defp quota_remaining_percent(%Quota.AccountQuotaWindow{} = window) do
@@ -308,6 +310,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   defp quota_count_label(%Quota.AccountQuotaWindow{credits: credits, active_limit: active_limit})
        when is_integer(credits) and is_integer(active_limit) and active_limit > 0 do
     "#{Formatting.format_integer(credits)} / #{Formatting.format_integer(active_limit)} credits"
+  end
+
+  defp quota_count_label(%Quota.AccountQuotaWindow{credits: credits, active_limit: active_limit})
+       when is_integer(credits) and credits > 0 and active_limit in [nil, 0] do
+    "#{Formatting.format_integer(credits)} credits"
   end
 
   defp quota_count_label(%Quota.AccountQuotaWindow{

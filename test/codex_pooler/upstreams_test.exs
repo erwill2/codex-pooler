@@ -5519,7 +5519,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     test "usage evidence replaces zero percent-only rate-limit event evidence" do
       identity = active_identity_fixture()
-      observed_at = ~U[2026-04-27 12:00:00Z]
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       event_reset_at = DateTime.add(observed_at, 604_800, :second)
       usage_observed_at = DateTime.add(observed_at, 60, :second)
       usage_reset_at = DateTime.add(usage_observed_at, 604_800, :second)
@@ -5589,6 +5589,269 @@ defmodule CodexPooler.UpstreamsTest do
       assert merged_window.source == "codex_usage_api"
       assert DateTime.compare(merged_window.reset_at, usage_reset_at) == :eq
       assert Decimal.equal?(merged_window.used_percent, Decimal.new("12"))
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "weak zero usage refresh keeps stronger account percent evidence while refreshing reset metadata" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      reset_at = DateTime.add(observed_at, 2, :hour)
+      weak_observed_at = DateTime.add(observed_at, 60, :second)
+      weak_reset_at = DateTime.add(weak_observed_at, 4, :hour)
+
+      assert {:ok, [known_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("11"),
+                   reset_at: reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("0"),
+                   reset_at: weak_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: weak_observed_at
+                 }
+               ])
+
+      assert merged_window.id == known_window.id
+      assert merged_window.source == "codex_usage_api"
+      assert DateTime.compare(merged_window.reset_at, weak_reset_at) == :eq
+      assert DateTime.compare(merged_window.observed_at, weak_observed_at) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("11"))
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "weak zero usage refresh keeps stronger model percent evidence visible" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      primary_reset_at = DateTime.add(observed_at, 2, :hour)
+      weekly_reset_at = DateTime.add(observed_at, 5, :day)
+      weak_observed_at = DateTime.add(observed_at, 60, :second)
+      weak_primary_reset_at = DateTime.add(weak_observed_at, 5, :hour)
+      weak_weekly_reset_at = DateTime.add(weak_observed_at, 7, :day)
+
+      assert {:ok, known_windows} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "codex_spark",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "gpt-5.3-codex-spark",
+                   display_label: "GPT-5.3-Codex-Spark",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("1"),
+                   reset_at: primary_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 },
+                 %{
+                   quota_key: "codex_spark",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "gpt-5.3-codex-spark",
+                   display_label: "GPT-5.3-Codex-Spark",
+                   window_kind: "secondary",
+                   window_minutes: 10_080,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("15"),
+                   reset_at: weekly_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, merged_windows} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "codex_spark",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "gpt-5.3-codex-spark",
+                   display_label: "GPT-5.3-Codex-Spark",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("0"),
+                   reset_at: weak_primary_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: weak_observed_at
+                 },
+                 %{
+                   quota_key: "codex_spark",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "gpt-5.3-codex-spark",
+                   display_label: "GPT-5.3-Codex-Spark",
+                   window_kind: "secondary",
+                   window_minutes: 10_080,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("0"),
+                   reset_at: weak_weekly_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: weak_observed_at
+                 }
+               ])
+
+      primary_window = Enum.find(merged_windows, &(&1.window_kind == "primary"))
+      weekly_window = Enum.find(merged_windows, &(&1.window_kind == "secondary"))
+      known_primary_window = Enum.find(known_windows, &(&1.window_kind == "primary"))
+      known_weekly_window = Enum.find(known_windows, &(&1.window_kind == "secondary"))
+
+      assert primary_window.id == known_primary_window.id
+      assert weekly_window.id == known_weekly_window.id
+      assert DateTime.compare(primary_window.reset_at, weak_primary_reset_at) == :eq
+      assert DateTime.compare(weekly_window.reset_at, weak_weekly_reset_at) == :eq
+      assert DateTime.compare(primary_window.observed_at, weak_observed_at) == :eq
+      assert DateTime.compare(weekly_window.observed_at, weak_observed_at) == :eq
+      assert Decimal.equal?(primary_window.used_percent, Decimal.new("1"))
+      assert Decimal.equal?(weekly_window.used_percent, Decimal.new("15"))
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "weak zero usage refresh can replace expired stronger evidence" do
+      identity = active_identity_fixture()
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      expired_observed_at = DateTime.add(now, -120, :second)
+      expired_reset_at = DateTime.add(now, -60, :second)
+      fresh_reset_at = DateTime.add(now, 5, :hour)
+
+      assert {:ok, [expired_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "codex_spark",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "gpt-5.3-codex-spark",
+                   display_label: "GPT-5.3-Codex-Spark",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("33"),
+                   reset_at: expired_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: expired_observed_at
+                 }
+               ])
+
+      refute QuotaWindows.fresh_window?(expired_window, now)
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "codex_spark",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "gpt-5.3-codex-spark",
+                   display_label: "GPT-5.3-Codex-Spark",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("0"),
+                   reset_at: fresh_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: now
+                 }
+               ])
+
+      assert merged_window.id == expired_window.id
+      assert DateTime.compare(merged_window.reset_at, fresh_reset_at) == :eq
+      assert DateTime.compare(merged_window.observed_at, now) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("0"))
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "later nonzero usage refresh replaces weak zero usage evidence" do
+      identity = active_identity_fixture()
+      observed_at = ~U[2026-07-09 10:19:00Z]
+      weak_reset_at = DateTime.add(observed_at, 4, :hour)
+      improved_observed_at = DateTime.add(observed_at, 60, :second)
+      improved_reset_at = DateTime.add(improved_observed_at, 2, :hour)
+
+      assert {:ok, [weak_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("0"),
+                   reset_at: weak_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert {:ok, [merged_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("9"),
+                   reset_at: improved_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: improved_observed_at
+                 }
+               ])
+
+      assert merged_window.id == weak_window.id
+      assert DateTime.compare(merged_window.reset_at, improved_reset_at) == :eq
+      assert Decimal.equal?(merged_window.used_percent, Decimal.new("9"))
     end
 
     test "headers cannot roll back a reset advanced by usage evidence" do
@@ -6037,6 +6300,63 @@ defmodule CodexPooler.UpstreamsTest do
         )
 
       assert zero_credit.eligible?
+    end
+
+    @tag :upstream_quota_evidence_stability
+    test "routing stays precise when weak zero usage refresh follows usable account evidence" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      reset_at = DateTime.add(observed_at, 2, :hour)
+      weak_observed_at = DateTime.add(observed_at, 60, :second)
+      weak_reset_at = DateTime.add(weak_observed_at, 4, :hour)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("11"),
+                   reset_at: reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: observed_at
+                 }
+               ])
+
+      assert %{eligible?: true, routing_state: :precise} =
+               QuotaWindows.routing_quota_eligibility(identity, at: observed_at)
+
+      assert {:ok, [_merged]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "account",
+                   quota_scope: "account",
+                   quota_family: "account",
+                   window_kind: "primary",
+                   window_minutes: 300,
+                   active_limit: 0,
+                   credits: 0,
+                   used_percent: Decimal.new("0"),
+                   reset_at: weak_reset_at,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   freshness_state: "fresh",
+                   observed_at: weak_observed_at
+                 }
+               ])
+
+      assert %{eligible?: true, routing_state: :precise, exclusions: []} =
+               QuotaWindows.routing_quota_eligibility(identity, at: weak_observed_at)
+
+      assert [persisted] = QuotaWindows.list_quota_windows(identity)
+      assert DateTime.compare(persisted.reset_at, weak_reset_at) == :eq
+      assert Decimal.equal?(persisted.used_percent, Decimal.new("11"))
     end
 
     test "routing quota eligibility rejects usable model evidence without account primary baseline" do
