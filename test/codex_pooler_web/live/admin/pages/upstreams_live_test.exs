@@ -2311,6 +2311,44 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
            )
   end
 
+  test "account quota rows keep zero percent-only capacity unknown evidence unreported", %{
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "zero-percent-only-upstream", name: "Zero Percent Pool"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Zero Percent Codex",
+        assignment_label: "Zero Percent assignment"
+      })
+
+    now = DateTime.utc_now()
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 active_limit: 0,
+                 credits: 0,
+                 used_percent: Decimal.new("0"),
+                 reset_at: DateTime.add(now, 6, :day),
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               }
+             ])
+
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+    weekly = Enum.find(account.quota_limits, &(&1.key == :weekly))
+
+    assert weekly.percent == nil
+    assert weekly.percent_value == 0
+    assert weekly.percent_label == "not reported"
+  end
+
   test "renames upstream account labels from the account actions menu", %{
     conn: conn,
     scope: scope
@@ -3159,6 +3197,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
                  quota_key: "gpt_5_3_codex_spark",
                  window_kind: "primary",
                  window_minutes: 300,
+                 active_limit: 100,
                  used_percent: Decimal.new("0"),
                  display_label: "GPT-5.3-Codex-Spark",
                  quota_scope: "model",
@@ -3225,6 +3264,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
                  quota_key: "gpt_5_3_codex_spark",
                  window_kind: "primary",
                  window_minutes: 300,
+                 active_limit: 100,
                  used_percent: Decimal.new("0"),
                  display_label: "GPT-5.3-Codex-Spark",
                  quota_scope: "model",

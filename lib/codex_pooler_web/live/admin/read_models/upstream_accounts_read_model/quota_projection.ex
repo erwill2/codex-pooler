@@ -4,6 +4,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   alias CodexPooler.Admin.UpstreamQuotaReadiness
   alias CodexPooler.Quotas.WindowClassifier
   alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Quota.Charts.Measurements
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting
   alias CodexPoolerWeb.DateTimeDisplay
 
@@ -276,27 +277,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
     }
   end
 
-  defp quota_remaining_percent(%Quota.AccountQuotaWindow{
-         credits: credits,
-         active_limit: active_limit
-       })
-       when is_integer(credits) and is_integer(active_limit) and active_limit > 0 do
-    credits
-    |> Decimal.new()
-    |> Decimal.mult(Decimal.new(100))
-    |> Decimal.div(Decimal.new(active_limit))
-    |> decimal_clamp_percent()
+  defp quota_remaining_percent(%Quota.AccountQuotaWindow{} = window) do
+    window
+    |> Measurements.for_window()
+    |> Map.get(:remaining_percent)
   end
-
-  defp quota_remaining_percent(%Quota.AccountQuotaWindow{
-         used_percent: %Decimal{} = used_percent
-       }) do
-    Decimal.new(100)
-    |> Decimal.sub(used_percent)
-    |> decimal_clamp_percent()
-  end
-
-  defp quota_remaining_percent(%Quota.AccountQuotaWindow{}), do: nil
 
   defp quota_percent_value(%Decimal{} = percent) do
     percent
@@ -352,12 +337,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   end
 
   defp quota_reset_title(_reset_at, _datetime_preferences), do: nil
-
-  defp decimal_clamp_percent(%Decimal{} = value) do
-    value
-    |> decimal_non_negative()
-    |> Decimal.min(Decimal.new(100))
-  end
 
   defp decimal_non_negative(%Decimal{} = value), do: Decimal.max(value, Decimal.new(0))
 end
