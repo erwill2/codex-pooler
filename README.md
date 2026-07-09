@@ -258,6 +258,23 @@ the 353.4k GPT-5.6 window used by these examples. OpenCode's request layer caps
 output at 32k by default; set `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=64000`
 only if you want OpenCode to request the full 64k cap.
 
+#### Oh My OpenAgent (OMO)
+
+If you use Oh My OpenAgent, keep the native `openai` provider configuration
+above and add agent/category overrides in
+`~/.config/opencode/oh-my-openagent.jsonc`. A balanced three-tier routing map is:
+
+| Primary tier | Agents and categories | Fallback |
+|---|---|---|
+| `gpt-5.6-luna` | `librarian`, `explore`, `quick`, `unspecified-low` | `gpt-5.6-terra` with the same reasoning variant |
+| `gpt-5.6-terra` | `sisyphus`, `multimodal-looker`, `atlas`, `sisyphus-junior`, `visual-engineering`, `unspecified-high`, `writing` | `gpt-5.6-sol` with the same reasoning variant |
+| `gpt-5.6-sol` | `hephaestus`, `oracle`, `prometheus`, `metis`, `momus`, `ultrabrain`, `deep`, `artistry` | `gpt-5.6-terra` with the same reasoning variant |
+
+Explicit `fallback_models` keep OMO retries inside the model ids served by the
+assigned Pool instead of falling through to older built-in model chains. The
+[OpenCode client guide](https://docs.codex-pooler.com/clients/opencode/#oh-my-openagent-omo-routing)
+contains the complete copyable OMO configuration and validation commands.
+
 </details>
 
 <details>
