@@ -1,6 +1,6 @@
 ---
 title: API keys
-description: Understand the admin API keys page, Pool-scoped client credentials, policy wizard, usage metadata, rotation, and destructive actions.
+description: Understand the admin API keys page, Pool-scoped client credentials, policy wizard, lifecycle registry, rotation, and destructive actions.
 ---
 
 The API keys page is the operator surface for runtime client credentials. A Pool API key lets a client send requests through one Pool. It does not represent an upstream account, and it is not an operator login credential.
@@ -11,10 +11,12 @@ Use this page when you need to answer:
 2. whether a key is active, paused, or revoked
 3. which model policy applies to a key
 4. whether request or token limits are configured
-5. how much usage has been attributed to a key
+5. when a key was last used or expires
 6. when a key needs rotation, pause, revoke, or deletion
 
-The page is metadata-only after create or rotate. It shows display names, safe key prefixes, Pool grouping, status, usage counters, model policy summaries, and action menus. It does not show raw Pool API keys after the one-time secret dialog is closed.
+The page is a lifecycle registry, not an analytics page. It shows display names, safe key prefixes, Pool grouping and filtering, status, last-used and expiry state, model-policy summaries and warnings, operator notes, and action menus. It does not show raw Pool API keys after the one-time secret dialog is closed.
+
+Use [Stats](/operators/stats/) for aggregate request, token, and cost analytics. Use [Request logs](/operators/request-logs/) for request-level investigation, including API key context, outcomes, and available settled usage metadata.
 
 ![API keys page overview](/operators/api-keys/api-keys-overview.png)
 
@@ -56,12 +58,12 @@ Keys are grouped by Pool. Each Pool registry has a compact identity rail and a l
       <td>Lifecycle state for the client credential. Active keys can authenticate new runtime requests; paused or revoked keys should not.</td>
     </tr>
     <tr>
-      <td>Usage</td>
-      <td>Request, token, cached-token, and cost metadata attributed to the key when usage data is available.</td>
+      <td>Lifecycle</td>
+      <td>Last-used and expiry state. These help identify credentials that need review or retirement, without presenting traffic totals.</td>
     </tr>
     <tr>
       <td>Policy</td>
-      <td>Short model-policy summary, such as all models or selected models.</td>
+      <td>Short model-policy summary, such as all models or selected models. A warning identifies configured models that are not currently available to the Pool.</td>
     </tr>
     <tr>
       <td>Actions</td>
@@ -91,7 +93,7 @@ The dialog footer keeps Docs on the left and actions on the right. `Cancel` clos
 
 Basics defines the operator label, owning Pool, status, optional expiry, and operator notes.
 
-Use one key per client, environment, or automation boundary. Separate keys make rotation and investigation easier because request logs and usage totals stay attributable to one client credential.
+Use one key per client, environment, or automation boundary. Separate keys make rotation and request investigation easier because Request logs retain the key context for each recorded request.
 
 Status choices are:
 
@@ -179,13 +181,13 @@ The model-scoped override is an optional single-model override. Use it when one 
 
 ## Review
 
-The Review step shows normalized policy before saving.
+The Review step shows the normalized effective policy before saving, including the selected Pool name, lifecycle settings, model access, enforced values, and configured limits.
 
 ![Create API key review step](/operators/api-keys/api-keys-create-review-dialog.png)
 
 Resolve review errors before saving. The submit button stays disabled when required policy data is missing. The review summary is useful because it shows what the key will actually enforce after normalization, not only what the operator entered on the previous steps.
 
-For existing keys, the review step can also show usage and active limits. Usage is metadata-only and should be used for operational attribution, not content review.
+Review does not show request, token, or cost totals. Open Stats for aggregates, or filter Request logs when you need to investigate recorded traffic.
 
 ## One-Time Secret Dialog
 
@@ -223,7 +225,7 @@ The current actions are:
     </tr>
     <tr>
       <td>Rotate</td>
-      <td>Creates a new raw bearer token for the same key record and shows it once. Update clients immediately.</td>
+      <td>Creates a new raw bearer token for the same key record and shows it once. Update clients immediately. The key keeps its identity, audit trail, and Request log attribution.</td>
     </tr>
     <tr>
       <td>Revoke</td>
@@ -253,4 +255,4 @@ When client traffic is rejected or not behaving as expected, check API keys in t
 9. use Request logs filtered by Pool or key metadata to inspect recent failures
 10. use Audit logs to confirm recent create, rotate, pause, revoke, or edit actions
 
-If the raw key was copied incorrectly or lost, do not create another unrelated key unless the client identity should change. Rotate the existing key so usage and audit history stay attached to the same operator label.
+If the raw key was copied incorrectly or lost, do not create another unrelated key unless the client identity should change. Rotate the existing key so its identity, audit history, and Request log attribution stay attached to the same operator label. Rotation does not make the API-key registry an analytics record. Use Stats for aggregates.
