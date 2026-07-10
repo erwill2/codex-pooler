@@ -21,6 +21,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
     "unprimed" => "Quota unprimed"
   }
 
+  @observed_zero_use_sources ~w(
+    codex_usage_api
+    codex_rate_limit_event
+    codex_response_headers
+    codex_rate_limit_error
+  )
+
   @type quota_limit_row :: %{
           required(:key) => atom() | String.t(),
           required(:label) => String.t(),
@@ -278,11 +285,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
          credits: credits,
          reset_at: %DateTime{},
          used_percent: %Decimal{} = used_percent,
-         source: "codex_usage_api",
+         source: source,
          source_precision: source_precision
        })
-       when scope in ["model", "upstream_model"] and active_limit in [nil, 0] and
-              credits in [nil, 0] and source_precision in ["observed", "authoritative"] do
+       when scope in ["account", "model", "upstream_model"] and active_limit in [nil, 0] and
+              credits in [nil, 0] and source in @observed_zero_use_sources and
+              source_precision in ["observed", "authoritative"] do
     used_percent |> remaining_percent_from_used() |> decimal_clamp_percent()
   end
 

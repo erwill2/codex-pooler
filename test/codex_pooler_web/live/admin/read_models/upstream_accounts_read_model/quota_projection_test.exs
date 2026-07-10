@@ -36,7 +36,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     assert primary.percent_label == "94%"
   end
 
-  test "account quota rows still show not reported when only zero-capacity evidence exists" do
+  @tag :quota_account_projection
+  test "provider-observed zero-use account limits remain visible" do
     observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
     outlier =
@@ -53,9 +54,61 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
       |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
       |> Enum.find(&(&1.key == :primary_5h))
 
+    assert Decimal.equal?(primary.percent, Decimal.new("100"))
+    assert primary.percent_value == 100
+    assert primary.percent_label == "100%"
+    assert String.starts_with?(primary.reset_label, "in ")
+  end
+
+  @tag :quota_account_projection
+  test "provider-observed zero-use account limits remain visible across runtime sources" do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    for source <- ~w(codex_rate_limit_event codex_response_headers codex_rate_limit_error) do
+      primary =
+        [
+          account_window(
+            active_limit: 0,
+            credits: 0,
+            used_percent: Decimal.new("0"),
+            reset_at: DateTime.add(observed_at, 5, :hour),
+            source: source,
+            observed_at: observed_at
+          )
+        ]
+        |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+        |> Enum.find(&(&1.key == :primary_5h))
+
+      assert Decimal.equal?(primary.percent, Decimal.new("100")), source
+      assert primary.percent_value == 100, source
+      assert primary.percent_label == "100%", source
+      assert String.starts_with?(primary.reset_label, "in "), source
+    end
+  end
+
+  @tag :quota_account_projection
+  test "resetless inferred zero-use account evidence stays unreported" do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    row =
+      account_window(
+        active_limit: 0,
+        credits: 0,
+        used_percent: Decimal.new("0"),
+        reset_at: nil,
+        source_precision: "inferred",
+        observed_at: observed_at
+      )
+
+    primary =
+      [row]
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+      |> Enum.find(&(&1.key == :primary_5h))
+
     assert primary.percent == nil
     assert primary.percent_value == 0
     assert primary.percent_label == "not reported"
+    assert primary.reset_label == nil
   end
 
   @tag :quota_spark_projection
@@ -82,6 +135,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
     assert secondary.percent_value == 100
     assert secondary.percent_label == "100%"
     assert String.starts_with?(secondary.reset_label, "in ")
+  end
+
+  @tag :quota_spark_projection
+  test "provider-observed zero-use Spark limits remain visible across runtime sources" do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    for source <- ~w(codex_rate_limit_event codex_response_headers codex_rate_limit_error) do
+      rows =
+        [spark_window("primary", 300, observed_at, source: source)]
+        |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+
+      assert primary = Enum.find(rows, &(&1.key == "model-codex_spark-primary-300"))
+      assert Decimal.equal?(primary.percent, Decimal.new("100")), source
+      assert primary.percent_value == 100, source
+      assert primary.percent_label == "100%", source
+      assert String.starts_with?(primary.reset_label, "in "), source
+    end
   end
 
   @tag :quota_spark_projection

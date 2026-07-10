@@ -2313,7 +2313,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
   @tag :upstream_quota_dashboard_regression
   @tag :upstream_quota_evidence_stability
-  test "upstream cards keep persisted account rows visible and hide weak model rows", %{
+  test "upstream cards keep persisted observed quota rows visible", %{
     conn: conn,
     scope: scope
   } do
@@ -2403,19 +2403,115 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(view, "#upstream-account-#{identity.id}-limit-weekly", "not reported")
 
-    refute has_element?(
+    assert has_element?(
              view,
-             "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300"
+             "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300",
+             "100%"
            )
 
-    refute has_element?(
+    assert has_element?(
              view,
-             "#upstream-account-#{identity.id}-limit-upstream_model-provider_codex_spark-primary-300"
+             "#upstream-account-#{identity.id}-limit-upstream_model-provider_codex_spark-primary-300",
+             "100%"
            )
   end
 
+  @tag :upstream_quota_evidence_stability
+  @tag :quota_runtime_source_transition
+  test "Spark zero-use quota stays visible while evidence sources change", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "spark-source-transition",
+        name: "Spark Source Transition"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Spark Source Transition Codex",
+        assignment_label: "Spark source transition assignment"
+      })
+
+    now = DateTime.utc_now()
+    usage_reset_at = DateTime.add(now, 5, :hour)
+
+    zero_use_spark = %{
+      quota_key: "codex_spark",
+      quota_scope: "model",
+      quota_family: "codex_model",
+      model: "gpt-5.3-codex-spark",
+      display_label: "GPT-5.3-Codex-Spark",
+      window_kind: "primary",
+      window_minutes: 300,
+      used_percent: Decimal.new("0"),
+      reset_at: usage_reset_at,
+      source: "codex_usage_api",
+      source_precision: "observed",
+      freshness_state: "fresh",
+      observed_at: now
+    }
+
+    assert {:ok, [_usage_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [zero_use_spark])
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+    selector = "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300"
+
+    assert has_element?(view, selector, "100%")
+    assert has_element?(view, "#{selector}-progress[value='100']")
+
+    headers_observed_at = DateTime.add(now, 60, :second)
+
+    assert {:ok, [_headers_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 zero_use_spark
+                 | source: "codex_response_headers",
+                   reset_at: DateTime.add(headers_observed_at, 5, :hour),
+                   observed_at: headers_observed_at
+               }
+             ])
+
+    assert [stored_headers_window] =
+             identity
+             |> QuotaWindows.list_quota_windows()
+             |> Enum.filter(&(&1.quota_key == "codex_spark" and &1.window_kind == "primary"))
+
+    assert stored_headers_window.source == "codex_response_headers"
+
+    execute_scheduled_upstreams_reload(view)
+
+    assert has_element?(view, selector, "100%")
+    assert has_element?(view, "#{selector}-progress[value='100']")
+
+    usage_observed_at = DateTime.add(now, 120, :second)
+
+    assert {:ok, [_next_usage_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 zero_use_spark
+                 | reset_at: DateTime.add(usage_observed_at, 5, :hour),
+                   observed_at: usage_observed_at
+               }
+             ])
+
+    assert [stored_usage_window] =
+             identity
+             |> QuotaWindows.list_quota_windows()
+             |> Enum.filter(&(&1.quota_key == "codex_spark" and &1.window_kind == "primary"))
+
+    assert stored_usage_window.source == "codex_usage_api"
+
+    execute_scheduled_upstreams_reload(view)
+
+    assert has_element?(view, selector, "100%")
+    assert has_element?(view, "#{selector}-progress[value='100']")
+  end
+
   @tag :upstream_quota_dashboard_regression
-  test "usage API zero percent zero capacity evidence renders the account quota as not reported",
+  test "usage API observed zero-use evidence renders the account quota as fully remaining",
        %{
          conn: conn,
          scope: scope
@@ -2466,9 +2562,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     primary = Enum.find(account.quota_limits, &(&1.key == :primary_5h))
     weekly = Enum.find(account.quota_limits, &(&1.key == :weekly))
 
-    assert primary.percent == nil
-    assert primary.percent_value == 0
-    assert primary.percent_label == "not reported"
+    assert Decimal.equal?(primary.percent, Decimal.new("100"))
+    assert primary.percent_value == 100
+    assert primary.percent_label == "100%"
     assert weekly.percent == Decimal.new("85.000")
     assert weekly.percent_value == 85
     assert weekly.percent_label == "85%"
@@ -2494,9 +2590,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
         has_element?(
           view,
           "#upstream-account-#{identity.id}-limit-primary_5h",
-          "not reported"
+          "100%"
         ) ||
-          "expected zero/zero usage API account evidence to render the 5h percent as not reported",
+          "expected observed zero-use account evidence to render the 5h quota as 100% remaining",
+        has_element?(
+          view,
+          "#upstream-account-#{identity.id}-limit-primary_5h-progress[value='100']"
+        ) ||
+          "expected observed zero-use account evidence to render a full 5h quota meter",
+        has_element?(view, "#upstream-account-#{identity.id}-limit-primary_5h-reset") ||
+          "expected observed zero-use account evidence to retain the provider reset countdown",
         has_element?(view, "#upstream-account-#{identity.id}-limit-weekly", "85%") ||
           "expected nonzero weekly usage API account evidence to render 85% remaining",
         not has_element?(
@@ -2509,10 +2612,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       |> Enum.reject(&(&1 == true))
 
     assert violations == [],
-           "expected zero/zero usage API card semantics to match task-4 contract; violations: #{Enum.join(violations, "; ")}"
+           "expected observed zero-use account quota card semantics; violations: #{Enum.join(violations, "; ")}"
   end
 
-  test "account quota rows keep zero percent-only capacity unknown evidence unreported", %{
+  test "account quota rows show reset-bearing observed zero-use evidence as fully remaining", %{
     scope: scope
   } do
     {:ok, pool} =
@@ -2545,9 +2648,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
     weekly = Enum.find(account.quota_limits, &(&1.key == :weekly))
 
-    assert weekly.percent == nil
-    assert weekly.percent_value == 0
-    assert weekly.percent_label == "not reported"
+    assert Decimal.equal?(weekly.percent, Decimal.new("100"))
+    assert weekly.percent_value == 100
+    assert weekly.percent_label == "100%"
   end
 
   @tag :upstream_quota_dashboard_regression
