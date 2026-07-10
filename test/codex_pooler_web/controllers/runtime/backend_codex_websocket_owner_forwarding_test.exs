@@ -1653,7 +1653,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
       assert {:ok, second_state} = receive_owner_socket_complete(second_state)
       assert second_state.websocket_owner_active_turn_reconnect? == false
-      assert_receive {:codex_response_done, _pid, :ok}
+      assert_receive {:codex_response_done, _pid, :ok}, @response_task_stop_timeout_ms
 
       assert [request_log] = request_logs(setup.pool.id)
       assert request_log.correlation_id == "ws-owner-active-reconnect-first"
@@ -1665,6 +1665,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
       assert owner_metadata["downstream_epoch"] == 1
     after
       send(owner_worker_pid, {:blocking_owner_upstream_release, release_ref})
+      assert_response_task_stopped!(first_state)
       CodexResponsesSocket.terminate(:closed, second_state)
     end
   end
