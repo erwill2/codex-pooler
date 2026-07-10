@@ -63,6 +63,29 @@ defmodule CodexPooler.Dev.SeedsTest do
     refute User.valid_password?(reloaded_owner, "dev-password-123")
   end
 
+  test "perf seed provides the deterministic dev owner without changing an existing owner" do
+    %{user: existing_owner} =
+      bootstrap_owner_fixture(%{
+        "display_name" => "Existing Owner",
+        "email" => "existing-owner@example.com",
+        "password" => "existing-owner-pass-123"
+      })
+
+    result = Seeds.perf()
+    reloaded_owner = Repo.get!(User, existing_owner.id)
+
+    assert result.pool.slug == "dev-perf-pool"
+
+    assert User.valid_password?(
+             Repo.get!(User, result.pool.created_by_user_id),
+             "dev-password-123"
+           )
+
+    assert reloaded_owner.email == "existing-owner@example.com"
+    assert reloaded_owner.display_name == "Existing Owner"
+    assert User.valid_password?(reloaded_owner, "existing-owner-pass-123")
+  end
+
   test "seeds refuse when development seed gate is disabled" do
     previous = Application.get_env(:codex_pooler, :dev_seeds_enabled)
     Application.put_env(:codex_pooler, :dev_seeds_enabled, false)

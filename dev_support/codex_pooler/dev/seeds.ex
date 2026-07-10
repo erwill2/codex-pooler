@@ -69,8 +69,14 @@ defmodule CodexPooler.Dev.Seeds do
   @doc "Seeds an isolated local fake dataset for gateway performance checks."
   @spec perf() :: map()
   def perf do
-    %{owner: owner} = compact()
+    require_dev_seeds_enabled!()
+    owner = ensure_perf_owner!()
     Perf.run(%{owner: owner})
+  end
+
+  defp ensure_perf_owner! do
+    owner = reset_owner_password!(ensure_user!(owner_spec()))
+    ensure_membership!(owner, "instance_owner", owner.id)
   end
 
   @spec ensure_owner!() :: User.t()
