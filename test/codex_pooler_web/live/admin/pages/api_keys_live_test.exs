@@ -11,6 +11,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
   alias CodexPooler.Events
   alias CodexPooler.Pools
   alias CodexPooler.Repo
+  alias Ecto.Adapters.SQL.Sandbox
 
   setup :register_and_log_in_user
 
@@ -498,22 +499,25 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
         receive do
           :broadcast_traffic_events ->
             Enum.each(1..count, fn index ->
-              broadcast =
-                if rem(index, 2) == 0,
-                  do: &Events.broadcast_usage/3,
-                  else: &Events.broadcast_request_logs/3
-
-              assert {:ok, _event} = broadcast.(pool_id, "traffic_updated", %{})
+              broadcast_traffic_event(pool_id, index)
             end)
 
             send(test_pid, :traffic_events_broadcast)
         end
       end)
 
-    Ecto.Adapters.SQL.Sandbox.allow(Repo, test_pid, task.pid)
+    Sandbox.allow(Repo, test_pid, task.pid)
     send(task.pid, :broadcast_traffic_events)
     assert_receive :traffic_events_broadcast
     Task.await(task)
+  end
+
+  defp broadcast_traffic_event(pool_id, index) when rem(index, 2) == 0 do
+    assert {:ok, _event} = Events.broadcast_usage(pool_id, "traffic_updated", %{})
+  end
+
+  defp broadcast_traffic_event(pool_id, _index) do
+    assert {:ok, _event} = Events.broadcast_request_logs(pool_id, "traffic_updated", %{})
   end
 
   defp capture_repo_queries(fun) when is_function(fun, 0) do

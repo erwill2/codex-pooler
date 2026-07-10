@@ -270,14 +270,16 @@ defmodule CodexPoolerWeb.Admin.PoolsLive do
   def handle_info(_message, socket), do: {:noreply, socket}
 
   defp pool_event_kind(topics, pool_id) when is_list(topics) and is_binary(pool_id) do
-    with {:ok, topics} <- Events.validate_topics(topics) do
-      cond do
-        Enum.any?(topics, &(&1 in ["pools", "upstreams"])) -> :lifecycle
-        "usage" in topics -> :usage
-        true -> :ignore
-      end
-    else
-      {:error, :invalid_topics} -> :ignore
+    case Events.validate_topics(topics) do
+      {:ok, topics} ->
+        cond do
+          Enum.any?(topics, &(&1 in ["pools", "upstreams"])) -> :lifecycle
+          "usage" in topics -> :usage
+          true -> :ignore
+        end
+
+      {:error, :invalid_topics} ->
+        :ignore
     end
   end
 
