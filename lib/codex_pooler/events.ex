@@ -35,6 +35,7 @@ defmodule CodexPooler.Events do
   @type reason :: String.t()
   @type payload :: map()
   @type broadcast_result :: {:ok, Event.t()} | {:error, term()}
+  @type subscription_topics :: :all | MapSet.t(topic())
 
   @spec topics() :: [topic()]
   def topics, do: @topics
@@ -46,6 +47,38 @@ defmodule CodexPooler.Events do
     |> case do
       nil -> {:error, :pool_id_required}
       pool_id -> PubSub.subscribe(@pubsub, pubsub_topic(pool_id))
+    end
+  end
+
+  @spec subscribe_pool(pool_ref(), topics()) :: :ok | {:error, term()}
+  def subscribe_pool(pool_or_id, topics) do
+    with pool_id when is_binary(pool_id) <- pool_id(pool_or_id),
+         {:ok, topics} <- validate_topics(topics) do
+      subscribe_topics(pool_id, topics)
+    else
+      nil -> {:error, :pool_id_required}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec unsubscribe_pool(pool_ref()) :: :ok | {:error, term()}
+  def unsubscribe_pool(pool_or_id) do
+    pool_or_id
+    |> pool_id()
+    |> case do
+      nil -> {:error, :pool_id_required}
+      pool_id -> PubSub.unsubscribe(@pubsub, pubsub_topic(pool_id))
+    end
+  end
+
+  @spec unsubscribe_pool(pool_ref(), topics()) :: :ok | {:error, term()}
+  def unsubscribe_pool(pool_or_id, topics) do
+    with pool_id when is_binary(pool_id) <- pool_id(pool_or_id),
+         {:ok, topics} <- validate_topics(topics) do
+      unsubscribe_topics(pool_id, topics)
+    else
+      nil -> {:error, :pool_id_required}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -139,13 +172,37 @@ defmodule CodexPooler.Events do
     end
   end
 
+  @spec pubsub_topic(pool_ref(), topic()) :: String.t() | {:error, term()}
+  def pubsub_topic(pool_or_id, topic) do
+    with pool_id when is_binary(pool_id) <- pool_id(pool_or_id),
+         {:ok, [topic]} <- validate_topics(topic) do
+      scoped_pubsub_topic(pool_id, topic)
+    else
+      nil -> {:error, :pool_id_required}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec validate_topics(topics()) :: {:ok, [topic()]} | {:error, :invalid_topics}
+  def validate_topics(topic) when is_binary(topic), do: validate_topics([topic])
+
+  def validate_topics(topics) when is_list(topics) do
+    if topics != [] and Enum.all?(topics, &(is_binary(&1) and &1 in @topics)) do
+      {:ok, Enum.uniq(topics)}
+    else
+      {:error, :invalid_topics}
+    end
+  end
+
+  def validate_topics(_topics), do: {:error, :invalid_topics}
+
   @spec broadcast_local_event(Event.t()) :: :ok | {:error, term()}
   def broadcast_local_event(%Event{} = event) do
     message = {@message_tag, event}
 
-    case PubSub.broadcast_from(@pubsub, self(), pubsub_topic(event.pool_id), message) do
-      :ok -> PubSub.broadcast_from(@pubsub, self(), @all_topic, message)
-      {:error, reason} -> {:error, reason}
+    with :ok <- PubSub.broadcast_from(@pubsub, self(), pubsub_topic(event.pool_id), message),
+         :ok <- broadcast_scoped_topics(event, message) do
+      PubSub.broadcast_from(@pubsub, self(), @all_topic, message)
     end
   end
 
@@ -158,19 +215,7 @@ defmodule CodexPooler.Events do
     |> Jason.encode()
   end
 
-  defp normalize_topics(topic) when is_binary(topic), do: normalize_topics([topic])
-
-  defp normalize_topics(topics) when is_list(topics) do
-    topics = topics |> Enum.map(&to_string/1) |> Enum.uniq()
-
-    if topics != [] and Enum.all?(topics, &(&1 in @topics)) do
-      {:ok, topics}
-    else
-      {:error, :invalid_topics}
-    end
-  end
-
-  defp normalize_topics(_topics), do: {:error, :invalid_topics}
+  defp normalize_topics(topics), do: validate_topics(topics)
 
   defp normalize_reason(reason) when is_binary(reason) do
     reason = String.trim(reason)
@@ -188,6 +233,39 @@ defmodule CodexPooler.Events do
   defp pool_id(%{id: id}) when is_binary(id), do: id
   defp pool_id(id) when is_binary(id), do: String.trim(id)
   defp pool_id(_pool_or_id), do: nil
+
+  defp subscribe_topics(pool_id, topics) do
+    Enum.reduce_while(topics, :ok, fn topic, :ok ->
+      case PubSub.subscribe(@pubsub, scoped_pubsub_topic(pool_id, topic)) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp unsubscribe_topics(pool_id, topics) do
+    Enum.each(topics, fn topic ->
+      :ok = PubSub.unsubscribe(@pubsub, scoped_pubsub_topic(pool_id, topic))
+    end)
+
+    :ok
+  end
+
+  defp broadcast_scoped_topics(%Event{} = event, message) do
+    Enum.reduce_while(event.topics, :ok, fn topic, :ok ->
+      case PubSub.broadcast_from(
+             @pubsub,
+             self(),
+             scoped_pubsub_topic(event.pool_id, topic),
+             message
+           ) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp scoped_pubsub_topic(pool_id, topic), do: pubsub_topic(pool_id) <> ":" <> topic
 
   defp broadcast_postgres_event(%Event{} = event) do
     with {:ok, payload} <- event_to_postgres_payload(event),

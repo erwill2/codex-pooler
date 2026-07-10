@@ -84,6 +84,84 @@ defmodule CodexPooler.EventsTest do
     refute_receive {Events, ^event}
   end
 
+  test "delivers only selected topics to a scoped pool subscriber" do
+    pool = pool_fixture()
+    assert :ok = Events.subscribe_pool(pool.id, "pools")
+
+    assert {:ok, usage} =
+             publish_from_task(fn -> Events.broadcast_usage(pool.id, "usage_updated", %{}) end)
+
+    assert {:ok, request_logs} =
+             publish_from_task(fn ->
+               Events.broadcast_request_logs(pool.id, "request_log_created", %{})
+             end)
+
+    refute_receive {Events, ^usage}
+    refute_receive {Events, ^request_logs}
+
+    assert {:ok, pools} =
+             publish_from_task(fn ->
+               Events.broadcast_pools(pool.id, "pool_routing_settings_updated", %{})
+             end)
+
+    assert_receive {Events, ^pools}
+  end
+
+  test "delivers each matching event once to a multi-topic pool subscriber" do
+    pool = pool_fixture()
+    assert :ok = Events.subscribe_pool(pool.id, ["pools", "upstreams"])
+
+    assert {:ok, pools} =
+             publish_from_task(fn ->
+               Events.broadcast_pools(pool.id, "pool_routing_settings_updated", %{})
+             end)
+
+    assert_receive {Events, ^pools}
+    refute_receive {Events, ^pools}
+
+    assert {:ok, upstreams} =
+             publish_from_task(fn ->
+               Events.broadcast_upstreams(pool.id, "upstream_account_imported", %{})
+             end)
+
+    assert_receive {Events, ^upstreams}
+    refute_receive {Events, ^upstreams}
+  end
+
+  test "rejects invalid subscription topics without subscribing" do
+    pool = pool_fixture()
+
+    assert Events.pubsub_topic(pool.id, "pools") ==
+             Events.pubsub_topic(pool.id) <> ":pools"
+
+    assert {:error, :invalid_topics} = Events.pubsub_topic(pool.id, "unknown")
+    assert {:error, :invalid_topics} = Events.subscribe_pool(pool.id, ["unknown"])
+
+    assert {:ok, event} =
+             publish_from_task(fn ->
+               Events.broadcast_pools(pool.id, "pool_routing_settings_updated", %{})
+             end)
+
+    refute_receive {Events, ^event}
+  end
+
+  test "rejects malformed scoped subscription topics without raising" do
+    pool = pool_fixture()
+
+    assert {:error, :invalid_topics} = Events.subscribe_pool(pool.id, [%{}])
+    assert {:error, :invalid_topics} = Events.unsubscribe_pool(pool.id, [123])
+    assert {:error, :invalid_topics} = Events.pubsub_topic(pool.id, %{})
+  end
+
+  test "does not deliver scoped local events back to the broadcasting subscriber" do
+    pool = pool_fixture()
+    assert :ok = Events.subscribe_pool(pool.id, "pools")
+
+    assert {:ok, event} = Events.broadcast_pools(pool.id, "pool_routing_settings_updated", %{})
+
+    refute_receive {Events, ^event}
+  end
+
   test "rejects invalid event topics" do
     pool = pool_fixture()
 
@@ -111,6 +189,40 @@ defmodule CodexPooler.EventsTest do
     assert_receive {Events, ^event}
   end
 
+  test "relays postgres notification payloads to scoped pool PubSub" do
+    pool = pool_fixture()
+    assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+    event = event_fixture(pool.id, ["upstreams"])
+
+    assert {:ok, payload} = Events.event_to_postgres_payload(event)
+    assert :ok = publish_from_task(fn -> PostgresBridge.relay_payload(payload) end)
+
+    assert_receive {Events, ^event}
+  end
+
+  test "rejects relayed invalid topics without delivering an event" do
+    pool = pool_fixture()
+    assert :ok = Events.subscribe_pool(pool.id)
+
+    event = event_fixture(pool.id, ["unknown"])
+
+    assert {:ok, payload} = Events.event_to_postgres_payload(event)
+    assert {:error, :invalid_topics} = PostgresBridge.relay_payload(payload)
+    refute_receive {Events, ^event}
+  end
+
+  test "rejects relayed malformed topic values without raising" do
+    pool = pool_fixture()
+    assert :ok = Events.subscribe_pool(pool.id)
+
+    event = event_fixture(pool.id, [123])
+
+    assert {:ok, payload} = Events.event_to_postgres_payload(event)
+    assert {:error, :invalid_topics} = PostgresBridge.relay_payload(payload)
+    refute_receive {Events, ^event}
+  end
+
   defp publish_from_task(fun) when is_function(fun, 0) do
     fun
     |> Task.async()
@@ -130,5 +242,17 @@ defmodule CodexPooler.EventsTest do
     assert {:ok, _uuid} = Ecto.UUID.cast(event.id)
     assert %DateTime{} = event.emitted_at
     assert is_map(payload)
+  end
+
+  defp event_fixture(pool_id, topics) do
+    %Event{
+      version: 1,
+      id: Ecto.UUID.generate(),
+      pool_id: pool_id,
+      topics: topics,
+      reason: "upstream_quota_windows_updated",
+      emitted_at: DateTime.utc_now() |> DateTime.truncate(:microsecond),
+      payload: %{"status" => "updated"}
+    }
   end
 end

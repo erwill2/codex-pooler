@@ -109,11 +109,12 @@ defmodule CodexPooler.Events.PostgresBridge do
 
   defp decode_emitted_at(_value), do: {:error, :invalid_emitted_at}
 
-  defp decode_topics([_ | _] = topics) do
-    if Enum.all?(topics, &is_binary/1), do: {:ok, topics}, else: {:error, :invalid_topics}
+  defp decode_topics(topics) do
+    case Events.validate_topics(topics) do
+      {:ok, _validated_topics} -> {:ok, topics}
+      {:error, reason} -> {:error, reason}
+    end
   end
-
-  defp decode_topics(_topics), do: {:error, :invalid_topics}
 
   defp decode_payload(payload) when is_map(payload), do: {:ok, payload}
   defp decode_payload(_payload), do: {:error, :invalid_payload}
