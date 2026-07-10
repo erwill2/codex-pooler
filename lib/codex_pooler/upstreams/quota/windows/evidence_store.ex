@@ -9,7 +9,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
-  @runtime_quota_sources ~w(codex_rate_limit_event codex_response_headers)
+  @runtime_quota_sources ~w(codex_rate_limit_event codex_response_headers codex_rate_limit_error)
   @usage_reset_forward_tolerance_seconds 5 * 60
   @relative_reset_refresh_tolerance_seconds 5
   @account_snapshot_reset_tolerance_seconds 5
@@ -39,8 +39,29 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
           {:ok, Quota.AccountQuotaWindow.t()}
           | {:error, Ecto.Changeset.t() | Evidence.errors() | map()}
   def record_evidence(identity_or_id, attrs, observed_at) do
+    if Repo.in_transaction?() do
+      record_evidence_in_transaction(identity_or_id, attrs, observed_at)
+    else
+      record_evidence_in_new_transaction(identity_or_id, attrs, observed_at)
+    end
+  end
+
+  defp record_evidence_in_new_transaction(identity_or_id, attrs, observed_at) do
+    Repo.transaction(fn ->
+      identity_or_id
+      |> record_evidence_in_transaction(attrs, observed_at)
+      |> unwrap_record_evidence_transaction()
+    end)
+  end
+
+  defp unwrap_record_evidence_transaction({:ok, window}), do: window
+  defp unwrap_record_evidence_transaction({:error, reason}), do: Repo.rollback(reason)
+
+  defp record_evidence_in_transaction(identity_or_id, attrs, observed_at) do
     with {:ok, evidence} <- Evidence.new(attrs, observed_at),
          identity_id when is_binary(identity_id) <- evidence_identity_id(identity_or_id, attrs) do
+      advisory_lock_evidence_identity(identity_id)
+
       attrs =
         evidence
         |> Evidence.to_window_attrs()
@@ -56,6 +77,13 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       {:error, _errors} = error -> error
       _missing_identity -> {:error, %{upstream_identity_id: ["can't be blank"]}}
     end
+  end
+
+  defp advisory_lock_evidence_identity(identity_id) do
+    _result =
+      Repo.query!("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [identity_id])
+
+    :ok
   end
 
   @spec list_evidence(identity_ref()) :: [Quota.AccountQuotaWindow.t()]
@@ -339,13 +367,14 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   defp runtime_percent_rollback?(
          %Evidence{source: source, used_percent: %Decimal{} = incoming_percent} = evidence,
          %Quota.AccountQuotaWindow{
-           source: "codex_usage_api",
+           source: existing_source,
            used_percent: %Decimal{} = existing_percent
          } =
            existing,
          timestamp
        )
-       when source in @runtime_quota_sources do
+       when source in @runtime_quota_sources and
+              existing_source in ["codex_usage_api" | @runtime_quota_sources] do
     rollback_guarded_quota_identity?(evidence) and same_evidence_identity?(evidence, existing) and
       weak_capacity?(evidence) and stronger_current_quota_information?(existing, timestamp) and
       Decimal.compare(incoming_percent, existing_percent) != :gt and
@@ -534,6 +563,22 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     same_evidence_identity?(evidence, existing) and weak_zero_percent_evidence?(evidence) and
       stronger_current_quota_information?(existing, timestamp) and
       not exhausted_by_used_percent?(existing)
+  end
+
+  defp incoming_refreshes_existing?(
+         %Evidence{source: source, used_percent: %Decimal{} = incoming_percent} = evidence,
+         %Quota.AccountQuotaWindow{
+           source: existing_source,
+           used_percent: %Decimal{} = existing_percent
+         } = existing,
+         timestamp
+       )
+       when source in @runtime_quota_sources and
+              existing_source in ["codex_usage_api" | @runtime_quota_sources] do
+    rollback_guarded_quota_identity?(evidence) and same_evidence_identity?(evidence, existing) and
+      weak_capacity?(evidence) and stronger_current_quota_information?(existing, timestamp) and
+      Decimal.compare(incoming_percent, existing_percent) == :eq and
+      not exhausted_by_used_percent?(evidence)
   end
 
   defp incoming_refreshes_existing?(_evidence, _existing, _timestamp), do: false
