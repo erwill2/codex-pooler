@@ -9449,6 +9449,58 @@ defmodule CodexPooler.UpstreamsTest do
     end
 
     @tag :upstream_quota_evidence_stability
+    test "relative weak zero usage outlier cannot split account percent from its reset" do
+      identity = active_identity_fixture()
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      reset_at = DateTime.add(observed_at, 2, :hour)
+      weak_observed_at = DateTime.add(observed_at, 60, :second)
+      weak_reset_at = DateTime.add(reset_at, 23, :minute)
+      recovered_observed_at = DateTime.add(observed_at, 120, :second)
+
+      payload = fn used_percent, sample_at, sample_reset_at ->
+        %{
+          "rate_limit" => %{
+            "primary_window" => %{
+              "used_percent" => used_percent,
+              "limit_window_seconds" => 18_000,
+              "reset_after_seconds" => DateTime.diff(sample_reset_at, sample_at, :second),
+              "reset_at" => DateTime.to_unix(sample_reset_at)
+            }
+          }
+        }
+      end
+
+      assert {:ok, [known_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 payload.(10, observed_at, reset_at),
+                 observed_at
+               )
+
+      assert {:ok, [after_outlier]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 payload.(0, weak_observed_at, weak_reset_at),
+                 weak_observed_at
+               )
+
+      assert after_outlier.id == known_window.id
+      assert Decimal.equal?(after_outlier.used_percent, Decimal.new("10"))
+      assert DateTime.compare(after_outlier.reset_at, reset_at) == :eq
+
+      assert {:ok, [recovered_window]} =
+               QuotaWindows.upsert_quota_windows_from_codex_usage_payload(
+                 identity,
+                 payload.(10, recovered_observed_at, reset_at),
+                 recovered_observed_at
+               )
+
+      assert recovered_window.id == known_window.id
+      assert Decimal.equal?(recovered_window.used_percent, Decimal.new("10"))
+      assert DateTime.compare(recovered_window.reset_at, reset_at) == :eq
+    end
+
+    @tag :upstream_quota_evidence_stability
     test "stronger account usage snapshot replaces the earlier snapshot atomically" do
       identity = active_identity_fixture()
       observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)

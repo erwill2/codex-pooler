@@ -375,15 +375,6 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
           not stale_same_cycle_exhausted_snapshot?(evidence, existing, timestamp) ->
         :same_cycle
 
-      relative_reset_metadata?(evidence.metadata) and
-          relative_reset_metadata?(existing.metadata) ->
-        relative_snapshot_decision(evidence, existing)
-
-      relative_reset_metadata?(evidence.metadata) ->
-        if higher_used_percent?(evidence.used_percent, existing.used_percent),
-          do: :continue,
-          else: :existing
-
       Evidence.expired?(existing, timestamp) ->
         :incoming
 
@@ -393,6 +384,15 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
 
       weak_zero_percent_evidence?(evidence) ->
         weak_zero_snapshot_decision(evidence, existing, timestamp)
+
+      relative_reset_metadata?(evidence.metadata) and
+          relative_reset_metadata?(existing.metadata) ->
+        relative_snapshot_decision(evidence, existing)
+
+      relative_reset_metadata?(evidence.metadata) ->
+        if higher_used_percent?(evidence.used_percent, existing.used_percent),
+          do: :continue,
+          else: :existing
 
       forward_reset_cycle?(evidence, existing) ->
         :incoming
