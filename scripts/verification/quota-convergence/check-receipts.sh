@@ -4,6 +4,8 @@ set -euo pipefail
 mode=""
 receipt=""
 image=""
+source_sha=""
+digest=""
 
 validate() {
   local expected_mode="$1"
@@ -125,14 +127,22 @@ while (($#)); do
     --mode) mode="${2:-}"; shift 2 ;;
     --receipt) receipt="${2:-}"; shift 2 ;;
     --image) image="${2:-}"; shift 2 ;;
+    --source-sha) source_sha="${2:-}"; shift 2 ;;
+    --digest) digest="${2:-}"; shift 2 ;;
     *) printf 'unsupported argument\n' >&2; exit 2 ;;
   esac
 done
 
-[[ "$image" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:@-]+$ ]] || { printf 'invalid image reference\n' >&2; exit 2; }
-trusted_source_sha="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")"
-trusted_digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")"
-trusted_digest="${trusted_digest##*@}"
+if [[ -n "$image" ]]; then
+  [[ "$image" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:@-]+$ ]] || { printf 'invalid image reference\n' >&2; exit 2; }
+  immutable_ref="$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")"
+  trusted_digest="${immutable_ref##*@}"
+  trusted_source_sha="$(docker buildx imagetools inspect "$immutable_ref" --format '{{json .Provenance}}' |
+    jq -er '.SLSA.runDetails.metadata.buildkit_metadata.vcs.revision')"
+else
+  trusted_source_sha="$source_sha"
+  trusted_digest="$digest"
+fi
 [[ "$trusted_source_sha" =~ ^[0-9a-f]{40}$ ]] || { printf 'trusted image revision unavailable\n' >&2; exit 1; }
 [[ "$trusted_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { printf 'trusted immutable image digest unavailable\n' >&2; exit 1; }
 

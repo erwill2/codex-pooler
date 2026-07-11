@@ -17,9 +17,10 @@ done
 
 [[ "$image" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/:@-]+$ ]] || { printf 'invalid image reference\n' >&2; exit 2; }
 [[ "$mode" == "equivalent" || "$mode" == "changed-second" ]] || { printf 'invalid mode\n' >&2; exit 2; }
-source_sha="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")"
 immutable_ref="$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")"
 image_digest="${immutable_ref##*@}"
+source_sha="$(docker buildx imagetools inspect "$immutable_ref" --format '{{json .Provenance}}' |
+  jq -er '.SLSA.runDetails.metadata.buildkit_metadata.vcs.revision')"
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || { printf 'trusted image revision unavailable\n' >&2; exit 1; }
 [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { printf 'trusted immutable image digest unavailable\n' >&2; exit 1; }
 
@@ -88,6 +89,6 @@ printf 'provenance\t%s\t%s\tpassed\n' "$source_sha" "$image_digest" >>"$temp_rec
 rm -f "$raw_output"
 
 "$root_dir/scripts/verification/quota-convergence/check-receipts.sh" \
-  --mode "$mode" --receipt "$temp_receipt" --image "$image"
+  --mode "$mode" --receipt "$temp_receipt" --source-sha "$source_sha" --digest "$image_digest"
 mv "$temp_receipt" "$receipt"
 printf 'release quota proof passed mode=%s receipt=%s\n' "$mode" "$(basename "$receipt")"
