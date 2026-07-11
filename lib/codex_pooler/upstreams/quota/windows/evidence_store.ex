@@ -46,17 +46,24 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
           {:ok, Quota.AccountQuotaWindow.t()}
           | {:error, Ecto.Changeset.t() | Evidence.errors() | map()}
   def record_evidence(identity_or_id, attrs, observed_at) do
+    record_evidence(identity_or_id, attrs, observed_at, now())
+  end
+
+  @spec record_evidence(identity_ref(), map(), DateTime.t(), DateTime.t()) ::
+          {:ok, Quota.AccountQuotaWindow.t()}
+          | {:error, Ecto.Changeset.t() | Evidence.errors() | map()}
+  def record_evidence(identity_or_id, attrs, observed_at, timestamp) do
     if Repo.in_transaction?() do
-      record_evidence_in_transaction(identity_or_id, attrs, observed_at)
+      record_evidence_in_transaction(identity_or_id, attrs, observed_at, timestamp)
     else
-      record_evidence_in_new_transaction(identity_or_id, attrs, observed_at)
+      record_evidence_in_new_transaction(identity_or_id, attrs, observed_at, timestamp)
     end
   end
 
-  defp record_evidence_in_new_transaction(identity_or_id, attrs, observed_at) do
+  defp record_evidence_in_new_transaction(identity_or_id, attrs, observed_at, timestamp) do
     Repo.transaction(fn ->
       identity_or_id
-      |> record_evidence_in_transaction(attrs, observed_at)
+      |> record_evidence_in_transaction(attrs, observed_at, timestamp)
       |> unwrap_record_evidence_transaction()
     end)
   end
@@ -64,7 +71,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   defp unwrap_record_evidence_transaction({:ok, window}), do: window
   defp unwrap_record_evidence_transaction({:error, reason}), do: Repo.rollback(reason)
 
-  defp record_evidence_in_transaction(identity_or_id, attrs, observed_at) do
+  defp record_evidence_in_transaction(identity_or_id, attrs, observed_at, timestamp) do
     with {:ok, evidence} <- Evidence.new(attrs, observed_at),
          identity_id when is_binary(identity_id) <- evidence_identity_id(identity_or_id, attrs) do
       advisory_lock_evidence_identity(identity_id)
@@ -75,7 +82,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
         |> Map.put(:upstream_identity_id, identity_id)
 
       with {:ok, existing} <- get_existing_evidence(identity_id, evidence) do
-        timestamped_attrs = merge_attrs(existing, attrs, evidence)
+        timestamped_attrs = merge_attrs(existing, attrs, evidence, timestamp)
 
         result =
           existing
@@ -278,12 +285,15 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       optional_string(window.raw_metered_feature) == optional_string(evidence.raw_metered_feature)
   end
 
-  defp merge_attrs(%Quota.AccountQuotaWindow{id: nil} = existing, attrs, _evidence),
+  defp merge_attrs(%Quota.AccountQuotaWindow{id: nil} = existing, attrs, _evidence, _timestamp),
     do: put_timestamps(attrs, existing)
 
-  defp merge_attrs(%Quota.AccountQuotaWindow{} = existing, attrs, %Evidence{} = evidence) do
-    timestamp = now()
-
+  defp merge_attrs(
+         %Quota.AccountQuotaWindow{} = existing,
+         attrs,
+         %Evidence{} = evidence,
+         timestamp
+       ) do
     case confirmed_snapshot_decision(evidence, existing, timestamp) do
       :incoming -> accepted_snapshot_attrs(existing, attrs, timestamp)
       {:candidate, metadata} -> candidate_snapshot_attrs(existing, metadata, timestamp)
@@ -358,9 +368,6 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       Evidence.current_freshness_state(evidence, timestamp) != "fresh" ->
         :existing
 
-      Evidence.current_freshness_state(existing, timestamp) != "fresh" ->
-        :incoming
-
       relative_reset_metadata?(evidence.metadata) and
           relative_reset_metadata?(existing.metadata) ->
         relative_snapshot_decision(evidence, existing)
@@ -373,11 +380,18 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       Evidence.expired?(existing, timestamp) ->
         :incoming
 
+      Evidence.current_freshness_state(existing, timestamp) != "fresh" and
+          forward_reset_cycle?(evidence, existing) ->
+        :incoming
+
       weak_zero_percent_evidence?(evidence) ->
         weak_zero_snapshot_decision(evidence, existing, timestamp)
 
       forward_reset_cycle?(evidence, existing) ->
         :incoming
+
+      stale_same_cycle_exhausted_snapshot?(evidence, existing, timestamp) ->
+        lower_snapshot_decision(evidence, existing, timestamp)
 
       true ->
         compare_confirmed_snapshot(evidence, existing, timestamp)
@@ -387,13 +401,17 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   defp confirmed_snapshot_decision(
          %Evidence{source: "codex_usage_api", used_percent: %Decimal{}} = evidence,
          %Quota.AccountQuotaWindow{source: "codex_usage_api"} = existing,
-         _timestamp
+         timestamp
        ) do
     same_confirmed_identity? = Evidence.identity_key(evidence) == Evidence.identity_key(existing)
 
     cond do
       not same_confirmed_identity? or not weak_capacity?(evidence) or not weak_capacity?(existing) ->
         :continue
+
+      relative_reset_metadata?(evidence.metadata) and
+          Evidence.current_freshness_state(existing, timestamp) != "fresh" ->
+        :existing
 
       relative_reset_metadata?(evidence.metadata) ->
         :continue
@@ -460,6 +478,11 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
        do: DateTime.diff(incoming, existing, :second) > @usage_reset_forward_tolerance_seconds
 
   defp forward_reset_cycle?(_evidence, _existing), do: false
+
+  defp stale_same_cycle_exhausted_snapshot?(evidence, existing, timestamp) do
+    Evidence.current_freshness_state(existing, timestamp) != "fresh" and
+      not exhausted_by_used_percent?(existing) and exhausted_by_used_percent?(evidence)
+  end
 
   defp reset_times_equivalent?(%DateTime{} = left, %DateTime{} = right) do
     abs(DateTime.diff(left, right, :second)) <= @account_snapshot_reset_tolerance_seconds
