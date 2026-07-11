@@ -2417,6 +2417,117 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   end
 
   @tag :upstream_quota_evidence_stability
+  test "quota cards distinguish colliding logical quota identities while collapsing source evidence",
+       %{
+         conn: conn,
+         scope: scope
+       } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "quota-card-presentation-identities",
+        name: "Quota Card Presentation Identities"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Quota Card Presentation Codex",
+        assignment_label: "Quota card presentation assignment"
+      })
+
+    now = DateTime.utc_now()
+
+    model_alpha = %{
+      quota_key: "shared_capacity",
+      quota_scope: "model",
+      quota_family: "alpha",
+      model: "alpha",
+      display_label: "Shared capacity",
+      window_kind: "primary",
+      window_minutes: 300,
+      used_percent: Decimal.new("10"),
+      reset_at: DateTime.add(now, 5, :hour),
+      source: "codex_usage_api",
+      source_precision: "observed",
+      freshness_state: "fresh",
+      observed_at: now
+    }
+
+    assert {:ok, [_model_alpha, _model_beta, _upstream_model_alpha, _upstream_model_beta]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               model_alpha,
+               %{
+                 model_alpha
+                 | quota_family: "beta",
+                   model: "beta",
+                   used_percent: Decimal.new("20")
+               },
+               Map.merge(model_alpha, %{
+                 quota_scope: "upstream_model",
+                 upstream_model: "alpha",
+                 model: nil,
+                 used_percent: Decimal.new("30")
+               }),
+               Map.merge(model_alpha, %{
+                 quota_scope: "upstream_model",
+                 quota_family: "beta",
+                 upstream_model: "beta",
+                 model: nil,
+                 used_percent: Decimal.new("40")
+               })
+             ])
+
+    assert {:ok, [_same_logical_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 model_alpha
+                 | source: "codex_response_headers",
+                   observed_at: DateTime.add(now, 1, :minute)
+               }
+             ])
+
+    assert identity
+           |> QuotaWindows.list_evidence()
+           |> Enum.count(&(&1.quota_key == "shared_capacity")) == 5
+
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+
+    additional_limits =
+      Enum.reject(account.quota_limits, &is_atom(&1.key))
+
+    assert length(additional_limits) == 4
+
+    assert Enum.map(additional_limits, & &1.key) ==
+             Enum.uniq(Enum.map(additional_limits, & &1.key))
+
+    assert Enum.map(additional_limits, & &1.label) ==
+             Enum.uniq(Enum.map(additional_limits, & &1.label))
+
+    assert Enum.sort(Enum.map(additional_limits, & &1.label)) == [
+             "Shared capacity 5h (Model scope, Family alpha, Model alpha)",
+             "Shared capacity 5h (Model scope, Family beta, Model beta)",
+             "Shared capacity 5h (Upstream model scope, Family alpha, Upstream model alpha)",
+             "Shared capacity 5h (Upstream model scope, Family beta, Upstream model beta)"
+           ]
+
+    {:ok, view, html} = live(conn, ~p"/admin/upstreams")
+
+    limit_ids =
+      Regex.scan(~r/id="(upstream-account-#{identity.id}-limit-[^"]+)"/, html,
+        capture: :all_but_first
+      )
+      |> List.flatten()
+
+    assert limit_ids == Enum.uniq(limit_ids)
+
+    for limit <- additional_limits do
+      selector = "#upstream-account-#{identity.id}-limit-#{limit.key}"
+
+      assert has_element?(view, selector)
+      assert has_element?(view, "#{selector} [data-role='upstream-limit-title']", limit.label)
+    end
+  end
+
+  @tag :upstream_quota_evidence_stability
   @tag :quota_runtime_source_transition
   test "Spark zero-use quota stays visible while evidence sources change", %{
     conn: conn,
@@ -2772,7 +2883,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              ])
 
     [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
-    spark = quota_limit!(account, "model-codex_spark-primary-300")
+
+    spark =
+      account
+      |> Map.fetch!(:quota_limits)
+      |> Enum.find(fn %{key: key} ->
+        is_binary(key) and String.starts_with?(key, "model-codex_spark-primary-300")
+      end)
 
     assert Decimal.equal?(spark.percent, Decimal.new("100"))
     assert spark.percent_value == 100
@@ -3804,8 +3921,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 
-    primary_selector = "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300"
-    weekly_selector = "#upstream-account-#{identity.id}-limit-model-codex_spark-secondary-10080"
+    primary_selector =
+      "#upstream-account-#{identity.id}-limit-model-codex_spark-primary-300"
+
+    weekly_selector =
+      "#upstream-account-#{identity.id}-limit-model-codex_spark-secondary-10080"
 
     assert has_element?(view, primary_selector, "99%")
     assert has_element?(view, weekly_selector, "85%")

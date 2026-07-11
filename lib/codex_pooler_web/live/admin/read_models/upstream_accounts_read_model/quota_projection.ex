@@ -97,11 +97,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
       |> Enum.reject(&account_quota_window?/1)
       |> Enum.filter(&informative_additional_quota_window?/1)
       |> Enum.sort_by(&quota_limit_sort_key/1)
-      |> Enum.with_index(1)
-      |> Enum.map(fn {window, index} ->
+      |> quota_limit_presentations()
+      |> Enum.map(fn {window, key, label} ->
         quota_limit_row(
-          quota_limit_key(window, index),
-          quota_limit_label(window),
+          key,
+          label,
           window,
           datetime_preferences
         )
@@ -161,7 +161,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
       quota_limit_label(window),
       window.window_kind,
       window.window_minutes || 0,
-      window.quota_key
+      window.quota_key,
+      window.quota_family || "",
+      window.model || "",
+      window.upstream_model || ""
     }
   end
 
@@ -170,29 +173,119 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   defp quota_scope_sort_value("feature"), do: 2
   defp quota_scope_sort_value(_scope), do: 3
 
-  defp quota_limit_key(%Quota.AccountQuotaWindow{} = window, index) do
-    [window.quota_scope, window.quota_key, window.window_kind, window.window_minutes || index]
-    |> Enum.join("-")
+  defp quota_limit_key(%Quota.AccountQuotaWindow{} = window) do
+    {scope, family, model, upstream_model, quota_key, window_kind, window_minutes} =
+      WindowSelector.logical_key(window)
+
+    [scope, family, model, upstream_model, quota_key, window_kind, window_minutes]
+    |> Enum.map(&quota_identity_token/1)
+    |> then(&"#{quota_limit_key_prefix(window)}-identity-#{Enum.join(&1, "-")}")
+  end
+
+  defp quota_limit_key_prefix(%Quota.AccountQuotaWindow{} = window) do
+    [window.quota_scope, window.quota_key, window.window_kind, window.window_minutes]
+    |> Enum.map_join("-", &quota_key_prefix_component/1)
+  end
+
+  defp quota_key_prefix_component(nil), do: "none"
+  defp quota_key_prefix_component(value) when is_integer(value), do: Integer.to_string(value)
+
+  defp quota_key_prefix_component(value) when is_binary(value) do
+    value
     |> String.downcase()
     |> String.replace(~r/[^a-z0-9_-]+/u, "-")
     |> String.trim("-")
   end
 
-  defp quota_limit_label(%Quota.AccountQuotaWindow{} = window) do
-    base_label =
-      [
-        window.display_label,
-        window.model,
-        window.upstream_model,
-        window.limit_name,
-        window.raw_limit_name,
-        window.metered_feature,
-        window.quota_key
-      ]
-      |> Enum.find(&Formatting.present_string?/1)
-      |> humanize_quota_label()
+  defp quota_identity_token(nil), do: "n"
+  defp quota_identity_token(value) when is_integer(value), do: "i#{value}"
 
-    "#{base_label} #{quota_window_label(window)}"
+  defp quota_identity_token(value) when is_binary(value) do
+    "s#{value |> Base.encode32(padding: false) |> String.downcase()}"
+  end
+
+  defp quota_limit_presentations(windows) do
+    windows_by_legacy_key = Enum.group_by(windows, &quota_limit_key_prefix/1)
+    labels_by_base = Enum.group_by(windows, &quota_limit_label/1)
+
+    Enum.map(windows, fn window ->
+      base_label = quota_limit_label(window)
+      legacy_key = quota_limit_key_prefix(window)
+
+      key =
+        case Map.fetch!(windows_by_legacy_key, legacy_key) do
+          [_window] -> legacy_key
+          _colliding_windows -> quota_limit_key(window)
+        end
+
+      label =
+        case Map.fetch!(labels_by_base, base_label) do
+          [_window] -> base_label
+          _colliding_windows -> "#{base_label} (#{quota_identity_label(window)})"
+        end
+
+      {window, key, label}
+    end)
+  end
+
+  defp quota_limit_label(%Quota.AccountQuotaWindow{} = window) do
+    window
+    |> quota_limit_base_label()
+    |> then(&"#{&1} #{quota_window_label(window)}")
+  end
+
+  defp quota_limit_base_label(%Quota.AccountQuotaWindow{} = window) do
+    [
+      window.display_label,
+      window.model,
+      window.upstream_model,
+      window.limit_name,
+      window.raw_limit_name,
+      window.metered_feature,
+      window.quota_key
+    ]
+    |> Enum.find(&Formatting.present_string?/1)
+    |> humanize_quota_label()
+  end
+
+  defp quota_identity_label(%Quota.AccountQuotaWindow{} = window) do
+    {scope, family, model, upstream_model, _quota_key, _window_kind, _window_minutes} =
+      WindowSelector.logical_key(window)
+
+    ([quota_scope_label(scope), identity_dimension_label("Family", family)] ++
+       scope_identity_dimension_labels(scope, model, upstream_model))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(", ")
+  end
+
+  defp quota_scope_label("model"), do: "Model scope"
+  defp quota_scope_label("upstream_model"), do: "Upstream model scope"
+  defp quota_scope_label("feature"), do: "Feature scope"
+  defp quota_scope_label(scope), do: identity_dimension_label("Scope", scope)
+
+  defp scope_identity_dimension_labels("model", model, _upstream_model),
+    do: [identity_dimension_label("Model", model)]
+
+  defp scope_identity_dimension_labels("upstream_model", _model, upstream_model),
+    do: [identity_dimension_label("Upstream model", upstream_model)]
+
+  defp scope_identity_dimension_labels(_scope, model, upstream_model) do
+    [
+      identity_dimension_label("Model", model),
+      identity_dimension_label("Upstream model", upstream_model)
+    ]
+  end
+
+  defp identity_dimension_label(_name, value) when not is_binary(value), do: nil
+
+  defp identity_dimension_label(name, value) do
+    value = String.trim(value)
+
+    if value == "" do
+      nil
+    else
+      "#{name} #{String.replace(value, ~r/[_-]+/u, " ")}"
+    end
   end
 
   defp quota_window_label(%Quota.AccountQuotaWindow{window_kind: "primary", window_minutes: 300}),
