@@ -25,6 +25,9 @@ validate_paths() {
       scripts/verification/quota-convergence/observe-development-rollout.sh|\
       scripts/verification/quota-convergence/proof.exs|\
       scripts/verification/quota-convergence/run.sh|\
+      scripts/verification/quota-convergence/verify-selectors.sh|\
+      lib/codex_pooler/upstreams/reconciliation/quota_convergence_verifier.ex|\
+      test/codex_pooler/upstreams/reconciliation/quota_convergence_verifier_test.exs|\
       RUNBOOK.md) ;;
       *) printf 'unsafe changed path: %s\n' "$path" >&2; return 1 ;;
     esac
