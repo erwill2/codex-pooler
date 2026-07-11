@@ -7136,7 +7136,7 @@ defmodule CodexPooler.UpstreamsTest do
 
     @tag :quota_confirmed_convergence
     @tag :quota_reset_cycle_regression
-    test "rejected same-cycle usage beyond drift tolerance still re-confirms window liveness" do
+    test "lower same-cycle usage with minute-scale backward drift keeps the higher canonical percent" do
       identity = active_identity_fixture()
       evaluation_at = quota_reset_evaluation_at()
       canonical_at = stale_quota_observed_at(evaluation_at)
@@ -7173,6 +7173,79 @@ defmodule CodexPooler.UpstreamsTest do
       assert DateTime.compare(stored.last_sync_at, incoming_at) == :eq
       assert Quotas.Evidence.current_freshness_state(stored, evaluation_at) == "fresh"
       refute confirmed_candidate(stored)
+    end
+
+    for {window_kind, drift_seconds, incoming_percent} <- [
+          {"primary", -1440, 8},
+          {"secondary", -361, 2}
+        ] do
+      @tag :quota_confirmed_convergence
+      @tag :quota_reset_cycle_regression
+      test "positive #{window_kind} usage claim raises a stored same-cycle weak-zero claim" do
+        identity = active_identity_fixture()
+        evaluation_at = quota_reset_evaluation_at()
+        canonical_at = DateTime.add(evaluation_at, -60, :second)
+
+        {window_seconds, window_minutes} =
+          case unquote(window_kind) do
+            "primary" -> {18_000, 300}
+            "secondary" -> {604_800, 10_080}
+          end
+
+        canonical_reset_at = DateTime.add(evaluation_at, div(window_seconds, 4), :second)
+
+        zero_claim_payload = %{
+          "rate_limit" => %{
+            "#{unquote(window_kind)}_window" => %{
+              "used_percent" => 0,
+              "limit_window_seconds" => window_seconds,
+              "reset_at" => DateTime.to_iso8601(canonical_reset_at),
+              "reset_after_seconds" => DateTime.diff(canonical_reset_at, canonical_at, :second)
+            }
+          }
+        }
+
+        assert {:ok, [canonical]} =
+                 upsert_codex_usage_payload_at(
+                   identity,
+                   zero_claim_payload,
+                   canonical_at,
+                   evaluation_at
+                 )
+
+        assert canonical.window_minutes == window_minutes
+        assert Decimal.equal?(canonical.used_percent, Decimal.new(0))
+
+        incoming_at = DateTime.add(evaluation_at, -1, :second)
+        incoming_reset_at = DateTime.add(canonical_reset_at, unquote(drift_seconds), :second)
+
+        positive_claim_payload = %{
+          "rate_limit" => %{
+            "#{unquote(window_kind)}_window" => %{
+              "used_percent" => unquote(incoming_percent),
+              "limit_window_seconds" => window_seconds,
+              "reset_at" => DateTime.to_iso8601(incoming_reset_at),
+              "reset_after_seconds" => DateTime.diff(incoming_reset_at, incoming_at, :second)
+            }
+          }
+        }
+
+        assert {:ok, [stored]} =
+                 upsert_codex_usage_payload_at(
+                   identity,
+                   positive_claim_payload,
+                   incoming_at,
+                   evaluation_at
+                 )
+
+        assert stored.id == canonical.id
+        assert Decimal.equal?(stored.used_percent, Decimal.new(unquote(incoming_percent)))
+        assert DateTime.compare(stored.reset_at, canonical_reset_at) == :eq
+        assert DateTime.compare(stored.observed_at, incoming_at) == :eq
+        assert DateTime.compare(stored.last_sync_at, incoming_at) == :eq
+        assert Quotas.Evidence.current_freshness_state(stored, evaluation_at) == "fresh"
+        refute confirmed_candidate(stored)
+      end
     end
 
     @tag :quota_confirmed_convergence

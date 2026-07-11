@@ -369,7 +369,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       Evidence.current_freshness_state(evidence, timestamp) != "fresh" ->
         :existing
 
-      same_cycle_reset?(evidence.reset_at, existing.reset_at) and
+      same_cycle_reset?(evidence, existing) and
         relative_reset_metadata?(evidence.metadata) and
         not weak_zero_percent_evidence?(evidence) and
           not stale_same_cycle_exhausted_snapshot?(evidence, existing, timestamp) ->
@@ -495,16 +495,32 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     abs(DateTime.diff(left, right, :second)) <= @account_snapshot_reset_tolerance_seconds
   end
 
-  # A same-cycle reset recomputed from a provider relative countdown can drift
-  # earlier than the stored reset by countdown rounding and fetch latency.
-  # Treat backward drift within the forward-cycle tolerance as the same cycle;
-  # anything later than the stored reset beyond a few seconds is a new cycle.
-  defp same_cycle_reset?(%DateTime{} = incoming, %DateTime{} = existing) do
+  # A same-cycle reset can drift earlier than the stored reset by countdown
+  # rounding, fetch latency, or the provider interleaving two claims of the
+  # same window whose resets differ by minutes. Any claim whose reset falls
+  # within the window's own duration behind the stored reset still describes
+  # the same running window, so its usage must be merged (fail-closed via
+  # highest percent) instead of rejected. Anything later than the stored reset
+  # beyond a few seconds is a new cycle handled by the forward paths.
+  defp same_cycle_reset?(
+         %Evidence{reset_at: %DateTime{} = incoming, window_minutes: window_minutes},
+         %Quota.AccountQuotaWindow{reset_at: %DateTime{} = existing}
+       ) do
     diff = DateTime.diff(incoming, existing, :second)
 
     diff <= @account_snapshot_reset_tolerance_seconds and
-      diff >= -@usage_reset_forward_tolerance_seconds
+      diff >= -same_cycle_backward_tolerance_seconds(window_minutes)
   end
+
+  defp same_cycle_reset?(_evidence, _existing), do: false
+
+  defp same_cycle_backward_tolerance_seconds(window_minutes)
+       when is_integer(window_minutes) and window_minutes > 0 do
+    window_minutes * 60 + @usage_reset_forward_tolerance_seconds
+  end
+
+  defp same_cycle_backward_tolerance_seconds(_window_minutes),
+    do: @usage_reset_forward_tolerance_seconds
 
   defp accepted_snapshot_attrs(existing, attrs, timestamp) do
     attrs
@@ -526,6 +542,24 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     |> accepted_snapshot_attrs(attrs, timestamp)
     |> Map.put(:reset_at, existing.reset_at)
     |> Map.put(:used_percent, highest_used_percent(existing.used_percent, evidence.used_percent))
+    |> preserve_existing_relative_reset_metadata(existing)
+  end
+
+  # The canonical reset stays pinned, so the merged metadata must not adopt the
+  # incoming claim's relative countdown, which was measured against the
+  # incoming (rejected) reset and would misdescribe the pinned one.
+  defp preserve_existing_relative_reset_metadata(merged_attrs, existing) do
+    existing_metadata = existing.metadata || %{}
+
+    Map.update(merged_attrs, :metadata, existing_metadata, fn metadata ->
+      case Map.fetch(existing_metadata, "reset_after_seconds") do
+        {:ok, existing_reset_after} ->
+          Map.put(metadata, "reset_after_seconds", existing_reset_after)
+
+        :error ->
+          Map.delete(metadata, "reset_after_seconds")
+      end
+    end)
   end
 
   defp candidate_snapshot_attrs(existing, metadata, timestamp) do
