@@ -296,8 +296,9 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
        ) do
     case confirmed_snapshot_decision(evidence, existing, timestamp) do
       :incoming -> accepted_snapshot_attrs(existing, attrs, timestamp)
+      :same_cycle -> same_cycle_snapshot_attrs(existing, attrs, evidence, timestamp)
       {:candidate, metadata} -> candidate_snapshot_attrs(existing, metadata, timestamp)
-      :existing -> rejected_snapshot_attrs(existing, timestamp)
+      :existing -> rejected_snapshot_attrs(existing, evidence, timestamp)
       :continue -> merge_attrs_by_quality(existing, attrs, evidence, timestamp)
     end
   end
@@ -336,7 +337,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
           Evidence.t(),
           Quota.AccountQuotaWindow.t(),
           DateTime.t()
-        ) :: :incoming | :existing | :continue | {:candidate, map()}
+        ) :: :incoming | :same_cycle | :existing | :continue | {:candidate, map()}
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   defp confirmed_snapshot_decision(
          %Evidence{
@@ -367,6 +368,12 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
 
       Evidence.current_freshness_state(evidence, timestamp) != "fresh" ->
         :existing
+
+      same_cycle_reset?(evidence.reset_at, existing.reset_at) and
+        relative_reset_metadata?(evidence.metadata) and
+        not weak_zero_percent_evidence?(evidence) and
+          not stale_same_cycle_exhausted_snapshot?(evidence, existing, timestamp) ->
+        :same_cycle
 
       relative_reset_metadata?(evidence.metadata) and
           relative_reset_metadata?(existing.metadata) ->
@@ -488,6 +495,17 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     abs(DateTime.diff(left, right, :second)) <= @account_snapshot_reset_tolerance_seconds
   end
 
+  # A same-cycle reset recomputed from a provider relative countdown can drift
+  # earlier than the stored reset by countdown rounding and fetch latency.
+  # Treat backward drift within the forward-cycle tolerance as the same cycle;
+  # anything later than the stored reset beyond a few seconds is a new cycle.
+  defp same_cycle_reset?(%DateTime{} = incoming, %DateTime{} = existing) do
+    diff = DateTime.diff(incoming, existing, :second)
+
+    diff <= @account_snapshot_reset_tolerance_seconds and
+      diff >= -@usage_reset_forward_tolerance_seconds
+  end
+
   defp accepted_snapshot_attrs(existing, attrs, timestamp) do
     attrs
     |> Map.put(:active_limit, preserved_active_limit(existing, Map.get(attrs, :active_limit)))
@@ -503,6 +521,13 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     |> Map.put(:updated_at, timestamp)
   end
 
+  defp same_cycle_snapshot_attrs(existing, attrs, evidence, timestamp) do
+    existing
+    |> accepted_snapshot_attrs(attrs, timestamp)
+    |> Map.put(:reset_at, existing.reset_at)
+    |> Map.put(:used_percent, highest_used_percent(existing.used_percent, evidence.used_percent))
+  end
+
   defp candidate_snapshot_attrs(existing, metadata, timestamp) do
     existing
     |> window_attrs()
@@ -510,12 +535,48 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     |> Map.put(:updated_at, timestamp)
   end
 
-  defp rejected_snapshot_attrs(existing, timestamp) do
+  defp rejected_snapshot_attrs(existing, evidence, timestamp) do
     existing
     |> window_attrs()
     |> Map.put(:metadata, clear_invalid_candidate(existing.metadata || %{}, timestamp))
     |> Map.put(:updated_at, timestamp)
+    |> maybe_refresh_same_cycle_sync(existing, evidence, timestamp)
   end
+
+  # Rejected or candidate same-cycle snapshots must still advance the sync
+  # bookkeeping: the provider re-confirmed the current window even when the
+  # canonical values win. Without this, rejected refreshes leave the row
+  # permanently stale within a cycle, quota admission fails closed, and the
+  # whole instance deadlocks into 503s until the next real reset.
+  defp maybe_refresh_same_cycle_sync(merged_attrs, existing, evidence, timestamp) do
+    if same_cycle_sync_refresh?(evidence, existing, timestamp) do
+      merged_attrs
+      |> Map.put(:observed_at, evidence.observed_at)
+      |> Map.put(:last_sync_at, evidence.observed_at)
+      |> Map.put(:freshness_state, "fresh")
+    else
+      merged_attrs
+    end
+  end
+
+  defp same_cycle_sync_refresh?(
+         %Evidence{
+           source_precision: incoming_precision,
+           observed_at: %DateTime{},
+           reset_at: %DateTime{}
+         } = evidence,
+         %Quota.AccountQuotaWindow{observed_at: %DateTime{}, reset_at: %DateTime{}} = existing,
+         timestamp
+       )
+       when incoming_precision in ["observed", "authoritative"] do
+    newer_observation?(evidence.observed_at, existing.observed_at) and
+      Evidence.current_freshness_state(evidence, timestamp) == "fresh" and
+      not Evidence.expired?(existing, timestamp) and
+      DateTime.diff(evidence.reset_at, existing.reset_at, :second) <=
+        @account_snapshot_reset_tolerance_seconds
+  end
+
+  defp same_cycle_sync_refresh?(_evidence, _existing, _timestamp), do: false
 
   defp clear_provider_candidates_after_runtime(
          {:ok, window},
