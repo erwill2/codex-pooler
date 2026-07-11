@@ -37,7 +37,9 @@ if [[ "${1:-}" == "--self-test" ]]; then
   printf '%s\n' 'lib/codex_pooler/upstreams/quota/windows/evidence_store.ex' 'scripts/verification/quota-convergence/run.sh' >"$temp_dir/safe"
   printf '%s\n' 'lib/codex_pooler/upstreams/quota/windows/evidence_store.ex' '.github/workflows/release.yml' >"$temp_dir/unsafe"
   validate_paths "$temp_dir/safe"
-  ! validate_paths "$temp_dir/unsafe"
+  if validate_paths "$temp_dir/unsafe"; then
+    exit 1
+  fi
   printf 'scope self-test passed\n'
   exit 0
 fi
