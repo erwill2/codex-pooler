@@ -512,8 +512,6 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       diff >= -same_cycle_backward_tolerance_seconds(window_minutes)
   end
 
-  defp same_cycle_reset?(_evidence, _existing), do: false
-
   defp same_cycle_backward_tolerance_seconds(window_minutes)
        when is_integer(window_minutes) and window_minutes > 0 do
     window_minutes * 60 + @usage_reset_forward_tolerance_seconds
