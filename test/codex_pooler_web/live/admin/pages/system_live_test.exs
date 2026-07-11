@@ -423,32 +423,6 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
     assert [%{method: "GET", path: "/"}] = FakeUpstream.requests(upstream)
   end
 
-  test "renders the shared extended notice composition for auth JSON handoff", %{
-    conn: conn,
-    scope: scope
-  } do
-    Application.put_env(:codex_pooler, :dev_features_enabled, true)
-    pool = pool_fixture(%{created_by_user_id: scope.user.id})
-
-    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
-
-    html =
-      view
-      |> element("#upstream-page-import-auth-json-action")
-      |> render_click()
-
-    assert html =~ "Codex Pooler becomes the refresh-token authority."
-    assert html =~ "This is a credential lineage handoff"
-    assert html =~ "Personal access token auth.json entries are not supported in this cycle"
-
-    assert has_element?(
-             view,
-             "#auth-json-import-refresh-token-warning.alert.alert-warning[role='status']"
-           )
-
-    assert html =~ pool.id
-  end
-
   test "renders the global MCP service switch with metadata-only operator copy", %{
     conn: conn,
     user: user

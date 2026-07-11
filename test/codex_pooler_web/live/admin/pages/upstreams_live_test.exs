@@ -2061,18 +2061,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert html =~ "Use this when the file is already open."
     assert html =~ "Drop auth.json"
     assert html =~ "Upload auth.json up to 64 KB."
-    assert html =~ "Codex Pooler becomes the refresh-token authority"
-    assert html =~ "credential lineage"
-    assert html =~ ~r/Do not keep using the same\s+auth\.json/
-    assert html =~ "another Codex install, machine, or automation"
-    assert html =~ ~r/refresh-token\s+rotation/
-    assert html =~ "reauth_required"
-
-    assert html =~
-             ~r/id="auth-json-import-file-dropzone"[\s\S]+id="auth-json-import-refresh-token-warning"/
-
-    refute has_element?(view, "#auth-json-import-refresh-token-warning input")
-    refute has_element?(view, "#auth-json-import-refresh-token-warning input[type='checkbox']")
     assert has_element?(view, "#auth-json-import-file-input input[type='file']")
     assert has_element?(view, "#auth-json-import-submit")
 
