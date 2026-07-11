@@ -6,6 +6,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Quotas.WindowClassifier
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Auth.TokenRefresh
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Reconciliation.UsageProbe
   alias CodexPooler.Upstreams.SavedResets
@@ -52,7 +53,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
              quota: quota_step
            }}
         else
-          health_step = record_reconciliation_health!(assignment)
+          health_step = record_reconciliation_health!(assignment, quota_step)
           status = summarize_reconciliation_status([health_step, quota_step])
 
           assignment =
@@ -95,13 +96,27 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
   defp load_active_assignment_with_identity(_pool_id, _assignment_id), do: nil
 
-  defp record_reconciliation_health!(%PoolUpstreamAssignment{} = assignment) do
+  defp record_reconciliation_health!(
+         %PoolUpstreamAssignment{},
+         %{
+           code: "quota_refresh_auth_unavailable",
+           identity: %UpstreamIdentity{status: "reauth_required"}
+         }
+       ) do
+    step_result(
+      :succeeded,
+      "health_preserved",
+      "assignment health was preserved for reauthentication"
+    )
+  end
+
+  defp record_reconciliation_health!(%PoolUpstreamAssignment{} = assignment, quota_step) do
     timestamp = now()
 
     assignment
     |> PoolUpstreamAssignment.changeset(%{
       health_status: @health_active,
-      eligibility_status: @eligible,
+      eligibility_status: eligibility_after_reconciliation(assignment, quota_step),
       last_healthcheck_at: timestamp,
       updated_at: timestamp
     })
@@ -109,6 +124,16 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
     step_result(:succeeded, "health_refreshed", "assignment health refreshed")
   end
+
+  defp eligibility_after_reconciliation(_assignment, %{
+         status: :succeeded,
+         code: "quota_refreshed"
+       }) do
+    @eligible
+  end
+
+  defp eligibility_after_reconciliation(assignment, _quota_step),
+    do: assignment.eligibility_status
 
   defp refresh_reconciliation_quota(identity, assignment, opts) do
     source = reconciliation_quota_source(identity, assignment, opts)
@@ -120,6 +145,9 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
           "quota_refresh_auth_unavailable",
           "quota refresh requires account reauthentication"
         )
+
+      :definitive_provider_auth_rejected ->
+        promote_definitive_provider_auth_rejection(identity)
 
       :usage_unavailable ->
         step_result(:failed, "quota_refresh_unavailable", "quota windows were not available")
@@ -156,6 +184,28 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         identity
         |> codex_usage_quota_windows(assignment, opts)
         |> maybe_reuse_persisted_quota_windows(identity)
+    end
+  end
+
+  defp promote_definitive_provider_auth_rejection(%UpstreamIdentity{} = identity) do
+    windows = Quota.Windows.list_quota_windows(identity)
+    eligibility = Quota.Windows.routing_quota_eligibility_from_windows(windows)
+
+    if eligibility.eligible? do
+      step_result(:failed, "quota_refresh_unavailable", "quota windows were not available")
+    else
+      case TokenRefresh.mark_provider_auth_reauth_required(identity) do
+        {:ok, reauth_identity} ->
+          step_result(
+            :failed,
+            "quota_refresh_auth_unavailable",
+            "quota refresh requires account reauthentication"
+          )
+          |> Map.put(:identity, reauth_identity)
+
+        {:error, reason} ->
+          step_result(:failed, "quota_refresh_failed", safe_error_message(reason))
+      end
     end
   end
 
@@ -288,7 +338,13 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   end
 
   defp codex_usage_quota_windows(%UpstreamIdentity{} = identity, assignment, opts) do
-    UsageProbe.reconciliation_source(identity, assignment, opts)
+    case UsageProbe.reconciliation_source(identity, assignment, opts) do
+      {:usage_unavailable, :definitive_provider_auth_rejected} ->
+        :definitive_provider_auth_rejected
+
+      result ->
+        result
+    end
   end
 
   defp maybe_reuse_persisted_quota_windows(

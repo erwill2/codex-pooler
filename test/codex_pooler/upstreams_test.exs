@@ -4636,6 +4636,84 @@ defmodule CodexPooler.UpstreamsTest do
              ]
     end
 
+    @tag :quota_probe_envelope
+    test "default ChatGPT probing keeps wham first and falls back to Codex after a 404" do
+      upstream =
+        start_path_upstream(%{
+          "/backend-api/wham/usage" => {404, %{}},
+          "/backend-api/codex/usage" => {200, reset_bearing_account_primary_payload()}
+        })
+
+      %{identity: identity, assignment: assignment} = usage_assignment_fixture(upstream)
+
+      assert {:ok, %UsageProbe.Result{usage_path: "/backend-api/codex/usage"}} =
+               UsageProbe.fetch_from_identity(
+                 identity,
+                 assignment,
+                 DateTime.utc_now() |> DateTime.truncate(:second),
+                 []
+               )
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/wham/usage",
+               "/backend-api/codex/usage"
+             ]
+    end
+
+    @tag :quota_probe_envelope
+    test "configured Codex usage paths remain Codex first while retaining wham fallback" do
+      upstream =
+        start_path_upstream(%{
+          "/backend-api/codex/usage" => {200, weekly_only_payload()},
+          "/backend-api/wham/usage" => {200, reset_bearing_account_primary_payload()}
+        })
+
+      %{identity: identity, assignment: assignment} = usage_assignment_fixture(upstream)
+
+      assert {:ok, assignment} =
+               PoolAssignments.update_pool_assignment(assignment, %{
+                 metadata: %{"usage_path" => "/backend-api/codex/usage"}
+               })
+
+      assert {:ok, %UsageProbe.Result{usage_path: "/backend-api/wham/usage"}} =
+               UsageProbe.fetch_from_identity(
+                 identity,
+                 assignment,
+                 DateTime.utc_now() |> DateTime.truncate(:second),
+                 []
+               )
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/codex/usage",
+               "/api/codex/usage",
+               "/backend-api/wham/usage"
+             ]
+    end
+
+    @tag :quota_probe_envelope
+    test "malformed wham data continues to the Codex fallback" do
+      upstream =
+        start_path_upstream(%{
+          "/backend-api/wham/usage" => FakeUpstream.malformed_json(),
+          "/backend-api/codex/usage" => {200, reset_bearing_account_primary_payload()}
+        })
+
+      %{identity: identity, assignment: assignment} = usage_assignment_fixture(upstream)
+
+      assert {:ok, %UsageProbe.Result{usage_path: "/backend-api/codex/usage"}} =
+               UsageProbe.fetch_from_identity(
+                 identity,
+                 assignment,
+                 DateTime.utc_now() |> DateTime.truncate(:second),
+                 []
+               )
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/wham/usage",
+               "/backend-api/codex/usage"
+             ]
+    end
+
     test "provider usage refresh updates reported plan metadata" do
       upstream =
         start_path_upstream(%{
@@ -11054,6 +11132,18 @@ defmodule CodexPooler.UpstreamsTest do
       },
       overrides
     )
+  end
+
+  defp reset_bearing_account_primary_payload do
+    %{
+      "rate_limit" => %{
+        "primary_window" => %{
+          "used_percent" => 12,
+          "limit_window_seconds" => 18_000,
+          "reset_after_seconds" => 900
+        }
+      }
+    }
   end
 
   defp descriptor_weekly_limit(limit_name) do

@@ -64,6 +64,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
 
   defp persist_link_tokens(%Scope{} = scope, %Pool{} = pool, attrs) do
     with {:ok, locked_assignment} <- lock_target_pool_assignment(pool, attrs),
+         recovery_relink? <- reauth_recovery_target?(attrs.target_identity_id),
          {:ok, identity_status, identity} <- upsert_link_identity(scope, attrs),
          {:ok, _secret} <-
            Secrets.store_encrypted_secret(identity, %{
@@ -72,7 +73,14 @@ defmodule CodexPooler.Upstreams.TokenLinking do
            }),
          {:ok, _refresh_secret} <- maybe_store_refresh_token(identity, attrs),
          {:ok, assignment_status, assignment} <-
-           upsert_link_assignment(scope, pool, identity, attrs, locked_assignment) do
+           upsert_link_assignment(
+             scope,
+             pool,
+             identity,
+             attrs,
+             locked_assignment,
+             recovery_relink?
+           ) do
       %{
         status: link_result_status(identity_status, assignment_status),
         identity: Repo.reload!(identity),
@@ -143,7 +151,8 @@ defmodule CodexPooler.Upstreams.TokenLinking do
          %Pool{} = pool,
          %UpstreamIdentity{} = identity,
          attrs,
-         locked_assignment
+         locked_assignment,
+         recovery_relink?
        ) do
     timestamp = now()
 
@@ -156,7 +165,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
       assignment_label: identity.account_label,
       status: @assignment_active,
       health_status: @health_active,
-      eligibility_status: @eligible,
+      eligibility_status: relink_eligibility_status(recovery_relink?),
       cooldown_until: nil,
       disabled_at: nil,
       created_by_user_id: scope.user.id,
@@ -274,6 +283,15 @@ defmodule CodexPooler.Upstreams.TokenLinking do
   end
 
   defp lock_target_pool_assignment(_pool, _attrs), do: {:ok, nil}
+
+  defp reauth_recovery_target?(identity_id) when is_binary(identity_id) do
+    match?(%UpstreamIdentity{status: "reauth_required"}, Repo.get(UpstreamIdentity, identity_id))
+  end
+
+  defp reauth_recovery_target?(_identity_id), do: false
+
+  defp relink_eligibility_status(true), do: PoolUpstreamAssignment.ineligible_status()
+  defp relink_eligibility_status(false), do: @eligible
 
   defp link_result_status(:created, :created), do: :created
   defp link_result_status(_identity_status, _assignment_status), do: :existing

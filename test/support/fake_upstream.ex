@@ -370,7 +370,7 @@ defmodule CodexPooler.FakeUpstream do
     |> Plug.Conn.send_resp(status, Jason.encode!(payload))
   end
 
-  defp respond(_pid, conn, {:path_json, routes}, _request) do
+  defp respond(pid, conn, {:path_json, routes}, request) do
     case Map.get(routes, conn.request_path) do
       {status, payload} ->
         conn
@@ -381,6 +381,9 @@ defmodule CodexPooler.FakeUpstream do
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
         |> Plug.Conn.send_resp(404, Jason.encode!(%{"error" => "not found"}))
+
+      mode ->
+        respond(pid, conn, mode, request)
     end
   end
 

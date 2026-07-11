@@ -428,6 +428,31 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
     reauth_identity
   end
 
+  @doc false
+  @spec mark_provider_auth_reauth_required(UpstreamIdentity.t()) ::
+          {:ok, UpstreamIdentity.t()} | {:error, Ecto.Changeset.t()}
+  def mark_provider_auth_reauth_required(%UpstreamIdentity{} = identity) do
+    timestamp = now()
+
+    identity
+    |> UpstreamIdentity.changeset(%{
+      status: @reauth_required,
+      disabled_at: timestamp,
+      updated_at: timestamp,
+      metadata:
+        put_token_refresh_metadata(identity.metadata, %{
+          "status" => "reauth_required",
+          "trigger_kind" => "account_reconciliation",
+          "completed_at" => DateTime.to_iso8601(timestamp),
+          "reason" => %{
+            "code" => "provider_usage_auth_rejected",
+            "message" => "provider usage authentication was rejected"
+          }
+        })
+    })
+    |> Repo.update()
+  end
+
   defp superseded_finalize_result(%UpstreamIdentity{} = identity) do
     metadata = token_refresh_metadata(identity.metadata)
 

@@ -5053,6 +5053,63 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, warning_selector, "Reinvite account")
   end
 
+  @tag :provider_auth_recovery
+  test "provider auth reauth state alone exposes authorized recovery controls without leaking evidence",
+       %{conn: conn, scope: scope} do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "provider-auth-recovery", name: "Provider Auth Recovery"})
+
+    private_marker = "provider-auth-private-marker-#{System.unique_integer([:positive])}"
+
+    %{identity: reauth_identity} =
+      upstream_assignment_fixture(pool, %{
+        chatgpt_account_id: "acct-provider-auth-recovery",
+        account_label: "Provider auth recovery",
+        identity_status: "reauth_required",
+        identity_metadata: %{
+          "token_refresh" => %{
+            "status" => "reauth_required",
+            "trigger_kind" => "account_reconciliation",
+            "reason" => %{
+              "code" => "provider_usage_auth_rejected",
+              "message" => "provider usage authentication was rejected"
+            }
+          },
+          "private_provider_evidence" => private_marker
+        }
+      })
+
+    %{identity: active_identity} =
+      upstream_assignment_fixture(pool, %{
+        chatgpt_account_id: "acct-provider-auth-active",
+        account_label: "Active provider auth",
+        identity_status: "active"
+      })
+
+    {:ok, view, html} = live(conn, ~p"/admin/upstreams")
+
+    assert has_element?(view, "#upstream-account-#{reauth_identity.id}-reauth-warning")
+
+    assert has_element?(
+             view,
+             "#oauth-relink-upstream-account-#{reauth_identity.id}",
+             "Relink account"
+           )
+
+    assert has_element?(
+             view,
+             "#replace-auth-json-upstream-account-#{reauth_identity.id}",
+             "Replace auth.json"
+           )
+
+    refute has_element?(view, "#oauth-relink-upstream-account-#{active_identity.id}")
+    refute has_element?(view, "#replace-auth-json-upstream-account-#{active_identity.id}")
+    refute html =~ private_marker
+
+    logged_out_conn = Phoenix.ConnTest.build_conn()
+    assert {:error, {:redirect, %{to: "/login"}}} = live(logged_out_conn, ~p"/admin/upstreams")
+  end
+
   @tag :recovery_actions
   @tag :recovery_actions_edge_cases
   test "recovery actions stay safe for no-assignment, deleted, usable auth, and invalid pool cases",

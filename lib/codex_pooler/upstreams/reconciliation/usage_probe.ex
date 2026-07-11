@@ -45,8 +45,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
   @type usage_probe_result ::
           {:ok, Result.t()}
           | :not_found
+          | {:auth_rejected, String.t()}
           | {:continue_error, term()}
           | {:halt_error, term()}
+  @type usage_probe_accumulator ::
+          usage_fetch_result() | {:auth_rejections, MapSet.t(String.t())}
 
   @spec reconciliation_source(UpstreamIdentity.t(), PoolUpstreamAssignment.t(), keyword()) ::
           {:usage, UpstreamIdentity.t(), Result.t()}
@@ -105,14 +108,16 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
     timeout = Keyword.get(opts, :receive_timeout, 30_000)
     headers = usage_headers(access_token, identity.chatgpt_account_id)
 
-    identity
-    |> usage_paths(assignment)
+    paths = usage_paths(identity, assignment)
+
+    paths
     |> Enum.reduce_while({:error, :not_found}, fn path, last_result ->
       base
       |> usage_url(path)
       |> probe_usage_url(identity, headers, observed_at, timeout)
       |> reduce_usage_probe_result(last_result)
     end)
+    |> finalize_usage_probe_result(paths)
   end
 
   defp usage_paths(%UpstreamIdentity{} = identity, %PoolUpstreamAssignment{} = assignment) do
@@ -230,9 +235,29 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
     Req.get(url,
       headers: CloudflareCookies.request_headers(url, headers),
       retry: false,
-      receive_timeout: timeout
+      receive_timeout: timeout,
+      decode_body: false
     )
+    |> decode_usage_response()
   end
+
+  @spec decode_usage_response({:ok, Req.Response.t()} | {:error, term()}) ::
+          {:ok, Req.Response.t()} | {:error, term()}
+  defp decode_usage_response({:ok, %Req.Response{body: body} = response}) do
+    {:ok, %{response | body: decode_response_body(body)}}
+  end
+
+  defp decode_usage_response(result), do: result
+
+  @spec decode_response_body(term()) :: term()
+  defp decode_response_body(body) when is_binary(body) do
+    case Jason.decode(body) do
+      {:ok, decoded} -> decoded
+      _invalid -> body
+    end
+  end
+
+  defp decode_response_body(body), do: body
 
   defp handle_usage_response(
          {:ok, %Req.Response{status: status, body: body} = response},
@@ -245,7 +270,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
        )
        when status in 200..299 do
     CloudflareCookies.store_from_response(url, response)
-    usage_probe_success(body, identity, url, observed_at, timeout, headers)
+
+    case decode_usage_body(body) do
+      {:ok, payload} -> usage_probe_success(payload, identity, url, observed_at, timeout, headers)
+      :error -> {:continue_error, :invalid_usage_payload}
+    end
   end
 
   defp handle_usage_response(
@@ -276,7 +305,12 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
     if html_response?(response) and stored_cookie? and not retried_after_cookie? do
       probe_usage_url(url, identity, headers, observed_at, timeout, true)
     else
-      auth_path_unavailable_response(status, response)
+      auth_path_unavailable_response(
+        status,
+        response,
+        URI.parse(url).path,
+        access_token_refresh_due_after_usage_auth_failure?(identity, observed_at)
+      )
     end
   end
 
@@ -317,14 +351,51 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
        ),
        do: {:halt_error, reason}
 
-  @spec auth_path_unavailable_response(pos_integer(), Req.Response.t()) :: usage_probe_result()
-  defp auth_path_unavailable_response(status, %Req.Response{} = response) do
+  @spec decode_usage_body(term()) :: {:ok, map()} | :error
+  defp decode_usage_body(%{} = payload), do: {:ok, payload}
+
+  defp decode_usage_body(payload) when is_binary(payload) do
+    case Jason.decode(payload) do
+      {:ok, %{} = decoded} -> {:ok, decoded}
+      _invalid -> :error
+    end
+  end
+
+  defp decode_usage_body(_payload), do: :error
+
+  @spec auth_path_unavailable_response(pos_integer(), Req.Response.t(), String.t(), boolean()) ::
+          usage_probe_result()
+  defp auth_path_unavailable_response(status, %Req.Response{} = response, path, refresh_due?) do
     if html_response?(response) do
       :not_found
     else
-      {:halt_error, {:upstream_status, status}}
+      auth_rejected_response(status, path, refresh_due?)
     end
   end
+
+  defp auth_rejected_response(401, _path, true),
+    do: {:halt_error, {:upstream_status, 401}}
+
+  defp auth_rejected_response(401, path, false), do: {:auth_rejected, path}
+
+  defp auth_rejected_response(status, _path, _refresh_due?) do
+    {:halt_error, {:upstream_status, status}}
+  end
+
+  @spec finalize_usage_probe_result(usage_probe_accumulator(), [String.t()]) ::
+          usage_fetch_result()
+  defp finalize_usage_probe_result({:auth_rejections, rejected_paths}, paths) do
+    approved_paths = MapSet.new(@chatgpt_usage_paths)
+
+    if MapSet.equal?(rejected_paths, approved_paths) and
+         MapSet.equal?(MapSet.new(paths), approved_paths) do
+      {:error, :definitive_provider_auth_rejected}
+    else
+      {:error, {:upstream_status, 401}}
+    end
+  end
+
+  defp finalize_usage_probe_result(result, _paths), do: result
 
   @spec html_response?(Req.Response.t()) :: boolean()
   defp html_response?(%Req.Response{body: body} = response) do
@@ -388,9 +459,18 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
     end
   end
 
-  @spec reduce_usage_probe_result(usage_probe_result(), usage_fetch_result()) ::
-          {:cont, usage_fetch_result()} | {:halt, usage_fetch_result()}
+  @spec reduce_usage_probe_result(usage_probe_result(), usage_probe_accumulator()) ::
+          {:cont, usage_probe_accumulator()} | {:halt, usage_probe_accumulator()}
   defp reduce_usage_probe_result(:not_found, last_result), do: {:cont, last_result}
+
+  defp reduce_usage_probe_result({:auth_rejected, _path}, {:ok, %Result{}} = last_result),
+    do: {:halt, last_result}
+
+  defp reduce_usage_probe_result({:auth_rejected, path}, {:auth_rejections, paths}),
+    do: {:cont, {:auth_rejections, MapSet.put(paths, path)}}
+
+  defp reduce_usage_probe_result({:auth_rejected, path}, _last_result),
+    do: {:cont, {:auth_rejections, MapSet.new([path])}}
 
   defp reduce_usage_probe_result({:halt_error, _reason}, {:ok, %Result{}} = last_result),
     do: {:halt, last_result}

@@ -22,6 +22,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   alias CodexPooler.Upstreams.Reconciliation.AccountReconciliation
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+  alias CodexPooler.Upstreams.TokenLinking
 
   import CodexPooler.PoolerFixtures
   import CodexPooler.AccountsFixtures
@@ -302,7 +303,14 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
            }}
         )
 
-      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+      {pool, assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(upstream)},
+          identity_metadata: %{
+            "access_token_expires_at" =>
+              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+          }
+        )
 
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
 
@@ -346,7 +354,14 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
            }}
         )
 
-      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+      {pool, assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(upstream)},
+          identity_metadata: %{
+            "access_token_expires_at" =>
+              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+          }
+        )
 
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
 
@@ -742,9 +757,12 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         [window] = QuotaWindows.list_quota_windows(identity)
         assert window.observed_at == observed_at
 
-        assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
-                 "/backend-api/wham/usage"
-               ]
+        expected_paths =
+          if status == 401,
+            do: ["/backend-api/wham/usage", "/backend-api/codex/usage"],
+            else: ["/backend-api/wham/usage"]
+
+        assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == expected_paths
       end
     end
 
@@ -847,7 +865,8 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert [] = incomplete_token_refresh_jobs(identity.id)
 
       assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
-               "/backend-api/wham/usage"
+               "/backend-api/wham/usage",
+               "/backend-api/codex/usage"
              ]
 
       safe_surfaces = [
@@ -860,6 +879,166 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
         refute surface =~ refresh_token
         refute surface =~ provider_body
       end
+    end
+
+    test "definitive provider usage auth rejection marks only the identity reauth required" do
+      rejected_body = %{"error" => "synthetic-auth-rejected-do-not-leak"}
+      upstream = start_upstream(unavailable_usage_paths(401, rejected_body))
+      healthchecked_at = ~U[2026-07-11 12:00:00.000000Z]
+
+      {pool, assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(upstream)},
+          identity_metadata: %{
+            "base_url" => FakeUpstream.url(upstream),
+            "access_token_expires_at" =>
+              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+          }
+        )
+
+      assignment =
+        assignment
+        |> PoolUpstreamAssignment.changeset(%{
+          health_status: "degraded",
+          eligibility_status: "ineligible",
+          last_healthcheck_at: healthchecked_at,
+          metadata: Map.put(assignment.metadata, "preserved_marker", "preserve-me")
+        })
+        |> Repo.update!()
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :partial
+      assert result.quota.code == "quota_refresh_auth_unavailable"
+      assert result.identity.status == "reauth_required"
+
+      persisted_identity = Repo.get!(UpstreamIdentity, identity.id)
+      assert persisted_identity.status == "reauth_required"
+
+      assert persisted_identity.metadata["token_refresh"]["reason"]["code"] ==
+               "provider_usage_auth_rejected"
+
+      persisted_assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      assert persisted_assignment.status == assignment.status
+      assert persisted_assignment.health_status == assignment.health_status
+      assert persisted_assignment.eligibility_status == assignment.eligibility_status
+      assert persisted_assignment.last_healthcheck_at == healthchecked_at
+      assert persisted_assignment.metadata["preserved_marker"] == "preserve-me"
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+               "/backend-api/wham/usage",
+               "/backend-api/codex/usage"
+             ]
+
+      refute inspect(persisted_identity.metadata) =~ rejected_body["error"]
+      refute inspect(persisted_assignment.metadata) =~ rejected_body["error"]
+    end
+
+    test "provider usage failures short of definitive auth rejection preserve active state" do
+      cases = [
+        {"single_401",
+         %{
+           "/backend-api/wham/usage" => {401, %{"error" => "rejected"}},
+           "/backend-api/codex/usage" => {404, %{}}
+         }},
+        {"html_challenge",
+         %{
+           "/backend-api/wham/usage" => {401, "<html>challenge</html>"},
+           "/backend-api/codex/usage" => {401, "<html>challenge</html>"}
+         }},
+        {"malformed",
+         %{
+           "/backend-api/wham/usage" => {200, %{}},
+           "/backend-api/codex/usage" => {200, %{}}
+         }},
+        {"quota_missing",
+         %{
+           "/backend-api/wham/usage" => {404, %{}},
+           "/backend-api/codex/usage" => {404, %{}}
+         }}
+      ]
+
+      for {case_name, paths} <- cases do
+        upstream = start_upstream({:path_json, paths})
+
+        {pool, assignment} =
+          active_assignment_fixture(
+            %{"base_url" => FakeUpstream.url(upstream)},
+            identity_metadata: %{
+              "access_token_expires_at" =>
+                DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+            }
+          )
+
+        identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+        assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+        assert result.identity.status == "active", case_name
+        assert Repo.get!(UpstreamIdentity, identity.id).status == "active", case_name
+        assert Repo.get!(PoolUpstreamAssignment, assignment.id).status == "active", case_name
+      end
+    end
+
+    test "fresh route-usable account evidence prevents auth rejection promotion" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      upstream = start_upstream(unavailable_usage_paths(401, %{"error" => "rejected"}))
+
+      {pool, assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(upstream)},
+          identity_metadata: %{
+            "access_token_expires_at" =>
+              DateTime.utc_now() |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+          }
+        )
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+      persist_quota_windows!(identity, [persisted_account_primary_window_attrs(observed_at)])
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.identity.status == "active"
+      assert result.quota.code == "quota_refresh_unavailable"
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "active"
+    end
+
+    test "relink keeps recovery assignment ineligible until reconciliation records fresh quota evidence" do
+      {pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+      scope = fixture_scope()
+
+      assert {:ok, reauth_identity} = TokenRefresh.mark_provider_auth_reauth_required(identity)
+      assert reauth_identity.status == "reauth_required"
+
+      assert {:ok, %{identity: linked_identity, assignment: linked_assignment}} =
+               TokenLinking.link_tokens(
+                 scope,
+                 pool,
+                 %{
+                   chatgpt_account_id: identity.chatgpt_account_id,
+                   account_label: identity.account_label,
+                   token: "relinked-access-token"
+                 },
+                 target_identity_id: identity.id
+               )
+
+      assert linked_identity.status == "active"
+      assert linked_assignment.status == "active"
+      assert linked_assignment.health_status == "active"
+      assert linked_assignment.eligibility_status == "ineligible"
+
+      assert {:ok, result} =
+               Upstreams.reconcile_pool_account(pool, linked_assignment,
+                 quota_windows: [persisted_account_primary_window_attrs(DateTime.utc_now())]
+               )
+
+      assert result.status == :succeeded
+      assert result.quota.code == "quota_refreshed"
+
+      recovered_assignment = Repo.get!(PoolUpstreamAssignment, linked_assignment.id)
+      assert recovered_assignment.status == "active"
+      assert recovered_assignment.health_status == "active"
+      assert recovered_assignment.eligibility_status == "eligible"
     end
 
     test "transient account reconciliation token refresh failure does not reuse persisted quota" do
