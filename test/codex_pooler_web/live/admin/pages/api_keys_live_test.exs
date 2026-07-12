@@ -492,8 +492,6 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
   end
 
   defp broadcast_traffic_events(pool_id, count) do
-    test_pid = self()
-
     task =
       Task.async(fn ->
         receive do
@@ -501,15 +499,12 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
             Enum.each(1..count, fn index ->
               broadcast_traffic_event(pool_id, index)
             end)
-
-            send(test_pid, :traffic_events_broadcast)
         end
       end)
 
-    Sandbox.allow(Repo, test_pid, task.pid)
+    Sandbox.allow(Repo, self(), task.pid)
     send(task.pid, :broadcast_traffic_events)
-    assert_receive :traffic_events_broadcast
-    Task.await(task)
+    assert :ok = Task.await(task, 5_000)
   end
 
   defp broadcast_traffic_event(pool_id, index) when rem(index, 2) == 0 do

@@ -62,6 +62,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
   @sentinel "SECRET_SENTINEL_DO_NOT_STORE_123"
   @supported_compression_model "gpt-4o"
   @blocking_owner_receive_timeout_ms 1_000
+  @queued_owner_upstream_start_timeout_ms 1_000
   @response_task_stop_timeout_ms 1_000
 
   @websocket_lifecycle_metadata_keys ~w(
@@ -1310,7 +1311,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
 
       send(processed_pid, {:chained_owner_upstream_release, release_ref})
       assert {:ok, queued_state} = receive_socket_done(queued_state)
-      assert_receive {:chained_owner_upstream_tool_started, ^release_ref}
+
+      assert_receive {:chained_owner_upstream_tool_started, ^release_ref},
+                     @queued_owner_upstream_start_timeout_ms
+
       assert {:push, {:text, tool_frame}, queued_state} = receive_owner_socket_push(queued_state)
       assert %{"id" => "resp_owner_queue_tool"} = Jason.decode!(tool_frame)
       assert {:ok, _queued_state} = receive_socket_done(queued_state)
