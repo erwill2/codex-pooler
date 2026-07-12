@@ -27,6 +27,22 @@ defmodule CodexPooler.Access.APIKeys.PolicyUpdate do
         ) :: api_key_result()
   def update_api_key_with_policy(%Scope{} = scope, %APIKey{} = api_key, attrs)
       when is_map(attrs) do
+    with {:ok, current_api_key} <- Queries.get_api_key(scope, api_key.id) do
+      update_current_api_key_with_policy(scope, current_api_key, attrs)
+    end
+  end
+
+  def update_api_key_with_policy(%Scope{} = scope, api_key_id, attrs)
+      when is_binary(api_key_id) do
+    with {:ok, api_key} <- Queries.get_api_key(scope, api_key_id) do
+      update_current_api_key_with_policy(scope, api_key, attrs)
+    end
+  end
+
+  def update_api_key_with_policy(_scope, _api_key, _attrs),
+    do: {:error, Errors.access_error(:invalid_request, "user scope is required")}
+
+  defp update_current_api_key_with_policy(scope, api_key, attrs) do
     with {:ok, target_pool_id} <- authorize_api_key_update(scope, api_key, attrs),
          {:ok, policy_attrs, policy_inputs} <-
            update_api_key_policy_attrs(scope, target_pool_id, attrs) do
@@ -46,16 +62,6 @@ defmodule CodexPooler.Access.APIKeys.PolicyUpdate do
       end)
     end
   end
-
-  def update_api_key_with_policy(%Scope{} = scope, api_key_id, attrs)
-      when is_binary(api_key_id) do
-    with {:ok, api_key} <- Queries.get_api_key(scope, api_key_id) do
-      update_api_key_with_policy(scope, api_key, attrs)
-    end
-  end
-
-  def update_api_key_with_policy(_scope, _api_key, _attrs),
-    do: {:error, Errors.access_error(:invalid_request, "user scope is required")}
 
   defp authorize_api_key_update(%Scope{} = scope, %APIKey{} = api_key, attrs) do
     target_pool_id = Map.get(attrs, :pool_id) || Map.get(attrs, "pool_id") || api_key.pool_id

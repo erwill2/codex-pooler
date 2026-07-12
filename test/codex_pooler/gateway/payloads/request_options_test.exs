@@ -1,6 +1,7 @@
 defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
   use ExUnit.Case, async: false
 
+  alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.RouteClass
@@ -18,6 +19,42 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
   end
 
   describe "boundary constructors" do
+    test "carries the reasoning decision through payload, websocket, and retargeting paths" do
+      decision = %Decision{
+        mode: :allow_up_to,
+        configured_effort: "high",
+        requested_effort: nil,
+        applied_effort: "medium"
+      }
+
+      options =
+        RequestOptions.build(
+          %{reasoning_effort_decision: decision},
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      assert options.routing.reasoning_effort_decision == decision
+
+      assert options
+             |> RequestOptions.for_payload(
+               "/backend-api/codex/responses/compact",
+               %{"model" => "example-model"}
+             )
+             |> then(&(&1.routing.reasoning_effort_decision == decision))
+
+      assert options
+             |> RequestOptions.for_websocket(%{"model" => "example-model"})
+             |> then(&(&1.routing.reasoning_effort_decision == decision))
+
+      assert options
+             |> RequestOptions.retarget(
+               "/backend-api/codex/responses/compact",
+               %{"model" => "example-model"}
+             )
+             |> then(&(&1.routing.reasoning_effort_decision == decision))
+    end
+
     test "from_conn_metadata keeps request metadata and classifies payload routes" do
       options =
         RequestOptions.from_conn_metadata(

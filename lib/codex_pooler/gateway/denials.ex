@@ -8,6 +8,8 @@ defmodule CodexPooler.Gateway.Denials do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.SessionContinuity
 
+  @known_reasoning_efforts ~w(none minimal low medium high xhigh max ultra)
+
   @pinned_continuation_reauth_operator_action "reauthenticate the pinned upstream account and restart the client without continuation anchors"
   @pinned_continuation_unavailable_operator_action "wait for the pinned upstream to recover, then restart the client without continuation anchors"
 
@@ -138,11 +140,25 @@ defmodule CodexPooler.Gateway.Denials do
     %{
       "code" => reason_code,
       "message" => message,
-      "param" => Map.get(reason, :param)
+      "param" => Map.get(reason, :param),
+      "reasoning_policy" => safe_reasoning_policy(Map.get(reason, :reasoning_policy))
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()
   end
+
+  defp safe_reasoning_policy(policy) when is_map(policy) do
+    policy
+    |> Map.take([:policy_mode, :configured_effort, :requested_effort, :applied_effort])
+    |> Map.update(:requested_effort, nil, &safe_requested_effort/1)
+    |> Map.new(fn {key, value} -> {to_string(key), value} end)
+  end
+
+  defp safe_reasoning_policy(_policy), do: nil
+
+  defp safe_requested_effort(value) when value in @known_reasoning_efforts, do: value
+  defp safe_requested_effort(nil), do: nil
+  defp safe_requested_effort(_value), do: "unknown"
 
   defp request_options(%RequestOptions{} = request_options, endpoint, payload),
     do: RequestOptions.for_payload(request_options, endpoint, payload)

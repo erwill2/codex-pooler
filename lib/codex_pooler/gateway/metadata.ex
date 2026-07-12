@@ -27,10 +27,19 @@ defmodule CodexPooler.Gateway.Metadata do
       pricing_buckets = Catalog.pricing_buckets_by_identifier(visibility.visible_models)
 
       models =
-        Enum.map(
-          visibility.visible_models,
-          &ModelMetadata.codex_model_payload(&1, pricing_buckets)
-        )
+        Enum.map(visibility.visible_models, fn model ->
+          {reasoning_levels, reasoning_default} =
+            ModelMetadata.reasoning_level_maps_and_default(model)
+
+          reasoning_projection =
+            Access.project_reasoning_effort_metadata(
+              auth.api_key,
+              reasoning_levels,
+              reasoning_default
+            )
+
+          ModelMetadata.codex_model_payload(model, pricing_buckets, reasoning_projection)
+        end)
 
       {:ok, %{status: 200, headers: json_headers(), body: %{"models" => models}}}
     end

@@ -111,6 +111,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :public_openai_chat_stream,
     :public_openai_responses_stream,
     :quota_decision,
+    :reasoning_effort_decision,
     :receive_timeout,
     :receive_timeout_ms,
     :reconnect_window_seconds,
@@ -409,6 +410,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       file_affinity_assignment_id: Map.get(opts, :file_affinity_assignment_id),
       prompt_cache_key: prompt_cache_key(opts, endpoint, payload),
       quota_decision: Map.get(opts, :quota_decision),
+      reasoning_effort_decision: Map.get(opts, :reasoning_effort_decision),
       routing_attempt_metadata: Map.get(opts, :routing_attempt_metadata),
       routing_circuit_state: Map.get(opts, :routing_circuit_state),
       use_responses_lite?: Map.get(opts, :use_responses_lite?, false) == true
@@ -509,7 +511,9 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   defp reasoning_effort_metadata_envelope(snapshot) when is_map(snapshot) do
     snapshot =
       snapshot
-      |> Map.take(~w(requested_effort applied_effort effective_effort source rewrite))
+      |> Map.take(
+        ~w(policy_mode configured_effort requested_effort applied_effort effective_effort source rewrite)
+      )
       |> Enum.reject(fn {_key, value} ->
         is_nil(value) or (is_binary(value) and String.trim(value) == "")
       end)

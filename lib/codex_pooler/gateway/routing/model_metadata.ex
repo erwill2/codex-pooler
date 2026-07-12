@@ -3,9 +3,11 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
   Codex-compatible model metadata and capability helpers for gateway routing.
   """
 
+  alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.MetadataProjection
   alias CodexPooler.Catalog
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Payloads.ReasoningEffort
 
   @short_context_price_bucket "short_context"
   @long_context_price_bucket "long_context"
@@ -36,7 +38,11 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
   @type pricing_buckets :: Catalog.pricing_bucket_map()
 
   @spec codex_model_payload(Model.t(), pricing_buckets()) :: map()
-  def codex_model_payload(%Model{} = model, pricing_buckets) do
+  def codex_model_payload(%Model{} = model, pricing_buckets),
+    do: codex_model_payload(model, pricing_buckets, nil)
+
+  @spec codex_model_payload(Model.t(), pricing_buckets(), MetadataProjection.t() | nil) :: map()
+  def codex_model_payload(%Model{} = model, pricing_buckets, reasoning_projection) do
     metadata =
       model
       |> metadata()
@@ -47,8 +53,10 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
         "slug" => model.exposed_model_id,
         "display_name" => model.display_name,
         "description" => metadata["description"] || model.display_name,
-        "default_reasoning_level" => default_reasoning_level(model, metadata),
-        "supported_reasoning_levels" => supported_reasoning_levels(model, metadata),
+        "default_reasoning_level" =>
+          projected_default_reasoning_level(reasoning_projection, model, metadata),
+        "supported_reasoning_levels" =>
+          projected_reasoning_levels(reasoning_projection, model, metadata),
         "shell_type" => "shell_command",
         "visibility" => "list",
         "priority" => int_metadata(metadata, "priority", 0),
@@ -105,6 +113,22 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
     end
   end
 
+  defp projected_default_reasoning_level(
+         %MetadataProjection{default_effort: default_effort},
+         _model,
+         _metadata
+       ),
+       do: default_effort
+
+  defp projected_default_reasoning_level(nil, model, metadata),
+    do: default_reasoning_level(model, metadata)
+
+  defp projected_reasoning_levels(%MetadataProjection{levels: levels}, _model, _metadata),
+    do: levels
+
+  defp projected_reasoning_levels(nil, model, metadata),
+    do: supported_reasoning_levels(model, metadata)
+
   @spec default_reasoning_level(Model.t(), metadata()) :: String.t() | nil
   def default_reasoning_level(%Model{supports_reasoning: true}, metadata) do
     string_metadata(metadata, "default_reasoning_level") ||
@@ -129,6 +153,35 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
 
   def supported_reasoning_levels(%Model{}, _metadata), do: []
 
+  @spec reasoning_levels_and_default(Model.t()) :: {[String.t()], String.t() | nil}
+  def reasoning_levels_and_default(%Model{} = model) do
+    metadata = metadata(model)
+
+    levels =
+      model
+      |> supported_reasoning_levels(metadata)
+      |> Enum.map(&Map.fetch!(&1, "effort"))
+
+    {levels, default_reasoning_level(model, metadata)}
+  end
+
+  @spec reasoning_level_maps_and_default(Model.t()) :: {[map()], String.t() | nil}
+  def reasoning_level_maps_and_default(%Model{} = model) do
+    metadata = metadata(model)
+
+    {effective_reasoning_level_maps(model, metadata),
+     canonical_default_reasoning_level(model, metadata)}
+  end
+
+  defp canonical_default_reasoning_level(%Model{} = model, metadata) do
+    model
+    |> default_reasoning_level(metadata)
+    |> case do
+      value when is_binary(value) -> clean_reasoning_level(value)
+      nil -> nil
+    end
+  end
+
   defp fallback_reasoning_levels do
     [
       %{"effort" => "low", "description" => "low"},
@@ -137,6 +190,46 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
       %{"effort" => "xhigh", "description" => "xhigh"}
     ]
   end
+
+  defp effective_reasoning_level_maps(%Model{supports_reasoning: true}, metadata) do
+    case reasoning_level_maps(metadata) do
+      [] -> fallback_reasoning_levels()
+      levels -> levels
+    end
+  end
+
+  defp effective_reasoning_level_maps(%Model{}, _metadata), do: []
+
+  defp reasoning_level_maps(metadata) do
+    metadata
+    |> metadata_values(["supported_reasoning_levels", "reasoning_efforts"])
+    |> Enum.map(&reasoning_level_map/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq_by(&Map.fetch!(&1, "effort"))
+  end
+
+  defp reasoning_level_map(%{"effort" => effort} = level) when is_binary(effort) do
+    case clean_reasoning_level(effort) do
+      nil -> nil
+      canonical_effort -> Map.put(level, "effort", canonical_effort)
+    end
+  end
+
+  defp reasoning_level_map(%{effort: effort} = level) when is_binary(effort) do
+    case clean_reasoning_level(effort) do
+      nil -> nil
+      canonical_effort -> level |> Map.delete(:effort) |> Map.put("effort", canonical_effort)
+    end
+  end
+
+  defp reasoning_level_map(value) when is_binary(value) do
+    case clean_reasoning_level(value) do
+      nil -> nil
+      effort -> %{"effort" => effort, "description" => effort}
+    end
+  end
+
+  defp reasoning_level_map(_value), do: nil
 
   defp reasoning_level_values(metadata) do
     metadata
@@ -158,7 +251,7 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
   defp clean_reasoning_level(value) do
     case String.trim(value) do
       "" -> nil
-      effort -> effort
+      effort -> ReasoningEffort.normalize_known(effort) || effort
     end
   end
 

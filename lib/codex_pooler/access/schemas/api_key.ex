@@ -8,7 +8,11 @@ defmodule CodexPooler.Access.APIKey do
   @reasoning_efforts ~w(none minimal low medium high xhigh max ultra)
   @service_tiers ~w(auto default flex priority scale)
 
-  @type t :: %__MODULE__{}
+  @type reasoning_effort :: String.t()
+  @type t :: %__MODULE__{
+          enforced_reasoning_effort: reasoning_effort() | nil,
+          maximum_reasoning_effort: reasoning_effort() | nil
+        }
   @type attrs :: map()
 
   schema "api_keys" do
@@ -22,6 +26,7 @@ defmodule CodexPooler.Access.APIKey do
     field :allowed_model_identifiers, {:array, :string}
     field :enforced_model_identifier, :string
     field :enforced_reasoning_effort, :string
+    field :maximum_reasoning_effort, :string
     field :enforced_service_tier, :string
     field :metadata, :map, default: %{}
     field :created_by_user_id, :binary_id
@@ -43,6 +48,7 @@ defmodule CodexPooler.Access.APIKey do
       :allowed_model_identifiers,
       :enforced_model_identifier,
       :enforced_reasoning_effort,
+      :maximum_reasoning_effort,
       :enforced_service_tier,
       :metadata,
       :created_by_user_id,
@@ -58,10 +64,19 @@ defmodule CodexPooler.Access.APIKey do
     |> validate_string_list(:allowed_model_identifiers)
     |> validate_model_identifier(:enforced_model_identifier)
     |> validate_inclusion(:enforced_reasoning_effort, @reasoning_efforts)
+    |> validate_inclusion(:maximum_reasoning_effort, @reasoning_efforts)
+    |> validate_reasoning_effort_policy_mutual_exclusion()
     |> validate_inclusion(:enforced_service_tier, @service_tiers)
     |> validate_metadata_shape()
     |> unique_constraint(:key_prefix, name: :api_keys_prefix_uq)
     |> unique_constraint(:key_hash, name: :api_keys_hash_uq)
+    |> check_constraint(:maximum_reasoning_effort,
+      name: :api_keys_maximum_reasoning_effort_check
+    )
+    |> check_constraint(:maximum_reasoning_effort,
+      name: :api_keys_reasoning_effort_policy_mutual_exclusion_check,
+      message: "cannot be set when exact reasoning effort is enforced"
+    )
   end
 
   defp normalize_model_identifiers(nil), do: nil
@@ -108,6 +123,21 @@ defmodule CodexPooler.Access.APIKey do
         [{field, "must be a non-empty model identifier without whitespace"}]
       end
     end)
+  end
+
+  defp validate_reasoning_effort_policy_mutual_exclusion(changeset) do
+    if get_field(changeset, :enforced_reasoning_effort) &&
+         get_field(changeset, :maximum_reasoning_effort) do
+      add_error(
+        changeset,
+        :maximum_reasoning_effort,
+        "cannot be set when exact reasoning effort is enforced",
+        constraint: :check,
+        constraint_name: :api_keys_reasoning_effort_policy_mutual_exclusion_check
+      )
+    else
+      changeset
+    end
   end
 
   defp validate_metadata_shape(changeset) do

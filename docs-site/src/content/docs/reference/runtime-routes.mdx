@@ -397,7 +397,44 @@ Supported work is translated into Codex-compatible requests and then routed thro
 or non-string context values fail before dispatch with
 `param: "reasoning.context"`.
 
-Reasoning effort values can come from the client request or API key policy. Policy may enforce `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`; `none` is sent as no requested reasoning effort, while an unset policy leaves the client value unchanged. Backend Codex compatibility normalization may rewrite some accepted values for the upstream target, and Request logs expose safe requested, applied, and effective reasoning metadata.
+Reasoning effort values can come from the client request or API-key policy. The
+policy is derived from its configured fields:
+
+1. **Unrestricted** preserves the current route behavior. Omission stays
+   absent, and any currently accepted explicit effort, including a custom
+   value, passes through this policy.
+2. **Allow up to** permits only known efforts at or below the selected ceiling:
+   `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
+   The selected model's effective known levels narrow the permitted set. An
+   omitted effort resolves to the permitted model default, or the highest
+   permitted known effort.
+3. **Always use** applies the legacy exact configured effort. It remains
+   compatible even when the configured effort is absent from model metadata.
+
+Allow up to never clamps or downgrades a request. An above-ceiling, unknown, or
+custom effort, or an omission with no permitted effort, returns `400` with code
+`reasoning_effort_not_allowed` and message
+`reasoning effort is not available for this API key` before reservation or
+upstream dispatch. Responses, backend Responses, and compact routes return
+`param: "reasoning.effort"`; Chat Completions returns
+`param: "reasoning_effort"`. API-key model denial remains first and returns the
+existing `403 model_not_allowed` response.
+
+The same policy runs after websocket upgrade for every `response.create` frame.
+A forbidden frame uses the existing websocket error frame with the same status,
+code, message, and route-native parameter. The connection is not rejected at
+upgrade time.
+
+Authenticated backend Codex model metadata reflects the policy. Unrestricted
+keeps the current levels and default. Allow up to filters to permitted known
+levels and a permitted default. Always use advertises its singleton only when it
+is model-effective, otherwise it returns no levels and no default. Models stay
+visible, and public `/v1/models` remains unchanged.
+
+`minimal` and `ultra` remain distinct for policy evaluation. Backend Codex
+compatibility rewrites them to `low` and `max` respectively before upstream
+dispatch. Safe reasoning summaries retain requested, applied, and effective
+values.
 
 Non-strict function tool schemas are lowered before local validation and
 upstream dispatch for backend Responses HTTP, backend Responses websocket

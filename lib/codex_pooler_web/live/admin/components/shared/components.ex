@@ -659,6 +659,7 @@ defmodule CodexPoolerWeb.Admin.Components do
 
   defp action_button_class(:primary, :md), do: "btn btn-primary w-full gap-2 px-5 sm:w-auto"
   defp action_button_class(:primary, :sm), do: "btn btn-primary btn-sm gap-2"
+
   defp action_button_class(:danger, _size), do: "btn btn-error btn-outline btn-sm gap-2"
   defp action_button_class(_variant, _size), do: "btn btn-secondary btn-sm gap-2"
 

@@ -1,9 +1,11 @@
 defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
   @moduledoc false
 
+  alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.OpenAICompatibility.Error
   alias CodexPooler.Gateway.Payloads.DebugPayloadSummary
+  alias CodexPooler.Gateway.Payloads.ReasoningEffort
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.ToolResultShape
   alias CodexPooler.Gateway.Payloads.ToolSchemaLowering
@@ -355,8 +357,19 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
     policy = request_options.routing.api_key_policy || %{}
 
     payload
-    |> apply_enforced_reasoning_effort(Map.get(policy, :enforced_reasoning_effort))
+    |> apply_reasoning_effort_decision(
+      request_options.routing.reasoning_effort_decision,
+      Map.get(policy, :enforced_reasoning_effort)
+    )
     |> apply_enforced_service_tier(Map.get(policy, :enforced_service_tier))
+  end
+
+  defp apply_reasoning_effort_decision(payload, %Decision{applied_effort: effort}, _legacy_effort) do
+    apply_enforced_reasoning_effort(payload, effort)
+  end
+
+  defp apply_reasoning_effort_decision(payload, nil, legacy_effort) do
+    apply_enforced_reasoning_effort(payload, legacy_effort)
   end
 
   defp apply_enforced_reasoning_effort(payload, effort) when is_binary(effort) do
@@ -388,11 +401,11 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
   defp normalize_client_reasoning_effort(payload) do
     case payload do
       %{"reasoning" => %{"effort" => effort} = reasoning} when is_binary(effort) ->
-        if String.downcase(String.trim(effort)) == "minimal" do
-          Map.put(payload, "reasoning", Map.put(reasoning, "effort", "low"))
-        else
-          payload
-        end
+        Map.put(
+          payload,
+          "reasoning",
+          Map.put(reasoning, "effort", ReasoningEffort.rewrite_client_upstream(effort))
+        )
 
       _payload ->
         payload
@@ -402,11 +415,11 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
   defp normalize_backend_codex_reasoning_effort(payload) do
     case payload do
       %{"reasoning" => %{"effort" => effort} = reasoning} when is_binary(effort) ->
-        if String.downcase(String.trim(effort)) == "ultra" do
-          Map.put(payload, "reasoning", Map.put(reasoning, "effort", "max"))
-        else
-          payload
-        end
+        Map.put(
+          payload,
+          "reasoning",
+          Map.put(reasoning, "effort", ReasoningEffort.rewrite_backend_upstream(effort))
+        )
 
       _payload ->
         payload
@@ -426,7 +439,11 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
          effective_effort,
          request_options
        ) do
+    decision = request_options.routing.reasoning_effort_decision
+
     %{}
+    |> maybe_put_reasoning_snapshot("policy_mode", decision_mode(decision))
+    |> maybe_put_reasoning_snapshot("configured_effort", decision_configured_effort(decision))
     |> maybe_put_reasoning_snapshot("requested_effort", requested_effort)
     |> maybe_put_reasoning_snapshot("applied_effort", applied_effort)
     |> maybe_put_reasoning_snapshot("effective_effort", effective_effort)
@@ -440,6 +457,18 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
     )
   end
 
+  defp reasoning_effort_source(requested_effort, %RequestOptions{
+         routing: %{reasoning_effort_decision: %Decision{mode: :unrestricted}}
+       }) do
+    reasoning_effort_client_source(requested_effort)
+  end
+
+  defp reasoning_effort_source(_requested_effort, %RequestOptions{
+         routing: %{reasoning_effort_decision: %Decision{mode: mode}}
+       })
+       when mode in [:allow_up_to, :always_use],
+       do: "api_key_policy"
+
   defp reasoning_effort_source(requested_effort, %RequestOptions{} = request_options) do
     policy = request_options.routing.api_key_policy || %{}
 
@@ -452,6 +481,12 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
 
   defp reasoning_effort_client_source(effort) when is_binary(effort), do: "client"
   defp reasoning_effort_client_source(_effort), do: nil
+
+  defp decision_mode(%Decision{mode: mode}), do: Atom.to_string(mode)
+  defp decision_mode(nil), do: nil
+
+  defp decision_configured_effort(%Decision{configured_effort: effort}), do: effort
+  defp decision_configured_effort(nil), do: nil
 
   defp reasoning_effort_rewrite(applied_effort, effective_effort) do
     case {normalize_effort_for_compare(applied_effort),
@@ -494,7 +529,9 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
   defp maybe_strip_unsupported_upstream_fields(payload, _endpoint), do: payload
 
   defp normalize_reasoning_aliases(payload) do
+    canonical_effort = ReasoningEffort.extract_native(payload)
     {reasoning_effort, payload} = pop_first(payload, ["reasoning_effort", "reasoningEffort"])
+    payload = Map.drop(payload, ["reasoning_effort", "reasoningEffort"])
     {reasoning_summary, payload} = pop_first(payload, ["reasoning_summary", "reasoningSummary"])
     {thinking, payload} = Map.pop(payload, "thinking")
     {enable_thinking, payload} = Map.pop(payload, "enable_thinking")
@@ -512,10 +549,17 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
         alias_reasoning -> merge_reasoning_alias(reasoning, alias_reasoning)
       end
 
+    reasoning = put_canonical_reasoning_effort(reasoning, canonical_effort)
+
     if reasoning == %{},
       do: Map.delete(payload, "reasoning"),
       else: Map.put(payload, "reasoning", reasoning)
   end
+
+  defp put_canonical_reasoning_effort(reasoning, nil), do: Map.delete(reasoning, "effort")
+
+  defp put_canonical_reasoning_effort(reasoning, effort),
+    do: Map.put(reasoning, "effort", effort)
 
   defp pop_first(payload, keys) do
     Enum.reduce_while(keys, {nil, payload}, fn key, {_value, payload} ->

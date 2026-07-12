@@ -122,6 +122,8 @@ defmodule CodexPooler.MCP.Tools.PoolMetadata.ApiKeys do
       allowed_model_identifiers: api_key.allowed_model_identifiers,
       enforced_model_identifier: api_key.enforced_model_identifier,
       enforced_reasoning_effort: api_key.enforced_reasoning_effort,
+      maximum_reasoning_effort: api_key.maximum_reasoning_effort,
+      reasoning_policy_mode: to_string(policy.reasoning_policy_mode),
       enforced_service_tier: api_key.enforced_service_tier,
       created_by_user_id: api_key.created_by_user_id,
       created_at: Common.timestamp(api_key.created_at),

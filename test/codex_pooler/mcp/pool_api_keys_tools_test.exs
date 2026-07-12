@@ -8,7 +8,15 @@ defmodule CodexPooler.MCP.PoolApiKeysToolsTest do
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.InstanceSettings
   alias CodexPooler.MCP
-  alias CodexPooler.MCP.{OperatorMCPKey, OperatorMCPSettings, Redaction, ToolDispatch}
+
+  alias CodexPooler.MCP.{
+    OperatorMCPKey,
+    OperatorMCPSettings,
+    PrivacyMatrix,
+    Redaction,
+    ToolDispatch
+  }
+
   alias CodexPooler.Repo
 
   setup do
@@ -83,6 +91,8 @@ defmodule CodexPooler.MCP.PoolApiKeysToolsTest do
     assert presented["key_prefix"] == api_key.key_prefix
     assert presented["allowed_model_identifiers"] == ["gpt-task-7"]
     assert presented["enforced_reasoning_effort"] == "minimal"
+    assert presented["reasoning_policy_mode"] == "always_use"
+    refute Map.has_key?(presented, "maximum_reasoning_effort")
     assert presented["policy_summary"]["count"] == 1
 
     refute inspect(result) =~ raw_key
@@ -92,6 +102,45 @@ defmodule CodexPooler.MCP.PoolApiKeysToolsTest do
     refute inspect(result) =~ "key_hash"
     refute inspect(result) =~ "raw_pool_api_key"
     assert :ok = Redaction.assert_mcp_output_safe!(result)
+  end
+
+  test "Pool API key metadata exposes derived maximum policy without arbitrary metadata", %{
+    auth: auth,
+    owner: owner
+  } do
+    pool = pool_fixture(%{name: "Maximum Policy Pool"})
+    metadata_sentinel = Redaction.forbidden_sentinel!(:raw_metadata)
+
+    assert {:ok, %{api_key: api_key}} =
+             Access.create_api_key(Scope.for_user(owner), pool, %{
+               display_name: "Maximum reasoning key",
+               maximum_reasoning_effort: "high",
+               metadata: %{"arbitrary_policy" => metadata_sentinel}
+             })
+
+    assert {:ok, result} =
+             ToolDispatch.call(
+               "codex_pooler_get_pool_api_key",
+               %{"selector" => api_key.key_prefix},
+               %{auth: auth}
+             )
+
+    item = result["structuredContent"]["item"]
+    assert item["reasoning_policy_mode"] == "allow_up_to"
+    assert item["maximum_reasoning_effort"] == "high"
+    refute Map.has_key?(item, "enforced_reasoning_effort")
+    refute inspect(result) =~ metadata_sentinel
+    refute inspect(result) =~ "arbitrary_policy"
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+  end
+
+  test "request-log MCP privacy projection does not expand with API key policy fields" do
+    assert PrivacyMatrix.project!(:request_logs, %{
+             reasoning_policy_mode: "allow_up_to",
+             configured_effort: "high",
+             maximum_reasoning_effort: "high",
+             enforced_reasoning_effort: "medium"
+           }) == %{}
   end
 
   test "gets one Pool API key by prefix", %{auth: auth} do

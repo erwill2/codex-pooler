@@ -214,18 +214,12 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
         </span>
       </div>
 
-      <div class="grid gap-4 md:grid-cols-3">
+      <div class="grid gap-4 md:grid-cols-2">
         <.input
           field={@form[:enforced_model_identifier]}
           type="select"
           label="Enforced model"
           options={@enforced_model_options}
-        />
-        <.input
-          field={@form[:enforced_reasoning_effort]}
-          type="select"
-          label="Enforced reasoning effort"
-          options={@reasoning_effort_options}
         />
         <.input
           field={@form[:enforced_service_tier]}
@@ -234,6 +228,53 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           options={@service_tier_options}
         />
       </div>
+      <fieldset
+        id="api-key-reasoning-policy"
+        aria-describedby="api-key-reasoning-policy-help"
+        class="grid gap-3 rounded-box border border-base-300 bg-base-100 p-4"
+      >
+        <legend class="px-1 font-semibold text-base-content">Reasoning effort policy</legend>
+        <p id="api-key-reasoning-policy-help" class="text-sm leading-6 text-base-content/60">
+          Leave requests unchanged, set a ceiling, or always send one effort.
+        </p>
+        <div class="grid gap-2 sm:grid-cols-3">
+          <.reasoning_policy_mode
+            id="api_key_reasoning_policy_mode_unrestricted"
+            field={@form[:reasoning_policy_mode]}
+            value="unrestricted"
+            label="Unrestricted"
+            description="Keep request values unchanged."
+          />
+          <.reasoning_policy_mode
+            id="api_key_reasoning_policy_mode_allow_up_to"
+            field={@form[:reasoning_policy_mode]}
+            value="allow_up_to"
+            label="Allow up to"
+            description="Permit request values through a selected ceiling."
+          />
+          <.reasoning_policy_mode
+            id="api_key_reasoning_policy_mode_always_use"
+            field={@form[:reasoning_policy_mode]}
+            value="always_use"
+            label="Always use"
+            description="Replace every request value with one effort."
+          />
+        </div>
+        <.input
+          :if={field_string_value(@form[:reasoning_policy_mode]) == "allow_up_to"}
+          field={@form[:maximum_reasoning_effort]}
+          type="select"
+          label="Maximum reasoning effort"
+          options={@reasoning_effort_options}
+        />
+        <.input
+          :if={field_string_value(@form[:reasoning_policy_mode]) == "always_use"}
+          field={@form[:enforced_reasoning_effort]}
+          type="select"
+          label="Enforced reasoning effort"
+          options={@reasoning_effort_options}
+        />
+      </fieldset>
       <div
         :if={@selector_state.enforced_unavailable_warning}
         id="api-key-enforced-model-warning"
@@ -412,6 +453,35 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           <span class="font-semibold text-base-content">{@label}</span>
           <span class="text-sm leading-5 text-base-content/60">{@description}</span>
         </span>
+      </span>
+    </label>
+    """
+  end
+
+  attr :id, :string, required: true
+  attr :field, :any, required: true
+  attr :value, :string, required: true
+  attr :label, :string, required: true
+  attr :description, :string, required: true
+
+  defp reasoning_policy_mode(assigns) do
+    ~H"""
+    <label class={[
+      "flex min-w-0 cursor-pointer items-start gap-3 rounded-box border p-3 transition-colors hover:bg-base-200",
+      field_string_value(@field) == @value && "border-primary bg-primary/10",
+      field_string_value(@field) != @value && "border-base-300 bg-base-100"
+    ]}>
+      <input
+        id={@id}
+        type="radio"
+        class="radio radio-primary radio-sm mt-1"
+        name={@field.name}
+        value={@value}
+        checked={field_string_value(@field) == @value}
+      />
+      <span class="grid gap-1">
+        <span class="font-semibold text-base-content">{@label}</span>
+        <span class="text-sm leading-5 text-base-content/60">{@description}</span>
       </span>
     </label>
     """

@@ -43,13 +43,15 @@ defmodule CodexPooler.Access.APIKeys.Policy do
     with {:ok, allowed_model_identifiers} <- normalize_model_mode(attrs),
          {:ok, enforced_model_identifier} <- normalize_enforced_model(attrs),
          :ok <- validate_enforced_model_mode(allowed_model_identifiers, enforced_model_identifier),
-         {:ok, enforced_reasoning_effort} <- normalize_enforced_reasoning_effort(attrs),
+         {:ok, enforced_reasoning_effort, maximum_reasoning_effort} <-
+           normalize_reasoning_policy(attrs),
          {:ok, enforced_service_tier} <- normalize_enforced_service_tier(attrs) do
       {:ok,
        %{
          allowed_model_identifiers: allowed_model_identifiers,
          enforced_model_identifier: enforced_model_identifier,
          enforced_reasoning_effort: enforced_reasoning_effort,
+         maximum_reasoning_effort: maximum_reasoning_effort,
          enforced_service_tier: enforced_service_tier
        }}
     end
@@ -103,7 +105,8 @@ defmodule CodexPooler.Access.APIKeys.Policy do
            ),
          {:ok, enforced_model_identifier} <- normalize_enforced_model(source),
          :ok <- validate_enforced_model_mode(allowed_model_identifiers, enforced_model_identifier),
-         {:ok, enforced_reasoning_effort} <- normalize_enforced_reasoning_effort(source),
+         {:ok, enforced_reasoning_effort, maximum_reasoning_effort} <-
+           normalize_reasoning_policy(source),
          {:ok, enforced_service_tier} <- normalize_enforced_service_tier(source),
          {:ok, metadata} <- normalize_metadata(input(source, [:metadata, "metadata"])) do
       {:ok,
@@ -113,6 +116,9 @@ defmodule CodexPooler.Access.APIKeys.Policy do
          allowed_model_identifiers: allowed_model_identifiers,
          enforced_model_identifier: enforced_model_identifier,
          enforced_reasoning_effort: enforced_reasoning_effort,
+         maximum_reasoning_effort: maximum_reasoning_effort,
+         reasoning_policy_mode:
+           reasoning_policy_mode(enforced_reasoning_effort, maximum_reasoning_effort),
          enforced_service_tier: enforced_service_tier,
          metadata: metadata
        }}
@@ -261,6 +267,37 @@ defmodule CodexPooler.Access.APIKeys.Policy do
       "enforced_reasoning_effort is invalid"
     )
   end
+
+  defp normalize_maximum_reasoning_effort(attrs) do
+    normalize_enforced_enum(
+      input(attrs, [:maximum_reasoning_effort, "maximum_reasoning_effort"]),
+      @reasoning_efforts,
+      "maximum_reasoning_effort is invalid"
+    )
+  end
+
+  defp normalize_reasoning_policy(attrs) do
+    with {:ok, enforced} <- normalize_enforced_reasoning_effort(attrs),
+         {:ok, maximum} <- normalize_maximum_reasoning_effort(attrs),
+         :ok <- validate_reasoning_policy_exclusivity(enforced, maximum) do
+      {:ok, enforced, maximum}
+    end
+  end
+
+  defp validate_reasoning_policy_exclusivity(enforced, maximum)
+       when is_binary(enforced) and is_binary(maximum),
+       do:
+         {:error,
+          access_error(
+            :invalid_policy,
+            "enforced_reasoning_effort and maximum_reasoning_effort cannot both be configured"
+          )}
+
+  defp validate_reasoning_policy_exclusivity(_enforced, _maximum), do: :ok
+
+  defp reasoning_policy_mode(nil, nil), do: :unrestricted
+  defp reasoning_policy_mode(nil, maximum) when is_binary(maximum), do: :allow_up_to
+  defp reasoning_policy_mode(enforced, nil) when is_binary(enforced), do: :always_use
 
   defp normalize_enforced_service_tier(attrs) do
     normalize_enforced_enum(

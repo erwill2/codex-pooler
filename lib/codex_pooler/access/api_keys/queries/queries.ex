@@ -167,11 +167,33 @@ defmodule CodexPooler.Access.APIKeys.Queries do
         model_mode: Policy.allow_list_mode(api_key.allowed_model_identifiers, :models),
         enforced_model_identifier: api_key.enforced_model_identifier,
         enforced_reasoning_effort: api_key.enforced_reasoning_effort,
+        maximum_reasoning_effort: api_key.maximum_reasoning_effort,
+        reasoning_policy_mode: reasoning_policy_mode(api_key),
         enforced_service_tier: api_key.enforced_service_tier
       },
       policy_bindings: bindings
     }
   end
+
+  defp reasoning_policy_mode(%APIKey{
+         enforced_reasoning_effort: nil,
+         maximum_reasoning_effort: nil
+       }),
+       do: :unrestricted
+
+  defp reasoning_policy_mode(%APIKey{
+         enforced_reasoning_effort: nil,
+         maximum_reasoning_effort: maximum
+       })
+       when is_binary(maximum),
+       do: :allow_up_to
+
+  defp reasoning_policy_mode(%APIKey{
+         enforced_reasoning_effort: enforced,
+         maximum_reasoning_effort: nil
+       })
+       when is_binary(enforced),
+       do: :always_use
 
   defp normalize_pool(%Pool{} = pool), do: pool
   defp normalize_pool(id) when is_binary(id), do: Pools.get_active_pool(id)

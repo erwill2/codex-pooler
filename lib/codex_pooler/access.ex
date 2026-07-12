@@ -22,6 +22,27 @@ defmodule CodexPooler.Access do
   @type invite_page :: Invites.invite_page()
   @type invite_page_result :: Invites.invite_page_result()
 
+  @spec resolve_reasoning_effort(
+          APIKey.t(),
+          String.t() | nil,
+          [String.t()] | nil,
+          String.t() | nil
+        ) :: APIKeys.ReasoningEffortPolicy.resolution()
+  defdelegate resolve_reasoning_effort(api_key, requested_effort, model_efforts, model_default),
+    to: APIKeys
+
+  @spec project_reasoning_effort_metadata(
+          APIKey.t(),
+          [APIKeys.ReasoningEffortPolicy.model_level()] | nil,
+          String.t() | nil
+        ) :: APIKeys.ReasoningEffortPolicy.MetadataProjection.t()
+  defdelegate project_reasoning_effort_metadata(api_key, model_levels, model_default),
+    to: APIKeys
+
+  @spec project_reasoning_effort_denial_metadata(APIKey.t(), String.t() | nil) ::
+          APIKeys.ReasoningEffortPolicy.denial_metadata()
+  defdelegate project_reasoning_effort_denial_metadata(api_key, requested_effort), to: APIKeys
+
   @spec create_invite(Scope.t(), Pool.t() | Ecto.UUID.t(), map()) ::
           invite_result()
   defdelegate create_invite(scope, pool_or_id, attrs \\ %{}), to: Invites

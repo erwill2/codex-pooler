@@ -92,6 +92,7 @@ defmodule CodexPooler.Access.APIKeys.Assignment do
       allowed_model_identifiers: api_key.allowed_model_identifiers,
       enforced_model_identifier: api_key.enforced_model_identifier,
       enforced_reasoning_effort: api_key.enforced_reasoning_effort,
+      maximum_reasoning_effort: api_key.maximum_reasoning_effort,
       enforced_service_tier: api_key.enforced_service_tier,
       default_policy: default_policy_attrs(bindings),
       model_policies: model_policy_attrs(bindings)

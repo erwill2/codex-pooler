@@ -358,6 +358,8 @@ defmodule CodexPooler.MCP.PrivacyMatrix do
         :allowed_model_identifiers,
         :enforced_model_identifier,
         :enforced_reasoning_effort,
+        :maximum_reasoning_effort,
+        :reasoning_policy_mode,
         :enforced_service_tier,
         :created_by_user_id,
         :created_at,

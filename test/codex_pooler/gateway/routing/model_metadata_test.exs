@@ -1,6 +1,7 @@
 defmodule CodexPooler.Gateway.Routing.ModelMetadataTest do
   use ExUnit.Case, async: true
 
+  alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.MetadataProjection
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Routing.ModelMetadata
 
@@ -54,7 +55,78 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadataTest do
              Enum.map(efforts, &%{"effort" => &1, "description" => &1})
   end
 
+  test "codex model payload applies an optional reasoning metadata projection verbatim" do
+    projection = %MetadataProjection{
+      levels: [
+        %{"effort" => "low", "description" => "Quick"},
+        %{"effort" => "medium", "description" => "Balanced"}
+      ],
+      default_effort: "medium"
+    }
+
+    payload =
+      %{"supported_reasoning_levels" => ~w(low medium high), "default_reasoning_level" => "high"}
+      |> reasoning_model()
+      |> ModelMetadata.codex_model_payload(%{}, projection)
+
+    assert payload["supported_reasoning_levels"] == projection.levels
+    assert payload["default_reasoning_level"] == "medium"
+  end
+
+  test "codex model payload keeps a reasoning model visible with an empty projection" do
+    projection = %MetadataProjection{levels: [], default_effort: nil}
+
+    payload =
+      %{"supported_reasoning_levels" => ~w(low medium), "default_reasoning_level" => "medium"}
+      |> reasoning_model()
+      |> ModelMetadata.codex_model_payload(%{}, projection)
+
+    assert payload["slug"] == "gpt-test-model"
+    assert payload["supported_reasoning_levels"] == []
+    assert is_nil(payload["default_reasoning_level"])
+  end
+
+  test "returns explicit or fallback reasoning levels with their default" do
+    explicit =
+      reasoning_model(%{
+        "supported_reasoning_levels" => ["low", "high"],
+        "default_reasoning_level" => "high"
+      })
+
+    fallback = reasoning_model(%{})
+
+    assert ModelMetadata.reasoning_levels_and_default(explicit) == {~w(low high), "high"}
+
+    assert ModelMetadata.reasoning_levels_and_default(fallback) ==
+             {~w(low medium high xhigh), "medium"}
+  end
+
+  test "returns effective reasoning maps with descriptions and canonical semantics" do
+    model =
+      reasoning_model(%{
+        "supported_reasoning_levels" => [
+          %{"effort" => "medium", "description" => "Balanced"},
+          %{"effort" => " HIGH ", "description" => "Deep", "extra" => "preserved"},
+          %{"effort" => "low", "description" => "Quick"}
+        ],
+        "default_reasoning_level" => " HIGH "
+      })
+
+    assert ModelMetadata.reasoning_level_maps_and_default(model) ==
+             {[
+                %{"effort" => "medium", "description" => "Balanced"},
+                %{"effort" => "high", "description" => "Deep", "extra" => "preserved"},
+                %{"effort" => "low", "description" => "Quick"}
+              ], "high"}
+  end
+
   defp model_payload(metadata) do
+    metadata
+    |> reasoning_model()
+    |> ModelMetadata.codex_model_payload(%{})
+  end
+
+  defp reasoning_model(metadata) do
     %Model{
       upstream_model_id: "upstream-model",
       exposed_model_id: "gpt-test-model",
@@ -66,6 +138,5 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadataTest do
       supports_reasoning: true,
       metadata: metadata
     }
-    |> ModelMetadata.codex_model_payload(%{})
   end
 end

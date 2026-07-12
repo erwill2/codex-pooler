@@ -1,7 +1,11 @@
 defmodule CodexPooler.Accounting.RequestSnapshotTest do
   use CodexPooler.DataCase, async: false
 
+  alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision
   alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Gateway.Denials
+  alias CodexPooler.Gateway.Payloads.{PayloadNormalizer, RequestOptions}
   alias CodexPooler.Repo
 
   import CodexPooler.AccountingTestSupport
@@ -202,6 +206,137 @@ defmodule CodexPooler.Accounting.RequestSnapshotTest do
 
       refute inspect(persisted) =~ raw_secret
       refute inspect(persisted) =~ raw_prompt
+    end
+
+    test "successful reasoning evidence keeps only the approved policy snapshot fields" do
+      setup = accounting_setup()
+
+      payload = %{
+        "model" => setup.model.exposed_model_id,
+        "reasoning" => %{"effort" => "minimal"}
+      }
+
+      decision = %Decision{
+        mode: :always_use,
+        configured_effort: "minimal",
+        requested_effort: "minimal",
+        applied_effort: "minimal"
+      }
+
+      request_options =
+        RequestOptions.build(
+          %{reasoning_effort_decision: decision},
+          "/backend-api/codex/responses",
+          payload
+        )
+
+      assert {:ok, _encoded, request_options} =
+               PayloadNormalizer.prepare_upstream_payload(
+                 payload,
+                 setup.model,
+                 "/backend-api/codex/responses",
+                 request_options
+               )
+
+      assert RequestOptions.reasoning_effort_attempt_metadata(request_options) == %{
+               "reasoning" => %{
+                 "policy_mode" => "always_use",
+                 "configured_effort" => "minimal",
+                 "requested_effort" => "minimal",
+                 "applied_effort" => "minimal",
+                 "effective_effort" => "low",
+                 "source" => "api_key_policy",
+                 "rewrite" => "minimal_to_low"
+               }
+             }
+
+      assert {:ok, reserved} =
+               Accounting.reserve(setup.auth, setup.model, payload, %{
+                 correlation_id: "corr-minimal-reasoning-success"
+               })
+
+      assert {:ok, attempt} = Accounting.create_attempt(reserved.request, setup.assignment)
+
+      assert {:ok, _result} =
+               Accounting.finalize_success(
+                 reserved.request,
+                 attempt,
+                 %{status: "usage_known", input_tokens: 1, output_tokens: 1, total_tokens: 2},
+                 %{
+                   response_status_code: 200,
+                   attempt_metadata:
+                     RequestOptions.reasoning_effort_attempt_metadata(request_options)
+                 }
+               )
+
+      persisted_attempt = Repo.get!(Attempt, attempt.id)
+
+      assert persisted_attempt.response_metadata["reasoning"] == %{
+               "policy_mode" => "always_use",
+               "configured_effort" => "minimal",
+               "requested_effort" => "minimal",
+               "applied_effort" => "minimal",
+               "effective_effort" => "low",
+               "source" => "api_key_policy",
+               "rewrite" => "minimal_to_low"
+             }
+
+      assert %{items: [log], total: 1} = Accounting.list_request_logs(setup.pool)
+      refute Map.has_key?(log, :reasoning_policy_mode)
+      refute Map.has_key?(log, :configured_reasoning_effort)
+    end
+
+    test "pre-reservation reasoning denial bounds unknown input and fabricates no attempt" do
+      setup = accounting_setup()
+      unknown_effort = String.duplicate("custom-", 512)
+
+      payload = %{
+        "model" => setup.model.exposed_model_id,
+        "reasoning" => %{"effort" => unknown_effort}
+      }
+
+      reason = %{
+        status: 400,
+        code: "reasoning_effort_not_allowed",
+        message: "reasoning effort is not available for this API key",
+        param: "reasoning.effort",
+        reasoning_policy: %{
+          policy_mode: "allow_up_to",
+          configured_effort: "medium",
+          requested_effort: unknown_effort,
+          applied_effort: nil,
+          arbitrary_metadata: "excluded"
+        },
+        arbitrary_metadata: "excluded"
+      }
+
+      assert {:error, ^reason} =
+               Denials.log_gateway(%Denials.Context{
+                 auth: setup.auth,
+                 model: setup.model,
+                 reason: reason,
+                 endpoint: "/backend-api/codex/responses",
+                 payload: payload,
+                 opts: RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+               })
+
+      assert [request] = Repo.all(Request)
+      assert Repo.all(Attempt) == []
+
+      assert request.request_metadata["gateway_denial"] == %{
+               "code" => "reasoning_effort_not_allowed",
+               "message" => "reasoning effort is not available for this API key",
+               "param" => "reasoning.effort",
+               "reasoning_policy" => %{
+                 "policy_mode" => "allow_up_to",
+                 "configured_effort" => "medium",
+                 "requested_effort" => "unknown",
+                 "applied_effort" => nil
+               }
+             }
+
+      refute inspect(request.request_metadata) =~ unknown_effort
+      refute inspect(request.request_metadata) =~ "arbitrary_metadata"
     end
   end
 end

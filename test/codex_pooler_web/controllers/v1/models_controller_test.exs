@@ -44,6 +44,31 @@ defmodule CodexPoolerWeb.V1.ModelsControllerTest do
     assert request.request_metadata["model_source"]["upstream_identity_id"] == setup.identity.id
   end
 
+  test "GET /v1/models keeps its schema unchanged for reasoning-restricted API keys", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "supported_reasoning_levels" => ~w(low medium high),
+          "default_reasoning_level" => "high"
+        }
+      )
+
+    setup.api_key
+    |> Ecto.Changeset.change(enforced_reasoning_effort: "medium")
+    |> Repo.update!()
+
+    conn = conn |> auth(setup) |> get("/v1/models")
+
+    assert %{"object" => "list", "data" => [model]} = json_response(conn, 200)
+    assert model["id"] == setup.model.exposed_model_id
+    refute Map.has_key?(model, "supported_reasoning_levels")
+    refute Map.has_key?(model, "default_reasoning_level")
+  end
+
   test "GET /v1/models only exposes policy-authorized visible models", %{conn: conn} do
     upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
     setup = gateway_setup(upstream)

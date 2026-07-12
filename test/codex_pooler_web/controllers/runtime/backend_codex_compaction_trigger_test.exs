@@ -4,9 +4,89 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexCompactionTriggerTest do
   import Ecto.Query
   import CodexPoolerWeb.Runtime.BackendCodexTestSupport
 
-  alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Repo
+
+  test "compaction trigger aliases enforce reasoning before compact dispatch", %{conn: conn} do
+    for path <- ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"] do
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+      setup = gateway_setup(upstream, compact?: true)
+
+      setup.api_key
+      |> Ecto.Changeset.change(maximum_reasoning_effort: "medium")
+      |> Repo.update!()
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(path, %{
+          "model" => setup.model.exposed_model_id,
+          "input" => visible_input("synthetic") ++ [compaction_trigger()],
+          "stream" => true,
+          "reasoning" => %{"effort" => "high"}
+        })
+
+      assert %{
+               "error" => %{
+                 "code" => "reasoning_effort_not_allowed",
+                 "message" => "reasoning effort is not available for this API key",
+                 "param" => "reasoning.effort"
+               }
+             } = json_response(response, 400)
+
+      assert FakeUpstream.count(upstream) == 0
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.endpoint == "/backend-api/codex/responses/compact"
+      assert request.status == "rejected"
+      assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+      assert Repo.aggregate(from(l in LedgerEntry, where: l.request_id == ^request.id), :count) ==
+               0
+    end
+  end
+
+  test "compaction trigger aliases apply exact reasoning to compact upstream", %{conn: conn} do
+    for path <- ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"] do
+      upstream =
+        start_upstream(
+          FakeUpstream.json_response(%{
+            "id" => "resp_compact_policy",
+            "object" => "response.compaction",
+            "output" => [
+              %{"type" => "compaction", "encrypted_content" => "synthetic-compact-content"}
+            ]
+          })
+        )
+
+      setup = gateway_setup(upstream, compact?: true)
+
+      setup.api_key
+      |> Ecto.Changeset.change(enforced_reasoning_effort: "high")
+      |> Repo.update!()
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(path, %{
+          "model" => setup.model.exposed_model_id,
+          "input" => visible_input("synthetic") ++ [compaction_trigger()],
+          "stream" => true,
+          "reasoning" => %{"effort" => "low"}
+        })
+
+      assert response.status == 200
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.path == "/backend-api/codex/responses/compact"
+      assert captured.json["reasoning"] == %{"effort" => "high"}
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert get_in(attempt.response_metadata, ["reasoning", "policy_mode"]) == "always_use"
+      assert get_in(attempt.response_metadata, ["reasoning", "applied_effort"]) == "high"
+    end
+  end
 
   @tag :client_metadata
   test "POST /backend-api/codex/responses bridges terminal compaction_trigger to compact SSE", %{

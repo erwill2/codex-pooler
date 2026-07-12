@@ -37,6 +37,169 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
 
   @supported_compression_model "gpt-4o"
+  @reasoning_denial_message "reasoning effort is not available for this API key"
+
+  test "backend Responses HTTP and SSE enforce native reasoning aliases before dispatch", %{
+    conn: conn
+  } do
+    cases = [
+      {false, %{"reasoning_effort" => "high"}, "reasoning.effort", "high"},
+      {true, %{"reasoningEffort" => "custom-above-policy"}, "reasoning.effort", "unknown"}
+    ]
+
+    for {stream?, effort_payload, param, persisted_effort} <- cases do
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+      setup = gateway_setup(upstream)
+      set_reasoning_policy!(setup, maximum_reasoning_effort: "medium")
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/backend-api/codex/responses",
+          Map.merge(
+            %{
+              "model" => setup.model.exposed_model_id,
+              "input" => "synthetic",
+              "stream" => stream?
+            },
+            effort_payload
+          )
+        )
+
+      assert %{
+               "error" => %{
+                 "code" => "reasoning_effort_not_allowed",
+                 "message" => @reasoning_denial_message,
+                 "param" => ^param
+               }
+             } = json_response(response, 400)
+
+      assert FakeUpstream.count(upstream) == 0
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.status == "rejected"
+      assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+      assert ledger_entry_kinds(request) == []
+
+      assert get_in(request.request_metadata, ["gateway_denial", "reasoning_policy"]) == %{
+               "policy_mode" => "allow_up_to",
+               "configured_effort" => "medium",
+               "requested_effort" => persisted_effort,
+               "applied_effort" => nil
+             }
+    end
+  end
+
+  test "backend Responses HTTP applies allowed, omitted, exact, and unrestricted aliases", %{
+    conn: conn
+  } do
+    cases = [
+      {[maximum_reasoning_effort: "medium"], %{}, "medium", "allow_up_to"},
+      {[maximum_reasoning_effort: "high"], %{"reasoning_effort" => "low"}, "low", "allow_up_to"},
+      {[enforced_reasoning_effort: "high"], %{"reasoningEffort" => "low"}, "high", "always_use"},
+      {[], %{}, nil, "unrestricted"},
+      {[], %{"reasoning" => %{"effort" => "focused"}}, "focused", "unrestricted"}
+    ]
+
+    for {policy, effort_payload, expected_effort, expected_mode} <- cases do
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_backend_policy"}))
+      setup = gateway_setup(upstream)
+      set_reasoning_policy!(setup, policy)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/backend-api/codex/responses",
+          Map.merge(
+            %{"model" => setup.model.exposed_model_id, "input" => "synthetic"},
+            effort_payload
+          )
+        )
+
+      assert %{"id" => "resp_backend_policy"} = json_response(response, 200)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert get_in(captured.json, ["reasoning", "effort"]) == expected_effort
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert get_in(attempt.response_metadata, ["reasoning", "policy_mode"]) == expected_mode
+      assert get_in(attempt.response_metadata, ["reasoning", "applied_effort"]) == expected_effort
+    end
+  end
+
+  test "backend Chat enforces reasoning availability before dispatch", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+    set_reasoning_policy!(setup, maximum_reasoning_effort: "medium")
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/v1/chat/completions", %{
+        "model" => setup.model.exposed_model_id,
+        "messages" => [%{"role" => "user", "content" => "Synthetic user"}],
+        "reasoning_effort" => "high"
+      })
+
+    assert %{
+             "error" => %{
+               "code" => "reasoning_effort_not_allowed",
+               "message" => @reasoning_denial_message,
+               "param" => "reasoning_effort"
+             }
+           } = json_response(response, 400)
+
+    assert FakeUpstream.count(upstream) == 0
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "rejected"
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+    assert ledger_entry_kinds(request) == []
+
+    assert get_in(request.request_metadata, ["gateway_denial", "reasoning_policy"]) == %{
+             "policy_mode" => "allow_up_to",
+             "configured_effort" => "medium",
+             "requested_effort" => "high",
+             "applied_effort" => nil
+           }
+  end
+
+  test "backend Chat applies maximum and enforced reasoning policies", %{conn: conn} do
+    cases = [
+      {[maximum_reasoning_effort: "medium"], %{}, "medium", "allow_up_to"},
+      {[enforced_reasoning_effort: "high"], %{"reasoning_effort" => "low"}, "high", "always_use"}
+    ]
+
+    for {policy, extra_payload, expected_effort, expected_mode} <- cases do
+      upstream = start_upstream(backend_chat_completed_upstream())
+      setup = gateway_setup(upstream)
+      set_reasoning_policy!(setup, policy)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/backend-api/codex/v1/chat/completions",
+          Map.merge(
+            %{
+              "model" => setup.model.exposed_model_id,
+              "messages" => [%{"role" => "user", "content" => "Synthetic user"}]
+            },
+            extra_payload
+          )
+        )
+
+      assert %{"id" => "resp_backend_chat_reasoning_policy"} = json_response(response, 200)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert get_in(captured.json, ["reasoning", "effort"]) == expected_effort
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert get_in(attempt.response_metadata, ["reasoning", "policy_mode"]) == expected_mode
+      assert get_in(attempt.response_metadata, ["reasoning", "applied_effort"]) == expected_effort
+    end
+  end
 
   defmodule ClosedChunkAdapter do
     def chunk(_payload, _chunk), do: {:error, :closed}
@@ -82,6 +245,125 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert is_nil(request.upstream_account_email)
     assert request.request_metadata["operation"] == "models"
     assert request.request_metadata["model_source"]["upstream_identity_id"] == setup.identity.id
+  end
+
+  test "GET /backend-api/codex/models filters reasoning metadata through API key policy", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "supported_reasoning_levels" => [
+            %{"effort" => "low", "description" => "Quick"},
+            %{"effort" => "medium", "description" => "Balanced"},
+            %{"effort" => "high", "description" => "Deep"}
+          ],
+          "default_reasoning_level" => "high"
+        }
+      )
+
+    setup.api_key
+    |> Ecto.Changeset.change(maximum_reasoning_effort: "medium")
+    |> Repo.update!()
+
+    conn = conn |> auth(setup) |> get("/backend-api/codex/models")
+
+    assert %{"models" => [model]} = json_response(conn, 200)
+
+    assert model["supported_reasoning_levels"] == [
+             %{"effort" => "low", "description" => "Quick"},
+             %{"effort" => "medium", "description" => "Balanced"}
+           ]
+
+    assert model["default_reasoning_level"] == "medium"
+  end
+
+  test "GET /backend-api/codex/models preserves level order and canonicalizes known semantics", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "supported_reasoning_levels" => [
+            %{"effort" => "medium", "description" => "Balanced"},
+            %{"effort" => " HIGH ", "description" => "Deep", "extra" => "preserved"},
+            %{"effort" => "low", "description" => "Quick"}
+          ],
+          "default_reasoning_level" => " HIGH "
+        }
+      )
+
+    setup.api_key
+    |> Ecto.Changeset.change(maximum_reasoning_effort: "high")
+    |> Repo.update!()
+
+    conn = conn |> auth(setup) |> get("/backend-api/codex/models")
+
+    assert %{"models" => [model]} = json_response(conn, 200)
+
+    assert model["supported_reasoning_levels"] == [
+             %{"effort" => "medium", "description" => "Balanced"},
+             %{"effort" => "high", "description" => "Deep", "extra" => "preserved"},
+             %{"effort" => "low", "description" => "Quick"}
+           ]
+
+    assert model["default_reasoning_level"] == "high"
+  end
+
+  test "GET /backend-api/codex/models keeps models visible when enforced reasoning is unavailable",
+       %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "supported_reasoning_levels" => ~w(low medium),
+          "default_reasoning_level" => "medium"
+        }
+      )
+
+    setup.api_key
+    |> Ecto.Changeset.change(enforced_reasoning_effort: "high")
+    |> Repo.update!()
+
+    conn = conn |> auth(setup) |> get("/backend-api/codex/models")
+
+    assert %{"models" => [model]} = json_response(conn, 200)
+    assert model["slug"] == setup.model.exposed_model_id
+    assert model["supported_reasoning_levels"] == []
+    assert is_nil(model["default_reasoning_level"])
+  end
+
+  test "GET /backend-api/codex/models advertises only an available enforced reasoning level", %{
+    conn: conn
+  } do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+
+    setup =
+      gateway_setup(upstream,
+        model_metadata: %{
+          "supported_reasoning_levels" => ~w(low medium high),
+          "default_reasoning_level" => "high"
+        }
+      )
+
+    setup.api_key
+    |> Ecto.Changeset.change(enforced_reasoning_effort: "medium")
+    |> Repo.update!()
+
+    conn = conn |> auth(setup) |> get("/backend-api/codex/models")
+
+    assert %{"models" => [model]} = json_response(conn, 200)
+
+    assert model["supported_reasoning_levels"] == [
+             %{"effort" => "medium", "description" => "medium"}
+           ]
+
+    assert model["default_reasoning_level"] == "medium"
   end
 
   test "GET /backend-api/codex/models records unique server correlation ids for repeated client request ids",
@@ -8372,6 +8654,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert is_boolean(routing["affinity_hit"])
   end
 
+  defp set_reasoning_policy!(setup, attrs) do
+    setup.api_key
+    |> Ecto.Changeset.change(attrs)
+    |> Repo.update!()
+  end
+
   defp assert_attempt_routing_metadata!(attempt, assignment, identity, rank) do
     assert %{"routing" => routing} = attempt.response_metadata
     assert routing["bridge_candidate_id"] == assignment.id
@@ -8823,6 +9111,27 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       inspect({requests, attempts, sessions, turns, audit_events, logs.items})
 
     refute persistence_text =~ turn_state
+  end
+
+  defp backend_chat_completed_upstream do
+    FakeUpstream.sse_stream([
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => "resp_backend_chat_reasoning_policy",
+           "status" => "completed",
+           "model" => "provider-gpt-test-model",
+           "output" => [
+             %{
+               "type" => "message",
+               "content" => [%{"type" => "output_text", "text" => "synthetic answer"}]
+             }
+           ],
+           "usage" => %{"input_tokens" => 4, "output_tokens" => 6, "total_tokens" => 10}
+         }
+       }}
+    ])
   end
 
   defp refute_lineage_text!(text, metadata) do

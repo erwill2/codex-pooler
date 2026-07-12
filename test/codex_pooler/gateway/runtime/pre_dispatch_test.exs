@@ -7,8 +7,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatchTest do
     only: [gateway_setup: 1, start_upstream: 1, strict_text_format_payload: 1]
 
   alias CodexPooler.Access
-  alias CodexPooler.Accounting.Request
+  alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.CodexSession
   alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
@@ -358,6 +359,182 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatchTest do
               code: "model_not_allowed",
               message: "api key is not allowed to use this model"
             }} = PreDispatch.prepare(auth, @endpoint_path, payload, request_options, setup.model)
+  end
+
+  test "model denial keeps precedence over reasoning availability" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    api_key = %{auth.api_key | maximum_reasoning_effort: "low"}
+    auth = %{auth | api_key: api_key}
+    payload = %{"model" => setup.model.exposed_model_id, "reasoning" => %{"effort" => "high"}}
+
+    request_options =
+      request_options(auth, payload,
+        requested_model: setup.model.exposed_model_id,
+        effective_model: setup.model.exposed_model_id
+      )
+      |> RequestOptions.put_routing(
+        api_key_policy: %{
+          allowed_model_identifiers: ["other-model"],
+          enforced_model_identifier: nil,
+          enforced_reasoning_effort: nil,
+          maximum_reasoning_effort: "low",
+          enforced_service_tier: nil,
+          metadata: %{}
+        }
+      )
+
+    assert {:error, %{status: 403, code: "model_not_allowed"}} =
+             PreDispatch.prepare(auth, @endpoint_path, payload, request_options, setup.model)
+  end
+
+  test "Gateway.execute records one model denial when model and reasoning are forbidden" do
+    fake = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(fake)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    api_key = %{
+      auth.api_key
+      | allowed_model_identifiers: ["other-model"],
+        maximum_reasoning_effort: "low"
+    }
+
+    auth = %{auth | api_key: api_key}
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "reasoning" => %{"effort" => "high"}
+    }
+
+    assert {:error,
+            %{
+              status: 403,
+              code: "model_not_allowed",
+              message: "api key is not allowed to use this model"
+            }} =
+             Gateway.execute(
+               auth,
+               @endpoint_path,
+               payload,
+               RequestOptions.build(%{}, @endpoint_path, payload)
+             )
+
+    assert [%Request{last_error_code: "model_not_allowed"}] = Repo.all(Request)
+    assert Repo.all(Attempt) == []
+    assert FakeUpstream.count(fake) == 0
+  end
+
+  test "prepare denies unavailable reasoning before reservation setup" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    api_key = %{auth.api_key | maximum_reasoning_effort: "low"}
+    auth = %{auth | api_key: api_key}
+    payload = %{"model" => setup.model.exposed_model_id, "reasoning" => %{"effort" => "high"}}
+
+    request_options =
+      request_options(auth, payload, requested_model: setup.model.exposed_model_id)
+
+    assert {:error,
+            %{
+              status: 400,
+              code: "reasoning_effort_not_allowed",
+              message: "reasoning effort is not available for this API key",
+              param: "reasoning.effort",
+              reasoning_policy: %{
+                policy_mode: "allow_up_to",
+                configured_effort: "low",
+                requested_effort: "high",
+                applied_effort: nil
+              }
+            }} = PreDispatch.prepare(auth, @endpoint_path, payload, request_options, setup.model)
+
+    assert Repo.all(Request) == []
+  end
+
+  test "Gateway.execute records one reasoning denial before attempts or upstream dispatch" do
+    fake = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(fake)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    api_key = %{auth.api_key | maximum_reasoning_effort: "low"}
+    auth = %{auth | api_key: api_key}
+
+    payload = %{
+      "model" => setup.model.exposed_model_id,
+      "reasoning" => %{"effort" => "high"}
+    }
+
+    assert {:error,
+            %{
+              status: 400,
+              code: "reasoning_effort_not_allowed",
+              message: "reasoning effort is not available for this API key",
+              param: "reasoning.effort"
+            }} =
+             Gateway.execute(
+               auth,
+               @endpoint_path,
+               payload,
+               RequestOptions.build(%{}, @endpoint_path, payload)
+             )
+
+    assert [request] = Repo.all(Request)
+    assert Repo.all(Attempt) == []
+    assert FakeUpstream.count(fake) == 0
+
+    assert request.request_metadata["gateway_denial"]["reasoning_policy"] == %{
+             "policy_mode" => "allow_up_to",
+             "configured_effort" => "low",
+             "requested_effort" => "high",
+             "applied_effort" => nil
+           }
+  end
+
+  test "prepare uses the preserved Chat Completions reasoning parameter" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    api_key = %{auth.api_key | maximum_reasoning_effort: "low"}
+    auth = %{auth | api_key: api_key}
+    payload = %{"model" => setup.model.exposed_model_id, "reasoning_effort" => "high"}
+
+    request_options =
+      auth
+      |> request_options(payload, requested_model: setup.model.exposed_model_id)
+      |> RequestOptions.put_openai_compatibility(
+        source_endpoint: "/v1/chat/completions",
+        openai_chat_payload: payload
+      )
+
+    assert {:error, %{code: "reasoning_effort_not_allowed", param: "reasoning_effort"}} =
+             PreDispatch.prepare(auth, @endpoint_path, payload, request_options, setup.model)
+  end
+
+  test "prepare carries reasoning decisions for all policy modes" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    for {api_key, payload, expected} <- [
+          {auth.api_key,
+           %{"model" => setup.model.exposed_model_id, "reasoning" => %{"effort" => "custom"}},
+           {:unrestricted, "custom"}},
+          {%{auth.api_key | maximum_reasoning_effort: "high"},
+           %{"model" => setup.model.exposed_model_id}, {:allow_up_to, "medium"}},
+          {%{auth.api_key | enforced_reasoning_effort: "ultra"},
+           %{"model" => setup.model.exposed_model_id, "reasoning" => %{"effort" => "low"}},
+           {:always_use, "ultra"}}
+        ] do
+      scoped_auth = %{auth | api_key: api_key}
+
+      options =
+        request_options(scoped_auth, payload, requested_model: setup.model.exposed_model_id)
+
+      assert {:ok, prepared} =
+               PreDispatch.prepare(scoped_auth, @endpoint_path, payload, options, setup.model)
+
+      assert %{mode: mode, applied_effort: applied} =
+               prepared.request_options.routing.reasoning_effort_decision
+
+      assert {mode, applied} == expected
+    end
   end
 
   defp request_options(auth, payload, attrs) do

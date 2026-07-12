@@ -161,18 +161,14 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveTest do
     assert has_element?(view, "#api-key-model-mode-selected")
     assert has_element?(view, "#api_key_manual_model_identifiers_text")
     assert has_element?(view, "#api_key_enforced_model_identifier")
-    assert has_element?(view, "#api_key_enforced_reasoning_effort")
+    assert has_element?(view, "#api-key-reasoning-policy[aria-describedby]")
+    assert has_element?(view, "#api-key-reasoning-policy legend", "Reasoning effort policy")
+    assert has_element?(view, "#api_key_reasoning_policy_mode_unrestricted[checked]")
+    assert has_element?(view, "#api_key_reasoning_policy_mode_allow_up_to[value='allow_up_to']")
+    assert has_element?(view, "#api_key_reasoning_policy_mode_always_use[value='always_use']")
+    refute has_element?(view, "#api_key_enforced_reasoning_effort")
+    refute has_element?(view, "#api_key_maximum_reasoning_effort")
 
-    assert has_element?(
-             view,
-             "#api_key_enforced_reasoning_effort option",
-             "None (request no reasoning)"
-           )
-
-    assert has_element?(view, "#api_key_enforced_reasoning_effort option", "Minimal")
-    assert has_element?(view, "#api_key_enforced_reasoning_effort option", "Extra high")
-    assert has_element?(view, "#api_key_enforced_reasoning_effort option", "Max")
-    assert has_element?(view, "#api_key_enforced_reasoning_effort option", "Ultra")
     assert has_element?(view, "#api_key_enforced_service_tier")
     assert has_element?(view, "#api_key_enforced_service_tier option", "Leave unchanged")
     assert has_element?(view, "#api_key_enforced_service_tier option", "Auto - upstream chooses")

@@ -74,7 +74,9 @@ defmodule CodexPooler.Access.APIKeys.AuditLog do
       changed_fields: api_key_audit_changed_fields(attrs),
       previous_pool_id: previous_api_key.pool_id,
       pool_changed: pool_changed?,
-      previous_status: previous_api_key.status
+      previous_status: previous_api_key.status,
+      previous_reasoning_policy_mode: reasoning_policy_mode(previous_api_key),
+      previous_reasoning_policy_configuration: reasoning_policy_configuration(previous_api_key)
     }
   end
 
@@ -97,7 +99,8 @@ defmodule CodexPooler.Access.APIKeys.AuditLog do
       allowed_model_mode: audit_model_mode(api_key.allowed_model_identifiers),
       allowed_model_count: audit_allowed_model_count(api_key.allowed_model_identifiers),
       enforced_model_identifier: api_key.enforced_model_identifier,
-      enforced_reasoning_effort: api_key.enforced_reasoning_effort,
+      reasoning_policy_mode: reasoning_policy_mode(api_key),
+      reasoning_policy_configuration: reasoning_policy_configuration(api_key),
       enforced_service_tier: api_key.enforced_service_tier
     }
   end
@@ -114,6 +117,7 @@ defmodule CodexPooler.Access.APIKeys.AuditLog do
       "allowed_models_mode",
       "enforced_model_identifier",
       "enforced_reasoning_effort",
+      "maximum_reasoning_effort",
       "enforced_service_tier",
       "default_policy",
       "model_policies"
@@ -133,4 +137,34 @@ defmodule CodexPooler.Access.APIKeys.AuditLog do
 
   defp audit_allowed_model_count(nil), do: nil
   defp audit_allowed_model_count(values) when is_list(values), do: length(values)
+
+  defp reasoning_policy_mode(%APIKey{
+         enforced_reasoning_effort: nil,
+         maximum_reasoning_effort: nil
+       }),
+       do: "unrestricted"
+
+  defp reasoning_policy_mode(%APIKey{
+         enforced_reasoning_effort: nil,
+         maximum_reasoning_effort: maximum
+       })
+       when is_binary(maximum),
+       do: "allow_up_to"
+
+  defp reasoning_policy_mode(%APIKey{
+         enforced_reasoning_effort: enforced,
+         maximum_reasoning_effort: nil
+       })
+       when is_binary(enforced),
+       do: "always_use"
+
+  defp reasoning_policy_configuration(%APIKey{enforced_reasoning_effort: enforced})
+       when is_binary(enforced),
+       do: enforced
+
+  defp reasoning_policy_configuration(%APIKey{maximum_reasoning_effort: maximum})
+       when is_binary(maximum),
+       do: maximum
+
+  defp reasoning_policy_configuration(%APIKey{}), do: nil
 end

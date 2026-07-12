@@ -33,6 +33,112 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Repo
+
+  @reasoning_denial_message "reasoning effort is not available for this API key"
+
+  test "POST /v1/responses denies unavailable canonical reasoning before JSON or SSE dispatch", %{
+    conn: conn
+  } do
+    for {stream?, requested_effort} <- [{false, "high"}, {true, "custom-above-policy"}] do
+      persisted_effort = if requested_effort == "high", do: "high", else: "unknown"
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+      setup = gateway_setup(upstream)
+      assert :ok = Events.subscribe_pool(setup.pool)
+
+      setup.api_key
+      |> Ecto.Changeset.change(maximum_reasoning_effort: "medium")
+      |> Repo.update!()
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic policy denial",
+          "stream" => stream?,
+          "reasoning" => %{"effort" => requested_effort}
+        })
+
+      assert %{
+               "error" => %{
+                 "code" => "reasoning_effort_not_allowed",
+                 "message" => @reasoning_denial_message,
+                 "param" => "reasoning.effort"
+               }
+             } = json_response(response, 400)
+
+      assert FakeUpstream.count(upstream) == 0
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.status == "rejected"
+      assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+      assert Repo.aggregate(from(l in LedgerEntry, where: l.request_id == ^request.id), :count) ==
+               0
+
+      assert get_in(request.request_metadata, ["gateway_denial", "reasoning_policy"]) == %{
+               "policy_mode" => "allow_up_to",
+               "configured_effort" => "medium",
+               "requested_effort" => persisted_effort,
+               "applied_effort" => nil
+             }
+    end
+  end
+
+  test "POST /v1/responses applies canonical reasoning policies across JSON and SSE", %{
+    conn: conn
+  } do
+    cases = [
+      {[maximum_reasoning_effort: "medium"], %{}, false, "medium", "allow_up_to"},
+      {[maximum_reasoning_effort: "high"], %{"reasoning" => %{"effort" => "low"}}, true, "low",
+       "allow_up_to"},
+      {[enforced_reasoning_effort: "high"], %{"reasoning" => %{"effort" => "low"}}, false, "high",
+       "always_use"},
+      {[], %{}, false, nil, "unrestricted"},
+      {[], %{"reasoning" => %{"effort" => "focused"}}, false, "focused", "unrestricted"}
+    ]
+
+    for {policy, extra_payload, stream?, expected_effort, expected_mode} <- cases do
+      upstream = start_upstream(reasoning_policy_responses_upstream())
+      setup = gateway_setup(upstream)
+
+      setup.api_key
+      |> Ecto.Changeset.change(policy)
+      |> Repo.update!()
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/v1/responses",
+          Map.merge(
+            %{
+              "model" => setup.model.exposed_model_id,
+              "input" => "synthetic",
+              "stream" => stream?
+            },
+            extra_payload
+          )
+        )
+
+      if stream? do
+        assert response.status == 200
+        assert response.resp_body =~ "response.completed"
+      else
+        assert %{"id" => "resp_reasoning_policy_v1"} = json_response(response, 200)
+      end
+
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert get_in(captured.json, ["reasoning", "effort"]) == expected_effort
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert get_in(attempt.response_metadata, ["reasoning", "policy_mode"]) == expected_mode
+      assert get_in(attempt.response_metadata, ["reasoning", "applied_effort"]) == expected_effort
+    end
+  end
+
   alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
 
   alias CodexPooler.Gateway.Persistence.{
@@ -44,7 +150,6 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   }
 
   alias CodexPooler.Gateway.Websocket, as: Gateway
-  alias CodexPooler.Repo
   alias CodexPoolerWeb.PublicGatewayResult
   alias Ecto.Adapters.SQL.Sandbox
 
@@ -380,6 +485,139 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       refute persistence_text =~ setup.raw_key
       refute persistence_text =~ "Bearer "
       refute persistence_text =~ "upstream-token"
+
+      conn
+    after
+      Mint.HTTP.close(conn)
+    end
+  end
+
+  @tag :v1_websocket
+  test "GET /v1/responses websocket resolves canonical reasoning policy after upgrade" do
+    cases = [
+      {[maximum_reasoning_effort: "medium"], %{}, "medium"},
+      {[enforced_reasoning_effort: "high"], %{"reasoning" => %{"effort" => "low"}}, "high"},
+      {[], %{"reasoning" => %{"effort" => "focused"}}, "focused"}
+    ]
+
+    for {policy, effort_payload, expected_effort} <- cases do
+      upstream =
+        start_upstream(public_websocket_completed_response("resp_v1_ws_reasoning_policy"))
+
+      setup = gateway_setup(upstream)
+      assert :ok = Events.subscribe_pool(setup.pool)
+
+      setup.api_key
+      |> Ecto.Changeset.change(policy)
+      |> Repo.update!()
+
+      port = start_public_endpoint!()
+      turn_state = "v1-ws-reasoning-policy-#{System.unique_integer([:positive])}"
+
+      {conn, websocket, ref, _response_headers} =
+        public_v1_websocket_connect!(port, setup, turn_state, [
+          {"openai-beta", "responses_websockets=2026-02-06"}
+        ])
+
+      try do
+        payload =
+          %{
+            "type" => "response.create",
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic public websocket policy request",
+            "stream" => true,
+            "generate" => true
+          }
+          |> Map.merge(effort_payload)
+          |> Jason.encode!()
+
+        {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+        {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+        assert %{
+                 "type" => "response.completed",
+                 "response" => %{"id" => "resp_v1_ws_reasoning_policy"}
+               } = Jason.decode!(frame)
+
+        assert [captured] = FakeUpstream.requests(upstream)
+        assert get_in(captured.json, ["reasoning", "effort"]) == expected_effort
+
+        assert_receive {Events,
+                        %{
+                          reason: "request_finalized",
+                          payload: %{"request_id" => request_id, "status" => "succeeded"}
+                        }},
+                       @websocket_frame_timeout
+
+        request = Repo.get!(Request, request_id)
+        assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+        assert get_in(attempt.response_metadata, ["reasoning", "applied_effort"]) ==
+                 expected_effort
+
+        conn
+      after
+        Mint.HTTP.close(conn)
+      end
+    end
+  end
+
+  @tag :v1_websocket
+  test "GET /v1/responses websocket denies unavailable canonical reasoning after upgrade" do
+    upstream = start_upstream(public_websocket_completed_response("must_not_dispatch"))
+    setup = gateway_setup(upstream)
+
+    setup.api_key
+    |> Ecto.Changeset.change(maximum_reasoning_effort: "medium")
+    |> Repo.update!()
+
+    port = start_public_endpoint!()
+    turn_state = "v1-ws-reasoning-denial-#{System.unique_integer([:positive])}"
+
+    {conn, websocket, ref, _response_headers} =
+      public_v1_websocket_connect!(port, setup, turn_state, [
+        {"openai-beta", "responses_websockets=2026-02-06"}
+      ])
+
+    try do
+      payload =
+        Jason.encode!(%{
+          "type" => "response.create",
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic public websocket policy denial",
+          "stream" => true,
+          "generate" => true,
+          "reasoning" => %{"effort" => "high"}
+        })
+
+      {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+      {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+      assert %{
+               "type" => "error",
+               "status" => 400,
+               "error" => %{
+                 "code" => "reasoning_effort_not_allowed",
+                 "message" => @reasoning_denial_message,
+                 "param" => "reasoning.effort"
+               }
+             } = Jason.decode!(frame)
+
+      assert FakeUpstream.count(upstream) == 0
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.endpoint == "/backend-api/codex/responses"
+      assert request.status == "rejected"
+      assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+      assert Repo.aggregate(from(l in LedgerEntry, where: l.request_id == ^request.id), :count) ==
+               0
+
+      assert get_in(request.request_metadata, ["gateway_denial", "reasoning_policy"]) == %{
+               "policy_mode" => "allow_up_to",
+               "configured_effort" => "medium",
+               "requested_effort" => "high",
+               "applied_effort" => nil
+             }
 
       conn
     after
@@ -5731,6 +5969,21 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       %{"type" => "response.completed"} -> {conn, websocket, frame}
       _other -> receive_public_websocket_until_completed!(conn, websocket, ref)
     end
+  end
+
+  defp reasoning_policy_responses_upstream do
+    FakeUpstream.sse_stream([
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => "resp_reasoning_policy_v1",
+           "status" => "completed",
+           "output" => [],
+           "usage" => %{"input_tokens" => 1, "output_tokens" => 1, "total_tokens" => 2}
+         }
+       }}
+    ])
   end
 
   defp start_public_v1_responses_request(port, setup, payload) do

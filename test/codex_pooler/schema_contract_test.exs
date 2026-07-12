@@ -278,6 +278,15 @@ defmodule CodexPooler.SchemaContractTest do
     assert constraints["api_keys_enforced_reasoning_effort_check"] =~ "'xhigh'"
     assert constraints["api_keys_enforced_reasoning_effort_check"] =~ "'max'"
     assert constraints["api_keys_enforced_reasoning_effort_check"] =~ "'ultra'"
+    assert constraints["api_keys_maximum_reasoning_effort_check"] =~ "'none'"
+    assert constraints["api_keys_maximum_reasoning_effort_check"] =~ "'ultra'"
+
+    assert constraints["api_keys_reasoning_effort_policy_mutual_exclusion_check"] =~
+             "maximum_reasoning_effort"
+
+    assert constraints["api_keys_reasoning_effort_policy_mutual_exclusion_check"] =~
+             "enforced_reasoning_effort"
+
     assert constraints["api_keys_enforced_service_tier_check"] =~ "'auto'"
     assert constraints["api_keys_enforced_service_tier_check"] =~ "'priority'"
     assert constraints["api_keys_enforced_service_tier_check"] =~ "'scale'"
@@ -430,6 +439,7 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert column_type("api_keys", "enforced_model_identifier") == "text"
     assert column_type("api_keys", "enforced_reasoning_effort") == "text"
+    assert column_type("api_keys", "maximum_reasoning_effort") == "text"
     assert column_type("api_keys", "enforced_service_tier") == "text"
 
     assert column_type("instance_settings", "updated_by_user_id") == "uuid"
@@ -1012,6 +1022,7 @@ defmodule CodexPooler.SchemaContractTest do
 
     assert APIKey.__schema__(:type, :enforced_model_identifier) == :string
     assert APIKey.__schema__(:type, :enforced_reasoning_effort) == :string
+    assert APIKey.__schema__(:type, :maximum_reasoning_effort) == :string
     assert APIKey.__schema__(:type, :enforced_service_tier) == :string
 
     assert UpstreamIdentity.__schema__(:type, :account_email) == :string

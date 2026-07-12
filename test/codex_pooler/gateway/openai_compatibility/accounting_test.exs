@@ -109,6 +109,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityAccountingTest do
     assert attempt.response_metadata["reasoning"] == %{
              "requested_effort" => "minimal",
              "applied_effort" => "minimal",
+             "policy_mode" => "unrestricted",
              "effective_effort" => "low",
              "source" => "client",
              "rewrite" => "minimal_to_low"

@@ -46,6 +46,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
       "allowed_model_identifiers" => api_key.allowed_model_identifiers || [],
       "enforced_model_identifier" => api_key.enforced_model_identifier || "",
       "enforced_reasoning_effort" => api_key.enforced_reasoning_effort || "",
+      "maximum_reasoning_effort" => api_key.maximum_reasoning_effort || "",
+      "reasoning_policy_mode" => reasoning_policy_mode(api_key),
       "enforced_service_tier" => api_key.enforced_service_tier || "",
       "operator_notes" => operator_notes(api_key)
     })
@@ -90,6 +92,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
   @spec attrs(params()) :: attrs()
   def attrs(params) do
     pool_id = blank_to_nil(params["pool_id"])
+    reasoning_effort_attrs = reasoning_effort_attrs(params)
 
     %{
       display_name: params |> Map.get("display_name", "") |> to_string() |> String.trim(),
@@ -99,7 +102,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
       model_mode: params["model_mode"],
       allowed_model_identifiers: policy_model_identifiers(params),
       enforced_model_identifier: blank_to_nil(params["enforced_model_identifier"]),
-      enforced_reasoning_effort: blank_to_nil(params["enforced_reasoning_effort"]),
+      enforced_reasoning_effort: reasoning_effort_attrs.enforced_reasoning_effort,
+      maximum_reasoning_effort: reasoning_effort_attrs.maximum_reasoning_effort,
       enforced_service_tier: blank_to_nil(params["enforced_service_tier"]),
       default_policy: default_policy_attrs(params),
       model_policies: model_policy_attrs(params),
@@ -124,6 +128,14 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
       "Selected model mode needs at least one model"
     )
     |> maybe_add_error(enforced_model_conflict?(params), "Enforced model must be allowed")
+    |> maybe_add_error(
+      incomplete_reasoning_policy?(params),
+      "Allow up to needs a maximum reasoning effort"
+    )
+    |> maybe_add_error(
+      incomplete_exact_reasoning_policy?(params),
+      "Always use needs a reasoning effort"
+    )
     |> Enum.reverse()
   end
 
@@ -278,6 +290,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
       "manual_model_identifiers_text" => "",
       "enforced_model_identifier" => "",
       "enforced_reasoning_effort" => "",
+      "maximum_reasoning_effort" => "",
+      "reasoning_policy_mode" => "unrestricted",
       "enforced_service_tier" => "",
       "operator_notes" => "",
       "model_policy_model_identifier" => ""
@@ -334,6 +348,43 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
   defp model_mode([]), do: "deny_all_models"
   defp model_mode(_values), do: "selected_models"
 
+  defp reasoning_policy_mode(%APIKey{enforced_reasoning_effort: effort}) when is_binary(effort),
+    do: "always_use"
+
+  defp reasoning_policy_mode(%APIKey{maximum_reasoning_effort: effort}) when is_binary(effort),
+    do: "allow_up_to"
+
+  defp reasoning_policy_mode(%APIKey{}), do: "unrestricted"
+
+  defp reasoning_effort_attrs(params) do
+    case params["reasoning_policy_mode"] do
+      "allow_up_to" ->
+        %{
+          enforced_reasoning_effort: nil,
+          maximum_reasoning_effort: blank_to_nil(params["maximum_reasoning_effort"])
+        }
+
+      "always_use" ->
+        %{
+          enforced_reasoning_effort: blank_to_nil(params["enforced_reasoning_effort"]),
+          maximum_reasoning_effort: nil
+        }
+
+      _other ->
+        %{enforced_reasoning_effort: nil, maximum_reasoning_effort: nil}
+    end
+  end
+
+  defp incomplete_reasoning_policy?(params) do
+    params["reasoning_policy_mode"] == "allow_up_to" and
+      blank_to_nil(params["maximum_reasoning_effort"]) == nil
+  end
+
+  defp incomplete_exact_reasoning_policy?(params) do
+    params["reasoning_policy_mode"] == "always_use" and
+      blank_to_nil(params["enforced_reasoning_effort"]) == nil
+  end
+
   defp maybe_add_error(errors, true, message), do: [message | errors]
   defp maybe_add_error(errors, false, _message), do: errors
 
@@ -381,7 +432,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
       {"Mode", model_mode_label(form[:model_mode].value)},
       {"Selected", model_selection_summary(form, selector_state)},
       {"Enforced model", blank_to_nil(form[:enforced_model_identifier].value) || "Not enforced"},
-      {"Reasoning", blank_to_nil(form[:enforced_reasoning_effort].value) || "Not enforced"},
+      {"Reasoning", reasoning_policy_label(form)},
       {"Service tier", blank_to_nil(form[:enforced_service_tier].value) || "Not enforced"}
     ]
   end
@@ -435,6 +486,30 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
   defp model_mode_label("selected_models"), do: "Selected models"
   defp model_mode_label("deny_all_models"), do: "Deny all models"
   defp model_mode_label(_mode), do: "All models"
+
+  defp reasoning_policy_label(form) do
+    case form[:reasoning_policy_mode].value do
+      "allow_up_to" ->
+        reasoning_policy_value("Allow up to", form[:maximum_reasoning_effort].value)
+
+      "always_use" ->
+        reasoning_policy_value("Always use", form[:enforced_reasoning_effort].value)
+
+      _other ->
+        "Unrestricted"
+    end
+  end
+
+  defp reasoning_policy_value(prefix, value) do
+    case blank_to_nil(value) do
+      nil -> prefix
+      effort -> "#{prefix} #{reasoning_effort_label(effort)}"
+    end
+  end
+
+  defp reasoning_effort_label("xhigh"), do: "Extra high"
+  defp reasoning_effort_label("none"), do: "None"
+  defp reasoning_effort_label(effort), do: String.capitalize(effort)
 
   defp model_selection_summary(form, selector_state) do
     count =

@@ -29,6 +29,7 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
     reasoning_minimal
     reasoning_none
     reasoning_ultra
+    api_key_reasoning_availability
     reasoning_context
     unsupported_upstream_fields
     firewall

@@ -76,6 +76,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLivePolicyTest do
           "manual_model_identifiers_text" => "custom/manual-test-model",
           "enforced_model_identifier" => "custom/manual-test-model",
           "enforced_reasoning_effort" => "none",
+          "reasoning_policy_mode" => "always_use",
           "enforced_service_tier" => "priority",
           "default_max_tokens_per_week" => "100000",
           "operator_notes" => "limited rollout"
@@ -133,6 +134,195 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLivePolicyTest do
     assert edited.status == "paused"
     assert edited.allowed_model_identifiers == nil
     assert {:error, :api_key_disabled} = Access.normalize_api_key_policy(edited)
+  end
+
+  test "reasoning policy modes create, edit, clear stale values, and survive remount", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "reasoning-modes", name: "Reasoning Modes"})
+
+    {:ok, view, _html} = live(conn, ~p"/admin/api-keys")
+    open_create_dialog(view)
+    select_api_key_section(view, :models)
+
+    allow_up_to_params =
+      api_key_payload(%{
+        "display_name" => "Allow up to key",
+        "pool_id" => pool.id,
+        "reasoning_policy_mode" => "allow_up_to",
+        "maximum_reasoning_effort" => "high",
+        "enforced_reasoning_effort" => "ultra"
+      })
+
+    view |> element("#api-key-form") |> render_change(%{"api_key" => allow_up_to_params})
+
+    assert has_element?(view, "#api_key_reasoning_policy_mode_allow_up_to[checked]")
+    assert has_element?(view, "#api_key_maximum_reasoning_effort option[selected][value='high']")
+    refute has_element?(view, "#api_key_enforced_reasoning_effort")
+
+    select_api_key_section(view, :review)
+    assert has_element?(view, "#api-key-review-summary", "Allow up to High")
+
+    view
+    |> element("#api-key-form")
+    |> render_submit(%{"api_key" => allow_up_to_params})
+
+    api_key = Repo.get_by!(APIKey, display_name: "Allow up to key")
+    assert api_key.maximum_reasoning_effort == "high"
+    assert api_key.enforced_reasoning_effort == nil
+
+    view |> element("#edit-api-key-#{api_key.id}") |> render_click()
+    select_api_key_section(view, :models)
+    assert has_element?(view, "#api_key_reasoning_policy_mode_allow_up_to[checked]")
+    assert has_element?(view, "#api_key_maximum_reasoning_effort option[selected][value='high']")
+
+    always_use_params =
+      api_key_payload(%{
+        "id" => api_key.id,
+        "display_name" => api_key.display_name,
+        "pool_id" => pool.id,
+        "reasoning_policy_mode" => "always_use",
+        "enforced_reasoning_effort" => "minimal",
+        "maximum_reasoning_effort" => "high"
+      })
+
+    view |> element("#api-key-form") |> render_change(%{"api_key" => always_use_params})
+    assert has_element?(view, "#api_key_reasoning_policy_mode_always_use[checked]")
+
+    assert has_element?(
+             view,
+             "#api_key_enforced_reasoning_effort option[selected][value='minimal']"
+           )
+
+    refute has_element?(view, "#api_key_maximum_reasoning_effort")
+
+    select_api_key_section(view, :review)
+    assert has_element?(view, "#api-key-review-summary", "Always use Minimal")
+
+    view
+    |> element("#api-key-form")
+    |> render_submit(%{"api_key" => always_use_params})
+
+    always_use_key = Repo.get!(APIKey, api_key.id)
+    assert always_use_key.enforced_reasoning_effort == "minimal"
+    assert always_use_key.maximum_reasoning_effort == nil
+
+    view |> element("#edit-api-key-#{api_key.id}") |> render_click()
+    select_api_key_section(view, :models)
+
+    unrestricted_params =
+      api_key_payload(%{
+        "id" => api_key.id,
+        "display_name" => api_key.display_name,
+        "pool_id" => pool.id,
+        "reasoning_policy_mode" => "unrestricted",
+        "enforced_reasoning_effort" => "ultra",
+        "maximum_reasoning_effort" => "high"
+      })
+
+    view |> element("#api-key-form") |> render_change(%{"api_key" => unrestricted_params})
+    assert has_element?(view, "#api_key_reasoning_policy_mode_unrestricted[checked]")
+    refute has_element?(view, "#api_key_enforced_reasoning_effort")
+    refute has_element?(view, "#api_key_maximum_reasoning_effort")
+
+    select_api_key_section(view, :review)
+    assert has_element?(view, "#api-key-review-summary", "Unrestricted")
+
+    view
+    |> element("#api-key-form")
+    |> render_submit(%{"api_key" => unrestricted_params})
+
+    unrestricted_key = Repo.get!(APIKey, api_key.id)
+    assert unrestricted_key.enforced_reasoning_effort == nil
+    assert unrestricted_key.maximum_reasoning_effort == nil
+
+    {:ok, remounted_view, _html} = live(conn, ~p"/admin/api-keys")
+    remounted_view |> element("#edit-api-key-#{api_key.id}") |> render_click()
+    select_api_key_section(remounted_view, :models)
+    assert has_element?(remounted_view, "#api_key_reasoning_policy_mode_unrestricted[checked]")
+  end
+
+  test "reasoning mode changes use accessible radios and incomplete contextual values block review",
+       %{
+         conn: conn,
+         scope: scope
+       } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "reasoning-legacy", name: "Reasoning Legacy"})
+
+    {:ok, %{api_key: legacy_key}} =
+      Access.create_api_key(scope, pool, %{
+        display_name: "Legacy exact key",
+        enforced_reasoning_effort: "xhigh"
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/api-keys")
+    view |> element("#edit-api-key-#{legacy_key.id}") |> render_click()
+    select_api_key_section(view, :models)
+
+    assert has_element?(view, "#api_key_reasoning_policy_mode_always_use[checked]")
+
+    assert has_element?(
+             view,
+             "#api_key_enforced_reasoning_effort option[selected][value='xhigh']"
+           )
+
+    reasoning_mode_params =
+      api_key_payload(%{
+        "id" => legacy_key.id,
+        "display_name" => legacy_key.display_name,
+        "pool_id" => pool.id
+      })
+
+    Enum.each(["unrestricted", "allow_up_to", "always_use"], fn mode ->
+      view
+      |> element("#api-key-form")
+      |> render_change(%{
+        "api_key" => Map.put(reasoning_mode_params, "reasoning_policy_mode", mode)
+      })
+
+      assert has_element?(view, "#api_key_reasoning_policy_mode_#{mode}[checked]")
+    end)
+
+    incomplete_allow_up_to =
+      api_key_payload(%{
+        "id" => legacy_key.id,
+        "display_name" => legacy_key.display_name,
+        "pool_id" => pool.id,
+        "reasoning_policy_mode" => "allow_up_to",
+        "maximum_reasoning_effort" => ""
+      })
+
+    view |> element("#api-key-form") |> render_change(%{"api_key" => incomplete_allow_up_to})
+    select_api_key_section(view, :review)
+
+    assert has_element?(
+             view,
+             "#api-key-review-errors",
+             "Allow up to needs a maximum reasoning effort"
+           )
+
+    refute has_element?(view, "#api-key-submit:not([disabled])")
+
+    incomplete_always_use =
+      api_key_payload(%{
+        "id" => legacy_key.id,
+        "display_name" => legacy_key.display_name,
+        "pool_id" => pool.id,
+        "reasoning_policy_mode" => "always_use",
+        "enforced_reasoning_effort" => ""
+      })
+
+    view |> element("#api-key-form") |> render_change(%{"api_key" => incomplete_always_use})
+    select_api_key_section(view, :review)
+
+    assert has_element?(
+             view,
+             "#api-key-review-errors",
+             "Always use needs a reasoning effort"
+           )
+
+    refute has_element?(view, "#api-key-submit:not([disabled])")
   end
 
   test "edit sections preserve unavailable saved model chips", %{conn: conn, scope: scope} do
@@ -436,6 +626,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLivePolicyTest do
         "manual_model_identifiers_text" => "",
         "enforced_model_identifier" => "",
         "enforced_reasoning_effort" => "",
+        "maximum_reasoning_effort" => "",
+        "reasoning_policy_mode" => "unrestricted",
         "enforced_service_tier" => "",
         "default_max_requests_per_minute" => "",
         "default_max_tokens_per_day" => "",

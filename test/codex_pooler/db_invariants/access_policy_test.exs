@@ -220,6 +220,42 @@ defmodule CodexPooler.DBInvariants.AccessPolicyTest do
              ).rows
   end
 
+  test "database preserves exact reasoning enforcement and accepts every maximum bound" do
+    user_id = create_user!("owner-api-key-reasoning-policy@example.com")
+    pool_id = create_pool!(user_id, "api-key-reasoning-policy", "API Key Reasoning Policy")
+
+    exact_id =
+      insert_reasoning_policy_key!(pool_id, user_id, "exact", "high", nil)
+
+    assert [["high", nil]] = reasoning_policy_values(exact_id)
+
+    for effort <- ~w(none minimal low medium high xhigh max ultra) do
+      maximum_id =
+        insert_reasoning_policy_key!(pool_id, user_id, "maximum-#{effort}", nil, effort)
+
+      assert [[nil, ^effort]] = reasoning_policy_values(maximum_id)
+    end
+  end
+
+  test "database rejects invalid maximum reasoning effort and mutually exclusive policies" do
+    user_id = create_user!("owner-api-key-reasoning-policy-invalid@example.com")
+
+    pool_id =
+      create_pool!(
+        user_id,
+        "api-key-reasoning-policy-invalid",
+        "Invalid API Key Reasoning Policy"
+      )
+
+    assert_db_constraint("api_keys_maximum_reasoning_effort_check", fn ->
+      insert_reasoning_policy_key!(pool_id, user_id, "invalid-maximum", nil, "extreme")
+    end)
+
+    assert_db_constraint("api_keys_reasoning_effort_policy_mutual_exclusion_check", fn ->
+      insert_reasoning_policy_key!(pool_id, user_id, "conflicting", "high", "medium")
+    end)
+  end
+
   test "database preserves pre-policy API key rows with nullable advanced policy fields" do
     user_id = create_user!("owner-api-key-legacy-preserve@example.com")
     pool_id = create_pool!(user_id, "api-key-legacy-preserve", "API Key Legacy Preserve")
@@ -272,6 +308,29 @@ defmodule CodexPooler.DBInvariants.AccessPolicyTest do
              ).rows
   end
 
+  test "database preserves existing exact-enforced API key rows unchanged" do
+    user_id = create_user!("owner-api-key-exact-preserve@example.com")
+    pool_id = create_pool!(user_id, "api-key-exact-preserve", "API Key Exact Preserve")
+
+    [[api_key_id]] =
+      Repo.query!(
+        """
+        INSERT INTO api_keys (
+          pool_id, display_name, key_prefix, key_hash, status, created_by_user_id,
+          enforced_reasoning_effort
+        ) VALUES ($1, 'Exact preserved key', 'sk_exact_preserve', $2, 'active', $3, 'high')
+        RETURNING id
+        """,
+        [pool_id, <<"exact-preserve">>, user_id]
+      ).rows
+
+    assert [["high"]] =
+             Repo.query!(
+               "SELECT enforced_reasoning_effort FROM api_keys WHERE id = $1",
+               [api_key_id]
+             ).rows
+  end
+
   defp create_user!(email) do
     [[id]] =
       Repo.query!(
@@ -314,6 +373,41 @@ defmodule CodexPooler.DBInvariants.AccessPolicyTest do
     id
   end
 
+  defp insert_reasoning_policy_key!(pool_id, user_id, suffix, enforced, maximum) do
+    [[id]] =
+      Repo.query!(
+        """
+        INSERT INTO api_keys (
+          pool_id, display_name, key_prefix, key_hash, status, created_by_user_id,
+          enforced_reasoning_effort, maximum_reasoning_effort
+        ) VALUES ($1, $2, $3, $4, 'active', $5, $6, $7)
+        RETURNING id
+        """,
+        [
+          pool_id,
+          "Reasoning policy #{suffix}",
+          "sk_reasoning_#{suffix}",
+          suffix,
+          user_id,
+          enforced,
+          maximum
+        ]
+      ).rows
+
+    id
+  end
+
+  defp reasoning_policy_values(api_key_id) do
+    Repo.query!(
+      """
+      SELECT enforced_reasoning_effort, maximum_reasoning_effort
+      FROM api_keys
+      WHERE id = $1
+      """,
+      [api_key_id]
+    ).rows
+  end
+
   defp count_rows(table_name, id) do
     [[count]] = Repo.query!("SELECT COUNT(*) FROM #{table_name} WHERE id = $1", [id]).rows
     count
@@ -326,6 +420,19 @@ defmodule CodexPooler.DBInvariants.AccessPolicyTest do
       rescue
         error in Postgrex.Error ->
           assert error.postgres.code == code
+          reraise error, __STACKTRACE__
+      end
+    end
+  end
+
+  defp assert_db_constraint(constraint, fun) do
+    assert_raise Postgrex.Error, fn ->
+      try do
+        fun.()
+      rescue
+        error in Postgrex.Error ->
+          assert error.postgres.code == :check_violation
+          assert error.postgres.constraint == constraint
           reraise error, __STACKTRACE__
       end
     end

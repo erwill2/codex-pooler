@@ -7,6 +7,41 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
   describe "upstream_payload/4" do
+    test "materializes present malformed reasoning aliases without lower-priority fallthrough" do
+      cases = [
+        %{"reasoning" => %{"effort" => 42}, "reasoning_effort" => "high"},
+        %{"reasoning" => %{"effort" => "  "}, "reasoning_effort" => "high"},
+        %{"reasoning_effort" => %{"invalid" => true}, "reasoningEffort" => "high"},
+        %{"reasoning_effort" => "  ", "reasoningEffort" => "high"},
+        %{"reasoningEffort" => 42, "thinking" => "high"},
+        %{"reasoningEffort" => " ", "thinking" => "high"},
+        %{"thinking" => 42, "enable_thinking" => true},
+        %{"thinking" => " ", "enable_thinking" => true}
+      ]
+
+      model = %Model{upstream_model_id: "provider-model"}
+
+      for aliases <- cases do
+        payload = Map.merge(%{"model" => "gpt-4.1", "input" => "hello"}, aliases)
+        request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+        assert {:ok, encoded} =
+                 PayloadNormalizer.upstream_payload(
+                   payload,
+                   model,
+                   "/backend-api/codex/responses",
+                   request_options
+                 )
+
+        upstream = Jason.decode!(encoded)
+        refute get_in(upstream, ["reasoning", "effort"])
+        refute Map.has_key?(upstream, "reasoning_effort")
+        refute Map.has_key?(upstream, "reasoningEffort")
+        refute Map.has_key?(upstream, "thinking")
+        refute Map.has_key?(upstream, "enable_thinking")
+      end
+    end
+
     test "removes backend Codex encrypted tool schema markers from HTTP upstream JSON" do
       payload = encrypted_tool_schema_payload()
       request_options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
@@ -623,7 +658,155 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
       assert upstream["parallel_tool_calls"] == false
     end
 
-    test "maps enforced ultra reasoning effort to max only in the backend Codex upstream payload" do
+    test "uses the pre-dispatch applied effort for compact payloads without re-deciding policy" do
+      payload = %{"model" => "gpt-4.1", "input" => "hello"}
+
+      decision = %CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision{
+        mode: :allow_up_to,
+        configured_effort: "high",
+        requested_effort: nil,
+        applied_effort: "medium"
+      }
+
+      request_options =
+        RequestOptions.build(
+          %{
+            reasoning_effort_decision: decision,
+            api_key_policy: %{enforced_reasoning_effort: "ultra"}
+          },
+          "/backend-api/codex/responses/compact",
+          payload
+        )
+
+      assert {:ok, encoded, updated_options} =
+               PayloadNormalizer.prepare_upstream_payload(
+                 payload,
+                 %Model{upstream_model_id: "provider-model"},
+                 "/backend-api/codex/responses/compact",
+                 request_options
+               )
+
+      assert Jason.decode!(encoded)["reasoning"] == %{"effort" => "medium"}
+
+      assert updated_options.runtime.reasoning_effort_snapshot == %{
+               "applied_effort" => "medium",
+               "configured_effort" => "high",
+               "effective_effort" => "medium",
+               "policy_mode" => "allow_up_to",
+               "source" => "api_key_policy"
+             }
+    end
+
+    test "preserves unrestricted explicit and omitted effort decisions" do
+      model = %Model{upstream_model_id: "provider-model"}
+
+      for {requested, payload, expected_reasoning} <- [
+            {"high",
+             %{"model" => "gpt-4.1", "input" => "hello", "reasoning" => %{"effort" => "high"}},
+             %{"effort" => "high"}},
+            {nil, %{"model" => "gpt-4.1", "input" => "hello"}, nil}
+          ] do
+        decision = %CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision{
+          mode: :unrestricted,
+          configured_effort: nil,
+          requested_effort: requested,
+          applied_effort: requested
+        }
+
+        options =
+          RequestOptions.build(
+            %{reasoning_effort_decision: decision},
+            "/backend-api/codex/responses",
+            payload
+          )
+
+        assert {:ok, encoded} =
+                 PayloadNormalizer.upstream_payload(
+                   payload,
+                   model,
+                   "/backend-api/codex/responses",
+                   options
+                 )
+
+        assert Jason.decode!(encoded)["reasoning"] == expected_reasoning
+      end
+    end
+
+    test "ignores stale enforced policy when attributing unrestricted decisions" do
+      model = %Model{upstream_model_id: "provider-model"}
+
+      for {requested, payload, expected_source} <- [
+            {"high",
+             %{
+               "model" => "gpt-4.1",
+               "input" => "hello",
+               "reasoning" => %{"effort" => "high"}
+             }, "client"},
+            {nil, %{"model" => "gpt-4.1", "input" => "hello"}, nil}
+          ] do
+        decision = %CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision{
+          mode: :unrestricted,
+          configured_effort: nil,
+          requested_effort: requested,
+          applied_effort: requested
+        }
+
+        options =
+          RequestOptions.build(
+            %{
+              reasoning_effort_decision: decision,
+              api_key_policy: %{enforced_reasoning_effort: "ultra"}
+            },
+            "/backend-api/codex/responses",
+            payload
+          )
+
+        assert {:ok, encoded, updated_options} =
+                 PayloadNormalizer.prepare_upstream_payload(
+                   payload,
+                   model,
+                   "/backend-api/codex/responses",
+                   options
+                 )
+
+        upstream_reasoning = Jason.decode!(encoded)["reasoning"]
+        snapshot = updated_options.runtime.reasoning_effort_snapshot
+
+        assert get_in(upstream_reasoning || %{}, ["effort"]) == requested
+        assert snapshot["source"] == expected_source
+        assert snapshot["policy_mode"] == "unrestricted"
+      end
+    end
+
+    test "always-use decision overwrites an explicit client effort" do
+      payload = %{"model" => "gpt-4.1", "input" => "hello", "reasoning" => %{"effort" => "low"}}
+
+      decision = %CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision{
+        mode: :always_use,
+        configured_effort: "ultra",
+        requested_effort: "low",
+        applied_effort: "ultra"
+      }
+
+      options =
+        RequestOptions.build(
+          %{reasoning_effort_decision: decision},
+          "/backend-api/codex/responses",
+          payload
+        )
+
+      assert {:ok, encoded} =
+               PayloadNormalizer.upstream_payload(
+                 payload,
+                 %Model{upstream_model_id: "provider-model"},
+                 "/backend-api/codex/responses",
+                 options
+               )
+
+      assert Jason.decode!(encoded)["reasoning"] == %{"effort" => "max"}
+    end
+
+    test "maps legacy directly-normalized enforced ultra effort to backend max" do
       payload = %{"model" => "gpt-4.1", "input" => "hello", "reasoning" => %{"effort" => "low"}}
 
       request_options =

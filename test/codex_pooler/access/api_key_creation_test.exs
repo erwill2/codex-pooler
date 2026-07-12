@@ -78,6 +78,160 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
                )
     end
 
+    test "persists, transitions, queries, moves, and audits reasoning policy modes" do
+      {scope, pool} = owner_scope_and_pool()
+
+      {:ok, other_pool} =
+        Pools.create_pool(scope, %{
+          slug: "reasoning-policy-#{System.unique_integer([:positive])}",
+          name: "Reasoning policy"
+        })
+
+      assert {:ok, %{api_key: api_key}} =
+               Access.create_api_key(scope, pool, %{
+                 display_name: "Reasoning policy key",
+                 maximum_reasoning_effort: " High "
+               })
+
+      assert api_key.maximum_reasoning_effort == "high"
+      assert is_nil(api_key.enforced_reasoning_effort)
+
+      assert {:ok, [%{policy: maximum_policy}]} = Access.list_api_keys_with_policy(scope)
+      assert maximum_policy.reasoning_policy_mode == :allow_up_to
+      assert maximum_policy.maximum_reasoning_effort == "high"
+      assert is_nil(maximum_policy.enforced_reasoning_effort)
+
+      assert {:ok, %{api_key: exact_key}} =
+               Access.update_api_key_with_policy(scope, api_key, %{
+                 enforced_reasoning_effort: " XHigh "
+               })
+
+      assert exact_key.enforced_reasoning_effort == "xhigh"
+      assert is_nil(exact_key.maximum_reasoning_effort)
+
+      assert {:ok, %{api_key: unrestricted_key}} =
+               Access.update_api_key_with_policy(scope, exact_key, %{})
+
+      assert is_nil(unrestricted_key.enforced_reasoning_effort)
+      assert is_nil(unrestricted_key.maximum_reasoning_effort)
+
+      assert {:ok, %{api_key: maximum_key}} =
+               Access.update_api_key_with_policy(scope, unrestricted_key, %{
+                 maximum_reasoning_effort: "medium"
+               })
+
+      assert :ok = Access.assign_api_keys_to_pool(scope, other_pool, [maximum_key.id])
+
+      moved_key = Repo.get!(APIKey, maximum_key.id)
+      assert moved_key.pool_id == other_pool.id
+      assert moved_key.maximum_reasoning_effort == "medium"
+      assert is_nil(moved_key.enforced_reasoning_effort)
+
+      audits =
+        Repo.all(
+          from event in AuditEvent,
+            where: event.target_id == ^api_key.id,
+            order_by: [asc: event.occurred_at]
+        )
+
+      assert Enum.any?(audits, fn event ->
+               event.details["reasoning_policy_mode"] == "allow_up_to" and
+                 event.details["reasoning_policy_configuration"] == "high"
+             end)
+
+      assert Enum.any?(audits, fn event ->
+               event.details["previous_reasoning_policy_mode"] == "allow_up_to" and
+                 event.details["reasoning_policy_mode"] == "always_use" and
+                 event.details["reasoning_policy_configuration"] == "xhigh"
+             end)
+
+      refute Enum.any?(audits, fn event ->
+               Map.has_key?(event.details, "enforced_reasoning_effort") or
+                 Map.has_key?(event.details, "maximum_reasoning_effort")
+             end)
+    end
+
+    test "rejects malformed or conflicting reasoning policy without update or audit" do
+      {scope, pool} = owner_scope_and_pool()
+
+      assert {:ok, %{api_key: api_key}} =
+               Access.create_api_key(scope, pool, %{
+                 display_name: "Stable reasoning key",
+                 enforced_reasoning_effort: "high"
+               })
+
+      initial_audit_count =
+        Repo.aggregate(from(event in AuditEvent, where: event.target_id == ^api_key.id), :count)
+
+      assert {:error, %{code: :invalid_policy, message: both_message}} =
+               Access.update_api_key_with_policy(scope, api_key, %{
+                 display_name: "Must not persist",
+                 enforced_reasoning_effort: "medium",
+                 maximum_reasoning_effort: "high"
+               })
+
+      assert both_message =~ "cannot both"
+
+      assert {:error, %{code: :invalid_policy, message: malformed_message}} =
+               Access.update_api_key_with_policy(scope, api_key, %{
+                 maximum_reasoning_effort: %{invalid: true}
+               })
+
+      assert malformed_message =~ "maximum_reasoning_effort"
+
+      persisted = Repo.get!(APIKey, api_key.id)
+      assert persisted.display_name == "Stable reasoning key"
+      assert persisted.enforced_reasoning_effort == "high"
+      assert is_nil(persisted.maximum_reasoning_effort)
+
+      assert Repo.aggregate(
+               from(event in AuditEvent, where: event.target_id == ^api_key.id),
+               :count
+             ) == initial_audit_count
+    end
+
+    test "reloads a stale API key struct before policy update and audit" do
+      {scope, pool} = owner_scope_and_pool()
+
+      assert {:ok, %{api_key: maximum_key}} =
+               Access.create_api_key(scope, pool, %{
+                 display_name: "Stale reasoning key",
+                 maximum_reasoning_effort: "high"
+               })
+
+      stale_maximum_key = Repo.get!(APIKey, maximum_key.id)
+
+      assert {:ok, %{api_key: exact_key}} =
+               Access.update_api_key_with_policy(scope, maximum_key.id, %{
+                 enforced_reasoning_effort: "xhigh"
+               })
+
+      assert exact_key.enforced_reasoning_effort == "xhigh"
+      assert is_nil(exact_key.maximum_reasoning_effort)
+
+      assert {:ok, %{api_key: returned_key}} =
+               Access.update_api_key_with_policy(scope, stale_maximum_key, %{})
+
+      persisted_key = Repo.get!(APIKey, maximum_key.id)
+      assert returned_key.enforced_reasoning_effort == persisted_key.enforced_reasoning_effort
+      assert returned_key.maximum_reasoning_effort == persisted_key.maximum_reasoning_effort
+      assert is_nil(returned_key.enforced_reasoning_effort)
+      assert is_nil(returned_key.maximum_reasoning_effort)
+
+      latest_audit =
+        Repo.one!(
+          from event in AuditEvent,
+            where: event.target_id == ^maximum_key.id and event.action == "api_key.update",
+            order_by: [desc: event.occurred_at],
+            limit: 1
+        )
+
+      assert latest_audit.details["previous_reasoning_policy_mode"] == "always_use"
+      assert latest_audit.details["previous_reasoning_policy_configuration"] == "xhigh"
+      assert latest_audit.details["reasoning_policy_mode"] == "unrestricted"
+      assert is_nil(latest_audit.details["reasoning_policy_configuration"])
+    end
+
     test "rejects API key assignment when a selected key is not visible" do
       {scope, pool} = owner_scope_and_pool()
       missing_api_key_id = Ecto.UUID.generate()
@@ -292,6 +446,7 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
       assert is_nil(unrestricted_key.allowed_model_identifiers)
       assert is_nil(unrestricted_key.enforced_model_identifier)
       assert is_nil(unrestricted_key.enforced_reasoning_effort)
+      assert is_nil(unrestricted_key.maximum_reasoning_effort)
       assert is_nil(unrestricted_key.enforced_service_tier)
 
       assert {:ok, %{api_key: deny_all_key}} =
@@ -352,6 +507,49 @@ defmodule CodexPooler.Access.APIKeyCreationTest do
         })
 
       assert none_reasoning_api_key_changeset.valid?
+
+      maximum_reasoning_api_key_changeset =
+        APIKey.changeset(%APIKey{}, %{
+          pool_id: Ecto.UUID.generate(),
+          display_name: "Maximum reasoning policy key",
+          key_prefix: "sk_typed_policy_maximum",
+          key_hash: <<"typed-policy-maximum">>,
+          status: "active",
+          maximum_reasoning_effort: "ultra"
+        })
+
+      assert maximum_reasoning_api_key_changeset.valid?
+
+      invalid_maximum_reasoning_api_key_changeset =
+        APIKey.changeset(%APIKey{}, %{
+          pool_id: Ecto.UUID.generate(),
+          display_name: "Invalid maximum reasoning policy key",
+          key_prefix: "sk_typed_policy_invalid_maximum",
+          key_hash: <<"typed-policy-invalid-maximum">>,
+          status: "active",
+          maximum_reasoning_effort: "extreme"
+        })
+
+      refute invalid_maximum_reasoning_api_key_changeset.valid?
+
+      assert "is invalid" in errors_on(invalid_maximum_reasoning_api_key_changeset).maximum_reasoning_effort
+
+      conflicting_reasoning_api_key_changeset =
+        APIKey.changeset(%APIKey{}, %{
+          pool_id: Ecto.UUID.generate(),
+          display_name: "Conflicting reasoning policy key",
+          key_prefix: "sk_typed_policy_conflicting_reasoning",
+          key_hash: <<"typed-policy-conflicting-reasoning">>,
+          status: "active",
+          enforced_reasoning_effort: "high",
+          maximum_reasoning_effort: "medium"
+        })
+
+      refute conflicting_reasoning_api_key_changeset.valid?
+
+      assert "cannot be set when exact reasoning effort is enforced" in errors_on(
+               conflicting_reasoning_api_key_changeset
+             ).maximum_reasoning_effort
 
       ultrafast_api_key_changeset =
         APIKey.changeset(%APIKey{}, %{

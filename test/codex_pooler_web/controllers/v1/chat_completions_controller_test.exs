@@ -7,9 +7,88 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     only: [auth: 2, gateway_setup: 1, start_upstream: 1]
 
   alias CodexPooler.Accounting.{Attempt, Request, RequestLogs}
+  alias CodexPooler.Accounting.LedgerEntry
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Persistence.CodexSession
   alias CodexPooler.Repo
+
+  @reasoning_denial_message "reasoning effort is not available for this API key"
+
+  test "POST /v1/chat/completions enforces reasoning availability before gateway effort", %{
+    conn: conn
+  } do
+    for requested_effort <- ["high", "custom-above-policy"] do
+      persisted_effort = if requested_effort == "high", do: "high", else: "unknown"
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+      setup = gateway_setup(upstream)
+      set_reasoning_policy!(setup, maximum_reasoning_effort: "medium")
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(
+          "/v1/chat/completions",
+          Map.put(chat_payload(setup), "reasoning_effort", requested_effort)
+        )
+
+      assert %{
+               "error" => %{
+                 "code" => "reasoning_effort_not_allowed",
+                 "message" => @reasoning_denial_message,
+                 "param" => "reasoning_effort"
+               }
+             } = json_response(response, 400)
+
+      assert FakeUpstream.count(upstream) == 0
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.status == "rejected"
+      assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+      assert Repo.aggregate(from(l in LedgerEntry, where: l.request_id == ^request.id), :count) ==
+               0
+
+      assert get_in(request.request_metadata, ["gateway_denial", "reasoning_policy"]) == %{
+               "policy_mode" => "allow_up_to",
+               "configured_effort" => "medium",
+               "requested_effort" => persisted_effort,
+               "applied_effort" => nil
+             }
+    end
+  end
+
+  test "POST /v1/chat/completions applies maximum, exact, and unrestricted reasoning policies", %{
+    conn: conn
+  } do
+    cases = [
+      {[maximum_reasoning_effort: "medium"], %{}, "medium", "allow_up_to"},
+      {[maximum_reasoning_effort: "high"], %{"reasoning_effort" => "low"}, "low", "allow_up_to"},
+      {[enforced_reasoning_effort: "high"], %{"reasoning_effort" => "low"}, "high", "always_use"},
+      {[], %{}, nil, "unrestricted"},
+      {[], %{"reasoning_effort" => "focused"}, "focused", "unrestricted"}
+    ]
+
+    for {policy, extra_payload, expected_effort, expected_mode} <- cases do
+      upstream = start_upstream(completed_chat_upstream())
+      setup = gateway_setup(upstream)
+      set_reasoning_policy!(setup, policy)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/chat/completions", Map.merge(chat_payload(setup), extra_payload))
+
+      assert %{"id" => "resp_reasoning_policy_chat"} = json_response(response, 200)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert get_in(captured.json, ["reasoning", "effort"]) == expected_effort
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+      assert get_in(attempt.response_metadata, ["reasoning", "policy_mode"]) == expected_mode
+      assert get_in(attempt.response_metadata, ["reasoning", "applied_effort"]) == expected_effort
+    end
+  end
 
   test "POST /v1/chat/completions non-streaming returns OpenAI chat shape", %{conn: conn} do
     upstream =
@@ -1510,6 +1589,28 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
         %{"role" => "user", "content" => "Synthetic user"}
       ]
     }
+  end
+
+  defp set_reasoning_policy!(setup, attrs) do
+    setup.api_key
+    |> Ecto.Changeset.change(attrs)
+    |> Repo.update!()
+  end
+
+  defp completed_chat_upstream do
+    FakeUpstream.sse_stream([
+      {"response.completed",
+       %{
+         "type" => "response.completed",
+         "response" => %{
+           "id" => "resp_reasoning_policy_chat",
+           "status" => "completed",
+           "model" => "provider-gpt-test-model",
+           "output" => [],
+           "usage" => %{"input_tokens" => 1, "output_tokens" => 1, "total_tokens" => 2}
+         }
+       }}
+    ])
   end
 
   defp function_tool do

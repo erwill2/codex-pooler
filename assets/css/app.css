@@ -579,6 +579,16 @@ body {
   color: var(--color-primary-content) !important;
 }
 
+.btn.btn-primary:disabled,
+.btn.btn-primary[disabled] {
+  cursor: not-allowed;
+  border-color: var(--color-base-300);
+  background-color: var(--color-base-300);
+  color: var(--color-base-content);
+  box-shadow: none;
+  opacity: 1;
+}
+
 .codex-otp-groups {
   display: flex;
   align-items: center;

@@ -148,6 +148,29 @@ defmodule CodexPooler.CompatibilityMatrix do
         "client-facing ultra reasoning is accepted and rewritten to backend-compatible max before backend Codex regular and compact upstream dispatch"
     },
     %{
+      slug: :api_key_reasoning_availability,
+      status: :supported,
+      current: :pre_reservation_three_mode_policy,
+      categories: [:route, :auth, :error, :streaming, :ownership],
+      routes: [
+        %{method: :get, path: "/backend-api/codex/models"},
+        %{method: :post, path: "/backend-api/codex/responses"},
+        %{method: :get, path: "/backend-api/codex/responses", transport: "websocket"},
+        %{method: :post, path: "/backend-api/codex/responses/compact"},
+        %{method: :post, path: "/backend-api/codex/v1/responses"},
+        %{method: :get, path: "/backend-api/codex/v1/responses", transport: "websocket"},
+        %{method: :post, path: "/backend-api/codex/v1/responses/compact"},
+        %{method: :post, path: "/backend-api/codex/v1/chat/completions"},
+        %{method: :post, path: "/v1/responses"},
+        %{method: :get, path: "/v1/responses", transport: "websocket"},
+        %{method: :post, path: "/v1/chat/completions"}
+      ],
+      future_routes: [],
+      fixture: :api_key_reasoning_availability,
+      contract:
+        "API keys derive unrestricted, allow_up_to, or always_use reasoning policy from their configured fields. Unrestricted preserves omission and current accepted explicit values. Allow_up_to accepts known values through its ceiling and the selected model's effective known levels, resolves omission from the permitted default or highest permitted known value, and rejects above-ceiling, unknown, custom, or empty-intersection requests before reservation or upstream work without clamping. Always_use preserves legacy exact enforcement regardless of metadata membership. Denials are status 400 reasoning_effort_not_allowed with message reasoning effort is not available for this API key and param reasoning.effort for Responses/backend/compact or reasoning_effort for Chat; model_not_allowed remains the prior status 403 decision. Upgraded response.create frames receive the same existing error frame after upgrade, not an upgrade rejection. Backend model metadata is filtered by policy while models remain visible, and public /v1/models remains unchanged. minimal and ultra are evaluated before their backend low and max rewrites."
+    },
+    %{
       slug: :reasoning_context,
       status: :supported,
       current: :openai_sdk_literal_normalization,
@@ -555,6 +578,37 @@ defmodule CodexPooler.CompatibilityMatrix do
         "model" => "gpt-fixture-text",
         "input" => "synthetic reasoning request",
         "reasoning" => %{"effort" => "ultra"}
+      }
+    },
+    api_key_reasoning_availability: %{
+      modes: [:unrestricted, :allow_up_to, :always_use],
+      known_efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+      denial: %{
+        status: 400,
+        code: "reasoning_effort_not_allowed",
+        message: "reasoning effort is not available for this API key",
+        responses_param: "reasoning.effort",
+        chat_param: "reasoning_effort",
+        before_reservation: true,
+        upstream_called: false
+      },
+      websocket: %{
+        policy_timing: "response.create_after_upgrade",
+        denial: "existing_error_frame",
+        upgrade_rejected: false
+      },
+      metadata: %{
+        unrestricted: "existing_levels_and_default",
+        allow_up_to: "permitted_known_levels_and_default",
+        always_use: "singleton_when_model_effective_else_empty",
+        models_remain_visible: true,
+        public_v1_models_changed: false
+      },
+      aliases: %{"minimal" => "low", "ultra" => "max"},
+      json: %{
+        "model" => "gpt-fixture-text",
+        "input" => "synthetic reasoning availability request",
+        "reasoning" => %{"effort" => "medium"}
       }
     },
     reasoning_context: %{

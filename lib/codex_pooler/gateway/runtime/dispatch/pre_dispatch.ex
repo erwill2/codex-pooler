@@ -4,8 +4,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   alias CodexPooler.Access
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Contracts, as: GatewayContracts
-  alias CodexPooler.Gateway.Denials
   alias CodexPooler.Gateway.Payloads.InputShape
+  alias CodexPooler.Gateway.Payloads.ReasoningEffort
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.StrictSchema
   alias CodexPooler.Gateway.Routing.CandidateEligibility
@@ -70,6 +70,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
       when is_list(visible_models) do
     with :ok <- authorize_model_policy(auth, model, endpoint, payload, request_options),
          {:ok, request_options} <-
+           resolve_reasoning_effort(auth, model, payload, request_options),
+         {:ok, request_options} <-
            SessionContinuity.attach_file_affinity(auth, endpoint, payload, request_options),
          :ok <- ensure_model_supports(model, endpoint, payload, request_options),
          :ok <- StrictSchema.validate(payload),
@@ -120,7 +122,13 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
     end
   end
 
-  defp authorize_model_policy(auth, %Model{} = model, endpoint, payload, %RequestOptions{} = opts) do
+  defp authorize_model_policy(
+         _auth,
+         %Model{} = model,
+         _endpoint,
+         _payload,
+         %RequestOptions{} = opts
+       ) do
     policy = opts.routing.api_key_policy
 
     model_identifier = opts.routing.effective_model || model.exposed_model_id
@@ -130,9 +138,45 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
         :ok
 
       {:error, reason} ->
-        Denials.log_policy(denial_context(auth, model, reason, endpoint, payload, opts))
+        {:error, policy_error(reason)}
     end
   end
+
+  defp resolve_reasoning_effort(auth, model, payload, request_options) do
+    requested_effort = ReasoningEffort.extract(payload, request_options)
+
+    {model_efforts, model_default} =
+      reasoning_model_availability(auth.api_key, model)
+
+    case Access.resolve_reasoning_effort(
+           auth.api_key,
+           requested_effort,
+           model_efforts,
+           model_default
+         ) do
+      {:ok, decision} ->
+        {:ok, RequestOptions.put_routing(request_options, reasoning_effort_decision: decision)}
+
+      {:error, :reasoning_effort_not_allowed} ->
+        {:error,
+         error(
+           400,
+           "reasoning_effort_not_allowed",
+           "reasoning effort is not available for this API key",
+           ReasoningEffort.parameter(request_options)
+         )
+         |> Map.put(
+           :reasoning_policy,
+           Access.project_reasoning_effort_denial_metadata(auth.api_key, requested_effort)
+         )}
+    end
+  end
+
+  defp reasoning_model_availability(%{maximum_reasoning_effort: effort}, model)
+       when is_binary(effort),
+       do: ModelMetadata.reasoning_levels_and_default(model)
+
+  defp reasoning_model_availability(_api_key, _model), do: {nil, nil}
 
   defp ensure_model_supports(
          %Model{},
@@ -179,16 +223,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
     end
   end
 
-  defp denial_context(auth, model, reason, endpoint, payload, opts) do
-    %Denials.Context{
-      auth: auth,
-      model: model,
-      reason: reason,
-      endpoint: endpoint,
-      payload: payload,
-      opts: opts
-    }
-  end
+  defp policy_error(:model_not_allowed),
+    do: error(403, "model_not_allowed", "api key is not allowed to use this model", nil)
 
   defp error(status, code, message, param),
     do: %{status: status, code: code, message: message, param: param}

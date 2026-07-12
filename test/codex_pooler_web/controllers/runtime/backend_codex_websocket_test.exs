@@ -42,6 +42,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
 
   @websocket_frame_timeout 1_000
   @large_websocket_frame_timeout 5_000
+  @reasoning_denial_message "reasoning effort is not available for this API key"
 
   @websocket_lifecycle_metadata_keys ~w(
     codex_session_id
@@ -513,6 +514,142 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
       conn
     after
       Mint.HTTP.close(conn)
+    end
+  end
+
+  test "backend websocket routes resolve reasoning policy after upgrade" do
+    cases = [
+      {"/backend-api/codex/responses", [maximum_reasoning_effort: "medium"], %{}, "medium"},
+      {"/backend-api/codex/v1/responses", [maximum_reasoning_effort: "high"],
+       %{"reasoning_effort" => "low"}, "low"},
+      {"/backend-api/codex/responses", [enforced_reasoning_effort: "high"],
+       %{"reasoningEffort" => "low"}, "high"},
+      {"/backend-api/codex/v1/responses", [], %{"reasoning_effort" => "focused"}, "focused"}
+    ]
+
+    for {path, policy, effort_payload, expected_effort} <- cases do
+      upstream =
+        start_upstream(
+          FakeUpstream.json_response(%{
+            "id" => "resp_ws_reasoning_policy",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          })
+        )
+
+      setup = gateway_setup(upstream)
+      assert :ok = Events.subscribe_pool(setup.pool)
+
+      setup.api_key
+      |> Ecto.Changeset.change(policy)
+      |> Repo.update!()
+
+      port = start_public_endpoint!()
+      turn_state = "ws-reasoning-policy-#{System.unique_integer([:positive])}"
+      {conn, websocket, ref} = public_websocket_connect!(port, setup, turn_state, path)
+
+      try do
+        payload =
+          %{
+            "type" => "response.create",
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic websocket policy request",
+            "stream" => true,
+            "generate" => true
+          }
+          |> Map.merge(effort_payload)
+          |> Jason.encode!()
+
+        {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+        {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+        assert %{"id" => "resp_ws_reasoning_policy"} = Jason.decode!(frame)
+        assert [captured] = FakeUpstream.requests(upstream)
+        assert get_in(captured.json, ["reasoning", "effort"]) == expected_effort
+
+        assert_receive {Events,
+                        %{
+                          reason: "request_finalized",
+                          payload: %{"request_id" => request_id, "status" => "succeeded"}
+                        }},
+                       @websocket_frame_timeout
+
+        request = Repo.get!(Request, request_id)
+        assert request.status == "succeeded"
+        assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+        assert get_in(attempt.response_metadata, ["reasoning", "applied_effort"]) ==
+                 expected_effort
+
+        conn
+      after
+        Mint.HTTP.close(conn)
+      end
+    end
+  end
+
+  test "backend websocket routes deny unavailable reasoning after upgrade without reservation" do
+    cases = [
+      {"/backend-api/codex/responses", %{"reasoning_effort" => "high"}, "high"},
+      {"/backend-api/codex/v1/responses", %{"reasoningEffort" => "custom-effort"}, "unknown"}
+    ]
+
+    for {path, effort_payload, persisted_effort} <- cases do
+      upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+      setup = gateway_setup(upstream)
+
+      setup.api_key
+      |> Ecto.Changeset.change(maximum_reasoning_effort: "medium")
+      |> Repo.update!()
+
+      port = start_public_endpoint!()
+      turn_state = "ws-reasoning-denial-#{System.unique_integer([:positive])}"
+      {conn, websocket, ref} = public_websocket_connect!(port, setup, turn_state, path)
+
+      try do
+        payload =
+          %{
+            "type" => "response.create",
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic websocket policy denial",
+            "stream" => true,
+            "generate" => true
+          }
+          |> Map.merge(effort_payload)
+          |> Jason.encode!()
+
+        {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+        {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+        assert %{
+                 "type" => "error",
+                 "status" => 400,
+                 "error" => %{
+                   "code" => "reasoning_effort_not_allowed",
+                   "message" => @reasoning_denial_message,
+                   "param" => "reasoning.effort"
+                 }
+               } = Jason.decode!(frame)
+
+        assert FakeUpstream.count(upstream) == 0
+        assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+        assert request.status == "rejected"
+        assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+        assert Repo.aggregate(from(l in LedgerEntry, where: l.request_id == ^request.id), :count) ==
+                 0
+
+        assert get_in(request.request_metadata, ["gateway_denial", "reasoning_policy"]) == %{
+                 "policy_mode" => "allow_up_to",
+                 "configured_effort" => "medium",
+                 "requested_effort" => persisted_effort,
+                 "applied_effort" => nil
+               }
+
+        conn
+      after
+        Mint.HTTP.close(conn)
+      end
     end
   end
 

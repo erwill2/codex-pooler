@@ -64,6 +64,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
   @blocking_owner_receive_timeout_ms 1_000
   @queued_owner_upstream_start_timeout_ms 1_000
   @response_task_stop_timeout_ms 1_000
+  @reasoning_denial_message "reasoning effort is not available for this API key"
 
   @websocket_lifecycle_metadata_keys ~w(
     codex_session_id
@@ -188,6 +189,54 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
       refute_raw_turn_state_session_key!(setup.pool.id, "stable-ws-owner-forwarding")
       assert session.owner_instance_id == Atom.to_string(node())
       assert {:ok, _owner_pid} = WebsocketOwnerSession.lookup(session.id)
+    after
+      CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  test "owner-forwarded websocket reasoning denial cannot bypass pre-dispatch policy" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    setup.api_key
+    |> Ecto.Changeset.change(maximum_reasoning_effort: "medium")
+    |> Repo.update!()
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, state} = owner_socket(auth, "ws-owner-reasoning-denial", "owner-reasoning-denial")
+
+    try do
+      payload =
+        websocket_payload(setup, "synthetic owner policy denial", %{"reasoning_effort" => "high"})
+
+      assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+      assert {:push, {:text, error_frame}, state} = receive_socket_done(state)
+
+      assert %{
+               "type" => "error",
+               "status" => 400,
+               "error" => %{
+                 "code" => "reasoning_effort_not_allowed",
+                 "message" => @reasoning_denial_message,
+                 "param" => "reasoning.effort"
+               }
+             } = Jason.decode!(error_frame)
+
+      assert {:ok, _owner_pid} = WebsocketOwnerSession.lookup(state.codex_session.id)
+      assert FakeUpstream.count(upstream) == 0
+      assert [request] = request_logs(setup.pool.id)
+      assert request.status == "rejected"
+      assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count) == 0
+
+      assert Repo.aggregate(from(l in LedgerEntry, where: l.request_id == ^request.id), :count) ==
+               0
+
+      assert get_in(request.request_metadata, ["gateway_denial", "reasoning_policy"]) == %{
+               "policy_mode" => "allow_up_to",
+               "configured_effort" => "medium",
+               "requested_effort" => "high",
+               "applied_effort" => nil
+             }
     after
       CodexResponsesSocket.terminate(:closed, state)
     end

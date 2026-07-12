@@ -13,7 +13,8 @@ defmodule CodexPooler.Access.APIKeys do
     Policy,
     PolicyPersistence,
     PolicyUpdate,
-    Queries
+    Queries,
+    ReasoningEffortPolicy
   }
 
   alias CodexPooler.Accounts.Scope
@@ -45,6 +46,31 @@ defmodule CodexPooler.Access.APIKeys do
         }
   @type api_key_result :: {:ok, map()} | {:error, Ecto.Changeset.t() | access_error()}
   @type policy_result :: {:ok, map()} | {:error, atom() | access_error()}
+
+  @spec resolve_reasoning_effort(
+          APIKey.t(),
+          String.t() | nil,
+          [String.t()] | nil,
+          String.t() | nil
+        ) :: ReasoningEffortPolicy.resolution()
+  defdelegate resolve_reasoning_effort(api_key, requested_effort, model_efforts, model_default),
+    to: ReasoningEffortPolicy,
+    as: :resolve
+
+  @spec project_reasoning_effort_metadata(
+          APIKey.t(),
+          [ReasoningEffortPolicy.model_level()] | nil,
+          String.t() | nil
+        ) :: ReasoningEffortPolicy.MetadataProjection.t()
+  defdelegate project_reasoning_effort_metadata(api_key, model_levels, model_default),
+    to: ReasoningEffortPolicy,
+    as: :project_metadata
+
+  @spec project_reasoning_effort_denial_metadata(APIKey.t(), String.t() | nil) ::
+          ReasoningEffortPolicy.denial_metadata()
+  defdelegate project_reasoning_effort_denial_metadata(api_key, requested_effort),
+    to: ReasoningEffortPolicy,
+    as: :project_denial_metadata
 
   @spec create_api_key(Scope.t(), Pool.t() | Ecto.UUID.t(), map()) ::
           api_key_result()
