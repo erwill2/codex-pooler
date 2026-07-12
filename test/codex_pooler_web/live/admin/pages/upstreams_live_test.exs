@@ -2517,6 +2517,60 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
   @tag :upstream_quota_evidence_stability
   @tag :quota_runtime_source_transition
+  test "credit-backed quota rows render striped progress bars", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{
+        slug: "credit-backed-striped",
+        name: "Credit Backed Striped"
+      })
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Credit Backed Striped Codex",
+        assignment_label: "Credit backed striped assignment"
+      })
+
+    now = DateTime.utc_now() |> DateTime.add(-60, :second)
+
+    assert {:ok, [_credit_primary, _percent_weekly]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 window_kind: "primary",
+                 window_minutes: 43_200,
+                 active_limit: 4_192,
+                 credits: 3_414,
+                 used_percent: Decimal.new("18.5"),
+                 reset_at: DateTime.add(now, 11, :day),
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               },
+               %{
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 used_percent: Decimal.new("10"),
+                 reset_at: DateTime.add(now, 6, :day),
+                 source: "codex_usage_api",
+                 source_precision: "observed",
+                 freshness_state: "fresh",
+                 observed_at: now
+               }
+             ])
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    monthly_selector = "#upstream-account-#{identity.id}-limit-primary_30d"
+    weekly_selector = "#upstream-account-#{identity.id}-limit-weekly"
+
+    assert has_element?(view, "#{monthly_selector}-progress.progress-striped")
+    assert has_element?(view, "#{weekly_selector}-progress")
+    refute has_element?(view, "#{weekly_selector}-progress.progress-striped")
+  end
+
   test "Spark zero-use quota stays visible while evidence sources change", %{
     conn: conn,
     scope: scope

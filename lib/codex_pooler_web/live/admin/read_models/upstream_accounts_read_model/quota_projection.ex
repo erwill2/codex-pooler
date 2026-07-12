@@ -354,6 +354,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
       percent_value: quota_percent_value(remaining_percent),
       percent_label: quota_percent_label(remaining_percent),
       count_label: quota_count_label(window),
+      credit_backed: credit_backed_window?(window),
       reset_label: quota_reset_label(window.reset_at),
       reset_title: quota_reset_title(window.reset_at, datetime_preferences)
     }
@@ -367,10 +368,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
       percent_value: 0,
       percent_label: "not reported",
       count_label: nil,
+      credit_backed: false,
       reset_label: nil,
       reset_title: nil
     }
   end
+
+  # A limit is credit-backed when credits with a known capacity drive its
+  # meter (remaining = credits / capacity, the free-plan and dev-seed shape):
+  # the card renders its progress bar striped to signal the value burns
+  # credits. A bare credit balance beside a percent-based window (Pro weekly
+  # rows carry the account balance too) does not make the meter
+  # credit-backed.
+  defp credit_backed_window?(%Quota.AccountQuotaWindow{
+         credits: credits,
+         active_limit: active_limit
+       }),
+       do: is_integer(credits) and is_integer(active_limit) and active_limit > 0
 
   defp quota_remaining_percent(%Quota.AccountQuotaWindow{
          quota_scope: scope,

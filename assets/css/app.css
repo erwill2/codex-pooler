@@ -469,6 +469,25 @@ body {
   }
 }
 
+/* Credit-backed quota meters keep their tone color but render striped so
+   operators can tell at a glance that the remaining value burns credits
+   rather than a percent-based window. */
+.progress-striped::-webkit-progress-value {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgb(255 255 255 / 0.35) 0 5px,
+    transparent 5px 10px
+  );
+}
+
+.progress-striped::-moz-progress-bar {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgb(255 255 255 / 0.35) 0 5px,
+    transparent 5px 10px
+  );
+}
+
 .admin-apex-bar-chart {
   min-width: 0;
 }
