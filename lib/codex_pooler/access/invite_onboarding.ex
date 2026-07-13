@@ -12,6 +12,7 @@ defmodule CodexPooler.Access.InviteOnboarding do
   alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.CodexAuth
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Lifecycle.InternalLifecycle
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
@@ -146,7 +147,11 @@ defmodule CodexPooler.Access.InviteOnboarding do
              %{
                account_label: label,
                onboarding_method: "invite",
-               metadata: %{"invite_id" => invite.id, "onboarding_method" => method}
+               metadata:
+                 CredentialFencing.initialize_metadata(%{
+                   "invite_id" => invite.id,
+                   "onboarding_method" => method
+                 })
              },
              %{
                assignment_label: label,
@@ -268,6 +273,8 @@ defmodule CodexPooler.Access.InviteOnboarding do
   end
 
   defp complete_pending_account(invite, identity, assignment, tokens, method, info) do
+    identity = CredentialFencing.lock_credential_replacement(identity)
+
     with {:ok, %{identity: identity, assignment: assignment}} <-
            activate_verified_pool_account(identity, assignment, invite, method, info),
          {:ok, _secret} <- store_verified_tokens(identity, tokens),
@@ -286,6 +293,8 @@ defmodule CodexPooler.Access.InviteOnboarding do
          method,
          info
        ) do
+    existing = CredentialFencing.lock_credential_replacement(existing)
+
     with {:ok, identity} <- activate_verified_identity(existing, invite, method, info),
          {:ok, _secret} <- store_verified_tokens(identity, tokens),
          {:ok, assignment} <- ensure_verified_assignment(invite, identity, method),
@@ -303,7 +312,8 @@ defmodule CodexPooler.Access.InviteOnboarding do
       |> Map.put(:account_label, identity.account_label)
       |> Map.put(
         :metadata,
-        identity.metadata
+        identity
+        |> replacement_metadata()
         |> complete_onboarding_metadata(invite, method)
         |> Map.put("chatgpt_user_id", info.chatgpt_user_id)
         |> put_account_email(info.email)
@@ -319,7 +329,8 @@ defmodule CodexPooler.Access.InviteOnboarding do
       Map.put(
         verified_identity_attrs(identity, info),
         :metadata,
-        identity.metadata
+        identity
+        |> replacement_metadata()
         |> complete_onboarding_metadata(invite, method)
         |> Map.put("chatgpt_user_id", info.chatgpt_user_id)
         |> put_account_email(info.email)
@@ -341,6 +352,12 @@ defmodule CodexPooler.Access.InviteOnboarding do
       {:ok, secret}
     end
   end
+
+  defp replacement_metadata(%UpstreamIdentity{status: "pending", metadata: metadata}),
+    do: CredentialFencing.initialize_metadata(metadata)
+
+  defp replacement_metadata(%UpstreamIdentity{} = identity),
+    do: CredentialFencing.advance_credential_epoch(identity)
 
   defp activate_verified_assignment(assignment, invite, method) do
     PoolAssignments.activate_pool_assignment(assignment, %{

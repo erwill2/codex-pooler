@@ -9,6 +9,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Lifecycle.AccountAudit
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPooler.Upstreams.Secrets
@@ -63,9 +64,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
   end
 
   defp persist_link_tokens(%Scope{} = scope, %Pool{} = pool, attrs) do
-    with {:ok, locked_assignment} <- lock_target_pool_assignment(pool, attrs),
-         recovery_relink? <- reauth_recovery_target?(attrs.target_identity_id),
-         {:ok, identity_status, identity} <- upsert_link_identity(scope, attrs),
+    with {:ok, identity_status, identity, recovery_relink?} <- upsert_link_identity(scope, attrs),
          {:ok, _secret} <-
            Secrets.store_encrypted_secret(identity, %{
              secret_kind: "access_token",
@@ -78,7 +77,7 @@ defmodule CodexPooler.Upstreams.TokenLinking do
              pool,
              identity,
              attrs,
-             locked_assignment,
+             nil,
              recovery_relink?
            ) do
       %{
@@ -119,29 +118,31 @@ defmodule CodexPooler.Upstreams.TokenLinking do
         {:error, reason}
 
       {:ok, %UpstreamIdentity{} = identity} ->
+        identity = CredentialFencing.lock_credential_replacement(identity)
+
         attrs =
           Map.update!(identity_attrs, :metadata, fn link_metadata ->
-            link_metadata
-            |> put_token_refresh_metadata(identity.metadata, timestamp, attrs)
-            |> then(&Map.merge(identity.metadata || %{}, &1))
+            existing_link_metadata(identity, link_metadata, timestamp, attrs)
           end)
           |> maybe_preserve_missing_workspace_slot(identity)
           |> Map.put(:account_label, identity.account_label)
 
         with {:ok, active_identity} <- activate_identity_with_plan(identity, attrs) do
-          {:ok, :existing, active_identity}
+          {:ok, :existing, active_identity, identity.status == "reauth_required"}
         end
 
       {:ok, nil} ->
         identity_attrs =
           Map.update!(identity_attrs, :metadata, fn link_metadata ->
-            put_token_refresh_metadata(link_metadata, %{}, timestamp, attrs)
+            link_metadata
+            |> put_token_refresh_metadata(%{}, timestamp, attrs)
+            |> CredentialFencing.initialize_metadata()
           end)
 
         with {:ok, identity} <-
                create_identity_with_plan(Map.put(identity_attrs, :status, @pending)),
              {:ok, active_identity} <- activate_identity_with_plan(identity, identity_attrs) do
-          {:ok, :created, active_identity}
+          {:ok, :created, active_identity, false}
         end
     end
   end
@@ -264,32 +265,6 @@ defmodule CodexPooler.Upstreams.TokenLinking do
     )
   end
 
-  @spec lock_target_pool_assignment(Pool.t(), map()) ::
-          {:ok, PoolUpstreamAssignment.t() | nil} | {:error, lifecycle_error()}
-  defp lock_target_pool_assignment(%Pool{id: pool_id}, %{target_identity_id: target_identity_id})
-       when is_binary(pool_id) and is_binary(target_identity_id) do
-    case Repo.one(
-           from assignment in PoolUpstreamAssignment,
-             where:
-               assignment.pool_id == ^pool_id and
-                 assignment.upstream_identity_id == ^target_identity_id and
-                 assignment.status != ^@assignment_deleted,
-             lock: "FOR UPDATE",
-             limit: 1
-         ) do
-      %PoolUpstreamAssignment{} = assignment -> {:ok, assignment}
-      nil -> {:error, identity_mismatch_error()}
-    end
-  end
-
-  defp lock_target_pool_assignment(_pool, _attrs), do: {:ok, nil}
-
-  defp reauth_recovery_target?(identity_id) when is_binary(identity_id) do
-    match?(%UpstreamIdentity{status: "reauth_required"}, Repo.get(UpstreamIdentity, identity_id))
-  end
-
-  defp reauth_recovery_target?(_identity_id), do: false
-
   defp relink_eligibility_status(true), do: PoolUpstreamAssignment.ineligible_status()
   defp relink_eligibility_status(false), do: @eligible
 
@@ -310,6 +285,15 @@ defmodule CodexPooler.Upstreams.TokenLinking do
   end
 
   defp link_identity_metadata(metadata, _attrs), do: metadata
+
+  defp existing_link_metadata(identity, link_metadata, timestamp, attrs) do
+    metadata =
+      link_metadata
+      |> put_token_refresh_metadata(identity.metadata, timestamp, attrs)
+      |> then(&Map.merge(identity.metadata || %{}, &1))
+
+    CredentialFencing.advance_credential_epoch(%{identity | metadata: metadata})
+  end
 
   defp put_token_refresh_metadata(link_metadata, existing_metadata, timestamp, attrs) do
     generation =

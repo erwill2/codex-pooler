@@ -311,6 +311,9 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
     identity = Repo.one!(UpstreamIdentity)
     assert identity.status == "active"
     assert identity.account_email == "codex-user@example.com"
+    assert identity.metadata["credential_epoch"] == 1
+    assert identity.metadata["usage_probe_sequence"] == 0
+    assert identity.metadata["usage_probe_applied_sequence"] == 0
     assert Repo.one!(PoolUpstreamAssignment).status == "active"
     assert active_secret_count("access_token") == 1
     assert active_secret_count("refresh_token") == 1
@@ -404,6 +407,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
       end)
 
     assert_receive {Events, %{topics: ["upstreams"], reason: "upstream_account_onboarded"}}
+    first_epoch = first_completed.identity.metadata["credential_epoch"]
 
     assert {:ok, first_identity} =
              first_completed.identity
@@ -426,6 +430,7 @@ defmodule CodexPoolerWeb.OnboardingLive.InviteTest do
       InviteOnboarding.poll_device(second_token, second_start.account.identity.id)
 
     assert second_completed.identity.id == first_completed.identity.id
+    assert second_completed.identity.metadata["credential_epoch"] == first_epoch + 1
     assert second_completed.assignment.id == first_completed.assignment.id
     assert second_completed.identity.account_email == "codex-user@example.com"
     assert second_completed.identity.account_label == "codex01"

@@ -7,6 +7,7 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
   alias CodexPooler.Repo
 
   alias CodexPooler.Upstreams.Auth.CodexAuth
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPooler.Upstreams.Secrets
@@ -318,6 +319,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          trigger_kind,
          attempt
        ) do
+    identity = CredentialFencing.lock_credential_replacement_after_identity(identity)
+
     with {:ok, _secret} <-
            Secrets.store_encrypted_secret(identity, %{
              secret_kind: "access_token",
@@ -336,7 +339,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
           disabled_at: nil,
           updated_at: timestamp,
           metadata:
-            identity.metadata
+            identity
+            |> CredentialFencing.advance_credential_epoch()
             |> maybe_put_access_token_expiry(token_attrs, timestamp)
             |> put_token_refresh_metadata(
               terminal_token_refresh_metadata(attempt, trigger_kind, timestamp, %{
@@ -599,17 +603,17 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
     case integer_seconds(expires_in) do
       seconds when is_integer(seconds) and seconds > 0 ->
         Map.put(
-          metadata || %{},
+          metadata,
           "access_token_expires_at",
           DateTime.to_iso8601(DateTime.add(timestamp, seconds, :second))
         )
 
       _value ->
-        metadata || %{}
+        metadata
     end
   end
 
-  defp maybe_put_access_token_expiry(metadata, _token_attrs, _timestamp), do: metadata || %{}
+  defp maybe_put_access_token_expiry(metadata, _token_attrs, _timestamp), do: metadata
 
   defp integer_seconds(value) when is_integer(value), do: value
 

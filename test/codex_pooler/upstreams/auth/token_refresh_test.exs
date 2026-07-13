@@ -52,6 +52,9 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefreshTest do
                Secrets.decrypt_active_secret(identity, "refresh_token")
 
       persisted = Repo.get!(UpstreamIdentity, identity.id)
+      assert persisted.metadata["credential_epoch"] == 2
+      assert persisted.metadata["usage_probe_sequence"] == 0
+      assert persisted.metadata["usage_probe_applied_sequence"] == 0
       assert persisted.metadata["token_refresh"]["status"] == "succeeded"
       assert persisted.metadata["token_refresh"]["trigger_kind"] == "unit_test"
       assert %DateTime{} = persisted.last_successful_refresh_at

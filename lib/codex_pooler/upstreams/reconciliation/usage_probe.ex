@@ -6,6 +6,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
   alias CodexPooler.Upstreams.Auth.TokenRefresh
   alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.EndpointMetadata
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Reconciliation.SavedResetUsageEnrichment
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
@@ -30,12 +31,20 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
     alias CodexPooler.Quotas.Evidence
 
     @enforce_keys [:payload, :usage_url, :usage_path, :windows, :covered_descriptors]
-    defstruct [:payload, :usage_url, :usage_path, windows: [], covered_descriptors: MapSet.new()]
+    defstruct [
+      :payload,
+      :usage_url,
+      :usage_path,
+      :credential_fence,
+      windows: [],
+      covered_descriptors: MapSet.new()
+    ]
 
     @type t :: %__MODULE__{
             payload: term(),
             usage_url: String.t(),
             usage_path: String.t(),
+            credential_fence: CredentialFencing.fence() | nil,
             windows: [map()],
             covered_descriptors: MapSet.t(Evidence.descriptor_key())
           }
@@ -53,16 +62,21 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
 
   @spec reconciliation_source(UpstreamIdentity.t(), PoolUpstreamAssignment.t(), keyword()) ::
           {:usage, UpstreamIdentity.t(), Result.t()}
+          | {:usage_rejected, UpstreamIdentity.t(), CredentialFencing.fence()}
           | {:usage_unavailable, term()}
           | :auth_unavailable
   def reconciliation_source(%UpstreamIdentity{} = identity, assignment, opts) do
     with chatgpt_account_id when is_binary(chatgpt_account_id) and chatgpt_account_id != "" <-
            identity.chatgpt_account_id,
-         {:ok, access_token} <- Secrets.decrypt_active_secret(identity, "access_token"),
+         {:ok, fenced_identity, fence} <- CredentialFencing.allocate_usage_probe(identity),
+         {:ok, access_token} <- Secrets.decrypt_active_secret(fenced_identity, "access_token"),
          observed_at <- now() do
-      case fetch(identity, assignment, access_token, observed_at, opts) do
+      case fetch(fenced_identity, assignment, access_token, observed_at, opts) do
         {:ok, %Result{} = result} ->
-          {:usage, identity, result}
+          {:usage, fenced_identity, %{result | credential_fence: fence}}
+
+        {:error, :definitive_provider_auth_rejected} ->
+          {:usage_rejected, fenced_identity, fence}
 
         {:error, {:upstream_status, status}} when status in [401, 403] ->
           maybe_retry_after_token_refresh(identity, assignment, observed_at, opts)
@@ -87,8 +101,18 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
         %DateTime{} = observed_at,
         opts
       ) do
-    with {:ok, access_token} <- Secrets.decrypt_active_secret(identity, "access_token") do
-      fetch(identity, assignment, access_token, observed_at, opts)
+    with {:ok, fenced_identity, fence} <- CredentialFencing.allocate_usage_probe(identity),
+         {:ok, access_token} <- Secrets.decrypt_active_secret(fenced_identity, "access_token") do
+      case fetch(fenced_identity, assignment, access_token, observed_at, opts) do
+        {:ok, %Result{} = result} ->
+          {:ok, %{result | credential_fence: fence}}
+
+        {:error, :definitive_provider_auth_rejected} ->
+          {:error, {:definitive_provider_auth_rejected, fence}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
     end
   end
 
@@ -100,6 +124,14 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
           keyword()
         ) :: usage_fetch_result()
   def fetch(%UpstreamIdentity{} = identity, assignment, access_token, observed_at, opts) do
+    fence = Keyword.get(opts, :credential_fence)
+
+    with {:ok, result} <- do_fetch(identity, assignment, access_token, observed_at, opts) do
+      {:ok, %{result | credential_fence: fence}}
+    end
+  end
+
+  defp do_fetch(%UpstreamIdentity{} = identity, assignment, access_token, observed_at, opts) do
     base =
       identity
       |> EndpointMetadata.usage_base_url(assignment)
@@ -173,17 +205,28 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
   end
 
   defp fetch_after_successful_token_refresh(refreshed_identity, assignment, opts) do
-    with {:ok, access_token} <- Secrets.decrypt_active_secret(refreshed_identity, "access_token"),
-         observed_at <- now(),
-         {:ok, %Result{} = result} <-
-           fetch(
-             refreshed_identity,
-             assignment,
-             access_token,
-             observed_at,
-             opts
-           ) do
-      {:usage, refreshed_identity, result}
+    case CredentialFencing.allocate_usage_probe(refreshed_identity) do
+      {:ok, fenced_identity, fence} ->
+        fetch_refreshed_probe(fenced_identity, assignment, fence, opts)
+
+      _unavailable ->
+        :auth_unavailable
+    end
+  end
+
+  defp fetch_refreshed_probe(fenced_identity, assignment, fence, opts) do
+    with {:ok, access_token} <- Secrets.decrypt_active_secret(fenced_identity, "access_token"),
+         observed_at <- now() do
+      case fetch(fenced_identity, assignment, access_token, observed_at, opts) do
+        {:ok, %Result{} = result} ->
+          {:usage, fenced_identity, %{result | credential_fence: fence}}
+
+        {:error, :definitive_provider_auth_rejected} ->
+          {:usage_rejected, fenced_identity, fence}
+
+        _unavailable ->
+          :auth_unavailable
+      end
     else
       _unavailable -> :auth_unavailable
     end
@@ -366,10 +409,10 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
   @spec auth_path_unavailable_response(pos_integer(), Req.Response.t(), String.t(), boolean()) ::
           usage_probe_result()
   defp auth_path_unavailable_response(status, %Req.Response{} = response, path, refresh_due?) do
-    if html_response?(response) do
-      :not_found
-    else
+    if decoded_json_object?(response.body) do
       auth_rejected_response(status, path, refresh_due?)
+    else
+      :not_found
     end
   end
 
@@ -378,6 +421,8 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
 
   defp auth_rejected_response(401, path, false), do: {:auth_rejected, path}
 
+  defp auth_rejected_response(403, path, _refresh_due?), do: {:auth_rejected, path}
+
   defp auth_rejected_response(status, _path, _refresh_due?) do
     {:halt_error, {:upstream_status, status}}
   end
@@ -385,10 +430,9 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
   @spec finalize_usage_probe_result(usage_probe_accumulator(), [String.t()]) ::
           usage_fetch_result()
   defp finalize_usage_probe_result({:auth_rejections, rejected_paths}, paths) do
-    approved_paths = MapSet.new(@chatgpt_usage_paths)
+    expected_paths = MapSet.new(paths)
 
-    if MapSet.equal?(rejected_paths, approved_paths) and
-         MapSet.equal?(MapSet.new(paths), approved_paths) do
+    if MapSet.equal?(rejected_paths, expected_paths) do
       {:error, :definitive_provider_auth_rejected}
     else
       {:error, {:upstream_status, 401}}
@@ -396,6 +440,9 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
   end
 
   defp finalize_usage_probe_result(result, _paths), do: result
+
+  defp decoded_json_object?(%{}), do: true
+  defp decoded_json_object?(_body), do: false
 
   @spec html_response?(Req.Response.t()) :: boolean()
   defp html_response?(%Req.Response{body: body} = response) do

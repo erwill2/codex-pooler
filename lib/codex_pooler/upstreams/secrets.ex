@@ -147,6 +147,17 @@ defmodule CodexPooler.Upstreams.Secrets do
     end
   end
 
+  @doc false
+  @spec lock_encrypted_secrets(Ecto.UUID.t()) :: [EncryptedSecret.t()]
+  def lock_encrypted_secrets(identity_id) when is_binary(identity_id) do
+    Repo.all(
+      from secret in EncryptedSecret,
+        where: secret.upstream_identity_id == ^identity_id,
+        order_by: [asc: secret.id],
+        lock: "FOR UPDATE"
+    )
+  end
+
   @spec validate_upstream_secret_key!(binary() | nil) :: :ok
   def validate_upstream_secret_key!(configured_key) do
     SecretBox.validate_secret_key!(configured_key)
