@@ -1,11 +1,74 @@
 defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
-  use ExUnit.Case, async: true
+  use CodexPooler.DataCase, async: false
 
+  alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Quotas.Evidence
+  alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows
+  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
+
+  import CodexPooler.PoolerFixtures
 
   @observed_at ~U[2026-05-22 12:00:00Z]
+
+  describe "lifecycle routing eligibility" do
+    test "definitive provider rejection excludes retained high-percent quota immediately" do
+      upstream = start_upstream(unavailable_usage_paths(401))
+      %{pool: pool, identity: identity, assignment: assignment} = routing_fixture(upstream)
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 persisted_account_window("primary", 300, observed_at,
+                   used_percent: Decimal.new("1")
+                 )
+               ])
+
+      model = routing_model(pool, assignment)
+      assert {:ok, [_candidate]} = CandidateEligibility.routable_candidates(model)
+
+      assert {:error, :definitive_provider_auth_rejected} =
+               PoolReconciliation.refresh_quota_from_usage(identity, assignment)
+
+      assert [_retained_window] = QuotaWindows.list_quota_windows(identity)
+
+      assert {:error, %{code: "no_eligible_backend"}} =
+               CandidateEligibility.routable_candidates(model)
+    end
+
+    test "non-definitive idle failures retain weekly-only probe eligibility" do
+      upstream = start_upstream(unavailable_usage_paths(404))
+      %{pool: pool, identity: identity, assignment: assignment} = routing_fixture(upstream)
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      assert {:ok, [_weekly]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 persisted_account_window("secondary", 10_080, observed_at)
+               ])
+
+      assert {:error, :not_found} =
+               PoolReconciliation.refresh_quota_from_usage(identity, assignment)
+
+      model = routing_model(pool, assignment)
+
+      assert {:ok, [{current_assignment, current_identity}]} =
+               CandidateEligibility.routable_candidates(model)
+
+      assert current_assignment.id == assignment.id
+      assert current_identity.id == identity.id
+
+      assert %{eligible?: true, routing_state: :weekly_only_probe} =
+               QuotaWindows.routing_quota_eligibility(current_identity,
+                 at: observed_at,
+                 model: model.exposed_model_id,
+                 requested_model: model.exposed_model_id,
+                 upstream_model: model.upstream_model_id
+               )
+    end
+  end
 
   describe "routing_quota_eligibility_from_windows/2" do
     test "ordinary models stay eligible when Spark quota evidence is absent" do
@@ -575,6 +638,71 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
                )
     end
 
+    @tag :quota_reversible_provider_shape
+    test "provider 5h to weekly-only to 5h shape is reversible and excludes superseded evidence" do
+      frozen_at = DateTime.add(@observed_at, -3_600, :second)
+      future_at = DateTime.add(@observed_at, 1, :second)
+
+      initial = [
+        account_primary_window(),
+        account_secondary_window(observed_at: @observed_at),
+        model_window([]),
+        model_window(
+          window_kind: "secondary",
+          window_minutes: 10_080,
+          reset_at: DateTime.add(@observed_at, 6, :day)
+        )
+      ]
+
+      assert %{eligible?: true, routing_state: :precise, selection: initial_selection} =
+               routing_shape(initial)
+
+      assert window_shape(initial_selection.routing_windows) == [
+               {"account", "primary", 300},
+               {"account", "secondary", 10_080},
+               {"codex_spark", "primary", 300},
+               {"codex_spark", "secondary", 10_080}
+             ]
+
+      weekly_only = [
+        account_primary_window(observed_at: frozen_at),
+        account_secondary_window(observed_at: @observed_at),
+        model_window(observed_at: frozen_at),
+        model_window(
+          window_kind: "secondary",
+          window_minutes: 10_080,
+          reset_at: DateTime.add(@observed_at, 6, :day)
+        ),
+        account_primary_window(observed_at: future_at),
+        model_window(observed_at: future_at)
+      ]
+
+      assert %{eligible?: true, routing_state: :weekly_only_probe, selection: weekly_selection} =
+               routing_shape(weekly_only)
+
+      assert window_shape(weekly_selection.routing_windows) == [
+               {"account", "secondary", 10_080},
+               {"codex_spark", "secondary", 10_080}
+             ]
+
+      restored = [
+        account_primary_window(),
+        account_secondary_window(observed_at: @observed_at),
+        model_window([]),
+        model_window(
+          window_kind: "secondary",
+          window_minutes: 10_080,
+          reset_at: DateTime.add(@observed_at, 6, :day)
+        )
+      ]
+
+      assert %{eligible?: true, routing_state: :precise, selection: restored_selection} =
+               routing_shape(restored)
+
+      assert window_shape(restored_selection.routing_windows) ==
+               window_shape(initial_selection.routing_windows)
+    end
+
     test "positive credits do not revive primary model upstream-model or additional exhaustion" do
       scenarios = [
         [account_primary_window(used_percent: Decimal.new("100"), credits: 42)],
@@ -723,5 +851,105 @@ defmodule CodexPooler.Gateway.Routing.QuotaWindowRoutingTest do
         attrs
       )
     )
+  end
+
+  defp routing_shape(windows) do
+    Windows.routing_quota_eligibility_from_windows(windows,
+      at: @observed_at,
+      model: "sample-codex-spark",
+      requested_model: "sample-codex-spark",
+      upstream_model: "sample-codex-spark-upstream"
+    )
+  end
+
+  defp window_shape(windows) do
+    windows
+    |> Enum.map(&{&1.quota_key, &1.window_kind, &1.window_minutes})
+    |> Enum.sort()
+  end
+
+  defp routing_fixture(upstream) do
+    pool = pool_fixture()
+    base_url = FakeUpstream.url(upstream)
+
+    routed =
+      upstream_assignment_fixture(pool, %{
+        identity_metadata: %{
+          "base_url" => base_url,
+          "access_token_expires_at" =>
+            DateTime.utc_now() |> DateTime.add(1, :day) |> DateTime.to_iso8601()
+        },
+        assignment_metadata: %{"base_url" => base_url}
+      })
+
+    configure_upstream_secret_key!()
+
+    assert {:ok, _secret} =
+             Upstreams.store_encrypted_secret(routed.identity, %{
+               secret_kind: "access_token",
+               plaintext: "synthetic-routing-token"
+             })
+
+    Map.put(routed, :pool, pool)
+  end
+
+  defp routing_model(pool, assignment) do
+    model_fixture(pool, %{
+      exposed_model_id: "sample-routing-model-#{System.unique_integer([:positive])}",
+      upstream_model_id: "sample-routing-upstream-model",
+      metadata: %{"source_assignment_ids" => [assignment.id]}
+    })
+  end
+
+  defp persisted_account_window(window_kind, window_minutes, observed_at, attrs \\ []) do
+    Map.merge(
+      %{
+        quota_key: "account",
+        quota_scope: "account",
+        quota_family: "account",
+        window_kind: window_kind,
+        window_minutes: window_minutes,
+        used_percent: Decimal.new("12"),
+        reset_at: DateTime.add(observed_at, 3_600, :second),
+        source: "codex_usage_api",
+        source_precision: "observed",
+        freshness_state: "fresh",
+        observed_at: observed_at
+      },
+      Map.new(attrs)
+    )
+  end
+
+  defp unavailable_usage_paths(status) do
+    {:path_json,
+     %{
+       "/api/codex/usage" => {status, %{"error" => "unavailable"}},
+       "/backend-api/codex/usage" => {status, %{"error" => "unavailable"}},
+       "/wham/usage" => {status, %{"error" => "unavailable"}},
+       "/backend-api/wham/usage" => {status, %{"error" => "unavailable"}}
+     }}
+  end
+
+  defp start_upstream(mode) do
+    {:ok, upstream} = FakeUpstream.start_link(mode)
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    upstream
+  end
+
+  defp configure_upstream_secret_key! do
+    previous = Application.get_env(:codex_pooler, CodexPooler.Upstreams)
+
+    Application.put_env(:codex_pooler, CodexPooler.Upstreams,
+      upstream_secret_key: Base.encode64(:crypto.hash(:sha256, "routing-test-secret-key")),
+      upstream_secret_key_version: "test-v1"
+    )
+
+    on_exit(fn ->
+      if previous do
+        Application.put_env(:codex_pooler, CodexPooler.Upstreams, previous)
+      else
+        Application.delete_env(:codex_pooler, CodexPooler.Upstreams)
+      end
+    end)
   end
 end

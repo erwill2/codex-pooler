@@ -7,7 +7,9 @@ defmodule CodexPooler.Alerts.PoolServingRiskTest do
     only: [primary_quota_window_attrs: 1]
 
   alias CodexPooler.Alerts
+  alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   test "pool_no_usable_assignments matches when no assignment can route" do
     timestamp = now()
@@ -124,6 +126,113 @@ defmodule CodexPooler.Alerts.PoolServingRiskTest do
 
     assert [%{action: :clear}] = Alerts.evaluate_rule(no_usable_rule, at: timestamp)
     assert [%{action: :clear}] = Alerts.evaluate_rule(all_missing_rule, at: timestamp)
+  end
+
+  test "reauth-required takes priority over fresh usable quota in pool serving risk" do
+    timestamp = now()
+    pool = pool_fixture()
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{identity_status: "reauth_required"})
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               primary_quota_window_attrs(%{
+                 used_percent: Decimal.new("10"),
+                 credits: 90,
+                 reset_at: DateTime.add(timestamp, 1, :hour),
+                 observed_at: timestamp
+               })
+             ])
+
+    reauth_rule =
+      alert_rule_fixture(pool,
+        rule_kind: "pool_all_assignments_in_state",
+        target_state: "reauth_required"
+      )
+
+    no_usable_rule = alert_rule_fixture(pool, rule_kind: "pool_no_usable_assignments")
+
+    assert [%{action: :match, match_attrs: reauth_match}] =
+             Alerts.evaluate_rule(reauth_rule, at: timestamp)
+
+    assert reauth_match.safe_evidence_snapshot["state_counts"] == %{"reauth_required" => 1}
+
+    assert [%{action: :match, match_attrs: no_usable_match}] =
+             Alerts.evaluate_rule(no_usable_rule, at: timestamp)
+
+    assert no_usable_match.safe_evidence_snapshot["usable_assignment_count"] == 0
+  end
+
+  test "reauth-required takes priority over stale quota in pool serving risk" do
+    timestamp = now()
+    pool = pool_fixture()
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{identity_status: "reauth_required"})
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               primary_quota_window_attrs(%{
+                 freshness_state: "stale",
+                 reset_at: DateTime.add(timestamp, 1, :hour),
+                 observed_at: timestamp
+               })
+             ])
+
+    reauth_rule =
+      alert_rule_fixture(pool,
+        rule_kind: "pool_all_assignments_in_state",
+        target_state: "reauth_required"
+      )
+
+    stale_rule =
+      alert_rule_fixture(pool,
+        rule_kind: "pool_all_assignments_in_state",
+        target_state: "stale"
+      )
+
+    assert [%{action: :match, match_attrs: reauth_match}] =
+             Alerts.evaluate_rule(reauth_rule, at: timestamp)
+
+    assert reauth_match.safe_evidence_snapshot["reason_code"] == "reauth_required"
+    assert [%{action: :clear}] = Alerts.evaluate_rule(stale_rule, at: timestamp)
+  end
+
+  test "fresh recovered quota clears reauth serving-risk predicates" do
+    timestamp = now()
+    pool = pool_fixture()
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{identity_status: "reauth_required"})
+
+    assert {:ok, [_window]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               primary_quota_window_attrs(%{
+                 used_percent: Decimal.new("20"),
+                 credits: 80,
+                 reset_at: DateTime.add(timestamp, 1, :hour),
+                 observed_at: timestamp
+               })
+             ])
+
+    reauth_rule =
+      alert_rule_fixture(pool,
+        rule_kind: "pool_all_assignments_in_state",
+        target_state: "reauth_required"
+      )
+
+    no_usable_rule = alert_rule_fixture(pool, rule_kind: "pool_no_usable_assignments")
+
+    assert [%{action: :match}] = Alerts.evaluate_rule(reauth_rule, at: timestamp)
+    assert [%{action: :match}] = Alerts.evaluate_rule(no_usable_rule, at: timestamp)
+
+    identity
+    |> UpstreamIdentity.changeset(%{status: "active", disabled_at: nil})
+    |> Repo.update!()
+
+    assert [%{action: :clear}] = Alerts.evaluate_rule(reauth_rule, at: timestamp)
+    assert [%{action: :clear}] = Alerts.evaluate_rule(no_usable_rule, at: timestamp)
   end
 
   defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
