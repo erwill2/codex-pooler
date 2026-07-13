@@ -51,8 +51,9 @@ Store the Pool API key outside the config and read it through environment expans
             "reasoningSummary": "auto",
             "textVerbosity": "medium",
             "include": ["reasoning.encrypted_content"],
-            "store": false,
-            "serviceTier": "priority"
+            // Optional: priority processing may cost more than the default tier.
+            // "serviceTier": "priority",
+            "store": false
           },
           "modalities": {
             "input": ["text", "image"],
@@ -77,8 +78,9 @@ Store the Pool API key outside the config and read it through environment expans
             "reasoningSummary": "auto",
             "textVerbosity": "medium",
             "include": ["reasoning.encrypted_content"],
-            "store": false,
-            "serviceTier": "priority"
+            // Optional: priority processing may cost more than the default tier.
+            // "serviceTier": "priority",
+            "store": false
           },
           "modalities": {
             "input": ["text", "image"],
@@ -103,8 +105,9 @@ Store the Pool API key outside the config and read it through environment expans
             "reasoningSummary": "auto",
             "textVerbosity": "medium",
             "include": ["reasoning.encrypted_content"],
-            "store": false,
-            "serviceTier": "priority"
+            // Optional: priority processing may cost more than the default tier.
+            // "serviceTier": "priority",
+            "store": false
           },
           "modalities": {
             "input": ["text", "image"],
@@ -126,7 +129,7 @@ Define only model ids your assigned Pool can serve. If you run Codex Pooler loca
 
 OpenCode uses `small_model` for background helpers such as automatic session titles. Without an explicit override, it may infer a nano model that Codex Pools do not serve. Point `small_model` at a lightweight model assigned to your Pool. The setting remains effective when OMO is loaded.
 
-Request-time OpenAI options belong under each model's `options` block. Keep only connection settings such as `baseURL` and `apiKey` in provider-level `options`. The example requests priority processing; remove `serviceTier` if your Pool or upstream does not offer it.
+Request-time OpenAI options belong under each model's `options` block. Keep only connection settings such as `baseURL` and `apiKey` in provider-level `options`. The commented `serviceTier` line shows how to opt into priority processing. Enable it only when your Pool and upstream offer it and you intentionally accept the potentially higher cost; leave it commented to use the default tier.
 
 OpenCode subtracts its compaction reserve from `limit.input` before declaring the session full. `289400` leaves 269.4k usable input tokens after the default 20k reserve, so 269.4k input plus a 64k output cap stays inside the 353.4k GPT-5.6 window used by these examples. OpenCode caps request output at 32k by default; set `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX=64000` only when you want OpenCode to request the full 64k cap.
 
