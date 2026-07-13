@@ -14,6 +14,9 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
                           "attempt_error"
                         ])
 
+  @upstream_error_param_max_bytes 160
+  @upstream_error_param_pattern ~r/\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*|\[(?:0|[1-9][0-9]{0,3})\])*\z/
+
   @list_debug_keys ~w(continuity failure attempt)
   @detail_debug_keys ~w(continuity terminal_state turn attempts)
 
@@ -129,6 +132,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
     |> text_row()
     |> maybe_put_value("response", Map.get(item, "response_status_code"))
     |> Map.put("upstream", upstream_text(item))
+    |> maybe_put_upstream_error_param_text(Map.get(item, "debug"))
     |> maybe_put_metadata_summary(Map.get(item, "metadata"))
   end
 
@@ -167,6 +171,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
       [
         {"response", "response"},
         {"upstream", "upstream", required: true},
+        {"upstream_error_param", "upstream_error_param"},
         {"metadata_summary", "metadata"}
       ]
   end
@@ -247,6 +252,30 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
   end
 
   defp maybe_put_metadata_summary(row, _metadata), do: row
+
+  defp maybe_put_upstream_error_param_text(row, %{"attempts" => attempts})
+       when is_list(attempts) do
+    attempts
+    |> Enum.find_value(&valid_failed_attempt_upstream_error_param/1)
+    |> then(&maybe_put_value(row, "upstream_error_param", &1))
+  end
+
+  defp maybe_put_upstream_error_param_text(row, _debug), do: row
+
+  defp valid_failed_attempt_upstream_error_param(%{
+         "status" => status,
+         "upstream_error_param" => value
+       })
+       when status in ["failed", "retryable_failed"] and is_binary(value) do
+    value = String.trim(value)
+
+    if byte_size(value) in 1..@upstream_error_param_max_bytes and
+         Regex.match?(@upstream_error_param_pattern, value) do
+      value
+    end
+  end
+
+  defp valid_failed_attempt_upstream_error_param(_attempt), do: nil
 
   defp metadata_summary(metadata) do
     keys =
@@ -344,6 +373,8 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
   end
 
   defp sanitize_debug_value(value) when is_map(value) do
+    value = sanitize_debug_attempt(value)
+
     Map.new(value, fn
       {key, source}
       when key in [
@@ -368,6 +399,15 @@ defmodule CodexPooler.MCP.Tools.LogMetadata.RequestLogPresenter do
   end
 
   defp sanitize_debug_value(value), do: value
+
+  defp sanitize_debug_attempt(%{"attempt_number" => _attempt_number} = attempt) do
+    case valid_failed_attempt_upstream_error_param(attempt) do
+      nil -> Map.delete(attempt, "upstream_error_param")
+      value -> Map.put(attempt, "upstream_error_param", value)
+    end
+  end
+
+  defp sanitize_debug_attempt(value), do: value
 
   defp safe_source(source) when is_binary(source) do
     if MapSet.member?(@public_debug_sources, source), do: source, else: nil

@@ -10,6 +10,7 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
   alias CodexPooler.Gateway.Admission, as: GatewayAdmission
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.ErrorSanitizer
+  alias CodexPooler.Gateway.Metadata
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
 
@@ -148,14 +149,20 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
       )
       |> maybe_mark_websocket_openai_origin(opts)
 
-    conn
-    |> put_resp_header("x-codex-turn-state", turn_state)
-    |> WebSockAdapter.upgrade(
-      CodexPoolerWeb.CodexResponsesSocket,
-      %{auth: auth, opts: request_options},
-      websocket_upgrade_opts()
-    )
-    |> halt()
+    case maybe_put_websocket_models_etag(conn, auth, request_options) do
+      {:ok, conn} ->
+        conn
+        |> put_resp_header("x-codex-turn-state", turn_state)
+        |> WebSockAdapter.upgrade(
+          CodexPoolerWeb.CodexResponsesSocket,
+          %{auth: auth, opts: request_options},
+          websocket_upgrade_opts()
+        )
+        |> halt()
+
+      {:error, reason} ->
+        send_error(conn, reason)
+    end
   rescue
     error in WebSockAdapter.UpgradeError ->
       send_error(conn, %{
@@ -163,6 +170,22 @@ defmodule CodexPoolerWeb.GatewayControllerHelpers do
         code: "websocket_upgrade_required",
         message: Exception.message(error)
       })
+  end
+
+  defp maybe_put_websocket_models_etag(conn, auth, %RequestOptions{} = request_options) do
+    source_endpoint = request_options.openai_compatibility.source_endpoint || conn.request_path
+
+    if source_endpoint in [
+         "/backend-api/codex/responses",
+         "/backend-api/codex/v1/responses"
+       ] do
+      case Metadata.codex_catalog_snapshot(auth, source_endpoint, request_options) do
+        {:ok, snapshot} -> {:ok, put_resp_header(conn, "x-models-etag", snapshot.etag)}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, conn}
+    end
   end
 
   @spec send_or_error(conn(), gateway_call_result()) :: conn()

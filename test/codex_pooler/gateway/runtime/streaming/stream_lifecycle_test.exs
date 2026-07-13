@@ -15,15 +15,115 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeDemotion, RoutingCircuitState}
   alias CodexPooler.Gateway.Routing.{BridgeRing, RoutePlanInput}
-  alias CodexPooler.Gateway.Runtime.Dispatch.{ResponseContext, SelectedCandidateContext}
+
+  alias CodexPooler.Gateway.Runtime.Dispatch.{
+    ResponseContext,
+    RouteState,
+    SelectedCandidateContext
+  }
+
   alias CodexPooler.Gateway.Runtime.Finalization.Streaming
   alias CodexPooler.Gateway.Runtime.Streaming.DownstreamStream
   alias CodexPooler.Gateway.Runtime.Streaming.OpenAIStreamCollector
+  alias CodexPooler.Gateway.Runtime.Streaming.StreamDispatch
   alias CodexPooler.Gateway.Runtime.Streaming.StreamLifecycle
   alias CodexPooler.Repo
 
   @endpoint_path "/backend-api/codex/responses"
   @public_responses_endpoint "/v1/responses"
+
+  test "backend Responses SSE headers use the immutable route-state catalog token" do
+    {setup, _first_upstream, _second_upstream} =
+      stream_retry_setup(FakeUpstream.sse_stream([]), FakeUpstream.sse_stream([]))
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    payload = payload(setup)
+    etag = ~s("catalog-token-#{System.unique_integer([:positive])}")
+
+    request_options = request_options(auth, payload, setup, endpoint: @endpoint_path)
+
+    route_state =
+      RouteState.new(%{
+        visible_model: setup.model,
+        candidates: [
+          {setup.assignment, setup.identity},
+          {setup.fallback_assignment, setup.fallback_identity}
+        ]
+      })
+      |> RouteState.put_codex_models_etag(etag)
+
+    context = %SelectedCandidateContext{
+      request_options: request_options,
+      route_state: route_state,
+      assignment: setup.fallback_assignment,
+      identity: setup.fallback_identity
+    }
+
+    result =
+      StreamDispatch.streaming_result(
+        %Req.Response{
+          status: 200,
+          headers: [
+            {"content-type", ["text/event-stream; charset=utf-8"]},
+            {"x-codex-turn-state", ["turn-state"]},
+            {"etag", ["upstream-standard-etag-must-not-win"]},
+            {"x-models-etag", ["upstream-must-not-win"]}
+          ]
+        },
+        context,
+        %{finalization_callbacks: finalization_callbacks()}
+      )
+
+    assert Map.new(result.headers) == %{
+             "cache-control" => "no-cache",
+             "content-type" => "text/event-stream; charset=utf-8",
+             "x-codex-turn-state" => "turn-state",
+             "x-models-etag" => etag
+           }
+  end
+
+  test "catalog token is absent outside backend noncompact Responses SSE" do
+    {setup, _first_upstream, _second_upstream} =
+      stream_retry_setup(FakeUpstream.sse_stream([]), FakeUpstream.sse_stream([]))
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    payload = payload(setup)
+
+    route_state =
+      RouteState.new(%{visible_model: setup.model, candidates: []})
+      |> RouteState.put_codex_models_etag(~s("catalog-token"))
+
+    cases = [
+      {@public_responses_endpoint, %{}},
+      {"/backend-api/codex/responses/compact", %{}},
+      {"/v1/responses/compact", %{}},
+      {"/backend-api/codex/usage", %{}},
+      {"/backend-api/transcribe", %{}},
+      {@endpoint_path, %{transport: "http_json"}}
+    ]
+
+    for {endpoint, opts} <- cases do
+      request_options =
+        request_options(
+          auth,
+          payload,
+          setup,
+          Keyword.merge([endpoint: endpoint], Map.to_list(opts))
+        )
+
+      result =
+        StreamDispatch.streaming_result(
+          sse_response(),
+          %SelectedCandidateContext{
+            request_options: request_options,
+            route_state: route_state
+          },
+          %{finalization_callbacks: finalization_callbacks()}
+        )
+
+      refute Map.has_key?(Map.new(result.headers), "x-models-etag")
+    end
+  end
 
   test "lifecycle handlers expose state-aware stream finalizers" do
     response_context = %ResponseContext{
@@ -746,7 +846,12 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
                Streaming.finalize_failure(
                  ~s(event: response.failed\ndata: {"type":"response.failed"}\n\n),
                  {:terminal_stream_failure,
-                  %{code: health_neutral_code, upstream_code: nil, event_type: "response.failed"}},
+                  %{
+                    code: health_neutral_code,
+                    upstream_code: nil,
+                    upstream_error_param: "reasoning.summary",
+                    event_type: "response.failed"
+                  }},
                  response_context
                )
 
@@ -757,6 +862,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamLifecycleTest do
       assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
       assert attempt.status == "failed"
       assert attempt.network_error_code == health_neutral_code
+      assert attempt.response_metadata["upstream_error_param"] == "reasoning.summary"
 
       assert Repo.all(from(d in BridgeDemotion)) == []
 

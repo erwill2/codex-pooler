@@ -209,7 +209,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt do
                attempt_metadata:
                  response
                  |> pre_visible_transport_metadata(context, code)
-                 |> maybe_put_transport_failure_metadata(response),
+                 |> maybe_put_transport_failure_metadata(response)
+                 |> Metadata.maybe_put_upstream_error_param(response),
                retry_count: context.retry_count
              }
            ),

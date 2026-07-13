@@ -99,6 +99,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
     response
     |> response_metadata(error_kind, opts)
     |> maybe_put_masked_error_metadata(failure.upstream_code, failure.code)
+    |> maybe_put_upstream_error_param(failure)
     |> Map.put("stream_failure_stage", "first_event")
     |> Map.put("stream_terminal_type", failure.event_type)
     |> Map.put("stream_error_code", failure.code)
@@ -120,6 +121,14 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Metadata do
   end
 
   def maybe_put_masked_error_metadata(metadata, _upstream_code, _code), do: metadata
+
+  @spec maybe_put_upstream_error_param(map(), term()) :: map()
+  def maybe_put_upstream_error_param(metadata, %{upstream_error_param: value})
+      when is_binary(value) and value != "" do
+    Map.put(metadata, "upstream_error_param", value)
+  end
+
+  def maybe_put_upstream_error_param(metadata, _failure), do: metadata
 
   @spec route_attempt_metadata(RequestOptions.t() | map() | term()) :: map()
   def route_attempt_metadata(%RequestOptions{} = request_options),

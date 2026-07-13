@@ -12,8 +12,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
   alias CodexPooler.Events
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway, as: RuntimeGateway
+  alias CodexPooler.Gateway.Metadata.CodexCatalog
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPoolerWeb.GatewayControllerHelpers, as: GatewayHelpers
 
   alias CodexPooler.Gateway.Persistence.{
     BridgeAffinity,
@@ -140,6 +142,235 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     end
   end
 
+  test "one authenticated catalog ETag is identical across every backend alias surface" do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_shared_catalog_etag",
+               "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+             }
+           }}
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    port = start_public_endpoint!()
+
+    model_responses =
+      for path <- ["/backend-api/codex/models", "/backend-api/codex/v1/models"] do
+        conn = build_conn() |> auth(setup) |> get(path)
+        body = json_response(conn, 200)
+        {conn.resp_body, get_resp_header(conn, "etag"), body}
+      end
+
+    assert [{body_bytes, [exact_etag], body}, {body_bytes, [exact_etag], body}] = model_responses
+    assert exact_etag == CodexCatalog.etag(body)
+    assert <<"W/\"cp-models-v1-", _digest::binary-size(64), "\"">> = exact_etag
+
+    for path <- ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"] do
+      conn =
+        build_conn()
+        |> auth(setup)
+        |> post(path, %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic shared catalog SSE request",
+          "stream" => true
+        })
+
+      assert conn.status == 200
+      assert get_resp_header(conn, "x-models-etag") == [exact_etag]
+      assert conn.resp_body =~ "resp_shared_catalog_etag"
+    end
+
+    models_request_count =
+      Repo.aggregate(
+        from(r in Request,
+          where: fragment("?->>'operation'", r.request_metadata) == "models"
+        ),
+        :count
+      )
+
+    for path <- ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"] do
+      {conn, websocket, ref, response_headers} =
+        public_websocket_connect_with_headers!(port, setup, "", path)
+
+      try do
+        assert List.keyfind(response_headers, "x-models-etag", 0) ==
+                 {"x-models-etag", exact_etag}
+
+        assert {"x-codex-turn-state", turn_state} =
+                 List.keyfind(response_headers, "x-codex-turn-state", 0)
+
+        assert {:ok, ^turn_state} = Ecto.UUID.cast(turn_state)
+
+        assert Repo.aggregate(
+                 from(r in Request,
+                   where: fragment("?->>'operation'", r.request_metadata) == "models"
+                 ),
+                 :count
+               ) == models_request_count
+
+        payload =
+          Jason.encode!(%{
+            "type" => "response.create",
+            "model" => setup.model.exposed_model_id,
+            "input" => "synthetic shared catalog websocket request",
+            "stream" => true
+          })
+
+        {conn, websocket} = public_websocket_send_text!(conn, websocket, ref, payload)
+        {conn, _websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+
+        refute frame =~ "x-models-etag"
+        refute Jason.decode!(frame)["x-models-etag"]
+        conn
+      after
+        Mint.HTTP.close(conn)
+      end
+    end
+  end
+
+  test "catalog headers are absent from every excluded controller route" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_catalog_header_exclusion",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream, compact?: true)
+    port = start_public_endpoint!()
+
+    public_models = build_conn() |> auth(setup) |> get("/v1/models")
+    assert %{"object" => "list", "data" => [_model]} = json_response(public_models, 200)
+    assert_no_catalog_headers(public_models)
+
+    public_response =
+      build_conn()
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic public response exclusion",
+        "stream" => false
+      })
+
+    assert %{"id" => "resp_catalog_header_exclusion", "object" => "response"} =
+             json_response(public_response, 200)
+
+    assert_no_catalog_headers(public_response)
+
+    {public_ws_conn, _websocket, _ref, public_ws_headers} =
+      public_websocket_connect_with_headers!(port, setup, "", "/v1/responses")
+
+    try do
+      refute List.keyfind(public_ws_headers, "etag", 0)
+      refute List.keyfind(public_ws_headers, "x-models-etag", 0)
+    after
+      Mint.HTTP.close(public_ws_conn)
+    end
+
+    for path <- [
+          "/backend-api/codex/responses/compact",
+          "/backend-api/codex/v1/responses/compact"
+        ] do
+      conn =
+        build_conn()
+        |> auth(setup)
+        |> post(path, %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic backend compact exclusion"
+        })
+
+      assert conn.status == 200
+      assert_no_catalog_headers(conn)
+    end
+
+    public_compact =
+      build_conn()
+      |> auth(setup)
+      |> post("/v1/responses/compact", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic public compact exclusion"
+      })
+
+    assert json_response(public_compact, 404)["error"]["code"] == "unsupported_endpoint"
+    assert_no_catalog_headers(public_compact)
+
+    for {path, expected_key} <- [
+          {"/api/codex/usage", "rate_limit"},
+          {"/wham/usage", "rate_limit"},
+          {"/backend-api/wham/usage", "rate_limit"},
+          {"/v1/usage", "total_tokens"}
+        ] do
+      conn = build_conn() |> auth(setup) |> get(path)
+      assert Map.has_key?(json_response(conn, 200), expected_key)
+      assert_no_catalog_headers(conn)
+    end
+
+    for path <- [
+          "/backend-api/codex/models",
+          "/backend-api/codex/v1/models",
+          "/backend-api/codex/responses",
+          "/backend-api/codex/v1/responses"
+        ] do
+      conn = get(build_conn(), path)
+      assert json_response(conn, 401)["error"]["code"] == "api_key_missing"
+      assert_no_catalog_headers(conn)
+    end
+
+    health = get(build_conn(), "/healthz")
+    assert json_response(health, 200) == %{"status" => "ok"}
+    assert_no_catalog_headers(health)
+  end
+
+  test "backend Responses websocket rejects malformed API-key policy before upgrade or accounting",
+       %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    authenticated_conn = auth(conn, setup)
+    assert {:ok, auth_context} = GatewayHelpers.authenticate(authenticated_conn)
+
+    malformed_auth = %{
+      auth_context
+      | api_key: %{auth_context.api_key | metadata: %{"labels" => [42]}}
+    }
+
+    request_count = Repo.aggregate(Request, :count)
+
+    conn =
+      authenticated_conn
+      |> Plug.Conn.put_private(:runtime_api_auth, malformed_auth)
+      |> get("/backend-api/codex/responses")
+
+    refute conn.status == 101
+    assert conn.status in [400, 403]
+    assert get_resp_header(conn, "x-models-etag") == []
+    assert Repo.aggregate(Request, :count) == request_count + 1
+
+    refute Repo.exists?(
+             from(r in Request,
+               where: fragment("?->>'operation'", r.request_metadata) == "models"
+             )
+           )
+
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "backend Responses websocket authentication failure skips catalog work", %{conn: conn} do
+    conn = get(conn, "/backend-api/codex/responses")
+
+    assert conn.status == 401
+    assert get_resp_header(conn, "x-models-etag") == []
+    assert Repo.aggregate(Request, :count) == 0
+  end
+
   test "GET /backend-api/codex/responses upgrades and dispatches through the public websocket route" do
     upstream =
       start_upstream(
@@ -151,6 +382,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
       )
 
     setup = gateway_setup(upstream)
+
     assert :ok = Events.subscribe_pool(setup.pool)
     port = start_public_endpoint!()
     turn_state = "public-ws-route-#{System.unique_integer([:positive])}"
@@ -1444,6 +1676,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
       )
 
     setup = gateway_setup(upstream)
+
+    setup =
+      put_setup_model_source_metadata!(setup, %{
+        "id" => setup.model.upstream_model_id,
+        "capabilities" => %{"responses" => true, "streaming" => true},
+        "supported_reasoning_levels" => [%{"effort" => "high"}],
+        "supports_reasoning_summary_parameter" => false
+      })
+
     {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
     {:ok, session} =
@@ -1480,7 +1721,15 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
           "parallel_tool_calls" => true,
           "store" => false,
           "stream" => true,
-          "include" => [],
+          "include" => [
+            "reasoning.encrypted_content",
+            "reasoning.encrypted_content"
+          ],
+          "reasoning" => %{
+            "effort" => "high",
+            "summary" => "auto",
+            "context" => "selected"
+          },
           "generate" => true,
           "previous_response_id" => "resp_ws_previous"
         }),
@@ -1499,6 +1748,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert captured.json["generate"] == true
     assert captured.json["previous_response_id"] == "resp_ws_previous"
     assert captured.json["instructions"] == ""
+
+    assert captured.json["reasoning"] == %{
+             "effort" => "high",
+             "context" => "selected"
+           }
+
+    assert captured.json["include"] == ["reasoning.encrypted_content"]
 
     assert captured.json["input"] == [
              %{"type" => "message", "role" => "user", "content" => "hello"},
@@ -5515,6 +5771,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
       assert first_attempt.network_error_code == "upstream_unauthorized"
       assert first_attempt.response_metadata["stream_failure_stage"] == "first_event"
       assert first_attempt.response_metadata["stream_error_code"] == auth_code
+      assert first_attempt.response_metadata["upstream_error_param"] == "reasoning.effort"
 
       assert second_attempt.pool_upstream_assignment_id == setup.assignment.id
       assert second_attempt.status == "succeeded"
@@ -6015,6 +6272,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                   "type" => "error",
                   "status" => 400,
                   "code" => "websocket_connection_limit_reached",
+                  "param" => "reasoning.effort",
                   "message" => "open a replacement websocket connection"
                 }}
              ],
@@ -6093,6 +6351,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
 
     assert first_attempt.response_metadata["stream_error_code"] ==
              "websocket_connection_limit_reached"
+
+    assert first_attempt.response_metadata["upstream_error_param"] == "reasoning.effort"
 
     assert second_attempt.pool_upstream_assignment_id == setup.assignment.id
     assert second_attempt.status == "succeeded"
@@ -6237,7 +6497,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
                "type" => "response.failed",
                "response" => %{
                  "id" => "resp_ws_failed",
-                 "error" => %{"code" => "upstream_terminal_failure"},
+                 "error" => %{
+                   "code" => "upstream_terminal_failure",
+                   "param" => "reasoning.effort"
+                 },
                  "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
                }
              }}
@@ -6276,6 +6539,9 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert [turn] = Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^session.id))
     assert turn.status == "failed"
     assert turn.error_code == "upstream_terminal_failure"
+
+    assert [attempt] = Repo.all(from(a in Attempt))
+    assert attempt.response_metadata["upstream_error_param"] == "reasoning.effort"
 
     assert [demotion] = Repo.all(from(d in BridgeDemotion))
     assert demotion.pool_upstream_assignment_id == setup.assignment.id
@@ -6340,6 +6606,56 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     assert turn.status == "failed"
     assert turn.error_code == "context_length_exceeded"
 
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+  end
+
+  test "websocket invalid first-present error param does not fall back or persist raw values" do
+    raw_sentinel = "raw-param-sentinel"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.failed",
+             %{
+               "type" => "response.failed",
+               "response" => %{
+                 "id" => "resp_ws_invalid_param",
+                 "error" => %{
+                   "code" => "unsupported_value",
+                   "param" => "invalid param #{raw_sentinel}",
+                   "message" => raw_sentinel
+                 }
+               },
+               "error" => %{"param" => "reasoning.effort"}
+             }}
+          ],
+          done: false
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "invalid safe parameter precedence",
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: "ws-invalid-error-param"},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, _frame}
+    assert [attempt] = Repo.all(from(a in Attempt))
+    refute Map.has_key?(attempt.response_metadata, "upstream_error_param")
+    refute inspect(attempt.response_metadata) =~ raw_sentinel
     assert Repo.all(from(d in BridgeDemotion)) == []
     assert Repo.all(from(c in RoutingCircuitState)) == []
   end
@@ -7759,7 +8075,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
            "type" => "response.failed",
            "response" => %{
              "id" => "resp_ws_terminal_auth_#{code}",
-             "error" => %{"code" => code},
+             "error" => %{"code" => code, "param" => "reasoning.effort"},
              "usage" => %{"input_tokens" => 4, "output_tokens" => 0, "total_tokens" => 4}
            }
          }}
@@ -8047,6 +8363,11 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
              QuotaWindows.list_quota_windows(identity),
              &(&1.source == "codex_rate_limit_event")
            )
+  end
+
+  defp assert_no_catalog_headers(conn) do
+    assert get_resp_header(conn, "etag") == []
+    assert get_resp_header(conn, "x-models-etag") == []
   end
 
   defp header!(headers, name) do

@@ -11,6 +11,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.TerminalOutcom
   @type terminal_failure :: %{
           required(:code) => String.t(),
           required(:upstream_code) => String.t() | nil,
+          required(:upstream_error_param) => String.t() | nil,
           required(:event_type) => String.t() | nil,
           required(:data_type) => String.t() | nil
         }
@@ -199,6 +200,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.TerminalOutcom
     %{
       code: Map.get(event, :error_code) || event_type,
       upstream_code: Map.get(event, :upstream_error_code),
+      upstream_error_param: Map.get(event, :upstream_error_param),
       event_type: event_type,
       data_type: Map.get(event, :data_type)
     }

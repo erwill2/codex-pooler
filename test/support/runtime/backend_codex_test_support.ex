@@ -188,22 +188,29 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexTestSupport do
     ])
   end
 
-  def first_event_terminal_sse(event_type, code) do
-    FakeUpstream.sse_stream([first_event_terminal_payload(event_type, code)], done: false)
+  def first_event_terminal_sse(event_type, code, error_param \\ nil) do
+    FakeUpstream.sse_stream([first_event_terminal_payload(event_type, code, error_param)],
+      done: false
+    )
   end
 
-  def first_event_terminal_payload(event_type, code) do
+  def first_event_terminal_payload(event_type, code, error_param \\ nil) do
     {event_type,
      %{
        "type" => event_type,
        "response" => %{
          "id" => "resp_first_event_failure",
-         "error" => %{"code" => code},
+         "error" =>
+           %{"code" => code, "message" => "raw-message-sentinel"}
+           |> maybe_put_error_param(error_param),
          "incomplete_details" => %{"reason" => code},
          "usage" => %{"input_tokens" => 4, "output_tokens" => 0, "total_tokens" => 4}
        }
      }}
   end
+
+  defp maybe_put_error_param(error, nil), do: error
+  defp maybe_put_error_param(error, param), do: Map.put(error, "param", param)
 
   def use_deterministic_rotation!(pool, ring_size) do
     use_routing_strategy!(pool, "deterministic_rotation", ring_size)

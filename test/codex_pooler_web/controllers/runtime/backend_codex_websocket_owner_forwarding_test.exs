@@ -45,6 +45,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
     BridgeSessionAlias,
     CodexSession,
     CodexTurn,
+    RoutingCircuitState,
     SessionContinuity
   }
 
@@ -132,6 +133,57 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
         value -> Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, value)
       end
     end)
+  end
+
+  @tag :todo_8_owner_forwarding_catalog_token
+  test "owner-forwarding-enabled Mint upgrades keep one catalog token across backend aliases",
+       %{conn: conn} do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+
+    models_conn =
+      conn
+      |> auth(setup)
+      |> get("/backend-api/codex/models")
+
+    assert [models_etag] = get_resp_header(models_conn, "etag")
+    models_accounting_count = Repo.aggregate(Request, :count)
+    port = start_public_endpoint!()
+
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, false)
+
+    {local_conn, _websocket, _ref, local_headers} =
+      public_websocket_connect_with_headers!(port, setup, "")
+
+    local_token =
+      try do
+        assert Repo.aggregate(Request, :count) == models_accounting_count
+        assert {"x-models-etag", token} = List.keyfind(local_headers, "x-models-etag", 0)
+        assert token == models_etag
+        token
+      after
+        Mint.HTTP.close(local_conn)
+      end
+
+    Application.put_env(:codex_pooler, :websocket_owner_forwarding_enabled, true)
+
+    alias_tokens =
+      for path <- ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"] do
+        {mint_conn, _websocket, _ref, response_headers} =
+          public_websocket_connect_with_headers!(port, setup, "", path)
+
+        try do
+          assert Application.fetch_env!(:codex_pooler, :websocket_owner_forwarding_enabled)
+          assert Repo.aggregate(Request, :count) == models_accounting_count
+          assert {"x-models-etag", token} = List.keyfind(response_headers, "x-models-etag", 0)
+          assert token == models_etag
+          token
+        after
+          Mint.HTTP.close(mint_conn)
+        end
+      end
+
+    assert alias_tokens == [local_token, local_token]
+    assert Repo.aggregate(Request, :count) == models_accounting_count
   end
 
   test "owner-forwarded websocket turns reuse one upstream websocket connection" do
@@ -239,6 +291,194 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketOwnerForwardingTest do
              }
     after
       CodexResponsesSocket.terminate(:closed, state)
+    end
+  end
+
+  @tag :f2_owner_terminal_error_param
+  test "owner-forwarded terminal failure persists only its safe upstream error param" do
+    message_sentinel = "owner-terminal-message-sentinel"
+    value_sentinel = "owner-terminal-value-sentinel"
+    frame_sentinel = "owner-terminal-frame-sentinel"
+    header_sentinel = "owner-terminal-header-sentinel"
+    token_sentinel = "owner-terminal-token-sentinel"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.failed",
+             %{
+               "type" => "response.failed",
+               "raw_frame" => frame_sentinel,
+               "response" => %{
+                 "id" => "resp_owner_safe_error_param",
+                 "error" => %{
+                   "code" => "upstream_terminal_failure",
+                   "param" => "reasoning.effort",
+                   "message" => message_sentinel,
+                   "value" => value_sentinel,
+                   "token" => token_sentinel
+                 },
+                 "usage" => %{"input_tokens" => 4, "output_tokens" => 0, "total_tokens" => 4}
+               }
+             }}
+          ],
+          done: false,
+          headers: [{"x-owner-raw-header", header_sentinel}]
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, state} = owner_socket(auth, "ws-owner-safe-error-param", "owner-safe-error-param")
+
+    logs =
+      capture_log(fn ->
+        try do
+          payload = websocket_payload(setup, "owner forwarded terminal failure")
+
+          assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+          assert {:push, {:text, terminal_frame}, state} = receive_owner_socket_push(state)
+          assert %{"type" => "response.failed"} = Jason.decode!(terminal_frame)
+          assert {:ok, _state} = receive_socket_done(state)
+          assert {:ok, _owner_pid} = WebsocketOwnerSession.lookup(state.codex_session.id)
+        after
+          CodexResponsesSocket.terminate(:closed, state)
+        end
+      end)
+
+    assert [request] = request_logs(setup.pool.id)
+    assert request.status == "failed"
+    assert request.transport == "websocket"
+    assert request.response_status_code == 200
+    assert request.last_error_code == "upstream_terminal_failure"
+    assert FakeUpstream.count(upstream) == 1
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    assert attempt.response_metadata["upstream_error_param"] == "reasoning.effort"
+
+    assert [turn] =
+             Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^state.codex_session.id))
+
+    assert turn.status == "failed"
+    assert turn.error_code == "upstream_terminal_failure"
+    assert Repo.get!(CodexSession, state.codex_session.id).status == "interrupted"
+
+    assert [demotion] = Repo.all(from(d in BridgeDemotion))
+    assert demotion.reason_code == "upstream_terminal_failure"
+
+    assert [circuit] =
+             Repo.all(from(c in RoutingCircuitState, where: c.route_class == "proxy_websocket"))
+
+    assert circuit.reason_code == "upstream_terminal_failure"
+
+    persisted = inspect({request.request_metadata, attempt.response_metadata})
+
+    for raw_sentinel <- [
+          message_sentinel,
+          value_sentinel,
+          frame_sentinel,
+          header_sentinel,
+          token_sentinel,
+          setup.authorization,
+          setup.raw_key,
+          "upstream-token"
+        ] do
+      refute persisted =~ raw_sentinel
+      refute logs =~ raw_sentinel
+    end
+  end
+
+  @tag :f2_owner_terminal_error_param
+  test "owner-forwarded invalid first error param does not fall back or persist raw diagnostics" do
+    message_sentinel = "owner-invalid-message-sentinel"
+    value_sentinel = "owner-invalid-value-sentinel"
+    frame_sentinel = "owner-invalid-frame-sentinel"
+    header_sentinel = "owner-invalid-header-sentinel"
+    token_sentinel = "owner-invalid-token-sentinel"
+
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"response.failed",
+             %{
+               "type" => "response.failed",
+               "raw_frame" => frame_sentinel,
+               "response" => %{
+                 "id" => "resp_owner_invalid_error_param",
+                 "error" => %{
+                   "code" => "unsupported_value",
+                   "param" => "invalid param #{value_sentinel}",
+                   "message" => message_sentinel,
+                   "value" => value_sentinel,
+                   "token" => token_sentinel
+                 }
+               },
+               "error" => %{"param" => "reasoning.effort"}
+             }}
+          ],
+          done: false,
+          headers: [{"x-owner-raw-header", header_sentinel}]
+        )
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    {:ok, state} = owner_socket(auth, "ws-owner-invalid-error-param", "owner-invalid-error-param")
+
+    logs =
+      capture_log(fn ->
+        try do
+          payload = websocket_payload(setup, "owner forwarded invalid terminal parameter")
+
+          assert {:ok, state} = CodexResponsesSocket.handle_in({payload, [opcode: :text]}, state)
+          assert {:push, {:text, terminal_frame}, state} = receive_owner_socket_push(state)
+          assert %{"type" => "response.failed"} = Jason.decode!(terminal_frame)
+          assert {:ok, _state} = receive_socket_done(state)
+          assert {:ok, _owner_pid} = WebsocketOwnerSession.lookup(state.codex_session.id)
+        after
+          CodexResponsesSocket.terminate(:closed, state)
+        end
+      end)
+
+    assert [request] = request_logs(setup.pool.id)
+    assert request.status == "failed"
+    assert request.transport == "websocket"
+    assert request.response_status_code == 200
+    assert request.last_error_code == "unsupported_value"
+    assert FakeUpstream.count(upstream) == 1
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.status == "failed"
+    refute Map.has_key?(attempt.response_metadata, "upstream_error_param")
+
+    assert [turn] =
+             Repo.all(from(t in CodexTurn, where: t.codex_session_id == ^state.codex_session.id))
+
+    assert turn.status == "failed"
+    assert turn.error_code == "unsupported_value"
+    assert Repo.get!(CodexSession, state.codex_session.id).status == "interrupted"
+    assert Repo.all(from(d in BridgeDemotion)) == []
+    assert Repo.all(from(c in RoutingCircuitState)) == []
+
+    persisted = inspect({request.request_metadata, attempt.response_metadata})
+
+    for raw_sentinel <- [
+          message_sentinel,
+          value_sentinel,
+          frame_sentinel,
+          header_sentinel,
+          token_sentinel,
+          setup.authorization,
+          setup.raw_key,
+          "upstream-token"
+        ] do
+      refute persisted =~ raw_sentinel
+      refute logs =~ raw_sentinel
     end
   end
 

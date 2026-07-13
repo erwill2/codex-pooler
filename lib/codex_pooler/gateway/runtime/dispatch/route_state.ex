@@ -43,6 +43,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
           required(:quota_window_dimension_keys) => [map()]
         }
   @type extensions :: %{optional(atom() | String.t()) => term()}
+  @codex_models_etag_extension :codex_models_etag
 
   @type t :: %__MODULE__{
           visible_model: Model.t(),
@@ -94,6 +95,22 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
   @spec put_candidates(t(), [candidate()]) :: t()
   def put_candidates(%__MODULE__{} = route_state, candidates) when is_list(candidates),
     do: %{route_state | candidates: candidates}
+
+  @spec put_codex_models_etag(t(), String.t()) :: t()
+  def put_codex_models_etag(%__MODULE__{} = route_state, etag) when is_binary(etag) do
+    %{
+      route_state
+      | extensions: Map.put(route_state.extensions, @codex_models_etag_extension, etag)
+    }
+  end
+
+  @spec codex_models_etag(t()) :: String.t() | nil
+  def codex_models_etag(%__MODULE__{} = route_state) do
+    case Map.get(route_state.extensions, @codex_models_etag_extension) do
+      etag when is_binary(etag) -> etag
+      _value -> nil
+    end
+  end
 
   @spec put_reservation_snapshot_inputs(t(), reservation_snapshot_inputs()) :: t()
   def put_reservation_snapshot_inputs(%__MODULE__{} = route_state, snapshot_inputs)

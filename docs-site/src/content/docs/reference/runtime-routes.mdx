@@ -443,6 +443,35 @@ limited to function tools, including nested function tools inside accepted
 namespace tools. Strict function tools and strict structured-output schemas stay
 on the strict validation path and are not made looser.
 
+### Catalog revision and final Responses envelope
+
+The authenticated backend model routes return the same effective catalog body
+for the same Pool and catalog snapshot. Both
+`GET /backend-api/codex/models` and `GET /backend-api/codex/v1/models` attach a
+deterministic weak `ETag` derived from that policy-visible body.
+
+Successful backend Responses streams expose the same token as
+`X-Models-Etag`. It appears on HTTP SSE response headers for the canonical and
+backend-alias `POST` routes, and on websocket upgrade headers for the matching
+`GET` routes. The token is produced by Codex Pooler, not relayed from upstream.
+It is not exposed by compact, public `/v1`, usage, or unauthenticated routes.
+Catalog convergence across replicas is eventual, so clients should compare a
+successful Responses token with a later authenticated backend models token.
+
+Every non-compact request that reaches the backend Responses destination has a
+`reasoning` object and exactly one `reasoning.encrypted_content` entry in
+`include` after final normalization. This applies to canonical backend HTTP and
+websocket traffic, backend `/v1` Responses and Chat Completions aliases, and
+translated `POST /v1/responses`, `GET /v1/responses`, and
+`POST /v1/chat/completions` traffic. Compact dispatch is excluded and keeps its
+narrow compact request shape.
+
+When upstream returns a valid parameter path with an error, failed attempt
+detail may expose it as `upstream_error_param`. The value is limited to a
+bounded field or numeric-index path. Invalid values and successful attempts
+omit the field, and raw upstream error messages or rejected values are never
+projected through it.
+
 ### Unsupported `/v1` Responses request shapes
 
 These `POST /v1/responses` request shapes return OpenAI-shaped `invalid_request` before gateway dispatch, not `unsupported_endpoint`:

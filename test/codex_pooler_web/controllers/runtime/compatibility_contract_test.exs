@@ -22,6 +22,10 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
     files
     backend_transcription
     backend_image_proxy_surface
+    backend_models_etag
+    backend_responses_etag
+    backend_responses_envelope
+    upstream_error_param
     responses_chat
     response_body_cap
     backend_v1_alias_surface
@@ -109,6 +113,22 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
                ],
                streaming_uses_existing_buffer_guards: true
              }
+    end
+
+    test "documents catalog, envelope, and safe error diagnostics as separate contracts" do
+      models_etag = CompatibilityMatrix.by_slug!(:backend_models_etag)
+      responses_etag = CompatibilityMatrix.by_slug!(:backend_responses_etag)
+      envelope = CompatibilityMatrix.by_slug!(:backend_responses_envelope)
+      error_param = CompatibilityMatrix.by_slug!(:upstream_error_param)
+
+      assert models_etag.contract =~ "policy-visible effective catalog body"
+      assert models_etag.contract =~ "eventual"
+      assert responses_etag.contract =~ "exact authenticated backend models ETag"
+      assert responses_etag.contract =~ "never relayed from upstream"
+      assert envelope.contract =~ "exactly one reasoning.encrypted_content include"
+      assert envelope.contract =~ "compact routes remain excluded"
+      assert error_param.contract =~ "failed-attempt detail only"
+      assert error_param.contract =~ "never raw upstream error messages or values"
     end
 
     test "documents reject versus strip behavior for unsupported OpenAI controls" do
@@ -1202,7 +1222,12 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert captured.path == "/backend-api/codex/responses"
       assert captured.json["text"]["format"]["type"] == "json_object"
       assert captured.json["store"] == false
-      assert captured.json["include"] == ["message.input_image.image_url"]
+
+      assert captured.json["include"] == [
+               "message.input_image.image_url",
+               "reasoning.encrypted_content"
+             ]
+
       assert captured.json["parallel_tool_calls"] == true
       assert captured.json["prompt_cache_key"] == "synthetic-cache-key"
       assert captured.json["metadata"] == %{"purpose" => "synthetic"}

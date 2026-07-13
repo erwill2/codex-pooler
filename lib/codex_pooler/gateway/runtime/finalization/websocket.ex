@@ -89,7 +89,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
         metadata_headers,
         websocket_frame_headers,
         code,
-        upstream_code
+        upstream_code,
+        Map.get(finalization, :upstream_error_param)
       )
 
     case Streaming.record_terminal_health_failure(upstream_code, metadata_headers, context) do
@@ -106,7 +107,8 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
          metadata_headers,
          websocket_frame_headers,
          code,
-         upstream_code
+         upstream_code,
+         upstream_error_param
        ) do
     metadata_headers
     |> Metadata.websocket_response_metadata(
@@ -115,6 +117,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
       websocket_frame_headers
     )
     |> Metadata.maybe_put_masked_error_metadata(upstream_code, code)
+    |> Metadata.maybe_put_upstream_error_param(%{upstream_error_param: upstream_error_param})
   end
 
   defp settle_terminal_failure(context, finalization, body, code, attempt_metadata) do
@@ -237,6 +240,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Websocket do
         Map.get(finalization, :websocket_frame_headers, %{})
       )
       |> maybe_put_transport_failure_metadata(finalization)
+      |> Metadata.maybe_put_upstream_error_param(finalization)
 
     with :ok <- Streaming.record_health_failure(code, code, context) do
       finalize_failed_after_health(context, finalization, code, metadata)

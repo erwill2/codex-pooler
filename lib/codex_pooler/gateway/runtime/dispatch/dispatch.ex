@@ -140,7 +140,12 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
           RequestOptions.put_routing(context.request_options,
             routing_attempt_metadata: selection.attempt_metadata,
             use_responses_lite?:
-              selected_uses_responses_lite?(context.model, selection.assignment)
+              selected_uses_responses_lite?(context.model, selection.assignment),
+            supports_reasoning_summary_parameter?:
+              selected_supports_reasoning_summary_parameter?(
+                context.model,
+                selection.assignment
+              )
           )
 
         selected_context =
@@ -162,11 +167,14 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
   end
 
   defp selected_uses_responses_lite?(model, assignment) do
-    metadata =
-      get_in(model.metadata || %{}, ["source_assignment_models", assignment.id]) ||
-        ModelMetadata.metadata(model)
-
+    metadata = ModelMetadata.selected_assignment_metadata(model, assignment.id)
     ModelMetadata.bool_metadata(metadata, "use_responses_lite")
+  end
+
+  defp selected_supports_reasoning_summary_parameter?(model, assignment) do
+    model
+    |> ModelMetadata.selected_assignment_metadata(assignment.id)
+    |> ModelMetadata.supports_reasoning_summary_parameter?()
   end
 
   defp put_routing_circuit_state(

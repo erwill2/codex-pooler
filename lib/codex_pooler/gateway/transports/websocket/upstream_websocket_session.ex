@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
   alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.UpstreamErrorParam
   alias CodexPooler.Gateway.Transports.TransportFailureReason
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ConnectionUpgrade
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ReceiveState
@@ -19,13 +20,15 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
           required(:terminal) => binary(),
           required(:status) => 200,
           required(:headers) => response_headers(),
-          optional(:websocket_frame_headers) => map()
+          optional(:websocket_frame_headers) => map(),
+          optional(:upstream_error_param) => String.t()
         }
   @type request_failure :: %{
           required(:body) => binary(),
           required(:reason) => term(),
           required(:headers) => response_headers(),
           optional(:websocket_frame_headers) => map(),
+          optional(:upstream_error_param) => String.t(),
           optional(:transport_failure) => TransportFailureReason.transport_failure_metadata()
         }
   @type request_result :: {:ok, request_success()} | {:error, request_failure()}
@@ -336,6 +339,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
             body: receive_body(receive_state),
             reason: :upstream_websocket_receive_timeout,
             headers: state.headers,
+            upstream_error_param: receive_state.terminal_upstream_error_param,
             websocket_frame_headers: receive_state.websocket_frame_headers,
             transport_failure:
               transport_failure_metadata(:upstream_websocket_receive_timeout, receive_state,
@@ -361,6 +365,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
             body: receive_body(receive_state),
             reason: reason,
             headers: state.headers,
+            upstream_error_param: receive_state.terminal_upstream_error_param,
             websocket_frame_headers: receive_state.websocket_frame_headers,
             transport_failure: transport_failure_metadata(reason, receive_state, phase: :receive)
           }}, %{state | conn: conn}}
@@ -381,6 +386,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
          body: receive_body(receive_state),
          reason: :upstream_websocket_pong_deadline,
          headers: state.headers,
+         upstream_error_param: receive_state.terminal_upstream_error_param,
          websocket_frame_headers: receive_state.websocket_frame_headers,
          transport_failure:
            transport_failure_metadata(:upstream_websocket_pong_deadline, receive_state,
@@ -426,6 +432,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
             status: 200,
             headers: state.headers,
             upstream_error_code: receive_state.terminal_upstream_error_code,
+            upstream_error_param: receive_state.terminal_upstream_error_param,
             websocket_frame_headers: receive_state.websocket_frame_headers
           }}, state}
 
@@ -435,6 +442,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
             body: receive_body(receive_state),
             reason: reason,
             headers: state.headers,
+            upstream_error_param: receive_state.terminal_upstream_error_param,
             websocket_frame_headers: receive_state.websocket_frame_headers,
             transport_failure:
               transport_failure_metadata(reason, receive_state, phase: failure_phase(reason))
@@ -541,7 +549,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   defp handle_text_frame(state, %ReceiveState{} = receive_state, raw_text, text) do
     receive_state =
       raw_text
-      |> maybe_put_terminal_upstream_error_code(receive_state)
+      |> maybe_put_terminal_upstream_error(receive_state)
       |> put_websocket_frame_headers(raw_text)
       |> increment_text_frame_count()
       |> append_receive_body(text)
@@ -624,13 +632,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   defp mark_terminal_seen(%ReceiveState{} = receive_state),
     do: %{receive_state | terminal_seen?: true}
 
-  defp maybe_put_terminal_upstream_error_code(raw_text, %ReceiveState{} = receive_state) do
-    with nil <- receive_state.terminal_upstream_error_code,
-         {:ok, %{} = decoded} <- Jason.decode(raw_text),
+  defp maybe_put_terminal_upstream_error(raw_text, %ReceiveState{} = receive_state) do
+    with {:ok, %{} = decoded} <- Jason.decode(raw_text),
          type when type in ["response.failed", "response.incomplete", "error"] <-
-           Map.get(decoded, "type"),
-         code when is_binary(code) <- StreamProtocol.upstream_error_code(decoded) do
-      %{receive_state | terminal_upstream_error_code: code}
+           Map.get(decoded, "type") do
+      %{
+        receive_state
+        | terminal_upstream_error_code:
+            receive_state.terminal_upstream_error_code ||
+              StreamProtocol.upstream_error_code(decoded),
+          terminal_upstream_error_param:
+            receive_state.terminal_upstream_error_param || UpstreamErrorParam.extract(decoded)
+      }
     else
       _other -> receive_state
     end

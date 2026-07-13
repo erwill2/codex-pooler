@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.PayloadNormalizer
   alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Payloads.ToolSchemaLowering
 
   describe "upstream_payload/4" do
     test "materializes present malformed reasoning aliases without lower-priority fallthrough" do
@@ -658,6 +659,326 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
       assert upstream["parallel_tool_calls"] == false
     end
 
+    test "normalizes the final non-compact reasoning and encrypted include envelope" do
+      model = %Model{upstream_model_id: "provider-model"}
+
+      capability_cases = [
+        {"absent capability", %{}, true},
+        {"true capability", %{supports_reasoning_summary_parameter?: true}, true},
+        {"false capability", %{supports_reasoning_summary_parameter?: false}, false}
+      ]
+
+      include_cases = [
+        {"missing include", %{}, ["reasoning.encrypted_content"]},
+        {"non-list include", %{"include" => "unsupported"}, ["reasoning.encrypted_content"]},
+        {"absent encrypted include", %{"include" => ["output_text.logprobs"]},
+         ["output_text.logprobs", "reasoning.encrypted_content"]},
+        {"duplicate encrypted include",
+         %{
+           "include" => [
+             "output_text.logprobs",
+             "reasoning.encrypted_content",
+             "message.input_image.image_url",
+             "reasoning.encrypted_content"
+           ]
+         },
+         [
+           "output_text.logprobs",
+           "reasoning.encrypted_content",
+           "message.input_image.image_url"
+         ]}
+      ]
+
+      for {capability_name, option_fields, preserves_summary?} <- capability_cases,
+          {include_name, include_fields, expected_include} <- include_cases do
+        payload =
+          Map.merge(
+            %{
+              "model" => "gpt-5.6-terra",
+              "input" => "hello",
+              "reasoning" => %{
+                "effort" => "high",
+                "summary" => "auto",
+                "context" => "selected",
+                "owner_policy" => "preserved"
+              }
+            },
+            include_fields
+          )
+
+        options = RequestOptions.build(option_fields, "/backend-api/codex/responses", payload)
+
+        assert {:ok, encoded} =
+                 PayloadNormalizer.upstream_payload(
+                   payload,
+                   model,
+                   "/backend-api/codex/responses",
+                   options
+                 )
+
+        upstream = Jason.decode!(encoded)
+        label = "#{capability_name}, #{include_name}"
+
+        assert upstream["include"] == expected_include, label
+        assert upstream["reasoning"]["effort"] == "high", label
+        assert upstream["reasoning"]["context"] == "selected", label
+        assert upstream["reasoning"]["owner_policy"] == "preserved", label
+
+        assert Map.has_key?(upstream["reasoning"], "summary") == preserves_summary?, label
+      end
+
+      for reasoning <- [nil, "unsupported", ["unsupported"]] do
+        payload = %{"model" => "gpt-5.6-terra", "input" => "hello", "reasoning" => reasoning}
+        options = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+        assert {:ok, encoded} =
+                 PayloadNormalizer.upstream_payload(
+                   payload,
+                   model,
+                   "/backend-api/codex/responses",
+                   options
+                 )
+
+        upstream = Jason.decode!(encoded)
+        assert upstream["reasoning"] == %{}
+        assert upstream["include"] == ["reasoning.encrypted_content"]
+      end
+    end
+
+    test "normal non-compact reasoning envelopes are idempotent after JSON serialization" do
+      model = %Model{upstream_model_id: "provider-model"}
+
+      for supports_summary? <- [true, false],
+          reasoning <- [
+            %{"effort" => "high", "summary" => "auto", "context" => "selected"},
+            nil,
+            "unsupported"
+          ] do
+        payload = %{
+          "model" => "gpt-5.6-terra",
+          "input" => "hello",
+          "include" => [
+            "output_text.logprobs",
+            "reasoning.encrypted_content",
+            "reasoning.encrypted_content"
+          ],
+          "reasoning" => reasoning
+        }
+
+        options =
+          RequestOptions.build(
+            %{supports_reasoning_summary_parameter?: supports_summary?},
+            "/backend-api/codex/responses",
+            payload
+          )
+
+        assert {:ok, first_encoded} =
+                 PayloadNormalizer.upstream_payload(
+                   payload,
+                   model,
+                   "/backend-api/codex/responses",
+                   options
+                 )
+
+        first = Jason.decode!(first_encoded)
+
+        second_options =
+          RequestOptions.build(
+            %{supports_reasoning_summary_parameter?: supports_summary?},
+            "/backend-api/codex/responses",
+            first
+          )
+
+        assert {:ok, second_encoded} =
+                 PayloadNormalizer.upstream_payload(
+                   first,
+                   model,
+                   "/backend-api/codex/responses",
+                   second_options
+                 )
+
+        assert Jason.decode!(second_encoded) == first
+        assert first["include"] == ["output_text.logprobs", "reasoning.encrypted_content"]
+        assert is_map(first["reasoning"])
+
+        assert Map.has_key?(first["reasoning"], "summary") ==
+                 (supports_summary? and is_map(reasoning))
+      end
+    end
+
+    test "normalizes non-compact Responses Lite tools and instructions idempotently" do
+      existing_prefix = %{
+        "type" => "additional_tools",
+        "role" => "developer",
+        "tools" => [%{"type" => "custom", "name" => "existing"}]
+      }
+
+      request_item = %{
+        "id" => "request_tools_1",
+        "type" => "additional_tools",
+        "role" => "developer",
+        "tools" => [%{"type" => "custom", "name" => "request_item"}]
+      }
+
+      populated_tool = %{
+        "type" => "function",
+        "name" => "lookup",
+        "strict" => false,
+        "parameters" => %{
+          "properties" => %{
+            "query" => %{"type" => "string", "encrypted" => true}
+          },
+          "required" => ["query"]
+        }
+      }
+
+      user_message = %{
+        "type" => "message",
+        "role" => "user",
+        "content" => [
+          %{
+            "type" => "input_image",
+            "image_url" => "data:image/png;base64,AA==",
+            "detail" => "high"
+          },
+          %{"type" => "input_text", "text" => "hello", "detail" => "keep"}
+        ]
+      }
+
+      tool_output = %{
+        "type" => "function_call_output",
+        "call_id" => "call_1",
+        "output" => [
+          %{
+            "type" => "input_image",
+            "image_url" => "data:image/png;base64,AA==",
+            "detail" => "original"
+          },
+          %{"type" => "input_text", "text" => "result", "detail" => "keep"}
+        ]
+      }
+
+      custom_tool_output = %{
+        "type" => "custom_tool_call_output",
+        "call_id" => "call_2",
+        "output" => %{
+          "content" => [
+            %{
+              "type" => "input_image",
+              "image_url" => "data:image/png;base64,AA==",
+              "detail" => "high"
+            }
+          ],
+          "detail" => "keep"
+        }
+      }
+
+      cases = [
+        {"absent tools reuses canonical prefix", %{"input" => [existing_prefix, user_message]}, 2,
+         existing_prefix["tools"]},
+        {"absent tools creates empty prefix",
+         %{"instructions" => "  ", "input" => [user_message]}, 2, []},
+        {"empty tools creates prefix before existing prefix",
+         %{"tools" => [], "input" => [existing_prefix, request_item, user_message]}, 4, []},
+        {"populated tools creates lowered prefix before existing prefix",
+         %{
+           "tools" => [populated_tool],
+           "instructions" => "  Follow the tool contract.  ",
+           "input" => [
+             existing_prefix,
+             request_item,
+             user_message,
+             tool_output,
+             custom_tool_output
+           ]
+         }, 7, [populated_tool]}
+      ]
+
+      for {name, fields, expected_prefix_count, _source_tools} <- cases do
+        payload = Map.merge(%{"model" => "gpt-5.6-terra"}, fields)
+        first = prepare_lite_payload(payload)
+        second = prepare_lite_payload(first)
+
+        assert second == first, name
+        refute Map.has_key?(first, "tools"), name
+        refute Map.has_key?(first, "instructions"), name
+        assert first["parallel_tool_calls"] == false, name
+        assert get_in(first, ["reasoning", "context"]) == "all_turns", name
+
+        [prefix | input] = first["input"]
+        assert prefix["type"] == "additional_tools", name
+        assert prefix["role"] == "developer", name
+        refute Map.has_key?(prefix, "id"), name
+        assert length(first["input"]) == expected_prefix_count, name
+
+        if Map.has_key?(fields, "tools") do
+          expected_tools =
+            fields
+            |> Map.fetch!("tools")
+            |> then(&%{"tools" => &1})
+            |> ToolSchemaLowering.lower_non_strict_function_tools()
+            |> Map.fetch!("tools")
+            |> Enum.map(&remove_encrypted_markers/1)
+
+          assert prefix["tools"] == expected_tools, name
+        end
+
+        if is_binary(fields["instructions"]) and String.trim(fields["instructions"]) != "" do
+          [instruction | preserved] = input
+
+          assert instruction == %{
+                   "type" => "message",
+                   "role" => "developer",
+                   "content" => [
+                     %{"type" => "input_text", "text" => fields["instructions"]}
+                   ]
+                 }
+
+          assert preserved ==
+                   [
+                     existing_prefix,
+                     request_item,
+                     strip_image_detail(user_message),
+                     strip_image_detail(tool_output),
+                     strip_image_detail(custom_tool_output)
+                   ]
+        end
+      end
+    end
+
+    test "does not expand compact Responses Lite tools instructions include or image details" do
+      payload = %{
+        "model" => "gpt-5.6-terra",
+        "instructions" => "compact instructions",
+        "include" => ["reasoning.encrypted_content"],
+        "tools" => [%{"type" => "custom", "name" => "compact_tool"}],
+        "input" => [
+          %{
+            "type" => "message",
+            "role" => "user",
+            "content" => [
+              %{
+                "type" => "input_image",
+                "image_url" => "data:image/png;base64,AA==",
+                "detail" => "high"
+              }
+            ]
+          }
+        ]
+      }
+
+      first = prepare_lite_payload(payload, "/backend-api/codex/responses/compact")
+      second = prepare_lite_payload(first, "/backend-api/codex/responses/compact")
+
+      assert second == first
+      assert first["instructions"] == payload["instructions"]
+      assert first["include"] == payload["include"]
+      assert first["tools"] == payload["tools"]
+      assert first["input"] == payload["input"]
+      assert first["parallel_tool_calls"] == false
+      assert get_in(first, ["reasoning", "context"]) == "all_turns"
+    end
+
     test "uses the pre-dispatch applied effort for compact payloads without re-deciding policy" do
       payload = %{"model" => "gpt-4.1", "input" => "hello"}
 
@@ -704,7 +1025,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
             {"high",
              %{"model" => "gpt-4.1", "input" => "hello", "reasoning" => %{"effort" => "high"}},
              %{"effort" => "high"}},
-            {nil, %{"model" => "gpt-4.1", "input" => "hello"}, nil}
+            {nil, %{"model" => "gpt-4.1", "input" => "hello"}, %{}}
           ] do
         decision = %CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision{
           mode: :unrestricted,
@@ -729,6 +1050,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
                  )
 
         assert Jason.decode!(encoded)["reasoning"] == expected_reasoning
+        assert Jason.decode!(encoded)["include"] == ["reasoning.encrypted_content"]
       end
     end
 
@@ -1228,6 +1550,53 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
       }
     }
   end
+
+  defp prepare_lite_payload(payload, endpoint \\ "/backend-api/codex/responses") do
+    request_options = RequestOptions.build(%{use_responses_lite?: true}, endpoint, payload)
+
+    assert {:ok, encoded, _request_options} =
+             PayloadNormalizer.prepare_upstream_payload(
+               payload,
+               %Model{upstream_model_id: "provider-model"},
+               endpoint,
+               request_options
+             )
+
+    Jason.decode!(encoded)
+  end
+
+  defp remove_encrypted_markers(%{} = value) do
+    value
+    |> Map.delete("encrypted")
+    |> Map.new(fn {key, nested} -> {key, remove_encrypted_markers(nested)} end)
+  end
+
+  defp remove_encrypted_markers(value) when is_list(value),
+    do: Enum.map(value, &remove_encrypted_markers/1)
+
+  defp remove_encrypted_markers(value), do: value
+
+  defp strip_image_detail(%{"content" => content} = item) when is_list(content) do
+    Map.put(item, "content", Enum.map(content, &strip_input_image_detail/1))
+  end
+
+  defp strip_image_detail(%{"output" => output} = item) when is_list(output) do
+    Map.put(item, "output", Enum.map(output, &strip_input_image_detail/1))
+  end
+
+  defp strip_image_detail(%{"output" => %{"content" => content} = output} = item)
+       when is_list(content) do
+    Map.put(
+      item,
+      "output",
+      Map.put(output, "content", Enum.map(content, &strip_input_image_detail/1))
+    )
+  end
+
+  defp strip_input_image_detail(%{"type" => "input_image"} = content),
+    do: Map.delete(content, "detail")
+
+  defp strip_input_image_detail(content), do: content
 
   defp content_shape(nil), do: nil
   defp content_shape(value) when is_binary(value), do: :binary

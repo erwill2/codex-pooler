@@ -7,6 +7,8 @@ defmodule CodexPooler.Gateway.Metadata do
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.Denials
   alias CodexPooler.Gateway.Metadata.Accounting, as: MetadataAccounting
+  alias CodexPooler.Gateway.Metadata.CodexCatalog
+  alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Gateway.Routing.ModelMetadata
@@ -14,34 +16,54 @@ defmodule CodexPooler.Gateway.Metadata do
   @type auth :: Access.auth_context()
   @type opts :: RequestOptions.t()
   @type gateway_error :: Contracts.gateway_error()
+  @type policy_result :: {:ok, map()} | {:error, gateway_error()}
   @type gateway_result :: Contracts.body_result()
+  @type codex_catalog_snapshot :: %{
+          required(:body) => CodexCatalog.body(),
+          required(:etag) => String.t(),
+          required(:visible_models) => [Model.t()],
+          required(:source_identity) => CodexPooler.Upstreams.Schemas.UpstreamIdentity.t() | nil
+        }
 
   @spec serve_codex_models(auth(), opts()) :: {:ok, gateway_result()} | {:error, gateway_error()}
   def serve_codex_models(auth, %RequestOptions{} = request_options) do
     endpoint = request_endpoint(request_options, "/backend-api/codex/models")
     request_options = request_options(request_options, endpoint, %{})
 
-    with {:ok, visibility} <- policy_visible_models(auth, endpoint, request_options),
+    with {:ok, snapshot} <- codex_catalog_snapshot(auth, endpoint, request_options),
          :ok <-
-           record_metadata_request(auth, endpoint, request_options, visibility) do
-      pricing_buckets = Catalog.pricing_buckets_by_identifier(visibility.visible_models)
+           record_metadata_request(auth, endpoint, request_options, snapshot) do
+      {:ok,
+       %{status: 200, headers: [{"etag", snapshot.etag} | json_headers()], body: snapshot.body}}
+    end
+  end
 
-      models =
-        Enum.map(visibility.visible_models, fn model ->
-          {reasoning_levels, reasoning_default} =
-            ModelMetadata.reasoning_level_maps_and_default(model)
+  @spec codex_catalog_snapshot(auth(), String.t(), opts()) ::
+          {:ok, codex_catalog_snapshot()} | {:error, gateway_error()}
+  def codex_catalog_snapshot(auth, endpoint, %RequestOptions{} = request_options)
+      when is_binary(endpoint) do
+    with {:ok, policy} <- normalize_policy_or_log(auth, endpoint, request_options) do
+      hydration = CandidateEligibility.hydrate_model_visibility(auth.pool)
 
-          reasoning_projection =
-            Access.project_reasoning_effort_metadata(
-              auth.api_key,
-              reasoning_levels,
-              reasoning_default
-            )
+      visible_models =
+        CandidateEligibility.policy_visible_models(hydration.visible_models, policy)
 
-          ModelMetadata.codex_model_payload(model, pricing_buckets, reasoning_projection)
-        end)
+      pricing_buckets = Catalog.pricing_buckets_by_identifier(visible_models)
+      context_window_overrides = OperationalSettings.current().model_context_window_overrides
 
-      {:ok, %{status: 200, headers: json_headers(), body: %{"models" => models}}}
+      catalog =
+        CodexCatalog.build(
+          hydration.visible_models,
+          policy,
+          pricing_buckets,
+          context_window_overrides
+        )
+
+      {:ok,
+       Map.merge(catalog, %{
+         visible_models: visible_models,
+         source_identity: CandidateEligibility.model_source_identity(hydration, visible_models)
+       })}
     end
   end
 
@@ -97,7 +119,9 @@ defmodule CodexPooler.Gateway.Metadata do
   defp policy_visible_models(auth, endpoint, %RequestOptions{} = request_options) do
     with {:ok, policy} <- normalize_policy_or_log(auth, endpoint, request_options) do
       hydration = CandidateEligibility.hydrate_model_visibility(auth.pool)
-      visible_models = CandidateEligibility.policy_visible_models(hydration, policy)
+
+      visible_models =
+        CandidateEligibility.policy_visible_models(hydration.visible_models, policy)
 
       {:ok,
        %{
@@ -107,6 +131,7 @@ defmodule CodexPooler.Gateway.Metadata do
     end
   end
 
+  @spec normalize_policy_or_log(auth(), String.t(), opts()) :: policy_result()
   defp normalize_policy_or_log(auth, endpoint, %RequestOptions{} = request_options) do
     case Access.normalize_api_key_policy(auth.api_key) do
       {:ok, policy} ->

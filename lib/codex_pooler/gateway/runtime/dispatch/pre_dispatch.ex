@@ -4,6 +4,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   alias CodexPooler.Access
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Contracts, as: GatewayContracts
+  alias CodexPooler.Gateway.Metadata.CodexCatalog
+  alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.InputShape
   alias CodexPooler.Gateway.Payloads.ReasoningEffort
   alias CodexPooler.Gateway.Payloads.RequestOptions
@@ -86,7 +88,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
              candidate_snapshots: candidate_snapshots,
              candidates: candidate_snapshots,
              routing_settings: PoolRouting.routing_settings_with_defaults(auth.pool)
-           }),
+           })
+           |> maybe_put_codex_models_etag(endpoint, request_options),
          {:ok, candidates} <-
            CandidateEligibility.filter_runtime_compatible_candidates(
              CandidateEligibility.FilterInput.new(%{
@@ -120,6 +123,60 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
 
       {:ok, %{request_options: request_options, candidates: candidates, route_state: route_state}}
     end
+  end
+
+  defp maybe_put_codex_models_etag(
+         %RouteState{} = route_state,
+         endpoint,
+         %RequestOptions{} = request_options
+       ) do
+    if codex_models_etag_eligible?(endpoint, request_options) do
+      policy = request_options.routing.api_key_policy
+
+      visible_models =
+        case policy do
+          %{} = policy ->
+            CandidateEligibility.policy_visible_models(
+              visible_models(route_state),
+              policy
+            )
+
+          nil ->
+            visible_models(route_state)
+        end
+
+      pricing_buckets = CodexPooler.Catalog.pricing_buckets_by_identifier(visible_models)
+      context_window_overrides = OperationalSettings.current().model_context_window_overrides
+
+      %{etag: etag} =
+        CodexCatalog.build(
+          route_state.visible_models,
+          policy,
+          pricing_buckets,
+          context_window_overrides
+        )
+
+      RouteState.put_codex_models_etag(route_state, etag)
+    else
+      route_state
+    end
+  end
+
+  defp codex_models_etag_eligible?(endpoint, %RequestOptions{} = request_options) do
+    source_endpoint = request_options.openai_compatibility.source_endpoint || endpoint
+
+    source_endpoint in [
+      "/backend-api/codex/responses",
+      "/backend-api/codex/v1/responses"
+    ] and request_options.transport.transport in ["http_json", "http_sse"] and
+      request_options.transport.route_class in [
+        RouteClass.proxy_http(),
+        RouteClass.proxy_stream()
+      ]
+  end
+
+  defp visible_models(%RouteState{visible_models: models}) do
+    Enum.filter(models, &match?(%Model{}, &1))
   end
 
   defp authorize_model_policy(

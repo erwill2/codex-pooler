@@ -173,9 +173,8 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
   def visible_model_context(_pool_or_id, _requested_model), do: nil
 
-  @spec policy_visible_models(model_visibility_hydration(), map()) :: [Model.t()]
-  def policy_visible_models(%{visible_models: visible_models}, policy)
-      when is_list(visible_models) do
+  @spec policy_visible_models([Model.t()], map()) :: [Model.t()]
+  def policy_visible_models(visible_models, policy) when is_list(visible_models) do
     Enum.filter(visible_models, &model_visible_to_policy?(&1, policy))
   end
 

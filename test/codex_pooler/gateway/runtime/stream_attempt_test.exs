@@ -49,6 +49,39 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttemptTest do
       assert state == %{classified?: true, buffer: ""}
     end
 
+    test "carries a validated upstream error param through retry and terminal classifications" do
+      retry =
+        sse_event("response.failed", %{
+          "type" => "response.failed",
+          "response" => %{
+            "error" => %{"code" => "server_error", "param" => "input[3].content"}
+          }
+        })
+
+      assert {{:retry, failure}, state} =
+               StreamAttempt.classify_first_event(retry, StreamAttempt.first_event_state())
+
+      assert failure.upstream_error_param == "input[3].content"
+
+      terminal =
+        sse_event("response.failed", %{
+          "type" => "response.failed",
+          "response" => %{
+            "error" => %{
+              "code" => "invalid_request",
+              "param" => "tools[0].name",
+              "message" => "raw-message-sentinel"
+            }
+          }
+        })
+
+      assert {{:write_terminal_failure, ^terminal, terminal_failure}, ^state} =
+               StreamAttempt.classify_first_event(terminal, state)
+
+      assert terminal_failure.upstream_error_param == "tools[0].name"
+      refute inspect(terminal_failure) =~ "raw-message-sentinel"
+    end
+
     test "classifies overloaded first terminal failures as retryable" do
       state = StreamAttempt.first_event_state()
 

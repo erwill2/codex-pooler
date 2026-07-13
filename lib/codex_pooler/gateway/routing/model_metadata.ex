@@ -26,6 +26,8 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
                           supported_modalities
                           supported_modes
                           supported_output_modalities
+                          supports_reasoning_summaries
+                          supports_reasoning_summary_parameter
                           transcription
                           transcriptions
                           upstream_model
@@ -36,6 +38,7 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
   @type metadata :: map()
   @type metadata_input :: Model.t() | metadata()
   @type pricing_buckets :: Catalog.pricing_bucket_map()
+  @type context_window_overrides :: %{optional(String.t()) => pos_integer()}
 
   @spec codex_model_payload(Model.t(), pricing_buckets()) :: map()
   def codex_model_payload(%Model{} = model, pricing_buckets),
@@ -43,74 +46,143 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
 
   @spec codex_model_payload(Model.t(), pricing_buckets(), MetadataProjection.t() | nil) :: map()
   def codex_model_payload(%Model{} = model, pricing_buckets, reasoning_projection) do
+    settings = OperationalSettings.current()
+
+    codex_model_payload(
+      model,
+      pricing_buckets,
+      reasoning_projection,
+      settings.model_context_window_overrides
+    )
+  end
+
+  @spec codex_model_payload(
+          Model.t(),
+          pricing_buckets(),
+          MetadataProjection.t() | nil,
+          context_window_overrides()
+        ) :: map()
+  def codex_model_payload(
+        %Model{} = model,
+        pricing_buckets,
+        reasoning_projection,
+        context_window_overrides
+      )
+      when is_map(context_window_overrides) do
     metadata =
       model
       |> metadata()
-      |> apply_context_window_policy(model, pricing_buckets)
+      |> apply_context_window_policy(model, pricing_buckets, context_window_overrides)
 
+    model
+    |> base_codex_model_payload(metadata, reasoning_projection)
+    |> maybe_put_reasoning_summary_capabilities(metadata)
+    |> maybe_put_comp_hash(metadata)
+  end
+
+  defp base_codex_model_payload(model, metadata, reasoning_projection) do
+    %{
+      "slug" => model.exposed_model_id,
+      "display_name" => model.display_name,
+      "description" => metadata["description"] || model.display_name,
+      "default_reasoning_level" =>
+        projected_default_reasoning_level(reasoning_projection, model, metadata),
+      "supported_reasoning_levels" =>
+        projected_reasoning_levels(reasoning_projection, model, metadata),
+      "shell_type" => "shell_command",
+      "visibility" => "list",
+      "priority" => int_metadata(metadata, "priority", 0),
+      "additional_speed_tiers" => list_metadata(metadata, "additional_speed_tiers"),
+      "service_tiers" => list_metadata(metadata, "service_tiers"),
+      "available_in_plans" => list_metadata(metadata, "available_in_plans"),
+      "default_service_tier" => string_metadata(metadata, "default_service_tier"),
+      "minimal_client_version" => json_metadata(metadata, "minimal_client_version"),
+      "availability_nux" => nil,
+      "upgrade" => nil,
+      "base_instructions" => metadata["base_instructions"] || "",
+      "default_reasoning_summary" => metadata["default_reasoning_summary"] || "auto",
+      "support_verbosity" => bool_metadata(metadata, "support_verbosity"),
+      "default_verbosity" => metadata["default_verbosity"],
+      "apply_patch_tool_type" => metadata["apply_patch_tool_type"],
+      "web_search_tool_type" => metadata["web_search_tool_type"] || "text",
+      "truncation_policy" =>
+        metadata["truncation_policy"] ||
+          %{
+            "mode" => "bytes",
+            "limit" => int_metadata(metadata, "truncation_limit", 10_000)
+          },
+      "supports_parallel_tool_calls" => model.supports_tools,
+      "supports_image_detail_original" => supports_image_detail_original?(metadata),
+      "model_messages" => map_metadata(metadata, "model_messages"),
+      "include_skills_usage_instructions" =>
+        bool_metadata(metadata, "include_skills_usage_instructions"),
+      "prefer_websockets" => bool_metadata(metadata, "prefer_websockets"),
+      "reasoning_summary_format" => string_metadata(metadata, "reasoning_summary_format"),
+      "context_window" => metadata["context_window"],
+      "max_context_window" => metadata["max_context_window"],
+      "auto_compact_token_limit" => metadata["auto_compact_token_limit"],
+      "effective_context_window_percent" =>
+        int_metadata(metadata, "effective_context_window_percent", 95),
+      "experimental_supported_tools" => list_metadata(metadata, "experimental_supported_tools"),
+      "input_modalities" => input_modalities(metadata),
+      "supports_search_tool" => bool_metadata(metadata, "supports_search_tool"),
+      "tool_mode" => tool_mode_metadata(metadata),
+      "upstream_model_id" => model.upstream_model_id,
+      "exposed_model_id" => model.exposed_model_id,
+      "status" => model.status,
+      "supported_in_api" => model.supports_responses,
+      "supports_responses" => model.supports_responses,
+      "supports_streaming" => model.supports_streaming,
+      "supports_tools" => model.supports_tools,
+      "supports_reasoning" => model.supports_reasoning,
+      "use_responses_lite" => bool_metadata(metadata, "use_responses_lite")
+    }
+  end
+
+  defp maybe_put_reasoning_summary_capabilities(payload, metadata) do
     payload =
-      %{
-        "slug" => model.exposed_model_id,
-        "display_name" => model.display_name,
-        "description" => metadata["description"] || model.display_name,
-        "default_reasoning_level" =>
-          projected_default_reasoning_level(reasoning_projection, model, metadata),
-        "supported_reasoning_levels" =>
-          projected_reasoning_levels(reasoning_projection, model, metadata),
-        "shell_type" => "shell_command",
-        "visibility" => "list",
-        "priority" => int_metadata(metadata, "priority", 0),
-        "additional_speed_tiers" => list_metadata(metadata, "additional_speed_tiers"),
-        "service_tiers" => list_metadata(metadata, "service_tiers"),
-        "available_in_plans" => list_metadata(metadata, "available_in_plans"),
-        "default_service_tier" => string_metadata(metadata, "default_service_tier"),
-        "minimal_client_version" => json_metadata(metadata, "minimal_client_version"),
-        "availability_nux" => nil,
-        "upgrade" => nil,
-        "base_instructions" => metadata["base_instructions"] || "",
-        "supports_reasoning_summaries" => bool_metadata(metadata, "supports_reasoning_summaries"),
-        "default_reasoning_summary" => metadata["default_reasoning_summary"] || "auto",
-        "support_verbosity" => bool_metadata(metadata, "support_verbosity"),
-        "default_verbosity" => metadata["default_verbosity"],
-        "apply_patch_tool_type" => metadata["apply_patch_tool_type"],
-        "web_search_tool_type" => metadata["web_search_tool_type"] || "text",
-        "truncation_policy" =>
-          metadata["truncation_policy"] ||
-            %{
-              "mode" => "bytes",
-              "limit" => int_metadata(metadata, "truncation_limit", 10_000)
-            },
-        "supports_parallel_tool_calls" => model.supports_tools,
-        "supports_image_detail_original" => supports_image_detail_original?(metadata),
-        "model_messages" => map_metadata(metadata, "model_messages"),
-        "include_skills_usage_instructions" =>
-          bool_metadata(metadata, "include_skills_usage_instructions"),
-        "prefer_websockets" => bool_metadata(metadata, "prefer_websockets"),
-        "reasoning_summary_format" => string_metadata(metadata, "reasoning_summary_format"),
-        "context_window" => metadata["context_window"],
-        "max_context_window" => metadata["max_context_window"],
-        "auto_compact_token_limit" => metadata["auto_compact_token_limit"],
-        "effective_context_window_percent" =>
-          int_metadata(metadata, "effective_context_window_percent", 95),
-        "experimental_supported_tools" => list_metadata(metadata, "experimental_supported_tools"),
-        "input_modalities" => input_modalities(metadata),
-        "supports_search_tool" => bool_metadata(metadata, "supports_search_tool"),
-        "tool_mode" => tool_mode_metadata(metadata),
-        "upstream_model_id" => model.upstream_model_id,
-        "exposed_model_id" => model.exposed_model_id,
-        "status" => model.status,
-        "supported_in_api" => model.supports_responses,
-        "supports_responses" => model.supports_responses,
-        "supports_streaming" => model.supports_streaming,
-        "supports_tools" => model.supports_tools,
-        "supports_reasoning" => model.supports_reasoning,
-        "use_responses_lite" => bool_metadata(metadata, "use_responses_lite")
-      }
+      if supports_reasoning_summary_parameter?(metadata) do
+        payload
+      else
+        Map.put(payload, "supports_reasoning_summary_parameter", false)
+      end
 
+    case literal_boolean_metadata(metadata, "supports_reasoning_summaries") do
+      value when is_boolean(value) -> Map.put(payload, "supports_reasoning_summaries", value)
+      nil -> payload
+    end
+  end
+
+  defp maybe_put_comp_hash(payload, metadata) do
     case optional_string_metadata(metadata, "comp_hash") do
       nil -> payload
       comp_hash -> Map.put(payload, "comp_hash", comp_hash)
     end
+  end
+
+  @spec supports_reasoning_summary_parameter?(metadata_input()) :: boolean()
+  def supports_reasoning_summary_parameter?(%Model{} = model) do
+    model
+    |> metadata()
+    |> supports_reasoning_summary_parameter?()
+  end
+
+  def supports_reasoning_summary_parameter?(metadata) when is_map(metadata) do
+    metadata =
+      case metadata_value(metadata, "upstream_model") do
+        %{} = upstream_model -> Map.merge(upstream_model, metadata)
+        _value -> metadata
+      end
+
+    metadata_value(metadata, "supports_reasoning_summary_parameter") != false
+  end
+
+  def supports_reasoning_summary_parameter?(_metadata), do: true
+
+  @spec selected_assignment_metadata(Model.t(), Ecto.UUID.t()) :: metadata()
+  def selected_assignment_metadata(%Model{} = model, assignment_id)
+      when is_binary(assignment_id) do
+    get_in(model.metadata || %{}, ["source_assignment_models", assignment_id]) || metadata(model)
   end
 
   defp projected_default_reasoning_level(
@@ -475,7 +547,28 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
       when is_map(metadata) do
     settings = OperationalSettings.current()
 
-    case Map.get(settings.model_context_window_overrides, model.exposed_model_id) do
+    apply_context_window_policy(
+      metadata,
+      model,
+      pricing_buckets,
+      settings.model_context_window_overrides
+    )
+  end
+
+  @spec apply_context_window_policy(
+          metadata(),
+          Model.t(),
+          pricing_buckets(),
+          context_window_overrides()
+        ) :: metadata()
+  def apply_context_window_policy(
+        metadata,
+        %Model{} = model,
+        pricing_buckets,
+        context_window_overrides
+      )
+      when is_map(metadata) and is_map(context_window_overrides) do
+    case Map.get(context_window_overrides, model.exposed_model_id) do
       context_window when is_integer(context_window) and context_window > 0 ->
         put_context_window(metadata, context_window)
 
@@ -627,6 +720,13 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadata do
       value = metadata_value(metadata, key)
       value in [true, "true", "supported", "enabled"]
     end)
+  end
+
+  defp literal_boolean_metadata(metadata, key) do
+    case metadata_value(metadata, key) do
+      value when is_boolean(value) -> value
+      _value -> nil
+    end
   end
 
   defp metadata_value(%{} = metadata, key) do

@@ -7,6 +7,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
+  alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Runtime.Streaming.DownstreamStream
@@ -50,7 +51,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
   defp relay_streaming_result(response, %SelectedCandidateContext{} = context, callbacks) do
     result = %{
       status: response.status,
-      headers: stream_headers(response, context.request_options)
+      headers: stream_headers(response, context)
     }
 
     case context.request_options.transport.websocket_writer do
@@ -441,12 +442,35 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
 
   defp maybe_mark_visible_output(state, _request, _visible?), do: state
 
-  defp stream_headers(response, request_options) do
+  defp stream_headers(response, %SelectedCandidateContext{} = context) do
     content_type = header(response, "content-type") || "text/event-stream"
 
     [{"cache-control", "no-cache"}, {"content-type", content_type}]
-    |> maybe_put_backend_turn_state_response_header(response, request_options)
+    |> maybe_put_backend_turn_state_response_header(response, context.request_options)
+    |> maybe_put_backend_models_etag(context)
   end
+
+  defp maybe_put_backend_models_etag(
+         headers,
+         %SelectedCandidateContext{
+           route_state: %RouteState{} = route_state,
+           request_options: %RequestOptions{
+             transport: %{
+               transport: "http_sse",
+               upstream_endpoint: "/backend-api/codex/responses",
+               websocket_writer: nil
+             },
+             openai_compatibility: %{source_endpoint: nil, openai_chat_payload: nil}
+           }
+         }
+       ) do
+    case RouteState.codex_models_etag(route_state) do
+      etag when is_binary(etag) -> [{"x-models-etag", etag} | headers]
+      _etag -> headers
+    end
+  end
+
+  defp maybe_put_backend_models_etag(headers, _context), do: headers
 
   defp maybe_put_backend_turn_state_response_header(
          headers,

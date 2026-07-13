@@ -58,6 +58,79 @@ defmodule CodexPooler.CompatibilityMatrix do
         "backend image generation and edit routes are explicit authenticated JSON proxy routes under /backend-api/codex/images, keep image-specific prompt and source fields intact, and stay distinct from the public /v1 image translator surface"
     },
     %{
+      slug: :backend_models_etag,
+      status: :supported,
+      current: :policy_visible_body_digest,
+      categories: [:route, :auth, :error, :ownership],
+      routes: [
+        %{method: :get, path: "/backend-api/codex/models"},
+        %{method: :get, path: "/backend-api/codex/v1/models"}
+      ],
+      future_routes: [],
+      fixture: :backend_models_etag,
+      contract:
+        "backend model aliases return the same policy-visible effective catalog body and deterministic weak ETag; cache coherence across processes or replicas is eventual after a successful Responses token is observed"
+    },
+    %{
+      slug: :backend_responses_etag,
+      status: :supported,
+      current: :predispatch_catalog_snapshot,
+      categories: [:route, :auth, :error, :streaming, :ownership, :degraded],
+      routes: [
+        %{method: :post, path: "/backend-api/codex/responses", transport: "http_sse"},
+        %{method: :post, path: "/backend-api/codex/v1/responses", transport: "http_sse"},
+        %{method: :get, path: "/backend-api/codex/responses", transport: "websocket"},
+        %{method: :get, path: "/backend-api/codex/v1/responses", transport: "websocket"}
+      ],
+      future_routes: [],
+      fixture: :backend_responses_etag,
+      contract:
+        "backend Responses HTTP SSE response headers and websocket upgrade headers expose x-models-etag equal byte-for-byte to the exact authenticated backend models ETag from the predispatch catalog snapshot; the value is never relayed from upstream and is excluded from backend JSON, compact, public /v1, usage, unauthenticated, and unrelated routes"
+    },
+    %{
+      slug: :backend_responses_envelope,
+      status: :supported,
+      current: :final_noncompact_backend_envelope,
+      categories: [:route, :auth, :error, :streaming, :ownership],
+      routes: [
+        %{method: :post, path: "/backend-api/codex/responses"},
+        %{method: :post, path: "/backend-api/codex/v1/responses"},
+        %{method: :get, path: "/backend-api/codex/responses", transport: "websocket"},
+        %{method: :get, path: "/backend-api/codex/v1/responses", transport: "websocket"},
+        %{method: :post, path: "/backend-api/codex/v1/chat/completions"},
+        %{method: :post, path: "/v1/responses", translation: "backend_responses"},
+        %{
+          method: :get,
+          path: "/v1/responses",
+          transport: "websocket",
+          translation: "backend_responses"
+        },
+        %{
+          method: :post,
+          path: "/v1/chat/completions",
+          translation: "backend_responses"
+        }
+      ],
+      future_routes: [],
+      fixture: :backend_responses_envelope,
+      contract:
+        "the final noncompact backend Responses envelope always has a reasoning map and exactly one reasoning.encrypted_content include after selected summary-capability normalization across backend, backend-alias, and translated public Responses surfaces; compact routes remain excluded and preserve their existing narrow shape"
+    },
+    %{
+      slug: :upstream_error_param,
+      status: :supported,
+      current: :sanitized_failed_attempt_detail,
+      categories: [:error, :ownership, :degraded],
+      routes: [
+        %{method: :post, path: "/backend-api/codex/responses"},
+        %{method: :get, path: "/backend-api/codex/responses", transport: "websocket"}
+      ],
+      future_routes: [],
+      fixture: :upstream_error_param,
+      contract:
+        "upstream_error_param is a bounded allowlisted field-path value projected on failed-attempt detail only; invalid values and successful attempts are omitted, with never raw upstream error messages or values projected"
+    },
+    %{
       slug: :responses_chat,
       status: :supported,
       current: :proxied_json_and_sse,
@@ -388,6 +461,55 @@ defmodule CodexPooler.CompatibilityMatrix do
         "model" => "gpt-fixture-image",
         "prompt" => "synthetic backend image proxy request"
       }
+    },
+    backend_models_etag: %{
+      header: "etag",
+      digest_input: "policy_visible_effective_catalog_body",
+      digest: "sha256_deterministic_canonical_json",
+      format: "weak_cp_models_v1",
+      aliases_share_exact_body_and_token: true,
+      cache_coherence: "eventual_after_successful_responses_token"
+    },
+    backend_responses_etag: %{
+      header: "x-models-etag",
+      equals: "authenticated_backend_models_etag",
+      http_sse: "response_header",
+      websocket: "upgrade_header",
+      upstream_etag_relay: false,
+      included_routes: [
+        "/backend-api/codex/responses",
+        "/backend-api/codex/v1/responses"
+      ],
+      excluded_surfaces: [
+        "backend_json",
+        "backend_compact",
+        "public_v1",
+        "usage",
+        "unauthenticated",
+        "unrelated_routes"
+      ]
+    },
+    backend_responses_envelope: %{
+      noncompact: %{
+        reasoning: "map",
+        encrypted_include: "reasoning.encrypted_content",
+        encrypted_include_count: 1,
+        summary_capability: "selected_assignment_literal_false_removes_summary",
+        idempotent_after_json_round_trip: true
+      },
+      compact: %{
+        applies_noncompact_envelope: false,
+        preserves_existing_shape: true
+      }
+    },
+    upstream_error_param: %{
+      field: "upstream_error_param",
+      source: "decoded_upstream_error_envelope",
+      projection: "failed_attempt_detail_only",
+      max_bytes: 160,
+      allowed_shape: "field_name_or_index_path",
+      invalid_or_successful_attempt: "omitted",
+      raw_error_message_or_value: "never_projected"
     },
     responses_chat: %{
       prompt_cache_routing: %{

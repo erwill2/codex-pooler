@@ -6,6 +6,8 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection do
   alias CodexPooler.Gateway.Persistence.SessionReadModel
 
   @bounded_detail_attempts 10
+  @upstream_error_param_max_bytes 160
+  @upstream_error_param_pattern ~r/\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*|\[(?:0|[1-9][0-9]{0,3})\])*\z/
 
   @spec build(Request.t(), map(), SessionReadModel.request_turn_row() | nil, [Attempt.t()]) ::
           map()
@@ -218,6 +220,7 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection do
       final: maybe_field(turn, :final_attempt_id) == attempt.id
     }
     |> maybe_put_transport_failure(attempt)
+    |> maybe_put_upstream_error_param(attempt)
   end
 
   defp maybe_put_transport_failure(projection, %Attempt{} = attempt) do
@@ -229,6 +232,27 @@ defmodule CodexPooler.Accounting.RequestLogs.DebugProjection do
         projection
     end
   end
+
+  defp maybe_put_upstream_error_param(projection, %Attempt{status: status} = attempt)
+       when status in ["failed", "retryable_failed"] do
+    case valid_upstream_error_param(attempt.response_metadata) do
+      nil -> projection
+      value -> Map.put(projection, :upstream_error_param, value)
+    end
+  end
+
+  defp maybe_put_upstream_error_param(projection, _attempt), do: projection
+
+  defp valid_upstream_error_param(%{"upstream_error_param" => value}) when is_binary(value) do
+    value = String.trim(value)
+
+    if byte_size(value) in 1..@upstream_error_param_max_bytes and
+         Regex.match?(@upstream_error_param_pattern, value) do
+      value
+    end
+  end
+
+  defp valid_upstream_error_param(_metadata), do: nil
 
   defp metadata_session_id(metadata) when is_map(metadata) do
     case Map.fetch(metadata, "codex_session_id") do

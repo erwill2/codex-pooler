@@ -32,7 +32,7 @@ defmodule CodexPooler.Access do
     to: APIKeys
 
   @spec project_reasoning_effort_metadata(
-          APIKey.t(),
+          APIKey.t() | APIKeys.ReasoningEffortPolicy.normalized_policy(),
           [APIKeys.ReasoningEffortPolicy.model_level()] | nil,
           String.t() | nil
         ) :: APIKeys.ReasoningEffortPolicy.MetadataProjection.t()

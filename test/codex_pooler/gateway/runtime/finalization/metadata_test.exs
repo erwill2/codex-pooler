@@ -60,6 +60,36 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.MetadataTest do
     assert metadata["stream_error_code"] == "usage_limit_exceeded"
   end
 
+  test "first-event metadata retains only the sanitized upstream error parameter" do
+    failure = %{
+      code: "invalid_request_error",
+      upstream_code: "unsupported_parameter",
+      upstream_error_param: "reasoning.summary",
+      event_type: "response.failed",
+      message: "raw-message-sentinel",
+      invalid_value: "raw-value-sentinel",
+      frame: "raw-frame-sentinel"
+    }
+
+    metadata =
+      Metadata.first_event_stream_metadata(
+        %Req.Response{status: 200, headers: [{"x-private-header", ["raw-header-sentinel"]}]},
+        failure,
+        "first_event_stream_failure",
+        %{}
+      )
+
+    assert metadata["upstream_error_param"] == "reasoning.summary"
+    assert metadata["upstream_error_code"] == "unsupported_parameter"
+    assert metadata["masked_error_code"] == "invalid_request_error"
+
+    encoded = Jason.encode!(metadata)
+    refute encoded =~ "raw-message-sentinel"
+    refute encoded =~ "raw-value-sentinel"
+    refute encoded =~ "raw-frame-sentinel"
+    refute encoded =~ "raw-header-sentinel"
+  end
+
   test "response metadata preserves known Codex rate limit reached type headers" do
     response = %Req.Response{
       status: 429,

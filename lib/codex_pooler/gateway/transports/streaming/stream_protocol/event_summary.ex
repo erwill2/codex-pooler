@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.EventSummary d
 
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.ErrorCodes
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.UpstreamErrorParam
 
   @incomplete_failure_reason_codes [
     "upstream_request_timeout",
@@ -31,6 +32,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.EventSummary d
           required(:event_type) => String.t() | nil,
           required(:error_code) => String.t() | nil,
           required(:upstream_error_code) => String.t() | nil,
+          required(:upstream_error_param) => UpstreamErrorParam.t(),
           required(:data_type) => String.t() | nil,
           required(:explicit_error?) => boolean(),
           required(:incomplete_reason) => String.t() | nil
@@ -48,6 +50,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.EventSummary d
       event_type: event_type,
       error_code: ErrorCodes.sse_error_code(decoded),
       upstream_error_code: ErrorCodes.upstream_error_code(decoded),
+      upstream_error_param: UpstreamErrorParam.extract(decoded),
       data_type: ErrorCodes.decoded_string(decoded, "type"),
       explicit_error?: explicit_terminal_error?(decoded),
       incomplete_reason: incomplete_reason(decoded)

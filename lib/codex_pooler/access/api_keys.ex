@@ -58,7 +58,7 @@ defmodule CodexPooler.Access.APIKeys do
     as: :resolve
 
   @spec project_reasoning_effort_metadata(
-          APIKey.t(),
+          APIKey.t() | ReasoningEffortPolicy.normalized_policy(),
           [ReasoningEffortPolicy.model_level()] | nil,
           String.t() | nil
         ) :: ReasoningEffortPolicy.MetadataProjection.t()

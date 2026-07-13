@@ -164,6 +164,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
           terminal_failure && terminal_failure.upstream_code,
           code
         )
+        |> Metadata.maybe_put_upstream_error_param(terminal_failure)
         |> TransportFailureReason.maybe_put_upstream_stream_interrupted_metadata(reason, body)
 
       AttemptSettlement.finalize_partial_stream_failure(

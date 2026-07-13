@@ -470,6 +470,119 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
   end
 
   describe "wrapped websocket/direct JSON terminal error frames" do
+    test "extracts the first present validated upstream error param by exact precedence" do
+      fixtures = [
+        {"response.error.param",
+         %{"response" => %{"error" => %{"param" => " input[0].content "}}}, "input[0].content"},
+        {"error.param", %{"error" => %{"param" => "tools[12].name"}}, "tools[12].name"},
+        {"response.status_details.error.param",
+         %{"response" => %{"status_details" => %{"error" => %{"param" => "items[9999]"}}}},
+         "items[9999]"},
+        {"status_details.error.param",
+         %{"status_details" => %{"error" => %{"param" => "reasoning.effort"}}},
+         "reasoning.effort"},
+        {"top-level error param", %{"type" => "error", "param" => "model"}, "model"}
+      ]
+
+      for {_label, payload, expected} <- fixtures do
+        decoded = Map.put_new(payload, "type", "response.failed")
+        assert {:ok, outcome} = StreamProtocol.terminal_outcome(decoded["type"], decoded)
+        assert outcome.failure.upstream_error_param == expected
+      end
+
+      precedence = %{
+        "type" => "error",
+        "param" => "fifth",
+        "status_details" => %{"error" => %{"param" => "fourth"}},
+        "error" => %{"param" => "second"},
+        "response" => %{
+          "error" => %{"code" => "server_error", "param" => "first"},
+          "status_details" => %{"error" => %{"param" => "third"}}
+        }
+      }
+
+      assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(precedence))
+      assert failure.upstream_error_param == "first"
+    end
+
+    test "accepts exact grammar and byte boundaries and rejects unsafe candidates" do
+      segment_160 = "a" <> String.duplicate("b", 159)
+
+      accepted = ["a", "A1_b.c2[0].D[9999]", segment_160]
+
+      rejected = [
+        "",
+        "   ",
+        "1field",
+        "field..name",
+        "field[-1]",
+        "field[00]",
+        "field[10000]",
+        "field[]",
+        "field name",
+        "https://example.com/path",
+        "user@example.com",
+        "a" <> String.duplicate("b", 160),
+        7,
+        %{"raw" => "field"}
+      ]
+
+      for candidate <- accepted do
+        payload = %{
+          "type" => "error",
+          "error" => %{"code" => "server_error", "param" => candidate}
+        }
+
+        assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(payload))
+        assert failure.upstream_error_param == String.trim(candidate)
+      end
+
+      for candidate <- rejected do
+        payload = %{
+          "type" => "error",
+          "error" => %{"code" => "server_error", "param" => candidate}
+        }
+
+        assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(payload))
+        assert failure.upstream_error_param == nil
+      end
+
+      non_error_top_level = %{
+        "type" => "response.failed",
+        "param" => "model",
+        "error" => %{"code" => "server_error"}
+      }
+
+      assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(non_error_top_level))
+      assert failure.upstream_error_param == nil
+    end
+
+    test "does not fall through after an invalid first-present param or copy raw sentinels" do
+      raw_value = "https://example.com/raw-value-sentinel"
+      raw_message = "raw-message-sentinel"
+
+      payload = %{
+        "type" => "response.failed",
+        "response" => %{
+          "error" => %{"code" => "server_error", "param" => raw_value, "message" => raw_message}
+        },
+        "error" => %{"param" => "valid.lower_priority"},
+        "param" => "also_lower_priority"
+      }
+
+      assert {:ok, event} = StreamProtocol.first_complete_event(Jason.encode!(payload))
+      assert event.upstream_error_param == nil
+
+      assert {:ok, failure} = StreamProtocol.terminal_failure(Jason.encode!(payload))
+      assert failure.upstream_error_param == nil
+
+      summary_text = inspect({event, failure})
+      refute summary_text =~ raw_value
+      refute summary_text =~ raw_message
+      refute summary_text =~ "valid.lower_priority"
+      refute summary_text =~ "also_lower_priority"
+    end
+
     test "canonicalizes typeless detail-only websocket frames as terminal failures" do
       frame = Jason.encode!(%{"detail" => "synthetic upstream detail must stay out of metadata"})
 

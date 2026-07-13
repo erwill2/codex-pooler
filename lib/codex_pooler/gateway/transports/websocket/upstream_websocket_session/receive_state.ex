@@ -7,6 +7,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Rece
     :message_mapper,
     :frame_observer,
     :terminal_upstream_error_code,
+    :terminal_upstream_error_param,
     downstream_output_started?: false,
     terminal_seen?: false,
     text_frame_count: 0,
@@ -22,6 +23,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Rece
           frame_observer:
             CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request.frame_observer(),
           terminal_upstream_error_code: String.t() | nil,
+          terminal_upstream_error_param: String.t() | nil,
           downstream_output_started?: boolean(),
           terminal_seen?: boolean(),
           text_frame_count: non_neg_integer(),

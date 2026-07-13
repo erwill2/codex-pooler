@@ -10,8 +10,11 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatchTest do
   alias CodexPooler.Accounting.{Attempt, Request}
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway
+  alias CodexPooler.Gateway.Metadata
+  alias CodexPooler.Gateway.Metadata.CodexCatalog
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.CodexSession
+  alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Pools
@@ -56,7 +59,14 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatchTest do
     assert [_window] = Map.fetch!(route_state.quota_window_snapshots, identity.id)
     assert Map.fetch!(route_state.circuit_snapshots, assignment.id).eligible? == true
     assert Map.fetch!(route_state.circuit_eligibility_snapshots, assignment.id).eligible? == true
-    assert route_state.extensions == %{}
+    {:ok, policy} = Access.normalize_api_key_policy(auth.api_key)
+    pricing = CodexPooler.Catalog.pricing_buckets_by_identifier([setup.model])
+    %{"models" => [catalog_model]} = CodexCatalog.build([setup.model], policy, pricing, %{}).body
+
+    assert RouteState.codex_models_etag(route_state) ==
+             CodexCatalog.etag(%{"models" => [catalog_model]})
+
+    assert catalog_model["slug"] == setup.model.exposed_model_id
 
     assert %{
              pool_id: pool_id,
@@ -98,6 +108,65 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatchTest do
 
     assert Enum.all?(quota_window_dimension_keys, &(&1.api_key_id == auth.api_key.id))
     assert Repo.all(Request) == []
+  end
+
+  test "prepare stores one full-policy catalog ETag instead of a selected-model or pool digest" do
+    setup = gateway_setup(start_upstream(FakeUpstream.json_response(%{"data" => []})))
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    %{assignment: denied_assignment} =
+      active_upstream_assignment_fixture(setup.pool, %{
+        account_label: "Pre-dispatch policy denied upstream"
+      })
+
+    denied_model =
+      CodexPooler.PoolerFixtures.model_fixture(setup.pool, %{
+        exposed_model_id: "gpt-pre-dispatch-policy-denied",
+        upstream_model_id: "provider-gpt-pre-dispatch-policy-denied",
+        display_name: "Pre-dispatch Policy Denied",
+        metadata: %{"source_assignment_ids" => [denied_assignment.id]}
+      })
+
+    api_key =
+      setup.api_key
+      |> Ecto.Changeset.change(allowed_model_identifiers: [setup.model.exposed_model_id])
+      |> Repo.update!()
+
+    auth = %{auth | api_key: api_key}
+    {:ok, policy} = Access.normalize_api_key_policy(api_key)
+
+    payload = %{"model" => setup.model.exposed_model_id, "input" => "policy snapshot"}
+
+    options =
+      request_options(auth, payload,
+        requested_model: setup.model.exposed_model_id,
+        effective_model: setup.model.exposed_model_id
+      )
+      |> RequestOptions.put_routing(api_key_policy: policy)
+
+    context = CandidateEligibility.visible_model_context(setup.pool, setup.model.exposed_model_id)
+
+    assert denied_model.id in Enum.map(context.visible_models, & &1.id)
+
+    assert {:ok, prepared} =
+             PreDispatch.prepare(auth, @endpoint_path, payload, options, setup.model, context)
+
+    models_options =
+      RequestOptions.build(%{}, "/backend-api/codex/models", %{})
+      |> RequestOptions.put_routing(api_key_policy: policy)
+
+    assert {:ok, expected} =
+             Metadata.codex_catalog_snapshot(
+               auth,
+               "/backend-api/codex/models",
+               models_options
+             )
+
+    assert RouteState.codex_models_etag(prepared.route_state) == expected.etag
+    assert Enum.map(expected.body["models"], & &1["slug"]) == [setup.model.exposed_model_id]
+
+    inherited = RouteState.put_candidates(prepared.route_state, Enum.reverse(prepared.candidates))
+    assert RouteState.codex_models_etag(inherited) == expected.etag
   end
 
   test "prepare attaches defaulted routing settings to the request-local route state without persisting" do

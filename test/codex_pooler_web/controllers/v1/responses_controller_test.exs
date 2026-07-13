@@ -417,6 +417,7 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
       start_upstream(public_websocket_completed_response("resp_v1_websocket_public"))
 
     setup = gateway_setup(upstream)
+    request_count = Repo.aggregate(Request, :count)
     assert :ok = Events.subscribe_pool(setup.pool)
     port = start_public_endpoint!()
     turn_state = "v1-public-ws-#{System.unique_integer([:positive])}"
@@ -432,6 +433,9 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     try do
       assert {"x-codex-turn-state", ^turn_state} =
                List.keyfind(response_headers, "x-codex-turn-state", 0)
+
+      refute List.keyfind(response_headers, "x-models-etag", 0)
+      assert Repo.aggregate(Request, :count) == request_count
 
       payload =
         Jason.encode!(%{
@@ -1348,7 +1352,10 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     refute persistence_text =~ raw_cache_key
   end
 
-  test "POST /v1/responses forwards normalized reasoning context", %{conn: conn} do
+  @tag :selected_assignment_false_reasoning_envelope
+  test "POST /v1/responses applies selected false while preserving the public response", %{
+    conn: conn
+  } do
     upstream =
       start_upstream(
         FakeUpstream.json_response(%{
@@ -1360,14 +1367,33 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
 
     setup = gateway_setup(upstream)
 
+    setup =
+      put_setup_model_source_metadata!(setup, %{
+        "id" => setup.model.upstream_model_id,
+        "capabilities" => %{"responses" => true, "streaming" => true},
+        "supported_reasoning_levels" => [%{"effort" => "high"}],
+        "supports_reasoning_summary_parameter" => false
+      })
+
     conn =
       conn
       |> auth(setup)
       |> post("/v1/responses", %{
         "model" => setup.model.exposed_model_id,
         "input" => "synthetic reasoning context request",
-        "reasoning" => %{"context" => " Current_Turn "}
+        "include" => [
+          "reasoning.encrypted_content",
+          "reasoning.encrypted_content"
+        ],
+        "reasoning" => %{
+          "effort" => "high",
+          "summary" => "auto",
+          "context" => " Current_Turn "
+        }
       })
+
+    assert conn.status == 200
+    assert get_resp_header(conn, "content-type") == ["application/json; charset=utf-8"]
 
     assert %{"id" => "resp_v1_reasoning_context", "object" => "response"} =
              json_response(conn, 200)
@@ -1376,7 +1402,13 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert captured.path == "/backend-api/codex/responses"
     assert captured.json["stream"] == true
     assert captured.json["store"] == false
-    assert captured.json["reasoning"] == %{"context" => "current_turn"}
+
+    assert captured.json["reasoning"] == %{
+             "effort" => "high",
+             "context" => "current_turn"
+           }
+
+    assert captured.json["include"] == ["reasoning.encrypted_content"]
   end
 
   test "POST /v1/responses normalizes an OMP 16.3.14 GPT-5.6 first turn for Responses Lite",
@@ -1464,8 +1496,18 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
              "summary" => "auto"
            }
 
-    assert [%{"type" => "message", "role" => "user"}] = captured.json["input"]
-    assert [%{"type" => "function", "name" => "lookup_fixture"}] = captured.json["tools"]
+    assert [
+             %{
+               "type" => "additional_tools",
+               "role" => "developer",
+               "tools" => [%{"type" => "function", "name" => "lookup_fixture"}]
+             },
+             %{"type" => "message", "role" => "developer"},
+             %{"type" => "message", "role" => "user"}
+           ] = captured.json["input"]
+
+    refute Map.has_key?(captured.json, "tools")
+    refute Map.has_key?(captured.json, "instructions")
     refute Map.has_key?(captured.json, "max_output_tokens")
   end
 
@@ -2604,6 +2646,8 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert captured.json["instructions"] == "synthetic developer instruction"
     assert captured.json["stream"] == true
     assert captured.json["store"] == false
+    assert captured.json["reasoning"] == %{"effort" => "xhigh", "summary" => "detailed"}
+    assert captured.json["include"] == ["reasoning.encrypted_content"]
 
     assert Enum.map(captured.json["input"], & &1["type"]) == [
              "message",

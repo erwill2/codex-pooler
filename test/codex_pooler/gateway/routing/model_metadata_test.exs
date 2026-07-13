@@ -40,6 +40,65 @@ defmodule CodexPooler.Gateway.Routing.ModelMetadataTest do
     end
   end
 
+  test "codex model payload applies current and legacy reasoning-summary semantics" do
+    cases = [
+      {:absent, %{}, nil, nil, true},
+      {true, %{"supports_reasoning_summary_parameter" => true}, nil, nil, true},
+      {false, %{"supports_reasoning_summary_parameter" => false}, false, nil, false},
+      {:malformed, %{"supports_reasoning_summary_parameter" => "false"}, nil, nil, true},
+      {:legacy_true, %{"supports_reasoning_summaries" => true}, nil, true, true},
+      {:legacy_false, %{"supports_reasoning_summaries" => false}, nil, false, true},
+      {:legacy_malformed, %{"supports_reasoning_summaries" => "true"}, nil, nil, true},
+      {:nested_false, %{"upstream_model" => %{"supports_reasoning_summary_parameter" => false}},
+       false, nil, false}
+    ]
+
+    for {_case_label, metadata, current_value, legacy_value, capability?} <- cases do
+      payload = model_payload(metadata)
+      encoded_payload = payload |> Jason.encode!() |> Jason.decode!()
+
+      assert Map.get(payload, "supports_reasoning_summary_parameter") == current_value
+      assert Map.get(payload, "supports_reasoning_summaries") == legacy_value
+      assert ModelMetadata.supports_reasoning_summary_parameter?(metadata) == capability?
+
+      if is_boolean(legacy_value) do
+        assert Map.has_key?(payload, "supports_reasoning_summaries")
+        assert encoded_payload["supports_reasoning_summaries"] == legacy_value
+      else
+        refute Map.has_key?(payload, "supports_reasoning_summaries")
+        refute Map.has_key?(encoded_payload, "supports_reasoning_summaries")
+      end
+    end
+  end
+
+  test "selected assignment reasoning-summary capability overrides model metadata" do
+    assignment_id = Ecto.UUID.generate()
+
+    model =
+      reasoning_model(%{
+        "supports_reasoning_summary_parameter" => true,
+        "source_assignment_models" => %{
+          assignment_id => %{"supports_reasoning_summary_parameter" => false}
+        }
+      })
+
+    assert model
+           |> ModelMetadata.selected_assignment_metadata(assignment_id)
+           |> ModelMetadata.supports_reasoning_summary_parameter?() == false
+
+    malformed_model =
+      put_in(
+        model.metadata["source_assignment_models"][assignment_id][
+          "supports_reasoning_summary_parameter"
+        ],
+        "false"
+      )
+
+    assert malformed_model
+           |> ModelMetadata.selected_assignment_metadata(assignment_id)
+           |> ModelMetadata.supports_reasoning_summary_parameter?()
+  end
+
   test "codex model payload preserves all advertised GPT-5.6 reasoning levels" do
     efforts = ~w(low medium high xhigh max ultra)
 

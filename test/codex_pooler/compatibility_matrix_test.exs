@@ -3,6 +3,111 @@ defmodule CodexPooler.CompatibilityMatrixTest do
 
   alias CodexPooler.CompatibilityMatrix
 
+  describe "catalog and Responses runtime contract" do
+    test "makes backend model catalog ETag derivation machine-readable" do
+      feature = CompatibilityMatrix.by_slug!(:backend_models_etag)
+      fixture = CompatibilityMatrix.fixture!(:backend_models_etag)
+
+      assert feature.current == :policy_visible_body_digest
+
+      assert feature.routes == [
+               %{method: :get, path: "/backend-api/codex/models"},
+               %{method: :get, path: "/backend-api/codex/v1/models"}
+             ]
+
+      assert fixture == %{
+               header: "etag",
+               digest_input: "policy_visible_effective_catalog_body",
+               digest: "sha256_deterministic_canonical_json",
+               format: "weak_cp_models_v1",
+               aliases_share_exact_body_and_token: true,
+               cache_coherence: "eventual_after_successful_responses_token"
+             }
+    end
+
+    test "pins exact backend Responses catalog header equality and exclusions" do
+      feature = CompatibilityMatrix.by_slug!(:backend_responses_etag)
+      fixture = CompatibilityMatrix.fixture!(:backend_responses_etag)
+
+      assert feature.current == :predispatch_catalog_snapshot
+      assert fixture.header == "x-models-etag"
+      assert fixture.equals == "authenticated_backend_models_etag"
+      assert fixture.http_sse == "response_header"
+      assert fixture.websocket == "upgrade_header"
+      assert fixture.upstream_etag_relay == false
+
+      assert fixture.included_routes == [
+               "/backend-api/codex/responses",
+               "/backend-api/codex/v1/responses"
+             ]
+
+      assert fixture.excluded_surfaces == [
+               "backend_json",
+               "backend_compact",
+               "public_v1",
+               "usage",
+               "unauthenticated",
+               "unrelated_routes"
+             ]
+    end
+
+    test "pins the final noncompact envelope and compact exclusion" do
+      feature = CompatibilityMatrix.by_slug!(:backend_responses_envelope)
+      fixture = CompatibilityMatrix.fixture!(:backend_responses_envelope)
+
+      assert feature.current == :final_noncompact_backend_envelope
+
+      assert feature.routes == [
+               %{method: :post, path: "/backend-api/codex/responses"},
+               %{method: :post, path: "/backend-api/codex/v1/responses"},
+               %{
+                 method: :get,
+                 path: "/backend-api/codex/responses",
+                 transport: "websocket"
+               },
+               %{
+                 method: :get,
+                 path: "/backend-api/codex/v1/responses",
+                 transport: "websocket"
+               },
+               %{method: :post, path: "/backend-api/codex/v1/chat/completions"},
+               %{method: :post, path: "/v1/responses", translation: "backend_responses"},
+               %{
+                 method: :get,
+                 path: "/v1/responses",
+                 transport: "websocket",
+                 translation: "backend_responses"
+               },
+               %{
+                 method: :post,
+                 path: "/v1/chat/completions",
+                 translation: "backend_responses"
+               }
+             ]
+
+      assert fixture.noncompact.reasoning == "map"
+      assert fixture.noncompact.encrypted_include == "reasoning.encrypted_content"
+      assert fixture.noncompact.encrypted_include_count == 1
+      assert fixture.noncompact.idempotent_after_json_round_trip == true
+      assert fixture.compact.applies_noncompact_envelope == false
+      assert fixture.compact.preserves_existing_shape == true
+    end
+
+    test "pins safe detail-only upstream error parameter projection" do
+      feature = CompatibilityMatrix.by_slug!(:upstream_error_param)
+      fixture = CompatibilityMatrix.fixture!(:upstream_error_param)
+
+      assert feature.current == :sanitized_failed_attempt_detail
+      assert fixture.field == "upstream_error_param"
+      assert fixture.source == "decoded_upstream_error_envelope"
+      assert fixture.projection == "failed_attempt_detail_only"
+      assert fixture.max_bytes == 160
+      assert fixture.allowed_shape == "field_name_or_index_path"
+      assert fixture.invalid_or_successful_attempt == "omitted"
+      assert fixture.raw_error_message_or_value == "never_projected"
+    end
+  end
+
   describe "request compression compatibility contract" do
     test "documents Pool-gated request-side fail-open metadata-only behavior" do
       feature = CompatibilityMatrix.by_slug!(:request_compression)

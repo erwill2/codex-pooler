@@ -141,7 +141,7 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
             "requires id; lookup is exact, scoped to the authenticated operator's visible Pools, and returns at most one metadata row"
         ),
       input_schema: detail_input_schema(),
-      output_schema: detail_output_schema(),
+      output_schema: request_log_detail_output_schema(),
       annotations: @read_only_annotations,
       handler: {__MODULE__, :get_request_log}
     }
@@ -301,6 +301,64 @@ defmodule CodexPooler.MCP.Tools.LogMetadata do
 
   defp detail_output_schema do
     DetailEnvelope.output_schema()
+  end
+
+  defp request_log_detail_output_schema do
+    %{
+      "type" => "object",
+      "required" => ["status", "kind", "item", "candidates", "message"],
+      "additionalProperties" => false,
+      "properties" => %{
+        "status" => %{"type" => "string"},
+        "kind" => %{"type" => "string"},
+        "item" => request_log_detail_item_output_schema(),
+        "candidates" => %{"type" => "array"},
+        "message" => %{"type" => "string"}
+      }
+    }
+  end
+
+  defp request_log_detail_item_output_schema do
+    %{
+      "type" => ["object", "null"],
+      "properties" => %{
+        "debug" => %{
+          "type" => "object",
+          "required" => ["continuity", "failure", "attempt", "terminal_state", "turn", "attempts"],
+          "additionalProperties" => false,
+          "properties" => %{
+            "continuity" => request_log_continuity_output_schema(),
+            "failure" => request_log_failure_output_schema(),
+            "attempt" => request_log_attempt_output_schema(),
+            "terminal_state" => %{"type" => "object"},
+            "turn" => %{"type" => "object"},
+            "attempts" => %{
+              "type" => "array",
+              "items" => request_log_detail_attempt_output_schema()
+            }
+          }
+        }
+      }
+    }
+  end
+
+  defp request_log_detail_attempt_output_schema do
+    %{
+      "type" => "object",
+      "additionalProperties" => false,
+      "properties" => %{
+        "attempt_ref" => nullable_string_property(),
+        "attempt_number" => %{"type" => ["integer", "null"]},
+        "status" => nullable_string_property(),
+        "retryable" => %{"type" => ["boolean", "null"]},
+        "upstream_status_code" => %{"type" => ["integer", "null"]},
+        "network_error_code" => nullable_string_property(),
+        "latency_ms" => %{"type" => ["integer", "null"]},
+        "final" => %{"type" => ["boolean", "null"]},
+        "upstream_error_param" => nullable_string_property(),
+        "transport_failure" => %{"type" => "object"}
+      }
+    }
   end
 
   defp strict_schema(properties) do

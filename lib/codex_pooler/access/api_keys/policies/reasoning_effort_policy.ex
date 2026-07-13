@@ -42,6 +42,11 @@ defmodule CodexPooler.Access.APIKeys.ReasoningEffortPolicy do
           required(:applied_effort) => nil
         }
   @type resolution :: {:ok, Decision.t()} | {:error, :reasoning_effort_not_allowed}
+  @type normalized_policy :: %{
+          required(:allowed_model_identifiers) => [term()] | nil,
+          required(:enforced_reasoning_effort) => String.t() | nil,
+          required(:maximum_reasoning_effort) => String.t() | nil
+        }
 
   @spec resolve(APIKey.t(), String.t() | nil, [String.t()] | nil, String.t() | nil) ::
           resolution()
@@ -58,12 +63,17 @@ defmodule CodexPooler.Access.APIKeys.ReasoningEffortPolicy do
     end
   end
 
-  @spec project_metadata(APIKey.t(), [model_level()] | nil, String.t() | nil) ::
+  @spec project_metadata(
+          APIKey.t() | normalized_policy(),
+          [model_level()] | nil,
+          String.t() | nil
+        ) ::
           MetadataProjection.t()
-  def project_metadata(%APIKey{} = api_key, model_levels, model_default) do
+  def project_metadata(api_key_or_policy, model_levels, model_default)
+      when is_struct(api_key_or_policy, APIKey) or is_map(api_key_or_policy) do
     levels = effective_level_maps(model_levels)
 
-    case policy(api_key) do
+    case policy(api_key_or_policy) do
       {:unrestricted, nil} ->
         projection(levels, model_default)
 
@@ -127,6 +137,14 @@ defmodule CodexPooler.Access.APIKeys.ReasoningEffortPolicy do
     do: {:allow_up_to, effort}
 
   defp policy(%APIKey{}), do: {:unrestricted, nil}
+
+  defp policy(%{enforced_reasoning_effort: effort}) when is_binary(effort),
+    do: {:always_use, effort}
+
+  defp policy(%{maximum_reasoning_effort: effort}) when is_binary(effort),
+    do: {:allow_up_to, effort}
+
+  defp policy(%{}), do: {:unrestricted, nil}
 
   defp effective_efforts(nil), do: @fallback_efforts
 

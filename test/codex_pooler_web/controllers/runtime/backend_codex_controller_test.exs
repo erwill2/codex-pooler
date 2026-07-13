@@ -16,6 +16,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Files
   alias CodexPooler.Gateway.Metadata
+  alias CodexPooler.Gateway.Metadata.CodexCatalog
   alias CodexPooler.Gateway.OperationalSettings
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Routing.CandidateEligibility
@@ -235,6 +236,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert model["input_modalities"] == ["text"]
     assert model["upstream_model_id"] == setup.model.upstream_model_id
     assert model["supported_in_api"] == true
+    assert [etag] = get_resp_header(conn, "etag")
+    assert etag == CodexCatalog.etag(%{"models" => [model]})
     assert FakeUpstream.count(upstream) == 0
 
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
@@ -245,6 +248,65 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert is_nil(request.upstream_account_email)
     assert request.request_metadata["operation"] == "models"
     assert request.request_metadata["model_source"]["upstream_identity_id"] == setup.identity.id
+  end
+
+  test "both backend model aliases return the exact policy-visible body ETag", %{conn: conn} do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+
+    %{assignment: denied_assignment} =
+      active_upstream_assignment_fixture(setup.pool, %{
+        account_label: "Policy denied catalog upstream"
+      })
+
+    denied_model =
+      model_fixture(setup.pool, %{
+        exposed_model_id: "gpt-backend-policy-denied-etag",
+        upstream_model_id: "provider-gpt-backend-policy-denied-etag",
+        display_name: "Backend Policy Denied ETag",
+        metadata: %{"source_assignment_ids" => [denied_assignment.id]}
+      })
+
+    setup.api_key
+    |> Ecto.Changeset.change(allowed_model_identifiers: [setup.model.exposed_model_id])
+    |> Repo.update!()
+
+    responses =
+      for endpoint <- ["/backend-api/codex/models", "/backend-api/codex/v1/models"] do
+        response = conn |> recycle() |> auth(setup) |> get(endpoint)
+        body = json_response(response, 200)
+
+        assert Enum.map(body["models"], & &1["slug"]) == [setup.model.exposed_model_id]
+        refute Enum.any?(body["models"], &(&1["slug"] == denied_model.exposed_model_id))
+        assert get_resp_header(response, "etag") == [CodexCatalog.etag(body)]
+
+        {response.resp_body, get_resp_header(response, "etag")}
+      end
+
+    assert [{body_bytes, [etag_bytes]}, {body_bytes, [etag_bytes]}] = responses
+    assert "W/\"cp-models-v1-" <> _digest = etag_bytes
+    assert String.ends_with?(etag_bytes, "\"")
+
+    setup.api_key
+    |> Ecto.Changeset.change(
+      allowed_model_identifiers: [
+        setup.model.exposed_model_id,
+        denied_model.exposed_model_id
+      ]
+    )
+    |> Repo.update!()
+
+    changed_response = conn |> recycle() |> auth(setup) |> get("/backend-api/codex/models")
+    changed_body = json_response(changed_response, 200)
+
+    assert Enum.map(changed_body["models"], & &1["slug"]) ==
+             Enum.sort([setup.model.exposed_model_id, denied_model.exposed_model_id])
+
+    refute changed_response.resp_body == body_bytes
+    refute get_resp_header(changed_response, "etag") == [etag_bytes]
+
+    assert Repo.aggregate(from(r in Request, where: r.pool_id == ^setup.pool.id), :count) == 3
+    assert FakeUpstream.count(upstream) == 0
   end
 
   test "GET /backend-api/codex/models filters reasoning metadata through API key policy", %{
@@ -1152,6 +1214,54 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.endpoint == "/backend-api/codex/responses"
     assert request.status == "succeeded"
+  end
+
+  test "POST /backend-api/codex/responses applies the selected non-compact reasoning envelope",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_backend_reasoning_envelope",
+          "object" => "response",
+          "status" => "completed",
+          "output" => [],
+          "usage" => %{"input_tokens" => 3, "output_tokens" => 2, "total_tokens" => 5}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    source_metadata = %{
+      "id" => setup.model.upstream_model_id,
+      "capabilities" => %{"responses" => true, "streaming" => true},
+      "supported_reasoning_levels" => [%{"effort" => "high"}],
+      "supports_reasoning_summary_parameter" => false
+    }
+
+    setup = put_setup_model_source_metadata!(setup, source_metadata)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic reasoning envelope",
+        "include" => [
+          "reasoning.encrypted_content",
+          "reasoning.encrypted_content"
+        ],
+        "reasoning" => %{
+          "effort" => "high",
+          "summary" => "auto"
+        }
+      })
+
+    assert %{"id" => "resp_backend_reasoning_envelope"} = json_response(conn, 200)
+    assert [captured] = FakeUpstream.requests(upstream)
+
+    assert captured.json["include"] == ["reasoning.encrypted_content"]
+
+    assert captured.json["reasoning"] == %{"effort" => "high"}
   end
 
   test "POST /backend-api/codex/v1/responses preserves request-shaped additional_tools input items",
@@ -5682,13 +5792,59 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
   @tag :task_4_first_event_stream_retry
   test "SSE first-event upstream_request_timeout retries and second attempt succeeds" do
     {setup, failing_upstream, success_upstream} =
-      stream_retry_setup(first_event_terminal_sse("response.failed", "upstream_request_timeout"))
+      stream_retry_setup(
+        first_event_terminal_sse(
+          "response.failed",
+          "upstream_request_timeout",
+          "reasoning.summary"
+        )
+      )
 
     execute_backend_stream!(setup, "first-event-timeout-retry")
 
     assert FakeUpstream.count(failing_upstream) == 1
     assert FakeUpstream.count(success_upstream) == 1
     assert_stream_retry_success!(setup, "upstream_request_timeout")
+
+    assert [failed_attempt, successful_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert failed_attempt.response_metadata["upstream_error_param"] == "reasoning.summary"
+    refute Map.has_key?(successful_attempt.response_metadata, "upstream_error_param")
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    refute Jason.encode!(request.request_metadata || %{}) =~ "raw-message-sentinel"
+    refute Jason.encode!(failed_attempt.response_metadata) =~ "raw-message-sentinel"
+  end
+
+  @tag :task_10_upstream_error_param
+  test "SSE first-event invalid error parameters are omitted without fallback" do
+    for invalid_param <- ["https://example.com/private", String.duplicate("a", 257)] do
+      {setup, _failing_upstream, _success_upstream} =
+        stream_retry_setup(
+          first_event_terminal_sse(
+            "response.failed",
+            "upstream_request_timeout",
+            invalid_param
+          )
+        )
+
+      execute_backend_stream!(setup, "invalid-error-param")
+
+      assert [failed_attempt, successful_attempt] =
+               Repo.all(
+                 from(a in Attempt,
+                   where:
+                     a.request_id in subquery(
+                       from(r in Request, where: r.pool_id == ^setup.pool.id, select: r.id)
+                     ),
+                   order_by: [asc: a.attempt_number]
+                 )
+               )
+
+      refute Map.has_key?(failed_attempt.response_metadata, "upstream_error_param")
+      refute Map.has_key?(successful_attempt.response_metadata, "upstream_error_param")
+    end
   end
 
   @tag :task_4_first_event_stream_retry
@@ -7014,6 +7170,101 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
   end
 
   @tag :client_metadata
+  test "backend Responses SSE aliases ignore upstream ETag headers and emit the exact predispatch models ETag",
+       %{conn: conn} do
+    for {alias_path, response_id} <- [
+          {"/backend-api/codex/responses", "resp_backend_models_etag"},
+          {"/backend-api/codex/v1/responses", "resp_backend_v1_models_etag"}
+        ] do
+      upstream =
+        start_upstream(
+          FakeUpstream.sse_stream(
+            [
+              {"response.completed",
+               %{
+                 "type" => "response.completed",
+                 "response" => %{
+                   "id" => response_id,
+                   "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+                 }
+               }}
+            ],
+            headers: [
+              {"etag", "upstream-standard-etag-must-not-relay"},
+              {"x-models-etag", "upstream-models-etag-must-not-relay"}
+            ]
+          )
+        )
+
+      setup = gateway_setup(upstream)
+
+      models_conn =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> get("/backend-api/codex/models")
+
+      assert [models_etag] = get_resp_header(models_conn, "etag")
+
+      stream_conn =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(alias_path, %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic backend catalog token request",
+          "stream" => true
+        })
+
+      assert get_resp_header(stream_conn, "x-models-etag") == [models_etag]
+      assert get_resp_header(stream_conn, "etag") == []
+      assert get_resp_header(stream_conn, "cache-control") == ["no-cache"]
+      assert ["text/event-stream" <> _suffix] = get_resp_header(stream_conn, "content-type")
+      assert stream_conn.resp_body =~ response_id
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.path == "/backend-api/codex/responses"
+    end
+  end
+
+  test "non-SSE backend routes never expose catalog or upstream ETag headers", %{conn: conn} do
+    cases = [
+      {"/backend-api/codex/responses", false, %{"id" => "resp_json_etag_exclusion"}},
+      {"/backend-api/codex/v1/responses", false, %{"id" => "resp_v1_json_etag_exclusion"}},
+      {"/backend-api/codex/responses/compact", true, %{"object" => "response.compaction"}},
+      {"/backend-api/codex/v1/responses/compact", true, %{"object" => "response.compaction"}}
+    ]
+
+    for {endpoint, compact?, response_body} <- cases do
+      upstream =
+        start_upstream(
+          FakeUpstream.json_response_with_headers(
+            response_body,
+            [
+              {"etag", "upstream-standard-etag-must-not-relay"},
+              {"x-models-etag", "upstream-models-etag-must-not-relay"}
+            ]
+          )
+        )
+
+      setup = gateway_setup(upstream, compact?: compact?)
+
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post(endpoint, %{
+          "model" => setup.model.exposed_model_id,
+          "input" => "synthetic excluded catalog header request",
+          "stream" => false
+        })
+
+      assert response.status == 200
+      assert get_resp_header(response, "etag") == []
+      assert get_resp_header(response, "x-models-etag") == []
+    end
+  end
+
+  @tag :client_metadata
   test "POST /backend-api/codex/responses forwards and relays x-codex-turn-state for streaming responses",
        %{conn: conn} do
     request_turn_state = "backend-stream-turn-state-#{System.unique_integer([:positive])}"
@@ -7049,6 +7300,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       })
 
     assert get_resp_header(conn, "x-codex-turn-state") == [response_turn_state]
+    assert [_models_etag] = get_resp_header(conn, "x-models-etag")
     assert conn.resp_body =~ "event: response.completed\n"
     assert conn.resp_body =~ "resp_backend_stream_turn_state"
     assert conn.resp_body =~ "data: [DONE]\n\n"
@@ -7059,6 +7311,35 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     assert_turn_state_not_persisted!(setup, request_turn_state)
     assert_turn_state_not_persisted!(setup, response_turn_state)
+  end
+
+  test "backend Responses SSE retry retains the original predispatch models ETag", %{conn: conn} do
+    {setup, failing_upstream, success_upstream} =
+      stream_retry_setup(first_event_terminal_sse("response.failed", "server_error"))
+
+    models_conn =
+      conn
+      |> recycle()
+      |> auth(setup)
+      |> get("/backend-api/codex/models")
+
+    assert [models_etag] = get_resp_header(models_conn, "etag")
+
+    stream_conn =
+      conn
+      |> recycle()
+      |> auth(setup)
+      |> put_req_header("x-request-id", deterministic_rotation_seed(2, 0))
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "synthetic retry catalog token request",
+        "stream" => true
+      })
+
+    assert get_resp_header(stream_conn, "x-models-etag") == [models_etag]
+    assert FakeUpstream.count(failing_upstream) == 1
+    assert FakeUpstream.count(success_upstream) == 1
+    assert stream_conn.resp_body =~ "resp_stream_retry_success"
   end
 
   test "POST /backend-api/codex/responses does not synthesize public terminal events for raw backend stream closes",
@@ -7274,6 +7555,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       })
 
     assert %{"object" => "response.compaction"} = json_response(conn, 200)
+    assert get_resp_header(conn, "x-models-etag") == []
     assert [captured] = FakeUpstream.requests(upstream)
     assert captured.path == "/backend-api/codex/responses/compact"
 

@@ -31,6 +31,12 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer.Attempts do
         mono: true
       ),
       detail(
+        "request-log-detail-attempt-#{attempt.attempt_number}-upstream-error-param",
+        "Upstream error parameter",
+        Map.get(attempt, :upstream_error_param),
+        mono: true
+      ),
+      detail(
         "request-log-detail-attempt-#{attempt.attempt_number}-latency",
         "Latency",
         format_route_latency(attempt.latency_ms),

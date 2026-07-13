@@ -1352,6 +1352,78 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     refute has_element?(view, "#request-log-detail-cache-write-cost")
   end
 
+  test "detail drawer shows only a valid failed-attempt upstream error parameter on desktop and mobile",
+       %{
+         conn: conn,
+         scope: scope
+       } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "upstream-error-param", name: "Upstream Error Param"})
+
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    raw_message = "raw upstream message must not render"
+    raw_value = "https://example.com/raw-upstream-value"
+    raw_frame = ~s({"type":"error","message":"raw websocket frame"})
+    raw_header = "Bearer raw-upstream-header"
+    raw_prompt = "raw upstream prompt must not render"
+    raw_body = "raw upstream response body must not render"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-upstream-error-param",
+        status: "failed",
+        correlation_id: "upstream-error-param-drawer"
+      })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 1,
+      status: "failed",
+      response_metadata: %{
+        "upstream_error_param" => "reasoning.summary",
+        "raw_message" => raw_message,
+        "value" => raw_value,
+        "websocket_frame" => raw_frame,
+        "headers" => %{"authorization" => raw_header},
+        "prompt" => raw_prompt,
+        "body" => raw_body
+      }
+    })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 2,
+      status: "failed",
+      response_metadata: %{"upstream_error_param" => raw_value}
+    })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
+
+    for prefix <- ["request-log", "mobile-request-log"] do
+      render_click(element(view, "##{prefix}-#{request.id}-open-details"))
+      assert_patch(view)
+
+      assert has_element?(
+               view,
+               "#request-log-detail-attempt-1-upstream-error-param",
+               "reasoning.summary"
+             )
+
+      refute has_element?(view, "#request-log-detail-attempt-2-upstream-error-param")
+
+      html = render(view)
+
+      for forbidden <- [raw_message, raw_value, raw_frame, raw_header, raw_prompt, raw_body] do
+        refute html =~ forbidden
+      end
+
+      render_click(
+        element(view, "#request-log-detail-sidebar [aria-label='Close request details']")
+      )
+
+      assert_patch(view)
+    end
+  end
+
   test "renders compression savings from safe metadata with token-first and byte fallback",
        %{conn: conn, scope: scope} do
     {:ok, pool} =

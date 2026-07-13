@@ -112,6 +112,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :public_openai_responses_stream,
     :quota_decision,
     :reasoning_effort_decision,
+    :supports_reasoning_summary_parameter?,
     :receive_timeout,
     :receive_timeout_ms,
     :reconnect_window_seconds,
@@ -411,6 +412,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       prompt_cache_key: prompt_cache_key(opts, endpoint, payload),
       quota_decision: Map.get(opts, :quota_decision),
       reasoning_effort_decision: Map.get(opts, :reasoning_effort_decision),
+      supports_reasoning_summary_parameter?:
+        Map.get(opts, :supports_reasoning_summary_parameter?, true) != false,
       routing_attempt_metadata: Map.get(opts, :routing_attempt_metadata),
       routing_circuit_state: Map.get(opts, :routing_circuit_state),
       use_responses_lite?: Map.get(opts, :use_responses_lite?, false) == true

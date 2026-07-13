@@ -55,6 +55,24 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
              |> then(&(&1.routing.reasoning_effort_decision == decision))
     end
 
+    test "defaults reasoning-summary parameter support true and preserves selected false" do
+      options =
+        RequestOptions.build(%{}, "/backend-api/codex/responses", %{"model" => "example-model"})
+
+      assert options.routing.supports_reasoning_summary_parameter?
+
+      selected =
+        RequestOptions.put_routing(options,
+          supports_reasoning_summary_parameter?: false,
+          reasoning_effort_decision: options.routing.reasoning_effort_decision
+        )
+
+      refute selected.routing.supports_reasoning_summary_parameter?
+
+      assert selected.routing.reasoning_effort_decision ==
+               options.routing.reasoning_effort_decision
+    end
+
     test "from_conn_metadata keeps request metadata and classifies payload routes" do
       options =
         RequestOptions.from_conn_metadata(

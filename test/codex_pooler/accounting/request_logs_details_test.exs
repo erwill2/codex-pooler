@@ -10,6 +10,7 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
 
   import CodexPooler.AccountsFixtures
   import CodexPooler.PoolerFixtures
+  import ExUnit.CaptureLog
 
   test "request log rows expose snapshots model settings route and cached token counts" do
     %{pool: pool, api_key: api_key} = active_api_key_fixture()
@@ -465,6 +466,75 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
     assert List.last(log.debug.attempts).final == true
     assert Enum.count(log.debug.attempts, & &1.final) == 1
     refute inspect(log.debug) =~ "raw attempt"
+  end
+
+  test "request log detail projects only valid upstream error parameters from failed attempts" do
+    %{pool: pool, api_key: api_key} = active_api_key_fixture()
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    raw_message = "raw upstream error message must stay hidden"
+    raw_value = "https://example.com/raw-error-value"
+    raw_frame = ~s({"type":"error","message":"raw websocket frame"})
+    raw_header = "Bearer hidden-header-value"
+    raw_prompt = "raw upstream prompt must stay hidden"
+    raw_body = "raw upstream response body must stay hidden"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-upstream-error-param",
+        status: "failed",
+        correlation_id: "upstream-error-param-detail"
+      })
+
+    valid_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 1,
+        status: "failed",
+        response_metadata: %{
+          "upstream_error_param" => "reasoning.summary",
+          "raw_message" => raw_message,
+          "value" => raw_value,
+          "websocket_frame" => raw_frame,
+          "headers" => %{"authorization" => raw_header},
+          "prompt" => raw_prompt,
+          "body" => raw_body
+        }
+      })
+
+    invalid_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 2,
+        status: "failed",
+        response_metadata: %{"upstream_error_param" => raw_value}
+      })
+
+    succeeded_attempt =
+      attempt_fixture(request, assignment, %{
+        attempt_number: 3,
+        status: "succeeded",
+        response_metadata: %{"upstream_error_param" => "reasoning.effort"}
+      })
+
+    {log, captured_logs} =
+      with_log(fn ->
+        assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
+        log
+      end)
+
+    assert log.debug.attempts
+           |> Enum.find(&(&1.attempt_number == valid_attempt.attempt_number))
+           |> Map.fetch!(:upstream_error_param) == "reasoning.summary"
+
+    for attempt <- [invalid_attempt, succeeded_attempt] do
+      projected_attempt =
+        Enum.find(log.debug.attempts, &(&1.attempt_number == attempt.attempt_number))
+
+      refute Map.has_key?(projected_attempt, :upstream_error_param)
+    end
+
+    for forbidden <- [raw_message, raw_value, raw_frame, raw_header, raw_prompt, raw_body] do
+      refute inspect(log) =~ forbidden
+      refute captured_logs =~ forbidden
+    end
   end
 
   defp debug_turn_fixture(pool, api_key, assignment, request, final_attempt_id) do

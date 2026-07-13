@@ -134,6 +134,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
       body: Jason.encode!(%{"type" => "response.failed"}),
       reason: {:auth_refresh_first_event, %{code: "invalid_api_key"}},
       headers: [],
+      upstream_error_param: "reasoning.effort",
       websocket_frame_headers: %{}
     }
 

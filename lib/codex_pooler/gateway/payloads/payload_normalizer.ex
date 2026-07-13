@@ -152,11 +152,13 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
     |> Map.put_new("type", "response.create")
     |> Map.put_new("instructions", "")
     |> normalize_backend_codex_websocket_input()
-    |> maybe_sanitize_backend_codex_response_item_ids(request_options)
     |> normalize_backend_codex_reasoning_effort()
-    |> normalize_backend_codex_responses_lite(request_options)
     |> ToolSchemaLowering.lower_non_strict_function_tools()
     |> remove_backend_codex_encrypted_tool_schema_markers()
+    |> normalize_backend_codex_responses_lite(request_options)
+    |> normalize_backend_codex_responses_lite_input(request_options)
+    |> normalize_noncompact_backend_responses_envelope(request_options)
+    |> maybe_sanitize_backend_codex_response_item_ids(request_options)
     |> maybe_put_websocket_responses_lite_client_metadata(request_options)
   end
 
@@ -208,11 +210,13 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
     |> maybe_drop_backend_codex_previous_response_id(opts)
     |> Map.put_new("instructions", "")
     |> normalize_backend_codex_http_input()
-    |> sanitize_backend_codex_response_item_ids()
     |> normalize_backend_codex_reasoning_effort()
-    |> normalize_backend_codex_responses_lite(opts)
     |> ToolSchemaLowering.lower_non_strict_function_tools()
     |> remove_backend_codex_encrypted_tool_schema_markers()
+    |> normalize_backend_codex_responses_lite(opts)
+    |> normalize_backend_codex_responses_lite_input(opts)
+    |> normalize_noncompact_backend_responses_envelope(opts)
+    |> sanitize_backend_codex_response_item_ids()
   end
 
   defp normalize_backend_codex_compact_payload(payload, opts) do
@@ -234,6 +238,128 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
   end
 
   defp normalize_backend_codex_responses_lite(payload, %RequestOptions{}), do: payload
+
+  defp normalize_backend_codex_responses_lite_input(
+         payload,
+         %RequestOptions{routing: %{use_responses_lite?: true}}
+       ) do
+    {tools_present?, tools, payload} = pop_responses_lite_tools(payload)
+    {instructions, payload} = Map.pop(payload, "instructions")
+    input = Map.get(payload, "input", [])
+    input = if is_list(input), do: input, else: []
+    {prefix, input} = responses_lite_tools_prefix(input, tools_present?, tools)
+
+    input =
+      [prefix | maybe_responses_lite_instructions(instructions) ++ input]
+      |> Enum.map(&strip_responses_lite_image_details/1)
+
+    Map.put(payload, "input", input)
+  end
+
+  defp normalize_backend_codex_responses_lite_input(payload, %RequestOptions{}), do: payload
+
+  defp normalize_noncompact_backend_responses_envelope(payload, %RequestOptions{} = opts) do
+    reasoning = payload |> Map.get("reasoning") |> reasoning_map()
+
+    reasoning =
+      if opts.routing.supports_reasoning_summary_parameter? == false,
+        do: Map.delete(reasoning, "summary"),
+        else: reasoning
+
+    payload
+    |> Map.put("reasoning", reasoning)
+    |> Map.put("include", normalize_backend_responses_include(Map.get(payload, "include")))
+  end
+
+  defp normalize_backend_responses_include(include) when is_list(include) do
+    encrypted_include = "reasoning.encrypted_content"
+
+    {normalized, found?} =
+      Enum.reduce(include, {[], false}, fn
+        ^encrypted_include, {entries, false} -> {[encrypted_include | entries], true}
+        ^encrypted_include, {entries, true} -> {entries, true}
+        entry, {entries, found?} -> {[entry | entries], found?}
+      end)
+
+    normalized = Enum.reverse(normalized)
+    if found?, do: normalized, else: normalized ++ [encrypted_include]
+  end
+
+  defp normalize_backend_responses_include(_include), do: ["reasoning.encrypted_content"]
+
+  defp pop_responses_lite_tools(payload) do
+    case Map.pop(payload, "tools") do
+      {tools, payload} when is_list(tools) -> {true, tools, payload}
+      {nil, payload} -> {false, [], payload}
+      {_tools, payload} -> {true, [], payload}
+    end
+  end
+
+  defp responses_lite_tools_prefix([first | rest] = input, false, _tools) do
+    if canonical_responses_lite_tools_prefix?(first),
+      do: {first, rest},
+      else: {additional_tools([]), input}
+  end
+
+  defp responses_lite_tools_prefix([], false, _tools), do: {additional_tools([]), []}
+  defp responses_lite_tools_prefix(input, true, tools), do: {additional_tools(tools), input}
+
+  defp canonical_responses_lite_tools_prefix?(
+         %{
+           "type" => "additional_tools",
+           "role" => "developer",
+           "tools" => tools
+         } = item
+       )
+       when is_list(tools),
+       do: not Map.has_key?(item, "id")
+
+  defp canonical_responses_lite_tools_prefix?(_item), do: false
+
+  defp additional_tools(tools),
+    do: %{"type" => "additional_tools", "role" => "developer", "tools" => tools}
+
+  defp maybe_responses_lite_instructions(instructions) when is_binary(instructions) do
+    if String.trim(instructions) == "" do
+      []
+    else
+      [
+        %{
+          "type" => "message",
+          "role" => "developer",
+          "content" => [%{"type" => "input_text", "text" => instructions}]
+        }
+      ]
+    end
+  end
+
+  defp maybe_responses_lite_instructions(_instructions), do: []
+
+  defp strip_responses_lite_image_details(%{"type" => "message", "content" => content} = item)
+       when is_list(content),
+       do: Map.put(item, "content", Enum.map(content, &strip_input_image_detail/1))
+
+  defp strip_responses_lite_image_details(%{"type" => type, "output" => output} = item)
+       when type in ["function_call_output", "custom_tool_call_output"] and is_list(output),
+       do: Map.put(item, "output", Enum.map(output, &strip_input_image_detail/1))
+
+  defp strip_responses_lite_image_details(
+         %{"type" => type, "output" => %{"content" => content} = output} = item
+       )
+       when type in ["function_call_output", "custom_tool_call_output"] and is_list(content) do
+    Map.put(
+      item,
+      "output",
+      Map.put(output, "content", Enum.map(content, &strip_input_image_detail/1))
+    )
+  end
+
+  defp strip_responses_lite_image_details(item), do: item
+
+  defp strip_input_image_detail(%{"type" => "input_image"} = content),
+    do: Map.delete(content, "detail")
+
+  defp strip_input_image_detail(content), do: content
 
   defp remove_backend_codex_encrypted_tool_schema_markers(%{"tools" => tools} = payload)
        when is_list(tools) do

@@ -744,6 +744,75 @@ defmodule CodexPooler.MCP.RequestLogsToolsTest do
     assert_no_unsafe_request_log_text(result)
   end
 
+  test "gets only valid failed-attempt upstream error parameters in structured detail and readable text",
+       %{
+         auth: auth
+       } do
+    pool = pool_fixture(%{slug: "mcp-upstream-error-param", name: "MCP Upstream Error Param"})
+    %{api_key: api_key} = active_api_key_fixture(pool)
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+    raw_message = "raw upstream message must stay out of MCP"
+    raw_value = "https://example.com/raw-upstream-value"
+    raw_frame = ~s({"type":"error","message":"raw websocket frame"})
+    raw_header = "Bearer raw-upstream-header"
+    raw_prompt = "raw upstream prompt must stay out of MCP"
+    raw_body = "raw upstream response body must stay out of MCP"
+
+    request =
+      request_fixture(%{pool: pool, api_key: api_key}, %{
+        requested_model: "gpt-mcp-upstream-error-param",
+        status: "failed",
+        correlation_id: "mcp-upstream-error-param"
+      })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 1,
+      status: "failed",
+      response_metadata: %{
+        "upstream_error_param" => "reasoning.summary",
+        "raw_message" => raw_message,
+        "value" => raw_value,
+        "websocket_frame" => raw_frame,
+        "headers" => %{"authorization" => raw_header},
+        "prompt" => raw_prompt,
+        "body" => raw_body
+      }
+    })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 2,
+      status: "failed",
+      response_metadata: %{"upstream_error_param" => raw_value}
+    })
+
+    attempt_fixture(request, assignment, %{
+      attempt_number: 3,
+      status: "succeeded",
+      response_metadata: %{"upstream_error_param" => "reasoning.effort"}
+    })
+
+    assert {:ok, result} =
+             ToolDispatch.call("codex_pooler_get_request_log", %{"id" => request.id}, %{
+               auth: auth
+             })
+
+    assert result["isError"] == false
+    assert :ok = Redaction.assert_mcp_output_safe!(result)
+    assert [%{"type" => "text", "text" => text}] = result["content"]
+    assert %{"status" => "ok", "item" => item} = result["structuredContent"]
+    assert [first_attempt, second_attempt, third_attempt] = item["debug"]["attempts"]
+    assert first_attempt["upstream_error_param"] == "reasoning.summary"
+    refute Map.has_key?(second_attempt, "upstream_error_param")
+    refute Map.has_key?(third_attempt, "upstream_error_param")
+    assert text =~ "upstream_error_param=reasoning.summary"
+
+    for forbidden <- [raw_message, raw_value, raw_frame, raw_header, raw_prompt, raw_body] do
+      refute text =~ forbidden
+      refute Jason.encode!(result["structuredContent"]) =~ forbidden
+      refute inspect(result) =~ forbidden
+    end
+  end
+
   test "gets request-log by exact id when a newer correlation id contains that id", %{auth: auth} do
     pool = pool_fixture(%{slug: "mcp-request-log-exact-id", name: "MCP Exact Request Log"})
     %{api_key: api_key} = active_api_key_fixture(pool, %{display_name: "MCP exact key"})

@@ -11,6 +11,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
     :prompt_cache_key,
     :quota_decision,
     :reasoning_effort_decision,
+    :supports_reasoning_summary_parameter?,
     :routing_attempt_metadata,
     :routing_circuit_state,
     :use_responses_lite?
@@ -24,6 +25,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.Routing do
           prompt_cache_key: String.t() | nil,
           quota_decision: map() | nil,
           reasoning_effort_decision: Decision.t() | nil,
+          supports_reasoning_summary_parameter?: boolean(),
           routing_attempt_metadata: map() | nil,
           routing_circuit_state: term(),
           use_responses_lite?: boolean()
