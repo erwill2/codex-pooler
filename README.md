@@ -183,8 +183,9 @@ OpenAI Realtime SDK compatibility.
             "reasoningSummary": "auto",
             "textVerbosity": "medium",
             "include": ["reasoning.encrypted_content"],
-            "store": false,
-            "serviceTier": "priority"
+            // Optional: priority processing may cost more than the default tier.
+            // "serviceTier": "priority",
+            "store": false
           },
           "modalities": {
             "input": ["text", "image"],
@@ -209,8 +210,9 @@ OpenAI Realtime SDK compatibility.
             "reasoningSummary": "auto",
             "textVerbosity": "medium",
             "include": ["reasoning.encrypted_content"],
-            "store": false,
-            "serviceTier": "priority"
+            // Optional: priority processing may cost more than the default tier.
+            // "serviceTier": "priority",
+            "store": false
           },
           "modalities": {
             "input": ["text", "image"],
@@ -235,8 +237,9 @@ OpenAI Realtime SDK compatibility.
             "reasoningSummary": "auto",
             "textVerbosity": "medium",
             "include": ["reasoning.encrypted_content"],
-            "store": false,
-            "serviceTier": "priority"
+            // Optional: priority processing may cost more than the default tier.
+            // "serviceTier": "priority",
+            "store": false
           },
           "modalities": {
             "input": ["text", "image"],
@@ -278,8 +281,9 @@ assigned to your Pool; the setting also remains effective when OMO is loaded.
 
 Request-time OpenAI options belong under each model's `options` block. Keep only
 connection settings such as `baseURL` and `apiKey` in provider-level `options`.
-The example requests priority processing; remove `serviceTier` if your Pool or
-upstream does not offer it.
+The commented `serviceTier` line shows how to opt into priority processing.
+Enable it only when your Pool and upstream offer it and you intentionally accept
+the potentially higher cost; leave it commented to use the default tier.
 
 OpenCode subtracts its compaction reserve from `limit.input` before deciding a
 conversation is full. The `289400` value leaves 269.4k usable input tokens after
