@@ -14,7 +14,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting do
 
   @spec relative_time_label(DateTime.t()) :: String.t()
   def relative_time_label(%DateTime{} = timestamp) do
-    diff = DateTime.diff(DateTime.utc_now(), timestamp, :second)
+    relative_time_label(timestamp, DateTime.utc_now())
+  end
+
+  @spec relative_time_label(DateTime.t(), DateTime.t()) :: String.t()
+  def relative_time_label(%DateTime{} = timestamp, %DateTime{} = now) do
+    diff = DateTime.diff(now, timestamp, :second)
 
     cond do
       diff < -60 -> "in #{format_reset_duration(abs(diff))}"
@@ -31,6 +36,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting do
     end
   end
 
+  def parse_datetime(%DateTime{} = value), do: DateTime.truncate(value, :microsecond)
   def parse_datetime(_value), do: nil
 
   @spec parse_timestamp(term()) :: DateTime.t() | nil

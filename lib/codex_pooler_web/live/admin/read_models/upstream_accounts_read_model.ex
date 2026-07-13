@@ -33,11 +33,32 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:quota_priming_status) => String.t(),
           required(:quota_priming_label) => String.t(),
           required(:last_successful_refresh_at) => DateTime.t() | nil,
+          optional(:last_reconciliation) => map() | nil,
           required(:pool_label) => String.t()
         }
   @type quota_limit_row :: QuotaProjection.quota_limit_row()
   @type quota_readiness :: UpstreamQuotaReadiness.t()
   @type routing_readiness :: UpstreamRoutingReadiness.t()
+  @type reconciliation_projection :: %{
+          required(:status) => String.t() | nil,
+          required(:code) => String.t() | nil,
+          required(:message) => String.t() | nil,
+          required(:finished_at) => DateTime.t() | nil,
+          required(:attempt_age) => String.t() | nil
+        }
+  @type credential_expiry_projection :: %{
+          required(:state) => String.t(),
+          required(:expires_at) => DateTime.t() | nil,
+          required(:age) => String.t() | nil
+        }
+  @type identity_observability :: %{
+          required(:reconciliation) => reconciliation_projection(),
+          required(:last_successful_quota_refresh_at) => DateTime.t() | nil,
+          required(:last_successful_quota_refresh_age) => String.t() | nil,
+          required(:quota_evidence_at) => DateTime.t() | nil,
+          required(:quota_evidence_age) => String.t() | nil,
+          required(:credential_expiry) => credential_expiry_projection()
+        }
   @type token_burn :: TokenBurnProjection.token_burn()
   @type saved_reset_snapshot :: SavedResetProjection.snapshot()
   @type action :: SavedResetProjection.action()
@@ -66,8 +87,27 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:assignments) => [assignment_snapshot()],
           required(:quota_readiness) => quota_readiness(),
           required(:routing_readiness) => routing_readiness(),
-          required(:quota_limits) => [quota_limit_row()]
+          required(:quota_limits) => [quota_limit_row()],
+          required(:identity_observability) => identity_observability()
         }
+
+  @terminal_reconciliation_statuses ~w(succeeded partial failed)
+  @safe_reconciliation_messages %{
+    "catalog_refreshed" => "catalog refreshed",
+    "catalog_sync_failed" => "catalog sync failed",
+    "catalog_sync_in_progress" => "catalog sync in progress",
+    "catalog_sync_skipped" => "catalog sync skipped",
+    "health_preserved" => "assignment health preserved",
+    "health_refreshed" => "assignment health refreshed",
+    "health_skipped" => "assignment health skipped",
+    "quota_refreshed" => "quota refreshed",
+    "quota_refresh_auth_unavailable" => "quota refresh authentication unavailable",
+    "quota_refresh_failed" => "quota refresh failed",
+    "quota_refresh_superseded" => "quota refresh superseded",
+    "quota_refresh_unavailable" => "quota refresh unavailable",
+    "quota_reused_fresh" => "fresh quota evidence reused",
+    "workspace_identity_mismatch" => "workspace identity mismatch"
+  }
   @type oauth_flow_state :: %{
           required(:items) => [Upstreams.oauth_flow_summary()],
           required(:count) => non_neg_integer(),
@@ -171,6 +211,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       quota_priming_status: QuotaProjection.assignment_priming_status(assignment),
       quota_priming_label: QuotaProjection.assignment_priming_label(assignment),
       last_successful_refresh_at: assignment.last_successful_refresh_at,
+      last_reconciliation: nested_map(assignment.metadata, "last_reconciliation"),
       pool_label: pool_label(pool)
     }
   end
@@ -182,6 +223,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     quota_windows = QuotaWindows.list_quota_windows(identity, snapshot_at)
     quota_readiness = QuotaProjection.readiness(quota_windows)
     identity_assignments = identity_assignments(identity, assignments, quota_readiness)
+
+    identity_observability =
+      identity_observability(
+        identity,
+        Map.get(assignments, identity.id, []),
+        quota_windows,
+        snapshot_at
+      )
 
     routing_readiness =
       UpstreamRoutingReadiness.from_inputs(identity, identity_assignments, quota_readiness)
@@ -226,7 +275,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       assignments: identity_assignments,
       quota_readiness: quota_readiness,
       routing_readiness: routing_readiness,
-      quota_limits: QuotaProjection.quota_limit_rows(quota_windows, datetime_preferences)
+      quota_limits: QuotaProjection.quota_limit_rows(quota_windows, datetime_preferences),
+      identity_observability: identity_observability
     }
 
     Map.put(
@@ -244,6 +294,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
   defp identity_assignment(assignment, identity, quota_readiness) do
     assignment
+    |> Map.delete(:last_reconciliation)
     |> Map.put(:assignment_label, assignment_display_label(identity, assignment))
     |> QuotaProjection.put_current_quota_priming(quota_readiness)
   end
@@ -478,6 +529,172 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   defp refresh_job_state(nil), do: nil
   defp refresh_job_state(%{state: state}) when is_binary(state), do: state
   defp refresh_job_state(_job), do: nil
+
+  @spec identity_observability(UpstreamIdentity.t(), [map()], [map()], DateTime.t()) ::
+          identity_observability()
+  def identity_observability(
+        %UpstreamIdentity{} = identity,
+        assignments,
+        quota_windows,
+        %DateTime{} = now
+      )
+      when is_list(assignments) and is_list(quota_windows) do
+    reconciliation = newest_terminal_reconciliation(assignments, now)
+
+    last_successful_refresh_at =
+      assignments
+      |> Enum.reject(&(map_value(&1, :status) == "deleted"))
+      |> newest_non_future_timestamp(:last_successful_refresh_at, now)
+
+    quota_evidence_at = newest_quota_evidence_at(quota_windows, now)
+
+    %{
+      reconciliation: reconciliation_projection(reconciliation, now),
+      last_successful_quota_refresh_at: last_successful_refresh_at,
+      last_successful_quota_refresh_age: relative_age(last_successful_refresh_at, now),
+      quota_evidence_at: quota_evidence_at,
+      quota_evidence_age: relative_age(quota_evidence_at, now),
+      credential_expiry: credential_expiry(identity, now)
+    }
+  end
+
+  defp newest_terminal_reconciliation(assignments, now) do
+    assignments
+    |> Enum.reject(&(map_value(&1, :status) == "deleted"))
+    |> Enum.flat_map(&terminal_reconciliation_candidate(&1, now))
+    |> Enum.max_by(
+      fn candidate ->
+        {DateTime.to_unix(candidate.finished_at, :microsecond), candidate.assignment_id}
+      end,
+      fn -> nil end
+    )
+  end
+
+  defp terminal_reconciliation_candidate(assignment, now) do
+    reconciliation =
+      case map_value(assignment, :last_reconciliation) do
+        %{} = projected -> projected
+        _missing -> assignment |> map_value(:metadata) |> nested_map("last_reconciliation")
+      end
+
+    with %{} <- reconciliation,
+         status when status in @terminal_reconciliation_statuses <-
+           map_value(reconciliation, :status),
+         %DateTime{} = finished_at <-
+           parse_non_future(map_value(reconciliation, :finished_at), now),
+         assignment_id when is_binary(assignment_id) <- map_value(assignment, :id) do
+      [
+        %{
+          assignment_id: assignment_id,
+          status: status,
+          finished_at: finished_at,
+          steps: map_value(reconciliation, :steps)
+        }
+      ]
+    else
+      _invalid -> []
+    end
+  end
+
+  defp reconciliation_projection(nil, _now) do
+    %{status: nil, code: nil, message: nil, finished_at: nil, attempt_age: nil}
+  end
+
+  defp reconciliation_projection(candidate, now) do
+    {code, message} = reconciliation_reason(candidate.status, candidate.steps)
+
+    %{
+      status: candidate.status,
+      code: code,
+      message: message,
+      finished_at: candidate.finished_at,
+      attempt_age: Formatting.relative_time_label(candidate.finished_at, now)
+    }
+  end
+
+  defp reconciliation_reason("succeeded", _steps), do: {nil, nil}
+
+  defp reconciliation_reason(status, steps) when status in ["partial", "failed"] do
+    steps
+    |> List.wrap()
+    |> Enum.find_value({nil, nil}, fn
+      %{} = step ->
+        code = map_value(step, :code)
+
+        if map_value(step, :status) == "failed" and
+             Map.has_key?(@safe_reconciliation_messages, code) do
+          {code, Map.fetch!(@safe_reconciliation_messages, code)}
+        end
+
+      _step ->
+        nil
+    end)
+  end
+
+  defp newest_non_future_timestamp(items, field, now) do
+    items
+    |> Enum.map(&(map_value(&1, field) |> parse_non_future(now)))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
+  end
+
+  defp newest_quota_evidence_at(windows, now) do
+    windows
+    |> Enum.flat_map(fn window ->
+      [map_value(window, :observed_at), map_value(window, :last_sync_at)]
+    end)
+    |> Enum.map(&parse_non_future(&1, now))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
+  end
+
+  defp credential_expiry(%UpstreamIdentity{} = identity, now) do
+    expires_at =
+      identity |> Map.get(:metadata, %{}) |> nested_map_value("access_token_expires_at")
+
+    case Formatting.parse_datetime(expires_at) do
+      %DateTime{} = timestamp ->
+        state = if DateTime.compare(timestamp, now) == :gt, do: "known_future", else: "known_past"
+
+        %{
+          state: state,
+          expires_at: timestamp,
+          age: Formatting.relative_time_label(timestamp, now)
+        }
+
+      nil ->
+        %{state: "unavailable", expires_at: nil, age: nil}
+    end
+  end
+
+  defp relative_age(%DateTime{} = timestamp, now),
+    do: Formatting.relative_time_label(timestamp, now)
+
+  defp relative_age(nil, _now), do: nil
+
+  defp parse_non_future(value, now) do
+    case Formatting.parse_datetime(value) do
+      %DateTime{} = timestamp ->
+        if DateTime.compare(timestamp, now) == :gt, do: nil, else: timestamp
+
+      nil ->
+        nil
+    end
+  end
+
+  defp map_value(%{} = map, field), do: Map.get(map, field) || Map.get(map, Atom.to_string(field))
+  defp map_value(_map, _field), do: nil
+
+  defp nested_map(%{} = map, key) do
+    case Map.get(map, key) do
+      %{} = nested -> nested
+      _value -> nil
+    end
+  end
+
+  defp nested_map(_map, _key), do: nil
+  defp nested_map_value(%{} = map, key), do: Map.get(map, key)
+  defp nested_map_value(_map, _key), do: nil
 
   defp pool_label(nil), do: "Unknown Pool"
   defp pool_label(pool), do: pool.name

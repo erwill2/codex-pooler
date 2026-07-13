@@ -5,6 +5,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
 
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus
   alias CodexPoolerWeb.DateTimeDisplay
 
   def cockpit_navigation(assigns) do
@@ -118,28 +119,35 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
       eyebrow="Upstream cockpit"
       title={@cockpit.header.title}
       description="Identity-scoped operational cockpit with redacted account state, assignment posture, chart placeholders, recent event summary, and safe cross-links."
+      actions_breakpoint={:lg}
     >
       <:actions>
-        <span
-          id="upstream-cockpit-safe-account-id"
-          class="badge badge-outline max-w-full break-all font-mono"
+        <div
+          id="upstream-cockpit-header-actions"
+          data-role="upstream-cockpit-header-actions"
+          class="flex min-w-0 flex-wrap items-center justify-start gap-2 lg:justify-end"
         >
-          {@cockpit.header.safe_account_id_label}
-        </span>
-        <span
-          :if={@cockpit.header.subject_ref}
-          id="upstream-cockpit-safe-subject-ref"
-          data-role="upstream-subject-ref"
-          class="badge badge-outline max-w-full break-all font-mono"
-        >
-          Subject {@cockpit.header.subject_ref}
-        </span>
-        <span class={Formatting.status_badge_class(@cockpit.header.status)}>
-          {@cockpit.header.status_label}
-        </span>
-        <span :if={@cockpit.header.plan_reported?} class="badge badge-outline">
-          {@cockpit.header.plan_label}
-        </span>
+          <span
+            id="upstream-cockpit-safe-account-id"
+            class="badge badge-outline max-w-full break-all font-mono"
+          >
+            {@cockpit.header.safe_account_id_label}
+          </span>
+          <span
+            :if={@cockpit.header.subject_ref}
+            id="upstream-cockpit-safe-subject-ref"
+            data-role="upstream-subject-ref"
+            class="badge badge-outline max-w-full break-all font-mono"
+          >
+            Subject {@cockpit.header.subject_ref}
+          </span>
+          <span class={Formatting.status_badge_class(@cockpit.header.status)}>
+            {@cockpit.header.status_label}
+          </span>
+          <span :if={@cockpit.header.plan_reported?} class="badge badge-outline">
+            {@cockpit.header.plan_label}
+          </span>
+        </div>
       </:actions>
     </AdminComponents.page_header>
     """
@@ -157,7 +165,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
       )
 
     ~H"""
-    <AdminComponents.metric_strip id="upstream-status-summary" compact_mobile={true}>
+    <AdminComponents.metric_strip
+      id="upstream-status-summary"
+      compact_mobile={true}
+      desktop_columns={:four}
+    >
       <AdminComponents.metric_card
         id="upstream-status-summary-identity"
         icon="hero-signal"
@@ -209,6 +221,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
         </span>
       </div>
     </AdminComponents.metric_strip>
+    <ReconciliationStatus.reconciliation_status
+      id_prefix="upstream-cockpit"
+      identity_observability={@cockpit.header.identity_observability}
+      reauth_required?={@cockpit.flags.reauth_required?}
+      recovery_href="#upstream-actions"
+      recovery_label="Open recovery actions"
+    />
     """
   end
 

@@ -16,8 +16,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.CodexAuth
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
-  alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, OAuthFlow, UpstreamIdentity}
+
+  alias CodexPooler.Upstreams.Schemas.{
+    EncryptedSecret,
+    OAuthFlow,
+    PoolUpstreamAssignment,
+    UpstreamIdentity
+  }
+
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
   alias CodexPoolerWeb.Admin.UpstreamCockpitReadModel
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus
   alias CodexPoolerWeb.DateTimeDisplay
 
   setup :register_and_log_in_user
@@ -25,6 +34,232 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   setup do
     Repo.delete_all(Oban.Job)
     :ok
+  end
+
+  test "reconciliation status renders one recovery region for a blocked summary" do
+    html =
+      render_component(&ReconciliationStatus.reconciliation_status/1, %{
+        id_prefix: "blocked-reconciliation",
+        identity_observability: %{
+          reconciliation: %{
+            status: "blocked",
+            code: "quota_refresh_auth_unavailable",
+            message: "quota refresh authentication unavailable"
+          }
+        },
+        reauth_required?: false,
+        recovery_href: "/admin/upstreams",
+        recovery_label: "Open recovery actions"
+      })
+
+    assert_occurrences(html, ~s(data-role="upstream-reconciliation-status"), 1)
+    assert_occurrences(html, ~s(id="blocked-reconciliation-reconciliation-recovery"), 1)
+    refute html =~ "reauth-warning"
+  end
+
+  @tag :identity_observability_projection
+  test "card and cockpit render shared reconciliation failure and later recovery safely", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "observability-parity", name: "Observability Parity"})
+
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    finished_at = DateTime.add(now, -120, :second)
+    refreshed_at = DateTime.add(now, -300, :second)
+    observed_at = DateTime.add(now, -900, :second)
+    expires_at = DateTime.add(now, 3_600, :second)
+    raw_provider_message = "provider-body-must-not-project"
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Projection Parity Codex",
+        identity_status: "reauth_required",
+        identity_metadata: %{"access_token_expires_at" => DateTime.to_iso8601(expires_at)},
+        assignment_metadata: %{
+          "last_reconciliation" => %{
+            "status" => "failed",
+            "finished_at" => DateTime.to_iso8601(finished_at),
+            "steps" => [
+              %{
+                "status" => "failed",
+                "code" => "quota_refresh_auth_unavailable",
+                "message" => raw_provider_message,
+                "details" => %{"body" => raw_provider_message}
+              }
+            ]
+          }
+        }
+      })
+
+    assignment
+    |> PoolUpstreamAssignment.changeset(%{last_successful_refresh_at: refreshed_at})
+    |> Repo.update!()
+
+    upsert_quota_window!(identity, %{
+      window_kind: "secondary",
+      window_minutes: 10_080,
+      active_limit: 100,
+      credits: 75,
+      used_percent: Decimal.new("25"),
+      reset_at: DateTime.add(now, 4, :hour),
+      freshness_state: "stale",
+      observed_at: observed_at,
+      last_sync_at: observed_at
+    })
+
+    [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+    cockpit = UpstreamCockpitReadModel.from_account_snapshot(account)
+
+    assert cockpit.header.identity_observability == account.identity_observability
+    assert account.identity_observability.reconciliation.status == "failed"
+    assert account.identity_observability.reconciliation.code == "quota_refresh_auth_unavailable"
+
+    assert account.identity_observability.reconciliation.message ==
+             "quota refresh authentication unavailable"
+
+    assert DateTime.compare(
+             account.identity_observability.last_successful_quota_refresh_at,
+             refreshed_at
+           ) == :eq
+
+    assert DateTime.compare(account.identity_observability.quota_evidence_at, observed_at) == :eq
+    assert account.identity_observability.credential_expiry.state == "known_future"
+    refute inspect(account.identity_observability) =~ raw_provider_message
+    refute inspect(account.assignments) =~ "last_reconciliation"
+
+    {:ok, card_view, card_html} = live(conn, ~p"/admin/upstreams")
+    {:ok, cockpit_view, cockpit_html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    for {view, prefix} <- [
+          {card_view, "upstream-account-#{identity.id}"},
+          {cockpit_view, "upstream-cockpit"}
+        ] do
+      assert_single_element(
+        view,
+        "##{prefix}-reconciliation-status[data-reconciliation-status='failed']"
+      )
+
+      assert_single_element(
+        view,
+        "##{prefix}-reconciliation-title",
+        "Reauthentication required"
+      )
+
+      assert_single_element(
+        view,
+        "##{prefix}-reconciliation-reason",
+        "quota refresh authentication unavailable"
+      )
+
+      assert_single_element(view, "##{prefix}-reconciliation-recovery", "Open recovery actions")
+      assert has_element?(view, "##{prefix}-last-successful-refresh")
+      assert has_element?(view, "##{prefix}-quota-evidence-age")
+      refute has_element?(view, "##{prefix}-reauth-warning")
+    end
+
+    refute card_html =~ raw_provider_message
+    refute cockpit_html =~ raw_provider_message
+
+    recovered_at = DateTime.add(now, -60, :second)
+
+    assignment
+    |> PoolUpstreamAssignment.changeset(%{
+      last_successful_refresh_at: recovered_at,
+      metadata: %{
+        "last_reconciliation" => %{
+          "status" => "succeeded",
+          "finished_at" => DateTime.to_iso8601(recovered_at),
+          "steps" => [%{"status" => "succeeded"}]
+        }
+      }
+    })
+    |> Repo.update!()
+
+    identity
+    |> UpstreamIdentity.changeset(%{status: "active"})
+    |> Repo.update!()
+
+    upsert_quota_window!(identity, %{
+      window_kind: "secondary",
+      window_minutes: 10_080,
+      active_limit: 100,
+      credits: 75,
+      used_percent: Decimal.new("25"),
+      reset_at: DateTime.add(now, 4, :hour),
+      freshness_state: "fresh",
+      observed_at: recovered_at,
+      last_sync_at: recovered_at
+    })
+
+    [recovered_account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+    recovered_cockpit = UpstreamCockpitReadModel.from_account_snapshot(recovered_account)
+
+    assert recovered_cockpit.header.identity_observability ==
+             recovered_account.identity_observability
+
+    assert recovered_account.identity_observability.reconciliation.status == "succeeded"
+    assert recovered_account.identity_observability.reconciliation.code == nil
+    assert recovered_account.identity_observability.reconciliation.message == nil
+    assert recovered_account.reauth_required? == false
+
+    {:ok, recovered_card_view, _html} = live(conn, ~p"/admin/upstreams")
+    {:ok, recovered_cockpit_view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    for {view, prefix} <- [
+          {recovered_card_view, "upstream-account-#{identity.id}"},
+          {recovered_cockpit_view, "upstream-cockpit"}
+        ] do
+      refute has_element?(view, "##{prefix}-reconciliation-status")
+      refute has_element?(view, "##{prefix}-reconciliation-title")
+      refute has_element?(view, "##{prefix}-reconciliation-recovery")
+      refute has_element?(view, "##{prefix}-reconciliation-reason")
+    end
+
+    identity
+    |> UpstreamIdentity.changeset(%{status: "active"})
+    |> Repo.update!()
+
+    assignment
+    |> PoolUpstreamAssignment.changeset(%{
+      metadata: %{
+        "last_reconciliation" => %{
+          "status" => "failed",
+          "finished_at" => DateTime.to_iso8601(DateTime.add(now, -15, :second)),
+          "steps" => [
+            %{
+              "status" => "failed",
+              "code" => "quota_refresh_auth_unavailable",
+              "message" => raw_provider_message
+            }
+          ]
+        }
+      }
+    })
+    |> Repo.update!()
+
+    {:ok, failed_card_view, _html} = live(conn, ~p"/admin/upstreams")
+    {:ok, failed_cockpit_view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    for {view, prefix} <- [
+          {failed_card_view, "upstream-account-#{identity.id}"},
+          {failed_cockpit_view, "upstream-cockpit"}
+        ] do
+      assert_single_element(
+        view,
+        "##{prefix}-reconciliation-status[data-reconciliation-status='failed']"
+      )
+
+      assert_single_element(
+        view,
+        "##{prefix}-reconciliation-title",
+        "Quota reconciliation needs attention"
+      )
+
+      assert_single_element(view, "##{prefix}-reconciliation-recovery", "Open recovery actions")
+      refute has_element?(view, "##{prefix}-reauth-warning")
+    end
   end
 
   @tag :route_navigation
@@ -54,6 +289,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     {:ok, target_pool} =
       Pools.create_pool(scope, %{slug: "shared-stale-target", name: "Shared Stale Target"})
 
+    {:ok, blocked_pool} =
+      Pools.create_pool(scope, %{slug: "shared-stale-blocked", name: "Shared Stale Blocked"})
+
     %{identity: identity, assignment: stale_assignment} =
       upstream_assignment_fixture(source_pool, %{
         account_label: "Current Shared Codex",
@@ -78,6 +316,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
                metadata: %{"quota_priming" => %{"status" => "known"}}
              })
 
+    assert {:ok, blocked_assignment} =
+             PoolAssignments.create_pool_assignment(blocked_pool, identity, %{
+               assignment_label: "blocked-shared-label@example.com",
+               status: "active",
+               health_status: "active",
+               eligibility_status: "eligible",
+               metadata: %{"quota_priming" => %{"status" => "blocked"}}
+             })
+
     upsert_quota_window!(identity, %{
       window_kind: "primary",
       window_minutes: 300,
@@ -93,24 +340,38 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert Map.fetch!(assignments_by_id, stale_assignment.id).assignment_label ==
              "Current Shared Codex"
 
-    assert Map.fetch!(assignments_by_id, stale_assignment.id).quota_priming_status == "known"
-    assert Map.fetch!(assignments_by_id, stale_assignment.id).quota_priming_label == "Quota known"
+    assert Map.fetch!(assignments_by_id, stale_assignment.id).quota_priming_status == "failed"
+
+    assert Map.fetch!(assignments_by_id, stale_assignment.id).quota_priming_label ==
+             "Quota failed"
+
+    assert Map.fetch!(assignments_by_id, fresh_assignment.id).quota_priming_status == "known"
+    assert Map.fetch!(assignments_by_id, fresh_assignment.id).quota_priming_label == "Quota known"
+
+    assert Map.fetch!(assignments_by_id, blocked_assignment.id).quota_priming_status == "blocked"
+
+    assert Map.fetch!(assignments_by_id, blocked_assignment.id).quota_priming_label ==
+             "Priming blocked"
 
     assert Map.fetch!(assignments_by_id, fresh_assignment.id).assignment_label ==
              "Current Shared Codex"
 
-    assert cockpit.charts.quota_health.kpis.assignment_count == 2
-    assert cockpit.charts.quota_health.kpis.routing_usable_count == 2
+    assert cockpit.charts.quota_health.kpis.assignment_count == 3
+    assert cockpit.charts.quota_health.kpis.routing_usable_count == 3
 
     {:ok, view, html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
     stale_selector = "#upstream-assignment-#{stale_assignment.id}"
+    blocked_selector = "#upstream-assignment-#{blocked_assignment.id}"
 
     assert has_element?(view, stale_selector, "Current Shared Codex")
-    assert has_element?(view, stale_selector, "Quota known")
+    assert has_element?(view, stale_selector, "Quota failed")
     assert has_element?(view, stale_selector, "Quota fresh")
+    assert has_element?(view, blocked_selector, "Priming blocked")
+    assert has_element?(view, blocked_selector, "Quota fresh")
 
     refute html =~ "old-shared-label@example.com"
     refute html =~ "another-old-shared-label@example.com"
+    refute html =~ "blocked-shared-label@example.com"
   end
 
   @tag :route_navigation
@@ -628,6 +889,22 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
 
     assert has_element?(view, "#upstream-cockpit-header", "Layout Shell Codex")
     assert has_element?(view, "#upstream-cockpit-header", "stored account id sha256:")
+
+    assert has_element?(
+             view,
+             "#upstream-cockpit-header-actions[data-role='upstream-cockpit-header-actions']"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-status-summary[data-desktop-columns='four']"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-actions #cockpit-redeem-saved-reset-upstream-account-#{identity.id}[title]"
+           )
+
     assert has_element?(view, "#upstream-status-summary", "Identity active")
     assert has_element?(view, "#upstream-assignments", "1 assignment")
     assert has_element?(view, "#quota-health-chart", "Quota health")
@@ -838,7 +1115,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, disabled_selector, "Assignment disabled")
     assert has_element?(view, disabled_selector, "Health disabled")
     assert has_element?(view, disabled_selector, "Routing ineligible")
-    assert has_element?(view, disabled_selector, "Quota known")
+    assert has_element?(view, disabled_selector, "Priming blocked")
     assert has_element?(view, disabled_selector, "Disabled or unusable assignment")
 
     paused = status_fixture!(scope, "paused", %{identity_status: "paused"})
@@ -912,6 +1189,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         reauth_required?: false,
         reauth_reason_code: nil,
         reauth_reason_message: nil,
+        identity_observability: empty_identity_observability(),
         assignments: [],
         quota_limits: []
       })
@@ -1373,6 +1651,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         reauth_required?: false,
         reauth_reason_code: nil,
         reauth_reason_message: nil,
+        identity_observability: empty_identity_observability(),
         assignments: [],
         quota_limits: []
       })
@@ -3185,6 +3464,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, "#cockpit-delete-upstream-account-#{identity.id}", "Delete")
     assert has_element?(view, "#cockpit-reactivate-upstream-account-#{identity.id}", "Reactivate")
 
+    assert has_element?(
+             view,
+             "#upstream-actions #cockpit-redeem-saved-reset-upstream-account-#{identity.id}[disabled]"
+           )
+
     view |> element("#cockpit-rename-upstream-account-#{identity.id}") |> render_click()
     assert has_element?(view, "#cockpit-rename-upstream-account-dialog[open]")
     assert_admin_dialog_docs_link(view, "cockpit-rename-upstream-account-dialog-footer")
@@ -3678,6 +3962,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert {:ok, [_window]} = QuotaWindows.upsert_quota_windows(identity, [attrs])
   end
 
+  defp empty_identity_observability do
+    %{
+      reconciliation: %{
+        status: nil,
+        code: nil,
+        message: nil,
+        finished_at: nil,
+        attempt_age: nil
+      },
+      last_successful_quota_refresh_at: nil,
+      last_successful_quota_refresh_age: nil,
+      quota_evidence_at: nil,
+      quota_evidence_age: nil,
+      credential_expiry: %{state: "unavailable", expires_at: nil, age: nil}
+    }
+  end
+
   defp assert_ordered_ids(html, ordered_ids) do
     positions =
       Enum.map(ordered_ids, fn id ->
@@ -3910,4 +4211,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   end
 
   defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
+
+  defp assert_single_element(view, selector, text \\ nil) do
+    rendered = view |> element(selector, text) |> render()
+    assert rendered != ""
+  end
+
+  defp assert_occurrences(html, needle, expected_count) do
+    actual_count = html |> String.split(needle) |> length() |> Kernel.-(1)
+    assert actual_count == expected_count
+  end
 end

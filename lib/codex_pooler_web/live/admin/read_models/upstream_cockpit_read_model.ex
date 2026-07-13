@@ -47,7 +47,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:reauth_reason_message) => String.t() | nil,
           required(:disabled?) => boolean(),
           required(:safe_account_id_label) => String.t(),
-          required(:subject_ref) => String.t() | nil
+          required(:subject_ref) => String.t() | nil,
+          required(:identity_observability) => UpstreamAccountsReadModel.identity_observability()
         }
   @type assignment :: %{
           required(:id) => Ecto.UUID.t(),
@@ -253,7 +254,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       reauth_reason_message: account.reauth_reason_message,
       disabled?: account.identity.status == "disabled",
       safe_account_id_label: safe_identity.safe_account_id_label,
-      subject_ref: safe_identity.subject_ref
+      subject_ref: safe_identity.subject_ref,
+      identity_observability: account.identity_observability
     }
   end
 

@@ -49,6 +49,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
       when is_binary(status),
       do: status
 
+  def assignment_priming_status(%{quota_priming_status: status}) when is_binary(status),
+    do: status
+
   def assignment_priming_status(_assignment), do: "unknown"
 
   @spec assignment_priming_label(map() | String.t()) :: String.t()
@@ -63,15 +66,25 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   end
 
   @spec put_current_quota_priming(map(), map()) :: map()
-  def put_current_quota_priming(assignment, %{state: "ready"}) do
+  def put_current_quota_priming(assignment, quota_readiness) do
+    case assignment_priming_status(assignment) do
+      status when status in ["failed", "blocked"] ->
+        put_quota_priming(assignment, status)
+
+      _status ->
+        put_derived_quota_priming(assignment, quota_readiness)
+    end
+  end
+
+  defp put_derived_quota_priming(assignment, %{state: "ready"}) do
     put_quota_priming(assignment, "known")
   end
 
-  def put_current_quota_priming(assignment, %{state: "weekly_only_probe"}) do
+  defp put_derived_quota_priming(assignment, %{state: "weekly_only_probe"}) do
     put_quota_priming(assignment, "weekly_only_probe")
   end
 
-  def put_current_quota_priming(assignment, _quota_readiness), do: assignment
+  defp put_derived_quota_priming(assignment, _quota_readiness), do: assignment
 
   @spec quota_refresh_status([map()], DateTimeDisplay.preferences()) :: String.t()
   def quota_refresh_status(assignments, datetime_preferences) do

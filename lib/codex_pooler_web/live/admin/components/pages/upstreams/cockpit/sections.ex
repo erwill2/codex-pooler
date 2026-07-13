@@ -506,7 +506,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
   defp cockpit_action_button(assigns) do
     ~H"""
     <div class="rounded-box border border-base-300 bg-base-200/60 p-3">
-      <div class="flex items-center justify-between gap-2">
+      <div class="flex min-w-0 flex-wrap items-center gap-2">
         <AdminComponents.action_button
           id={@id}
           icon={@icon}
@@ -532,7 +532,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
 
     ~H"""
     <div class="rounded-box border border-base-300 bg-base-200/60 p-3">
-      <div class="flex items-center justify-between gap-2">
+      <div class="flex min-w-0 flex-wrap items-center gap-2">
         <AdminComponents.action_button
           :if={@path}
           id={"cockpit-reinvite-upstream-account-#{@cockpit.identity.id}"}
