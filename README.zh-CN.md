@@ -148,18 +148,14 @@ websocket 路由，不是 OpenAI Realtime SDK 兼容性。
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
+  "small_model": "openai/gpt-5.6-luna",
   "provider": {
     "openai": {
       "npm": "@ai-sdk/openai",
       "name": "Codex Pooler",
       "options": {
         "baseURL": "http://localhost:4000/v1",
-        "apiKey": "{env:CODEX_POOLER_API_KEY}",
-        "reasoningEffort": "high",
-        "reasoningSummary": "auto",
-        "textVerbosity": "medium",
-        "include": ["reasoning.encrypted_content"],
-        "store": false
+        "apiKey": "{env:CODEX_POOLER_API_KEY}"
       },
       "models": {
         "gpt-5.6-luna": {
@@ -170,6 +166,14 @@ websocket 路由，不是 OpenAI Realtime SDK 兼容性。
           "reasoning": true,
           "tool_call": true,
           "temperature": false,
+          "options": {
+            "reasoningEffort": "high",
+            "reasoningSummary": "auto",
+            "textVerbosity": "medium",
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "serviceTier": "priority"
+          },
           "modalities": {
             "input": ["text", "image"],
             "output": ["text"]
@@ -188,6 +192,14 @@ websocket 路由，不是 OpenAI Realtime SDK 兼容性。
           "reasoning": true,
           "tool_call": true,
           "temperature": false,
+          "options": {
+            "reasoningEffort": "high",
+            "reasoningSummary": "auto",
+            "textVerbosity": "medium",
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "serviceTier": "priority"
+          },
           "modalities": {
             "input": ["text", "image"],
             "output": ["text"]
@@ -206,6 +218,14 @@ websocket 路由，不是 OpenAI Realtime SDK 兼容性。
           "reasoning": true,
           "tool_call": true,
           "temperature": false,
+          "options": {
+            "reasoningEffort": "high",
+            "reasoningSummary": "auto",
+            "textVerbosity": "medium",
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "serviceTier": "priority"
+          },
           "modalities": {
             "input": ["text", "image"],
             "output": ["text"]
@@ -238,6 +258,14 @@ websocket 路由，不是 OpenAI Realtime SDK 兼容性。
 只定义你分配到的 Pool 能服务的模型。对于已部署实例，把 `baseURL` 改为
 `https://codex-pooler.example.com/v1`；如果保留可选的运营者 MCP 条目，把它的
 `url` 改为 `https://codex-pooler.example.com/mcp`。
+
+OpenCode 会把 `small_model` 用于自动生成会话标题等后台辅助任务。如果没有显式
+覆盖，它可能会推断出 Codex Pool 不提供的 nano 模型。请把 `small_model` 指向实际
+分配给你的 Pool 的轻量模型；加载 OMO 后，这个设置仍然有效。
+
+请求级 OpenAI 选项应放在每个模型的 `options` 配置块中。provider 级 `options`
+只保留 `baseURL` 和 `apiKey` 等连接设置。这个示例会请求 priority processing；
+如果你的 Pool 或上游不提供该能力，请删除 `serviceTier`。
 
 OpenCode 会先从 `limit.input` 减去自己的压缩预留，再判断对话是否已满。
 `289400` 会在 OpenCode 默认 20k 预留之后留下 269.4k 可用输入 tokens，因此 269.4k

@@ -160,18 +160,14 @@ OpenAI Realtime SDK compatibility.
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
+  "small_model": "openai/gpt-5.6-luna",
   "provider": {
     "openai": {
       "npm": "@ai-sdk/openai",
       "name": "Codex Pooler",
       "options": {
         "baseURL": "http://localhost:4000/v1",
-        "apiKey": "{env:CODEX_POOLER_API_KEY}",
-        "reasoningEffort": "high",
-        "reasoningSummary": "auto",
-        "textVerbosity": "medium",
-        "include": ["reasoning.encrypted_content"],
-        "store": false
+        "apiKey": "{env:CODEX_POOLER_API_KEY}"
       },
       "models": {
         "gpt-5.6-luna": {
@@ -182,6 +178,14 @@ OpenAI Realtime SDK compatibility.
           "reasoning": true,
           "tool_call": true,
           "temperature": false,
+          "options": {
+            "reasoningEffort": "high",
+            "reasoningSummary": "auto",
+            "textVerbosity": "medium",
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "serviceTier": "priority"
+          },
           "modalities": {
             "input": ["text", "image"],
             "output": ["text"]
@@ -200,6 +204,14 @@ OpenAI Realtime SDK compatibility.
           "reasoning": true,
           "tool_call": true,
           "temperature": false,
+          "options": {
+            "reasoningEffort": "high",
+            "reasoningSummary": "auto",
+            "textVerbosity": "medium",
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "serviceTier": "priority"
+          },
           "modalities": {
             "input": ["text", "image"],
             "output": ["text"]
@@ -218,6 +230,14 @@ OpenAI Realtime SDK compatibility.
           "reasoning": true,
           "tool_call": true,
           "temperature": false,
+          "options": {
+            "reasoningEffort": "high",
+            "reasoningSummary": "auto",
+            "textVerbosity": "medium",
+            "include": ["reasoning.encrypted_content"],
+            "store": false,
+            "serviceTier": "priority"
+          },
           "modalities": {
             "input": ["text", "image"],
             "output": ["text"]
@@ -250,6 +270,16 @@ OpenAI Realtime SDK compatibility.
 Define only models that your assigned Pool can serve. For deployed instances,
 change `baseURL` to `https://codex-pooler.example.com/v1`; if you keep the optional
 operator MCP entry, change its `url` to `https://codex-pooler.example.com/mcp`.
+
+OpenCode uses `small_model` for background helpers such as automatic session
+titles. Without an explicit override, it may infer a nano model that Codex Pools
+do not serve. Point `small_model` at a lightweight model that is actually
+assigned to your Pool; the setting also remains effective when OMO is loaded.
+
+Request-time OpenAI options belong under each model's `options` block. Keep only
+connection settings such as `baseURL` and `apiKey` in provider-level `options`.
+The example requests priority processing; remove `serviceTier` if your Pool or
+upstream does not offer it.
 
 OpenCode subtracts its compaction reserve from `limit.input` before deciding a
 conversation is full. The `289400` value leaves 269.4k usable input tokens after
