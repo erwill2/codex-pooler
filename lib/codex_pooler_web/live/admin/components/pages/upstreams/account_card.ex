@@ -15,7 +15,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     TokenBurnPopover
   }
 
-  alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReinviteLink
+  alias CodexPoolerWeb.Admin.UpstreamPageComponents.{ReconciliationStatus, ReinviteLink}
   alias CodexPoolerWeb.DateTimeDisplay
 
   @reactivatable_statuses ~w(paused refresh_due refresh_failed)
@@ -34,6 +34,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
 
     saved_resets = saved_resets(assigns.account)
     saved_reset_policy = saved_reset_policy(assigns.account)
+    routing_readiness = routing_readiness(assigns.account)
+    lifecycle_warning = lifecycle_blocker_warning(assigns.account, routing_readiness)
 
     assigns =
       assigns
@@ -41,7 +43,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
       |> assign(:reported_quota_limits, reported_quota_limits(assigns.account.quota_limits))
       |> assign(:workspace_context_label, workspace_context_label(assigns.account))
       |> assign(:workspace_context_title, workspace_context_title(assigns.account))
-      |> assign(:routing_readiness, routing_readiness(assigns.account))
+      |> assign(:auth_expiration, auth_expiration(assigns.account, datetime_preferences))
+      |> assign(:routing_readiness, routing_readiness)
+      |> assign(:lifecycle_warning, lifecycle_warning)
       |> assign(:saved_resets, saved_resets)
       |> assign(:saved_reset_policy, saved_reset_policy)
       |> assign(
@@ -83,6 +87,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
               {@workspace_context_label}
             </span>
           </div>
+          <p
+            id={"upstream-account-#{@account.identity.id}-auth-expiration"}
+            data-role="upstream-auth-expiration"
+            class="mt-1 truncate text-xs leading-5 text-base-content/55"
+            title={@auth_expiration.title}
+          >
+            {@auth_expiration.label}
+          </p>
         </div>
         <div
           id={"upstream-account-#{@account.identity.id}-header-actions"}
@@ -242,9 +254,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
           </section>
         </div>
 
-        <.upstream_lifecycle_blocker_warning
-          account={@account}
-          routing_readiness={@routing_readiness}
+        <ReconciliationStatus.reconciliation_status
+          id_prefix={"upstream-account-#{@account.identity.id}"}
+          identity_observability={@account.identity_observability}
+          reauth_required?={@account.reauth_required?}
+          lifecycle_warning={@lifecycle_warning}
+          recovery_href={~p"/admin/upstreams/#{@account.identity.id}"}
+          recovery_label="Open recovery actions"
         />
       </div>
       <footer
@@ -307,6 +323,38 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
 
   defp saved_reset_policy(%{saved_reset_policy: saved_reset_policy}), do: saved_reset_policy
   defp saved_reset_policy(%{identity: identity}), do: SavedResets.auto_policy(identity)
+
+  @type auth_expiration :: %{label: String.t(), title: String.t() | nil}
+
+  @spec auth_expiration(map(), DateTimeDisplay.preferences()) :: auth_expiration()
+  defp auth_expiration(
+         %{identity_observability: %{credential_expiry: credential_expiry}},
+         preferences
+       )
+       when is_map(credential_expiry) do
+    case credential_expiry do
+      %{state: "known_future", expires_at: %DateTime{} = expires_at} ->
+        %{
+          label: "Auth expires #{credential_expiry_label(credential_expiry)}",
+          title: DateTimeDisplay.format_datetime(expires_at, preferences)
+        }
+
+      %{state: "known_past", expires_at: %DateTime{} = expires_at} ->
+        %{
+          label: "Auth expired #{credential_expiry_label(credential_expiry)}",
+          title: DateTimeDisplay.format_datetime(expires_at, preferences)
+        }
+
+      _unavailable ->
+        %{label: "Expiration unavailable", title: nil}
+    end
+  end
+
+  defp auth_expiration(_account, _preferences), do: %{label: "Expiration unavailable", title: nil}
+
+  @spec credential_expiry_label(map()) :: String.t()
+  defp credential_expiry_label(%{age: age}) when is_binary(age) and age != "", do: age
+  defp credential_expiry_label(_credential_expiry), do: "at an unknown time"
 
   defp normalize_panel_view(:pools, _saved_resets, account) do
     if pools_panel_available?(account), do: :pools, else: :usage
@@ -521,45 +569,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     "absolute inset-x-1 inset-y-[-0.35rem] z-20 cursor-pointer rounded border transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
   end
 
-  attr :account, :map, required: true
-  attr :routing_readiness, :map, required: true
-
-  defp upstream_lifecycle_blocker_warning(assigns) do
-    assigns =
-      assigns
-      |> assign(:warning, lifecycle_blocker_warning(assigns.account, assigns.routing_readiness))
-
-    ~H"""
-    <div
-      :if={@warning}
-      id={@warning.id}
-      class="rounded-box border border-error/30 bg-error/10 p-3 text-sm text-base-content"
-    >
-      <div class="flex items-start gap-2">
-        <.icon name="hero-exclamation-triangle" class="mt-0.5 size-5 shrink-0 text-error" />
-        <div class="space-y-1">
-          <p class="font-semibold text-error">{@warning.title}</p>
-          <p>
-            {@warning.body}
-          </p>
-          <p :if={@account.reauth_reason_message} class="text-xs text-base-content/70">
-            Reason: {@account.reauth_reason_code || "token refresh failed"} — {@account.reauth_reason_message}
-          </p>
-          <p
-            :if={!@account.reauth_reason_message && @account.reauth_reason_code}
-            class="text-xs text-base-content/70"
-          >
-            Reason: {@account.reauth_reason_code}
-          </p>
-          <p class="text-xs font-medium text-base-content/75">
-            Recovery: {@warning.recovery}
-          </p>
-        </div>
-      </div>
-    </div>
-    """
-  end
-
   @spec routing_readiness(map()) :: map()
   defp routing_readiness(%{routing_readiness: routing_readiness}) when is_map(routing_readiness),
     do: routing_readiness
@@ -579,7 +588,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
 
   @spec lifecycle_blocker_warning(map(), map()) :: map() | nil
   defp lifecycle_blocker_warning(
-         %{identity: %{id: id, status: "refresh_failed"}},
+         %{identity: %{id: id, status: "refresh_failed"}} = account,
          _routing_readiness
        ) do
     %{
@@ -587,25 +596,32 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
       title: "Token refresh failed",
       body:
         "This account is excluded from runtime routing until token refresh succeeds or credentials are relinked.",
-      recovery:
-        "use Refresh token to retry token refresh, Relink account to complete OpenAI OAuth again, Replace auth.json to load fresh credentials, or Reinvite account when the operator needs to complete hosted sign-in again."
+      reason: lifecycle_reason(account)
     }
   end
 
   defp lifecycle_blocker_warning(
-         %{identity: %{id: id, status: "reauth_required"}},
+         %{identity: %{id: id, status: "reauth_required"}} = account,
          _routing_readiness
        ) do
     %{
       id: "upstream-account-#{id}-reauth-warning",
       title: "Reauthentication required",
       body: "This account is excluded from routing until credentials are replaced.",
-      recovery:
-        "use Relink account to complete OpenAI OAuth again, Replace auth.json to load fresh credentials, or Reinvite account when the operator needs to complete hosted sign-in again."
+      reason: lifecycle_reason(account)
     }
   end
 
   defp lifecycle_blocker_warning(_account, _routing_readiness), do: nil
+
+  @spec lifecycle_reason(map()) :: String.t() | nil
+  defp lifecycle_reason(%{reauth_reason_message: message, reauth_reason_code: code})
+       when is_binary(message) and message != "" do
+    "#{code || "token refresh failed"} - #{message}"
+  end
+
+  defp lifecycle_reason(%{reauth_reason_code: code}) when is_binary(code) and code != "", do: code
+  defp lifecycle_reason(_account), do: nil
 
   @spec workspace_context_label(map()) :: String.t()
   defp workspace_context_label(%{workspace_label: label}) when is_binary(label) and label != "",

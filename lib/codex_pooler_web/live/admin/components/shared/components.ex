@@ -14,6 +14,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :eyebrow, :string, default: "Admin"
   attr :title, :string, required: true
   attr :description, :string, default: nil
+  attr :actions_breakpoint, :atom, default: :sm
 
   slot :actions
 
@@ -23,7 +24,7 @@ defmodule CodexPoolerWeb.Admin.Components do
       id={@id}
       class={[
         @actions != [] &&
-          "grid gap-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center",
+          "grid gap-4 #{actions_breakpoint_class(@actions_breakpoint)}",
         @actions == [] && "grid gap-2"
       ]}
     >
@@ -44,8 +45,15 @@ defmodule CodexPoolerWeb.Admin.Components do
     """
   end
 
+  defp actions_breakpoint_class(:lg),
+    do: "lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center"
+
+  defp actions_breakpoint_class(_breakpoint),
+    do: "sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+
   attr :id, :string, required: true
   attr :compact_mobile, :boolean, default: false
+  attr :desktop_columns, :atom, default: :five, values: [:four, :five]
 
   slot :inner_block, required: true
 
@@ -53,9 +61,10 @@ defmodule CodexPoolerWeb.Admin.Components do
     ~H"""
     <section
       id={@id}
+      data-desktop-columns={@desktop_columns}
       class={[
         "grid min-w-0 gap-2 md:grid-cols-3",
-        @compact_mobile && "grid-cols-2 sm:grid-cols-3 xl:grid-cols-5",
+        @compact_mobile && compact_metric_strip_columns(@desktop_columns),
         !@compact_mobile && "grid-cols-1"
       ]}
       aria-label="Page metrics"
@@ -64,6 +73,9 @@ defmodule CodexPoolerWeb.Admin.Components do
     </section>
     """
   end
+
+  defp compact_metric_strip_columns(:four), do: "grid-cols-2 sm:grid-cols-3 xl:grid-cols-4"
+  defp compact_metric_strip_columns(:five), do: "grid-cols-2 sm:grid-cols-3 xl:grid-cols-5"
 
   attr :id, :string, required: true
   attr :icon, :string, required: true

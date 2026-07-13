@@ -3707,24 +3707,99 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              "Quota ready"
            )
 
-    warning_selector = "#upstream-account-#{identity.id}-refresh-failed-warning"
-    assert has_element?(view, warning_selector, "Token refresh failed")
-    assert has_element?(view, warning_selector, "excluded from runtime routing")
+    reconciliation_selector = "#upstream-account-#{identity.id}-reconciliation-status"
+    assert_single_element(view, reconciliation_selector, "Token refresh failed")
+    assert has_element?(view, reconciliation_selector, "excluded from runtime routing")
 
     assert has_element?(
              view,
-             warning_selector,
+             reconciliation_selector,
              "token refresh succeeds or credentials are relinked"
            )
 
-    assert has_element?(view, warning_selector, "upstream OAuth refresh failed")
-    assert has_element?(view, warning_selector, "codex_oauth_refresh_failed")
+    assert has_element?(view, reconciliation_selector, "upstream OAuth refresh failed")
+    assert has_element?(view, reconciliation_selector, "codex_oauth_refresh_failed")
+    assert_single_element(view, "#upstream-account-#{identity.id}-reconciliation-recovery")
+    refute has_element?(view, "#upstream-account-#{identity.id}-refresh-failed-warning")
 
     assert has_element?(
              view,
              "#upstream-account-#{identity.id}-quota-readiness-contract",
              "Quota ready"
            )
+  end
+
+  test "account card reconciliation status supersedes stale weekly quota with safe recovery", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "stale-weekly-recovery", name: "Stale Weekly Recovery"})
+
+    raw_provider_marker = "raw-provider-marker-#{System.unique_integer([:positive])}"
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Stale Weekly Recovery Codex",
+        identity_status: "reauth_required",
+        assignment_metadata: %{
+          "last_reconciliation" => %{
+            "status" => "failed",
+            "finished_at" => DateTime.add(now, -60, :second) |> DateTime.to_iso8601(),
+            "steps" => [
+              %{
+                "status" => "failed",
+                "code" => "quota_refresh_auth_unavailable",
+                "message" => raw_provider_marker
+              }
+            ]
+          }
+        }
+      })
+
+    assignment
+    |> PoolUpstreamAssignment.changeset(%{
+      last_successful_refresh_at: DateTime.add(now, -600, :second)
+    })
+    |> Repo.update!()
+
+    assert {:ok, [_weekly]} =
+             QuotaWindows.upsert_quota_windows(identity, [
+               %{
+                 window_kind: "secondary",
+                 window_minutes: 10_080,
+                 active_limit: 100,
+                 credits: 75,
+                 used_percent: Decimal.new("25"),
+                 reset_at: DateTime.add(now, 4, :hour),
+                 freshness_state: "stale",
+                 observed_at: DateTime.add(now, -900, :second),
+                 last_sync_at: DateTime.add(now, -900, :second)
+               }
+             ])
+
+    {:ok, view, html} = live(conn, ~p"/admin/upstreams")
+    prefix = "upstream-account-#{identity.id}"
+
+    assert has_element?(
+             view,
+             "##{prefix}-reconciliation-status[data-reconciliation-status='failed']"
+           )
+
+    assert_single_element(view, "##{prefix}-reconciliation-title", "Reauthentication required")
+
+    assert has_element?(
+             view,
+             "##{prefix}-reconciliation-reason",
+             "quota refresh authentication unavailable"
+           )
+
+    assert_single_element(view, "##{prefix}-reconciliation-recovery", "Open recovery actions")
+    assert has_element?(view, "##{prefix}-last-successful-refresh")
+    assert has_element?(view, "##{prefix}-quota-evidence-age")
+    refute has_element?(view, "##{prefix}-reauth-warning")
+    refute html =~ raw_provider_marker
   end
 
   test "projects a happy-path account as quota ready", %{scope: scope} do
@@ -4346,6 +4421,74 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     html = render(view)
     refute html =~ access_token
     refute html =~ refresh_token
+  end
+
+  test "renders projection-backed auth expiration beneath the account header", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} = Pools.create_pool(scope, %{slug: "auth-expiration", name: "Auth Expiration"})
+
+    future_expires_at = DateTime.add(DateTime.utc_now(), 2, :hour)
+    past_expires_at = DateTime.add(DateTime.utc_now(), -2, :hour)
+
+    %{identity: future_identity} =
+      active_upstream_assignment_fixture(pool, %{
+        account_label: "Future Auth Expiration",
+        metadata: %{"access_token_expires_at" => DateTime.to_iso8601(future_expires_at)}
+      })
+
+    %{identity: past_identity} =
+      active_upstream_assignment_fixture(pool, %{
+        account_label: "Past Auth Expiration",
+        metadata: %{"access_token_expires_at" => DateTime.to_iso8601(past_expires_at)}
+      })
+
+    %{identity: missing_identity} =
+      active_upstream_assignment_fixture(pool, %{account_label: "Missing Auth Expiration"})
+
+    %{identity: malformed_identity} =
+      active_upstream_assignment_fixture(pool, %{
+        account_label: "Malformed Auth Expiration",
+        metadata: %{"access_token_expires_at" => "not-a-timestamp"}
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{future_identity.id}-auth-expiration[title]",
+             "Auth expires"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{past_identity.id}-auth-expiration[title]",
+             "Auth expired"
+           )
+
+    for identity <- [missing_identity, malformed_identity] do
+      selector = "#upstream-account-#{identity.id}-auth-expiration"
+
+      assert has_element?(view, selector, "Expiration unavailable")
+      refute has_element?(view, "#{selector}[title]")
+      refute has_element?(view, selector, "No expiration")
+    end
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{future_identity.id} header #upstream-account-#{future_identity.id}-mail"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{future_identity.id} header #upstream-account-#{future_identity.id}-header-actions"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-account-#{future_identity.id} header #upstream-account-#{future_identity.id}-routing-readiness"
+           )
   end
 
   test "does not duplicate token refresh failure prefixes", %{conn: conn, scope: scope} do
@@ -5101,10 +5244,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       |> Enum.map(&elem(&1, 0))
       |> Enum.find(&(&1.status == "reauth_required"))
 
-    warning_selector = "#upstream-account-#{reauth_identity.id}-reauth-warning"
-    assert has_element?(view, warning_selector, "Relink account")
-    assert has_element?(view, warning_selector, "Replace auth.json")
-    assert has_element?(view, warning_selector, "Reinvite account")
+    reconciliation_selector = "#upstream-account-#{reauth_identity.id}-reconciliation-status"
+    assert has_element?(view, reconciliation_selector, "Reauthentication required")
+    assert has_element?(view, "#upstream-account-#{reauth_identity.id}-reconciliation-recovery")
+    refute has_element?(view, "#upstream-account-#{reauth_identity.id}-reauth-warning")
   end
 
   @tag :provider_auth_recovery
@@ -5142,7 +5285,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     {:ok, view, html} = live(conn, ~p"/admin/upstreams")
 
-    assert has_element?(view, "#upstream-account-#{reauth_identity.id}-reauth-warning")
+    assert has_element?(view, "#upstream-account-#{reauth_identity.id}-reconciliation-status")
 
     assert has_element?(
              view,
@@ -5290,14 +5433,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     refute has_element?(view, "#upstream-account-#{refresh_due.id}-secret")
     refute has_element?(view, "#upstream-account-#{reauth.id}-secret")
 
-    warning_selector = "#upstream-account-#{reauth.id}-reauth-warning"
-    assert has_element?(view, warning_selector, "Reauthentication required")
-    assert has_element?(view, warning_selector, "excluded from routing")
-    assert has_element?(view, warning_selector, "Refresh token was revoked or expired")
-    assert has_element?(view, warning_selector, "refresh_token_revoked")
-    assert has_element?(view, warning_selector, "Relink account")
-    assert has_element?(view, warning_selector, "Replace auth.json")
-    assert has_element?(view, warning_selector, "Reinvite account")
+    reconciliation_selector = "#upstream-account-#{reauth.id}-reconciliation-status"
+    assert has_element?(view, reconciliation_selector, "Reauthentication required")
+    assert has_element?(view, reconciliation_selector, "excluded from routing")
+    assert has_element?(view, reconciliation_selector, "Refresh token was revoked or expired")
+    assert has_element?(view, reconciliation_selector, "refresh_token_revoked")
+    assert has_element?(view, "#upstream-account-#{reauth.id}-reconciliation-recovery")
+    refute has_element?(view, "#upstream-account-#{reauth.id}-reauth-warning")
   end
 
   test "active accounts ignore stale reauthentication token refresh metadata", %{scope: scope} do
@@ -5373,6 +5515,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       quota_refresh_status: "not run",
       auth_fresh_label: "auth imported not reported",
       auth_verified_label: "auth verified not reported",
+      identity_observability: %{
+        reconciliation: %{
+          status: nil,
+          code: nil,
+          message: nil,
+          finished_at: nil,
+          attempt_age: nil
+        },
+        last_successful_quota_refresh_at: nil,
+        last_successful_quota_refresh_age: nil,
+        quota_evidence_at: nil,
+        quota_evidence_age: nil,
+        credential_expiry: %{state: "unavailable", expires_at: nil, age: nil}
+      },
       access_token_label:
         Keyword.get(opts, :access_token_label, "access token expired 2026-05-04 12:00 UTC"),
       reauth_required?: status == "reauth_required",
@@ -5818,4 +5974,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   end
 
   defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")
+
+  defp assert_single_element(view, selector, text \\ nil) do
+    rendered = view |> element(selector, text) |> render()
+    assert rendered != ""
+  end
 end
