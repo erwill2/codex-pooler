@@ -13,6 +13,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.SavedResets.AutoEligibility
+  alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPooler.Upstreams.Secrets
 
@@ -170,6 +171,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     redemption = (identity.metadata || %{})["saved_reset_redemption"]
 
     cond do
+      RedemptionLifecycle.blocks_new_redemption?(redemption, timestamp) ->
+        {:error, :redemption_in_progress}
+
       fresh_redemption?(redemption, timestamp, receive_timeout) ->
         {:error, :redemption_in_progress}
 
@@ -234,32 +238,62 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
     metadata = locked_identity.metadata || %{}
     redemption = metadata["saved_reset_redemption"]
 
-    if redemption_in_progress_for_trigger?(redemption, started_at, receive_timeout, trigger_kind) do
-      Repo.rollback(:redemption_in_progress)
-    else
-      case validate_locked_gateway_auto(
-             locked_identity,
-             assignment,
-             gateway_auto_context,
-             started_at
-           ) do
-        {:ok, current_assignment} ->
-          locked_identity
-          |> maybe_mark_stale_admin_redemption!(metadata, redemption, trigger_kind, started_at)
-          |> build_redemption_claim!(
-            locked_identity,
-            current_assignment,
-            trigger_kind,
-            receive_timeout,
-            started_at
-          )
+    cond do
+      # A lifecycle that already consumed a credit (pending, in-flight, expired,
+      # or unrecognized) can never be overridden into a second consumption, not
+      # even by the stale-admin recovery path. Recovery is evidence-only.
+      RedemptionLifecycle.blocks_new_redemption?(redemption, started_at) ->
+        Repo.rollback(:redemption_in_progress)
 
-        {:noop, code} ->
-          {:noop, noop_result(locked_identity, assignment, code)}
+      redemption_in_progress_for_trigger?(redemption, started_at, receive_timeout, trigger_kind) ->
+        Repo.rollback(:redemption_in_progress)
 
-        {:error, reason} ->
-          Repo.rollback(reason)
-      end
+      true ->
+        claim_validated_identity!(
+          locked_identity,
+          assignment,
+          trigger_kind,
+          receive_timeout,
+          started_at,
+          gateway_auto_context,
+          metadata,
+          redemption
+        )
+    end
+  end
+
+  defp claim_validated_identity!(
+         locked_identity,
+         assignment,
+         trigger_kind,
+         receive_timeout,
+         started_at,
+         gateway_auto_context,
+         metadata,
+         redemption
+       ) do
+    case validate_locked_gateway_auto(
+           locked_identity,
+           assignment,
+           gateway_auto_context,
+           started_at
+         ) do
+      {:ok, current_assignment} ->
+        locked_identity
+        |> maybe_mark_stale_admin_redemption!(metadata, redemption, trigger_kind, started_at)
+        |> build_redemption_claim!(
+          locked_identity,
+          current_assignment,
+          trigger_kind,
+          receive_timeout,
+          started_at
+        )
+
+      {:noop, code} ->
+        {:noop, noop_result(locked_identity, assignment, code)}
+
+      {:error, reason} ->
+        Repo.rollback(reason)
     end
   end
 
@@ -406,7 +440,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
             consume_url,
             identity,
             access_token,
-            %{"credit_id" => credit_id, "redeem_request_id" => Ecto.UUID.generate()},
+            %{"credit_id" => credit_id, "redeem_request_id" => idempotency_key(claim)},
             available_count,
             claim,
             :chatgpt
@@ -431,7 +465,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           consume_url,
           identity,
           access_token,
-          %{"redeem_request_id" => Ecto.UUID.generate()},
+          %{"redeem_request_id" => idempotency_key(claim)},
           snapshot.available_count,
           claim,
           :codex
@@ -553,13 +587,21 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
             }
 
           {:error, _reason} ->
+            # The provider returned `reset`: a credit was consumed. A failed or
+            # partial usage refresh must not reverse that external side effect,
+            # and must not report `applied=false` (which would let a later
+            # request consume a second credit). Record the consumed credit as a
+            # pending confirmation, fail-closed, so it converges only from fresh
+            # provider evidence.
             %{
-              status: :failed,
-              applied?: false,
-              code: "post_reset_usage_refresh_failed",
+              status: :succeeded,
+              applied?: true,
+              code: code,
+              phase: RedemptionLifecycle.consumed_pending_probe(),
+              consumed_at: now(),
               available_count_before: available_count_before,
               http_status: status,
-              reason: "quota refresh after saved reset failed"
+              reason: "quota refresh after saved reset is pending confirmation"
             }
         end
 
@@ -683,18 +725,22 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       if redemption["attempt_id"] == claim.attempt_id and
            redemption["generation"] == claim.generation do
         finished_at = now()
-        final_status = Atom.to_string(result.status)
+
+        base = %{
+          "attempt_id" => claim.attempt_id,
+          "generation" => claim.generation,
+          "trigger_kind" => claim.trigger_kind,
+          "started_at" => DateTime.to_iso8601(claim.started_at),
+          "finished_at" => DateTime.to_iso8601(finished_at),
+          "result" => metadata_result(result)
+        }
 
         updated_identity =
-          update_redemption_metadata!(identity, metadata, %{
-            "status" => final_status,
-            "attempt_id" => claim.attempt_id,
-            "generation" => claim.generation,
-            "trigger_kind" => claim.trigger_kind,
-            "started_at" => DateTime.to_iso8601(claim.started_at),
-            "finished_at" => DateTime.to_iso8601(finished_at),
-            "result" => metadata_result(result)
-          })
+          update_redemption_metadata!(
+            identity,
+            metadata,
+            Map.merge(base, redemption_lifecycle_fields(result))
+          )
 
         updated_identity
       else
@@ -723,6 +769,34 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       "available_count_after" => Map.get(result, :available_count_after),
       "http_status" => Map.get(result, :http_status)
     }
+  end
+
+  # A result carrying a lifecycle `:phase` records the phase-driven legacy status
+  # plus the consume timestamp and bounded-window deadline. Every other result
+  # keeps the legacy top-level status derived from the redemption outcome.
+  defp redemption_lifecycle_fields(%{phase: phase, consumed_at: %DateTime{} = consumed_at})
+       when is_binary(phase) do
+    %{
+      "status" => RedemptionLifecycle.legacy_status_for(phase),
+      "phase" => phase,
+      "consumed_at" => DateTime.to_iso8601(consumed_at),
+      "deadline_at" => DateTime.to_iso8601(RedemptionLifecycle.deadline_at(consumed_at))
+    }
+  end
+
+  defp redemption_lifecycle_fields(result), do: %{"status" => Atom.to_string(result.status)}
+
+  # The provider idempotency key is derived deterministically from the persisted
+  # attempt id and generation, so a retry of the same claim reproduces the same
+  # key without persisting a raw secret. Different attempts derive distinct keys.
+  defp idempotency_key(%{attempt_id: attempt_id, generation: generation}) do
+    {:ok, uuid} =
+      :sha256
+      |> :crypto.hash("saved_reset_redeem:#{attempt_id}:#{generation}")
+      |> binary_part(0, 16)
+      |> Ecto.UUID.load()
+
+    uuid
   end
 
   defp noop_result(identity, assignment, code) when is_binary(code) do

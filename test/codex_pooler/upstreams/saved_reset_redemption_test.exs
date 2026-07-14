@@ -88,6 +88,107 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       refute Map.has_key?(body, "credit_id")
     end
 
+    test "derives a stable idempotency key so a retry reuses the same redeem_request_id" do
+      {:ok, fake} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+      assert {:ok, %{status: :succeeded, applied?: true}} =
+               SavedResetRedemption.redeem(assignment)
+
+      persisted = Repo.reload!(identity)
+      attempt_id = get_in(persisted.metadata, ["saved_reset_redemption", "attempt_id"])
+      generation = get_in(persisted.metadata, ["saved_reset_redemption", "generation"])
+
+      [consume | _] = FakeUpstream.requests(fake)
+      first_key = consume.json["redeem_request_id"]
+      assert is_binary(first_key)
+
+      # The key is a deterministic function of the persisted attempt id and
+      # generation, so the same attempt reproduces it without persisting a
+      # raw secret in the identity metadata.
+      refute Jason.encode!(persisted.metadata) =~ first_key
+
+      expected =
+        :sha256
+        |> :crypto.hash("saved_reset_redeem:#{attempt_id}:#{generation}")
+        |> binary_part(0, 16)
+        |> then(fn raw -> elem(Ecto.UUID.load(raw), 1) end)
+
+      assert first_key == expected
+    end
+
+    test "keeps a consumed reset truthful when the post-reset usage refresh fails" do
+      {:ok, fake} =
+        FakeUpstream.start_link({:path_json,
+         %{
+           "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+           # Provider consumed the credit but the usage refresh fails / omits
+           # the account window — the exact production deadlock shape.
+           "/api/codex/usage" => {500, %{"error" => "usage unavailable"}}
+         }})
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+      assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} =
+               SavedResetRedemption.redeem(assignment)
+
+      persisted = Repo.reload!(identity)
+      redemption = persisted.metadata["saved_reset_redemption"]
+
+      # Truthful: consumed and pending confirmation, not failed/not-applied.
+      assert redemption["phase"] == "consumed_pending_probe"
+      assert redemption["status"] == "redeeming"
+      assert redemption["result"]["applied"] == true
+      assert is_binary(redemption["consumed_at"])
+      assert is_binary(redemption["deadline_at"])
+    end
+
+    test "a consumed pending reset blocks a second credit even after the stale window" do
+      {:ok, fake} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      stale_started_at =
+        DateTime.utc_now() |> DateTime.add(-5, :minute) |> DateTime.truncate(:microsecond)
+
+      consumed_at =
+        DateTime.utc_now() |> DateTime.add(-5, :minute) |> DateTime.truncate(:microsecond)
+
+      %{assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
+          redemption: %{
+            "status" => "redeeming",
+            "phase" => "consumed_pending_probe",
+            "attempt_id" => Ecto.UUID.generate(),
+            "generation" => 2,
+            "trigger_kind" => "admin_manual",
+            "started_at" => DateTime.to_iso8601(stale_started_at),
+            "consumed_at" => DateTime.to_iso8601(consumed_at),
+            "deadline_at" => consumed_at |> DateTime.add(15, :minute) |> DateTime.to_iso8601(),
+            "finished_at" => nil,
+            "result" => %{"code" => "reset", "applied" => true}
+          }
+        )
+
+      assert {:error, :redemption_in_progress} = SavedResetRedemption.redeem(assignment)
+      assert [] = FakeUpstream.requests(fake)
+    end
+
     test "does not consume when no ChatGPT credit is usable and preserves expiration metadata" do
       {:ok, fake} =
         FakeUpstream.start_link(
