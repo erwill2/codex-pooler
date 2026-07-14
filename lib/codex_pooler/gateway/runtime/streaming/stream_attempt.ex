@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttempt do
   Tracks and classifies the first SSE event for a streaming gateway attempt.
   """
 
+  alias CodexPooler.Gateway.Runtime.ModelUnavailable
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
@@ -19,14 +20,16 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttempt do
   @spec first_event_state() :: first_event_state()
   def first_event_state, do: %{classified?: false, buffer: ""}
 
-  @spec classify_first_event(binary(), first_event_state()) ::
+  @spec classify_first_event(binary(), first_event_state(), term() | nil) ::
           {classification(), first_event_state()}
-  def classify_first_event(data, %{classified?: classified?, buffer: buffer} = state)
+  def classify_first_event(data, state, context \\ nil)
+
+  def classify_first_event(data, %{classified?: classified?, buffer: buffer} = state, context)
       when is_binary(data) and is_binary(buffer) do
     if classified? do
       classify_data_after_first_event(data)
     else
-      classify_data_before_first_event(data, state)
+      classify_data_before_first_event(data, state, context)
     end
   end
 
@@ -43,11 +46,11 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttempt do
     {classification, %{classified?: true, buffer: ""}}
   end
 
-  defp classify_data_before_first_event(data, %{buffer: buffer}) do
+  defp classify_data_before_first_event(data, %{buffer: buffer}, context) do
     buffer = buffer <> data
 
     case StreamProtocol.first_complete_event(buffer) do
-      {:ok, event} -> classify_complete_first_event(buffer, event)
+      {:ok, event} -> classify_complete_first_event(buffer, event, context)
       :incomplete -> classify_incomplete_first_event(buffer)
     end
   end
@@ -66,14 +69,29 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamAttempt do
     end
   end
 
-  defp classify_complete_first_event(buffer, event) do
+  defp classify_complete_first_event(buffer, event, context) do
     classification =
       case StreamProtocol.retryable_first_terminal_failure(event) do
-        {:ok, failure} -> {:retry, failure}
-        :error -> classify_non_retryable_first_event(buffer, event)
+        {:ok, failure} ->
+          {:retry, failure}
+
+        :error ->
+          classify_model_unavailable_or_terminal(buffer, event, context)
       end
 
     {classification, classify_complete_first_event_state(event)}
+  end
+
+  defp classify_model_unavailable_or_terminal(buffer, event, context) do
+    case StreamProtocol.terminal_failure_event(event) do
+      {:ok, failure} ->
+        if ModelUnavailable.retryable_failure?(failure, context),
+          do: {:retry, failure},
+          else: classify_non_retryable_first_event(buffer, event)
+
+      _not_terminal ->
+        classify_non_retryable_first_event(buffer, event)
+    end
   end
 
   defp classify_non_retryable_first_event(buffer, event) do

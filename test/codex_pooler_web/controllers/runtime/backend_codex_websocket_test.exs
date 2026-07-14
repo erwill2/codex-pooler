@@ -6259,6 +6259,104 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     refute metadata_text =~ "upstream-token"
   end
 
+  @tag :feature_model_unavailable_failover
+  test "websocket model_not_found first event fails over to the next catalog source" do
+    unavailable_upstream =
+      start_upstream(
+        FakeUpstream.sse_stream(
+          [
+            {"error",
+             %{
+               "type" => "error",
+               "status" => 404,
+               "code" => "model_not_found",
+               "param" => "model",
+               "message" => "model is not installed on this account"
+             }}
+          ],
+          done: false
+        )
+      )
+
+    fallback_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_ws_model_unavailable_fallback",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(unavailable_upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, fallback_upstream, "upstream-token-ws-model-fallback",
+        compact?: false
+      )
+
+    prime_routing_quota!(fallback.identity)
+    use_routing_strategy!(setup.pool, "bridge_ring", 2)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    request_id =
+      seed_preferring_assignment(
+        [setup.assignment.id, fallback.assignment.id],
+        setup.assignment.id
+      )
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert :ok =
+             execute_websocket_response(
+               auth,
+               Jason.encode!(%{
+                 "type" => "response.create",
+                 "model" => setup.model.exposed_model_id,
+                 "input" => "fail over unavailable websocket model",
+                 "stream" => true,
+                 "generate" => true
+               }),
+               %{request_id: request_id},
+               fn frame -> send(self(), {:websocket_frame, frame}) end
+             )
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_model_unavailable_fallback"} = Jason.decode!(frame)
+    refute_received {:websocket_frame, _unexpected}
+
+    assert FakeUpstream.count(unavailable_upstream) == 1
+    assert FakeUpstream.count(fallback_upstream) == 1
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert first_attempt.status == "retryable_failed"
+    assert first_attempt.retryable == true
+    assert first_attempt.network_error_code == "model_not_found"
+    assert first_attempt.response_metadata["stream_failure_stage"] == "first_event"
+    assert first_attempt.response_metadata["stream_error_code"] == "model_not_found"
+    assert first_attempt.response_metadata["upstream_error_param"] == "model"
+
+    assert second_attempt.pool_upstream_assignment_id == fallback.assignment.id
+    assert second_attempt.status == "succeeded"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.retry_count == 1
+    assert request.last_error_code == nil
+
+    metadata_text = inspect({request.request_metadata, first_attempt.response_metadata})
+    refute metadata_text =~ "model is not installed on this account"
+    refute metadata_text =~ "upstream-token-ws-model-fallback"
+  end
+
   @tag :feature_websocket_connection_limit_retry
   test "websocket connection limit first event retries same assignment without demotion" do
     upstream =

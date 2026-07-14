@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
 
   use GenServer
 
+  alias CodexPooler.Gateway.Runtime.ModelUnavailable
   alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.UpstreamErrorParam
@@ -603,7 +604,14 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
   defp retryable_pre_visible_terminal_event(event) do
     case StreamProtocol.auth_refresh_first_terminal_failure(event) do
       {:ok, failure} -> {:ok, {:auth_refresh_first_event, failure}}
-      :error -> retryable_connection_limit_event(event)
+      :error -> retryable_non_auth_terminal_event(event)
+    end
+  end
+
+  defp retryable_non_auth_terminal_event(event) do
+    case retryable_connection_limit_event(event) do
+      {:ok, result} -> {:ok, result}
+      :error -> model_unavailable_event(event)
     end
   end
 
@@ -613,6 +621,18 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession do
         {:ok, {:retryable_first_event, failure}}
 
       _other ->
+        :error
+    end
+  end
+
+  defp model_unavailable_event(event) do
+    case StreamProtocol.terminal_failure_event(event) do
+      {:ok, failure} ->
+        if ModelUnavailable.failure_signature?(failure),
+          do: {:ok, {:model_unavailable_first_event, failure}},
+          else: :error
+
+      _not_terminal ->
         :error
     end
   end

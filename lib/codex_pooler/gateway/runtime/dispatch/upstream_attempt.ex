@@ -64,6 +64,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.UpstreamAttempt do
   defp finalization_callbacks(callbacks) do
     %{
       register_continuity: Map.fetch!(callbacks, :register_continuity),
+      retry_dispatch: Map.fetch!(callbacks, :retry_dispatch),
       stream_result: fn response, context ->
         StreamDispatch.streaming_result(response, context, %{
           finalization_callbacks: finalization_callbacks(callbacks),

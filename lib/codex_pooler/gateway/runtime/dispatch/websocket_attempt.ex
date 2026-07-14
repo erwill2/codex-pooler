@@ -3,10 +3,16 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt do
 
   alias CodexPooler.Accounting
   alias CodexPooler.Accounting.FailureResponse
-  alias CodexPooler.Gateway.Runtime.Dispatch.PreparedContext
-  alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
+
+  alias CodexPooler.Gateway.Runtime.Dispatch.{
+    CandidateDispatch,
+    PreparedContext,
+    ResponseContext
+  }
+
   alias CodexPooler.Gateway.Runtime.Finalization
   alias CodexPooler.Gateway.Runtime.Finalization.{AttemptSettlement, Metadata}
+  alias CodexPooler.Gateway.Runtime.ModelUnavailable
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
   alias CodexPooler.Gateway.Transports.UpstreamDispatch
@@ -35,6 +41,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt do
 
   @type callbacks :: %{
           required(:register_continuity) => (term(), term(), term() -> term()),
+          required(:retry_dispatch) => (PreparedContext.t() -> dispatch_result()),
           required(:stream_result) => (Req.Response.t(), term() -> term())
         }
   @type dispatch_result :: CodexPooler.Gateway.Runtime.Dispatch.dispatch_result()
@@ -73,8 +80,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt do
           started
         )
 
-      {:error, %{reason: {:retryable_first_event, failure}} = response} ->
-        handle_retryable_first_websocket_event(
+      {:error, %{reason: {kind, failure}} = response}
+      when kind in [:retryable_first_event, :model_unavailable_first_event] ->
+        handle_pre_visible_terminal_websocket_event(
+          kind,
           prepared_context,
           dispatch_request,
           callbacks,
@@ -266,6 +275,89 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt do
     deliver_retry_exhausted_websocket_failure(dispatch_request, response)
 
     response_context = retryable_websocket_response_context(context, response)
+
+    Finalization.finalize_first_event_stream_failure(
+      Map.get(response, :body, ""),
+      failure,
+      response_context
+    )
+  end
+
+  defp handle_pre_visible_terminal_websocket_event(
+         :retryable_first_event,
+         prepared_context,
+         dispatch_request,
+         callbacks,
+         response,
+         failure
+       ) do
+    handle_retryable_first_websocket_event(
+      prepared_context,
+      dispatch_request,
+      callbacks,
+      response,
+      failure
+    )
+  end
+
+  defp handle_pre_visible_terminal_websocket_event(
+         :model_unavailable_first_event,
+         prepared_context,
+         dispatch_request,
+         callbacks,
+         response,
+         failure
+       ) do
+    handle_model_unavailable_websocket_event(
+      prepared_context,
+      dispatch_request,
+      callbacks,
+      response,
+      failure
+    )
+  end
+
+  defp handle_model_unavailable_websocket_event(
+         %PreparedContext{context: context},
+         dispatch_request,
+         callbacks,
+         response,
+         failure
+       ) do
+    response_context = retryable_websocket_response_context(context, response)
+
+    if ModelUnavailable.retryable_failure?(failure, context) do
+      next_index = context.retry_count + 1
+
+      with {:ok, _recorded_failure} <-
+             Finalization.record_retryable_first_event_stream_failure(
+               Map.get(response, :body, ""),
+               failure,
+               response_context
+             ) do
+        CandidateDispatch.dispatch_from(
+          context,
+          next_index,
+          Map.fetch!(callbacks, :retry_dispatch)
+        )
+      end
+    else
+      finalize_model_unavailable_websocket_failure(
+        dispatch_request,
+        response,
+        failure,
+        response_context
+      )
+    end
+  end
+
+  defp finalize_model_unavailable_websocket_failure(
+         dispatch_request,
+         response,
+         failure,
+         response_context
+       ) do
+    deliver_retry_exhausted_websocket_failure(dispatch_request, response)
 
     Finalization.finalize_first_event_stream_failure(
       Map.get(response, :body, ""),

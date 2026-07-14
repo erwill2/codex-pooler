@@ -4877,6 +4877,86 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert second_request.request_metadata["routing"]["bridge_ring_size"] == 2
   end
 
+  @tag :feature_model_unavailable_failover
+  test "POST /backend-api/codex/responses fails over when a catalog source lacks the model",
+       %{conn: conn} do
+    unavailable_upstream =
+      start_upstream(
+        FakeUpstream.json_response(
+          %{
+            "error" => %{
+              "code" => "model_not_found",
+              "message" => "model is not installed on this account",
+              "type" => "invalid_request_error"
+            }
+          },
+          404
+        )
+      )
+
+    success_upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_model_unavailable_http_fallback",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(unavailable_upstream)
+
+    fallback =
+      gateway_upstream(setup.pool, success_upstream, "upstream-token-model-fallback",
+        compact?: false
+      )
+
+    prime_routing_quota!(fallback.identity)
+    use_routing_strategy!(setup.pool, "bridge_ring", 2)
+
+    setup =
+      Map.put(
+        setup,
+        :model,
+        put_model_source_assignments!(setup.model, [setup.assignment, fallback.assignment])
+      )
+
+    request_id = seed_with_assignment_order([setup.assignment.id, fallback.assignment.id])
+
+    conn =
+      conn
+      |> put_req_header("x-request-id", request_id)
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => "model unavailable HTTP fallback"
+      })
+
+    assert %{"id" => "resp_model_unavailable_http_fallback"} = json_response(conn, 200)
+    assert FakeUpstream.count(unavailable_upstream) == 1
+    assert FakeUpstream.count(success_upstream) == 1
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert first_attempt.status == "retryable_failed"
+    assert first_attempt.retryable == true
+    assert first_attempt.upstream_status_code == 404
+    assert first_attempt.network_error_code == "model_unavailable"
+    assert second_attempt.pool_upstream_assignment_id == fallback.assignment.id
+    assert second_attempt.status == "succeeded"
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.transport == "http_json"
+    assert request.retry_count == 1
+    assert request.last_error_code == nil
+
+    metadata_text = inspect({request.request_metadata, first_attempt.response_metadata})
+    refute metadata_text =~ "model is not installed on this account"
+    refute metadata_text =~ "upstream-token-model-fallback"
+  end
+
   test "POST /backend-api/codex/responses bridge_ring retries only within the default shortlist",
        %{
          conn: conn
@@ -5845,6 +5925,24 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       refute Map.has_key?(failed_attempt.response_metadata, "upstream_error_param")
       refute Map.has_key?(successful_attempt.response_metadata, "upstream_error_param")
     end
+  end
+
+  @tag :feature_model_unavailable_failover
+  test "SSE first-event model_not_found fails over to the next catalog source" do
+    {setup, unavailable_upstream, success_upstream} =
+      stream_retry_setup(first_event_terminal_sse("response.failed", "model_not_found"))
+
+    execute_backend_stream!(setup, "first-event-model-unavailable-retry")
+
+    assert FakeUpstream.count(unavailable_upstream) == 1
+    assert FakeUpstream.count(success_upstream) == 1
+    assert_stream_retry_success!(setup, "model_not_found")
+
+    assert [first_attempt, second_attempt] =
+             Repo.all(from(a in Attempt, order_by: [asc: a.attempt_number]))
+
+    assert first_attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert second_attempt.pool_upstream_assignment_id == setup.fallback_assignment.id
   end
 
   @tag :task_4_first_event_stream_retry

@@ -206,7 +206,11 @@ defmodule CodexPooler.Gateway.Runtime.Streaming.StreamDispatch do
     fn conn, data ->
       if sse_response?(response) do
         {classification, first_event_state} =
-          StreamAttempt.classify_first_event(data, first_event_state(conn))
+          StreamAttempt.classify_first_event(
+            data,
+            first_event_state(conn),
+            response_context.context
+          )
 
         conn = put_first_event_state(conn, first_event_state)
 

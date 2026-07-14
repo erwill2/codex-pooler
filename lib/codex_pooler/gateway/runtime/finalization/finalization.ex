@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
 
   alias CodexPooler.Gateway.Runtime.Dispatch.ResponseContext
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
+  alias CodexPooler.Gateway.Runtime.ModelUnavailable
   alias CodexPooler.Gateway.Runtime.RateLimitObserver
   alias CodexPooler.Gateway.Runtime.Streaming.Types, as: StreamTypes
 
@@ -112,7 +113,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
   end
 
   def handle_http_response(
-        %Req.Response{status: status} = response,
+        %Req.Response{} = response,
         %SelectedCandidateContext{} = context,
         _callbacks
       ) do
@@ -126,6 +127,20 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
       body = Metadata.response_body(response)
       RateLimitObserver.record_error(identity, body)
 
+      finalize_non_retryable_http_status(response, context, body)
+    end
+  end
+
+  defp finalize_non_retryable_http_status(
+         %Req.Response{status: status} = response,
+         %SelectedCandidateContext{} = context,
+         body
+       ) do
+    if ModelUnavailable.http_error?(status, body, context) do
+      with :ok <- record_dispatch_route_failure("model_unavailable", context) do
+        finalize_model_unavailable_or_failure(response, context, body)
+      end
+    else
       with :ok <- maybe_record_unauthorized_route_failure(status, context) do
         finalize_upstream_status_failure(response, context, body)
       end
@@ -271,6 +286,30 @@ defmodule CodexPooler.Gateway.Runtime.Finalization do
       finalize_upstream_status_failure(response, context, body,
         attempt_status: if(allow_retry?, do: "retryable_failed", else: "failed")
       )
+    end
+  end
+
+  defp finalize_model_unavailable_or_failure(
+         %Req.Response{status: status} = response,
+         %SelectedCandidateContext{} = context,
+         body
+       ) do
+    %{reserved: reserved, attempt: attempt, request_options: request_options} = context
+
+    if ModelUnavailable.failover_allowed?(context) do
+      case AttemptSettlement.record_retryable_failure(reserved.request, attempt, %{
+             response_status_code: status,
+             last_error_code: "model_unavailable",
+             error_message: "model is not available on this assignment",
+             latency_ms: elapsed_ms(context.started),
+             attempt_metadata:
+               Metadata.response_metadata(response, "model_unavailable", request_options)
+           }) do
+        {:ok, _attempt} -> {:retry, :model_unavailable}
+        {:error, gateway_error} -> {:error, gateway_error}
+      end
+    else
+      finalize_upstream_status_failure(response, context, body, attempt_status: "failed")
     end
   end
 
