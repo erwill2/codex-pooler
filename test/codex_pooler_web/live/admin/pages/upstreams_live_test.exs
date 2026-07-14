@@ -356,7 +356,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "##{tokens_panel_id} ##{card_id}-tokens-summary",
-             "1.4k tokens, 3 models"
+             "3 models, $0.25"
            )
 
     # The leaderboard ranks by usage first, then descending name: the busy

@@ -190,7 +190,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
                   id={"upstream-account-#{@account.identity.id}-tokens-summary"}
                   class="truncate text-xs text-base-content/60"
                 >
-                  {tokens_panel_summary(@account, @token_leaderboard)}
+                  {tokens_panel_summary(@token_leaderboard)}
                 </p>
               </div>
               <div class="min-w-0 text-right">
@@ -649,9 +649,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   defp pool_assignment_summary_label([_assignment]), do: "1 routing lane"
   defp pool_assignment_summary_label(assignments), do: "#{length(assignments)} routing lanes"
 
-  defp tokens_panel_summary(account, leaderboard) do
-    tokens = recent_token_count_label(account)
-    "#{tokens}, #{model_count_label(length(leaderboard))}"
+  # The footer cell below already carries the window's token total, so the
+  # panel summary adds what nothing else shows: the settled spend.
+  defp tokens_panel_summary(leaderboard) do
+    total_cost_micros = leaderboard |> Enum.map(& &1.cost_micros) |> Enum.sum()
+    "#{model_count_label(length(leaderboard))}, #{Format.money_from_micros(total_cost_micros)}"
   end
 
   # A leaderboard of the account's models over the trailing five minutes: one
