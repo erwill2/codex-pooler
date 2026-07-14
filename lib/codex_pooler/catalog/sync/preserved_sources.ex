@@ -18,11 +18,24 @@ defmodule CodexPooler.Catalog.Sync.PreservedSources do
   @spec missing_sync_metadata_key() :: String.t()
   def missing_sync_metadata_key, do: @missing_source_assignment_syncs
 
-  @spec assignment_attrs(Model.t() | nil, aggregate(), [assignment_ref()], SyncRun.t()) :: attrs()
-  def assignment_attrs(existing, aggregate, assignments, %SyncRun{} = run) do
+  @spec assignment_attrs(
+          Model.t() | nil,
+          aggregate(),
+          [assignment_ref()],
+          [assignment_ref()],
+          SyncRun.t()
+        ) :: attrs()
+  def assignment_attrs(
+        existing,
+        aggregate,
+        assignments,
+        successful_assignments,
+        %SyncRun{} = run
+      ) do
     observed_models = normalize_source_assignment_models(aggregate.source_assignment_models)
     observed_ids = observed_models |> Map.keys() |> MapSet.new()
     eligible_ids = assignments |> Enum.map(& &1.assignment.id) |> MapSet.new()
+    successful_ids = successful_assignments |> Enum.map(& &1.assignment.id) |> MapSet.new()
     previous_ids = existing_source_assignment_ids(existing)
     previous_models = existing_source_assignment_models(existing)
     previously_missing = existing_missing_source_assignment_syncs(existing)
@@ -31,7 +44,8 @@ defmodule CodexPooler.Catalog.Sync.PreservedSources do
       Enum.filter(previous_ids, fn assignment_id ->
         MapSet.member?(eligible_ids, assignment_id) and
           not MapSet.member?(observed_ids, assignment_id) and
-          not Map.has_key?(previously_missing, assignment_id)
+          (not MapSet.member?(successful_ids, assignment_id) or
+             not Map.has_key?(previously_missing, assignment_id))
       end)
 
     preserved_models =
@@ -43,7 +57,18 @@ defmodule CodexPooler.Catalog.Sync.PreservedSources do
     source_assignment_ids = source_assignment_models |> Map.keys() |> Enum.sort()
 
     missing_source_assignment_syncs =
-      Map.new(preserved_ids, fn assignment_id -> {assignment_id, run.id} end)
+      Enum.reduce(preserved_ids, %{}, fn assignment_id, markers ->
+        cond do
+          MapSet.member?(successful_ids, assignment_id) ->
+            Map.put(markers, assignment_id, run.id)
+
+          Map.has_key?(previously_missing, assignment_id) ->
+            Map.put(markers, assignment_id, Map.fetch!(previously_missing, assignment_id))
+
+          true ->
+            markers
+        end
+      end)
 
     %{
       source_assignment_ids: source_assignment_ids,

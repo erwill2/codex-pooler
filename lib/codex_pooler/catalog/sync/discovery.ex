@@ -14,19 +14,35 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
   @type catalog_error :: %{required(:code) => atom(), required(:message) => String.t()}
 
   @spec discover_models([map()], (map() -> {:ok, [map()]} | {:error, term()})) ::
-          {:ok, [map()]} | {:error, term()}
+          {:ok, [map()], [map()]} | {:error, term()}
   def discover_models(assignments, fetcher) do
-    Enum.reduce_while(assignments, {:ok, []}, fn source, {:ok, discovered} ->
-      case fetcher.(source) do
-        {:ok, models} when is_list(models) ->
-          source_models = Enum.map(models, &Map.put(normalize_model_attrs(&1), :source, source))
-          {:cont, {:ok, discovered ++ source_models}}
+    results =
+      Enum.map(assignments, fn source ->
+        case fetcher.(source) do
+          {:ok, models} when is_list(models) ->
+            source_models = Enum.map(models, &Map.put(normalize_model_attrs(&1), :source, source))
+            {:ok, source, source_models}
 
-        {:error, reason} ->
-          {:halt, {:error, reason}}
-      end
-    end)
+          {:error, reason} ->
+            {:error, reason}
+        end
+      end)
+
+    successes = Enum.filter(results, &match?({:ok, _source, _models}, &1))
+
+    case successes do
+      [] ->
+        all_failed_result(results)
+
+      _successful_results ->
+        successful_assignments = Enum.map(successes, &elem(&1, 1))
+        discovered_models = Enum.flat_map(successes, &elem(&1, 2))
+        {:ok, successful_assignments, discovered_models}
+    end
   end
+
+  defp all_failed_result([]), do: {:ok, [], []}
+  defp all_failed_result([{:error, reason} | _rest]), do: {:error, reason}
 
   @spec fetch_models_for_assignment(map()) :: {:ok, [map()]} | {:error, catalog_error() | term()}
   def fetch_models_for_assignment(%{assignment: assignment, identity: identity}) do

@@ -17,11 +17,20 @@ defmodule CodexPooler.Catalog.Sync.Persistence do
   @succeeded "succeeded"
   @suppressed "suppressed"
 
-  @spec persist_catalog(SyncRun.t(), [map()], [map()]) :: {:ok, map()} | {:error, term()}
-  def persist_catalog(%SyncRun{} = run, assignments, discovered) do
+  @spec persist_catalog(SyncRun.t(), [map()], [map()], [map()]) ::
+          {:ok, map()} | {:error, term()}
+  def persist_catalog(%SyncRun{} = run, assignments, successful_assignments, discovered) do
     timestamp = now()
     grouped = aggregate_models(discovered)
     seen_exposed_ids = Map.keys(grouped)
+    successful_assignment_ids = Enum.map(successful_assignments, & &1.assignment.id)
+
+    failed_assignment_ids =
+      assignments
+      |> Enum.map(& &1.assignment.id)
+      |> Enum.reject(&(&1 in successful_assignment_ids))
+
+    partial? = failed_assignment_ids != []
 
     Multi.new()
     |> then(fn multi ->
@@ -29,17 +38,30 @@ defmodule CodexPooler.Catalog.Sync.Persistence do
         # Reason: per-model Multi step preserves aggregate-specific rollback context.
         # credo:disable-for-next-line Credo.Check.Refactor.Nesting
         Multi.run(multi, {:model, aggregate.exposed_model_id}, fn repo, _changes ->
-          upsert_model(repo, run, aggregate, assignments, timestamp)
+          upsert_model(
+            repo,
+            run,
+            aggregate,
+            assignments,
+            successful_assignments,
+            timestamp
+          )
         end)
       end)
     end)
     |> Multi.run(:stale_marked_count, fn repo, _changes ->
-      mark_missing_models_stale(repo, run, seen_exposed_ids, timestamp)
+      mark_missing_models_stale(
+        repo,
+        run,
+        seen_exposed_ids,
+        failed_assignment_ids,
+        timestamp
+      )
     end)
     |> Multi.update_all(
       :assignment_sync_timestamps,
       from(assignment in PoolUpstreamAssignment,
-        where: assignment.id in ^Enum.map(assignments, & &1.assignment.id)
+        where: assignment.id in ^Enum.map(successful_assignments, & &1.assignment.id)
       ),
       set: [last_successful_sync_at: timestamp, updated_at: timestamp]
     )
@@ -55,7 +77,11 @@ defmodule CodexPooler.Catalog.Sync.Persistence do
         upserted_model_count: upserted_count,
         stale_marked_count: stale_marked_count,
         retired_count: 0,
-        stats: %{"source_assignment_count" => length(assignments)}
+        stats: %{
+          "source_assignment_count" => length(assignments),
+          "successful_source_assignment_count" => length(successful_assignments),
+          "failed_source_assignment_count" => length(assignments) - length(successful_assignments)
+        }
       })
       |> repo.update()
     end)
@@ -67,7 +93,7 @@ defmodule CodexPooler.Catalog.Sync.Persistence do
           |> Map.values()
           |> Enum.filter(&match?(%Model{}, &1))
 
-        {:ok, %{sync_run: changes.sync_run, models: models}}
+        {:ok, %{sync_run: changes.sync_run, models: models, partial?: partial?}}
 
       {:error, _operation, reason, _changes} ->
         fail_sync_run(run, reason)
@@ -93,9 +119,24 @@ defmodule CodexPooler.Catalog.Sync.Persistence do
     end
   end
 
-  defp upsert_model(repo, run, aggregate, assignments, timestamp) do
+  defp upsert_model(
+         repo,
+         run,
+         aggregate,
+         assignments,
+         successful_assignments,
+         timestamp
+       ) do
     existing = get_model_by_exposed_id(run.pool_id, aggregate.exposed_model_id)
-    source_assignments = PreservedSources.assignment_attrs(existing, aggregate, assignments, run)
+
+    source_assignments =
+      PreservedSources.assignment_attrs(
+        existing,
+        aggregate,
+        assignments,
+        successful_assignments,
+        run
+      )
 
     attrs = %{
       pool_id: run.pool_id,
@@ -134,7 +175,13 @@ defmodule CodexPooler.Catalog.Sync.Persistence do
     |> repo.insert_or_update()
   end
 
-  defp mark_missing_models_stale(repo, run, seen_exposed_ids, timestamp) do
+  defp mark_missing_models_stale(
+         repo,
+         run,
+         seen_exposed_ids,
+         failed_assignment_ids,
+         timestamp
+       ) do
     lower_seen = Enum.map(seen_exposed_ids, &String.downcase/1)
 
     query =
@@ -146,7 +193,12 @@ defmodule CodexPooler.Catalog.Sync.Persistence do
               "coalesce(?->>'manual_smoke_provisioned', 'false') != 'true'",
               model.metadata
             ) and
-            fragment("lower(?)", model.exposed_model_id) not in ^lower_seen
+            fragment("lower(?)", model.exposed_model_id) not in ^lower_seen and
+            fragment(
+              "NOT (COALESCE(?->'source_assignment_ids', '[]'::jsonb) \\?| ?)",
+              model.metadata,
+              type(^failed_assignment_ids, {:array, :string})
+            )
 
     {count, _rows} =
       repo.update_all(query,

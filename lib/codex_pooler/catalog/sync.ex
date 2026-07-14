@@ -161,8 +161,11 @@ defmodule CodexPooler.Catalog.Sync do
 
   defp discover_and_persist_catalog(run, assignments, fetcher) do
     case Discovery.discover_models(assignments, fetcher) do
-      {:ok, discovered} -> Persistence.persist_catalog(run, assignments, discovered)
-      {:error, reason} -> Persistence.fail_sync_run(run, reason)
+      {:ok, successful_assignments, discovered} ->
+        Persistence.persist_catalog(run, assignments, successful_assignments, discovered)
+
+      {:error, reason} ->
+        Persistence.fail_sync_run(run, reason)
     end
   end
 
