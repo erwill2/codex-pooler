@@ -281,7 +281,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
             class="relative grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3 p-4 transition-colors hover:bg-base-200/60 focus-within:z-30 xl:grid-cols-[minmax(12rem,0.9fr)_minmax(12rem,0.85fr)_minmax(14rem,1fr)_auto] xl:gap-4"
           >
             <div class="grid min-w-0 gap-2 xl:contents">
-              <div id={"api-key-row-#{api_key.id}-key"} class="grid min-w-0 gap-1.5">
+              <div id={"api-key-row-#{api_key.id}-key"} class="grid min-w-0 gap-1.5 xl:content-start">
                 <div class="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
                   <span class="truncate font-semibold text-base-content">
                     {api_key.display_name}
@@ -291,16 +291,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                     id={"api-key-row-#{api_key.id}-notes"}
                     notes={ApiKeysReadModel.api_key_operator_notes(api_key)}
                   />
-                  <span
-                    id={"api-key-row-#{api_key.id}-status"}
-                    class={[AdminBadges.lifecycle_chip_class(api_key.status), "shrink-0"]}
-                  >
-                    {api_key.status}
-                  </span>
                 </div>
-                <span class="truncate font-mono text-xs text-base-content/55">
-                  {api_key.key_prefix}
-                </span>
               </div>
               <dl class="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm text-base-content/70 xl:grid xl:content-start xl:gap-2">
                 <div
@@ -310,17 +301,23 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                   <dt class="text-xs font-medium text-base-content/50">Last used</dt>
                   <dd>{last_used_label(api_key.last_used_at, @datetime_preferences)}</dd>
                 </div>
-                <div
-                  id={"api-key-row-#{api_key.id}-expires"}
-                  class="flex items-baseline gap-1.5 xl:grid xl:gap-0.5"
-                >
-                  <dt class="text-xs font-medium text-base-content/50">Expires</dt>
-                  <dd class={expiry_label_class(api_key.expires_at)}>
-                    {expiry_label(api_key.expires_at, @datetime_preferences)}
+                <div class="flex min-w-0 items-baseline gap-1.5 xl:grid xl:gap-0.5">
+                  <dt class="text-xs font-medium text-base-content/50">Prefix</dt>
+                  <dd class="min-w-0 truncate font-mono text-[0.7rem] leading-5 text-base-content/60">
+                    {api_key.key_prefix}
                   </dd>
                 </div>
               </dl>
               <div class="grid min-w-0 gap-1 text-sm text-base-content/70 xl:content-start xl:gap-2">
+                <div
+                  id={"api-key-row-#{api_key.id}-expires"}
+                  class="flex items-baseline gap-1.5 xl:grid xl:gap-0.5"
+                >
+                  <span class="text-xs font-medium text-base-content/50">Expires</span>
+                  <span class={expiry_label_class(api_key.expires_at)}>
+                    {expiry_label(api_key.expires_at, @datetime_preferences)}
+                  </span>
+                </div>
                 <div class="flex min-w-0 items-baseline gap-1.5 xl:grid xl:gap-0.5">
                   <span class="text-xs font-medium text-base-content/50">Model access</span>
                   <span
@@ -348,7 +345,13 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                 </span>
               </div>
             </div>
-            <div class="relative z-10 justify-self-end">
+            <div class="relative z-10 flex items-center gap-2 justify-self-end">
+              <span
+                id={"api-key-row-#{api_key.id}-status"}
+                class={[AdminBadges.lifecycle_chip_class(api_key.status), "shrink-0"]}
+              >
+                {api_key.status}
+              </span>
               <.api_key_actions_menu api_key={api_key} />
             </div>
           </article>
