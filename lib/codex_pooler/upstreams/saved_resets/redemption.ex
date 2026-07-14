@@ -36,6 +36,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           required(:assignment) => PoolUpstreamAssignment.t(),
           required(:applied?) => boolean(),
           required(:code) => String.t(),
+          optional(:phase) => String.t(),
+          optional(:consumed_at) => DateTime.t(),
           optional(:available_count_before) => non_neg_integer(),
           optional(:available_count_after) => non_neg_integer(),
           optional(:http_status) => non_neg_integer(),

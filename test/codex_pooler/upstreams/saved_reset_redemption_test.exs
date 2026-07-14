@@ -8,6 +8,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.SavedResetRedemption
   alias CodexPooler.Upstreams.SavedResets.AutoEligibility
+  alias CodexPooler.Upstreams.SavedResets.ProbeLease
   alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias Ecto.Adapters.SQL.Sandbox
@@ -686,12 +687,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
           Task.async(fn ->
             Sandbox.allow(Repo, parent, self())
 
-            CodexPooler.Upstreams.SavedResets.ProbeLease.claim(
-              identity,
-              generation,
-              attempt_id,
-              "token-#{index}"
-            )
+            ProbeLease.claim(identity, generation, attempt_id, "token-#{index}")
           end)
         end
         |> Task.await_many(15_000)

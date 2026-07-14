@@ -126,21 +126,10 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
     {precise_candidates, credit_backed_probe_candidates, weekly_probe_candidates,
      reset_probe_candidates, exclusions, refreshable_candidates} =
       Enum.reduce(candidates, {[], [], [], [], [], []}, fn {assignment, identity} = candidate,
-                                                           {precise, credit_backed, weekly_probes,
-                                                            reset_probes, excluded, refreshable} ->
+                                                           acc ->
         identity
         |> routing_quota_eligibility(model, route_state)
-        |> add_classified_quota_candidate(
-          candidate,
-          assignment,
-          identity,
-          precise,
-          credit_backed,
-          weekly_probes,
-          reset_probes,
-          excluded,
-          refreshable
-        )
+        |> add_classified_quota_candidate(candidate, assignment, acc)
       end)
 
     precise_candidates = Enum.reverse(precise_candidates)
@@ -182,13 +171,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
          %{routing_state: :precise},
          candidate,
          _assignment,
-         _identity,
-         precise,
-         credit_backed,
-         weekly_probes,
-         reset_probes,
-         excluded,
-         refreshable
+         {precise, credit_backed, weekly_probes, reset_probes, excluded, refreshable}
        ) do
     {[candidate | precise], credit_backed, weekly_probes, reset_probes, excluded, refreshable}
   end
@@ -197,13 +180,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
          %{routing_state: :credit_backed_probe},
          candidate,
          _assignment,
-         _identity,
-         precise,
-         credit_backed,
-         weekly_probes,
-         reset_probes,
-         excluded,
-         refreshable
+         {precise, credit_backed, weekly_probes, reset_probes, excluded, refreshable}
        ) do
     {precise, [candidate | credit_backed], weekly_probes, reset_probes, excluded, refreshable}
   end
@@ -212,13 +189,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
          %{routing_state: :weekly_only_probe},
          candidate,
          _assignment,
-         _identity,
-         precise,
-         credit_backed,
-         weekly_probes,
-         reset_probes,
-         excluded,
-         refreshable
+         {precise, credit_backed, weekly_probes, reset_probes, excluded, refreshable}
        ) do
     {precise, credit_backed, [candidate | weekly_probes], reset_probes, excluded, refreshable}
   end
@@ -227,13 +198,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
          %{exclusions: reasons},
          {_, identity} = candidate,
          assignment,
-         identity,
-         precise,
-         credit_backed,
-         weekly_probes,
-         reset_probes,
-         excluded,
-         refreshable
+         {precise, credit_backed, weekly_probes, reset_probes, excluded, refreshable}
        ) do
     if reset_probe_routeable?(identity, reasons) do
       # The quota window still reads exhausted, but this identity holds a
@@ -258,11 +223,12 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
       RedemptionLifecycle.routeable?(redemption_metadata(identity), now())
   end
 
-  defp weekly_exhaustion_only?(reasons) when is_list(reasons) do
-    reasons != [] and Enum.all?(reasons, &quota_exhaustion_reason?/1)
+  # Reached only from the exclusion clause, where `reasons` is a non-empty list
+  # of quota exclusion reasons. All must be exhaustion for the reset probe to
+  # override — any other block (auth, circuit, stale) still excludes.
+  defp weekly_exhaustion_only?(reasons) do
+    Enum.all?(reasons, &quota_exhaustion_reason?/1)
   end
-
-  defp weekly_exhaustion_only?(_reasons), do: false
 
   defp redemption_metadata(%{metadata: %{} = metadata}), do: metadata["saved_reset_redemption"]
   defp redemption_metadata(_identity), do: nil

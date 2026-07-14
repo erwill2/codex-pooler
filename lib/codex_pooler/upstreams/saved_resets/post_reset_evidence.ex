@@ -45,10 +45,10 @@ defmodule CodexPooler.Upstreams.SavedResets.PostResetEvidence do
   @spec classify([AccountQuotaWindow.t()], DateTime.t(), DateTime.t()) :: classification()
   def classify(windows, %DateTime{} = consumed_at, %DateTime{} = now) when is_list(windows) do
     fresh_account_windows =
-      windows
-      |> Enum.filter(&account_window?/1)
-      |> Enum.filter(&parse_safe?/1)
-      |> Enum.filter(&observed_at_or_after?(&1, consumed_at))
+      Enum.filter(windows, fn window ->
+        account_window?(window) and parse_safe?(window) and
+          observed_at_or_after?(window, consumed_at)
+      end)
 
     cond do
       fresh_account_windows == [] -> :pending
