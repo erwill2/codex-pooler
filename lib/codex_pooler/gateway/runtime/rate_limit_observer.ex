@@ -6,6 +6,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   require Logger
 
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.SavedResets.Convergence
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @max_event_buffer_bytes 16_384
@@ -22,7 +23,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
            response.headers
          ) do
       {:ok, _windows} ->
-        :ok
+        maybe_converge_saved_reset(identity)
 
       {:error, reason} ->
         log_failure("rate_limit_headers", identity_metadata(identity), reason)
@@ -35,7 +36,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
       when is_map(headers) and map_size(headers) > 0 do
     case QuotaWindows.upsert_quota_windows_from_codex_headers(identity, headers) do
       {:ok, _windows} ->
-        :ok
+        maybe_converge_saved_reset(identity)
 
       {:error, reason} ->
         log_failure("rate_limit_websocket_frame_headers", identity_metadata(identity), reason)
@@ -71,20 +72,24 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
 
   @spec record_error(UpstreamIdentity.t() | term(), binary() | term()) :: observer_result()
   def record_error(%UpstreamIdentity{} = identity, body) when is_binary(body) do
-    body
-    |> rate_limit_error_payloads()
-    |> Enum.each(fn payload ->
-      case QuotaWindows.upsert_quota_windows_from_codex_rate_limit_error(
-             identity,
-             payload
-           ) do
-        {:ok, _windows} ->
-          :ok
+    persisted_any? =
+      body
+      |> rate_limit_error_payloads()
+      |> Enum.reduce(false, fn payload, persisted_any? ->
+        case QuotaWindows.upsert_quota_windows_from_codex_rate_limit_error(
+               identity,
+               payload
+             ) do
+          {:ok, _windows} ->
+            true
 
-        {:error, reason} ->
-          log_failure("rate_limit_error", identity_metadata(identity), reason)
-      end
-    end)
+          {:error, reason} ->
+            log_failure("rate_limit_error", identity_metadata(identity), reason)
+            persisted_any?
+        end
+      end)
+
+    if persisted_any?, do: maybe_converge_saved_reset(identity), else: :ok
   end
 
   def record_error(_identity, _body), do: :ok
@@ -102,7 +107,13 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   defp persist_events_async(_identity, []), do: :ok
 
   defp persist_events_async(%UpstreamIdentity{} = identity, events) do
-    identity_snapshot = %UpstreamIdentity{id: identity.id, status: identity.status}
+    # Metadata rides along so the async task can run the cheap saved-reset
+    # convergence pre-filter without a reload.
+    identity_snapshot = %UpstreamIdentity{
+      id: identity.id,
+      status: identity.status,
+      metadata: identity.metadata
+    }
 
     case Task.Supervisor.start_child(@event_supervisor, fn ->
            Enum.each(events, &persist_event(identity_snapshot, &1))
@@ -124,11 +135,33 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
            event
          ) do
       {:ok, _windows} ->
-        :ok
+        maybe_converge_saved_reset(identity)
 
       {:error, reason} ->
         log_failure("rate_limit_event", identity_metadata(identity), reason)
     end
+  end
+
+  # Runtime evidence is the transport-agnostic seam for probe outcomes: a
+  # confirmed quota-exhaustion error or exhausted headers reblock a pending
+  # saved-reset lifecycle immediately, and usable evidence confirms it, without
+  # waiting for the next reconciliation pass. The metadata pre-filter keeps the
+  # per-request hot path free of extra transactions.
+  defp maybe_converge_saved_reset(%UpstreamIdentity{} = identity) do
+    if Convergence.pending_lifecycle?(identity) do
+      case Convergence.converge(identity) do
+        {:ok, _outcome} ->
+          :ok
+
+        {:error, reason} ->
+          log_failure("saved_reset_convergence", identity_metadata(identity), reason)
+      end
+    else
+      :ok
+    end
+  rescue
+    exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] ->
+      log_failure("saved_reset_convergence", identity_metadata(identity), exception)
   end
 
   defp normalize_event_state(%{buffer: buffer}) when is_binary(buffer), do: %{buffer: buffer}

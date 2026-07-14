@@ -152,6 +152,54 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
     end
   end
 
+  describe "saved reset convergence from runtime evidence" do
+    test "exhausted weekly headers reblock a pending reset immediately" do
+      identity = pending_reset_identity()
+
+      assert :ok =
+               RateLimitObserver.record_headers(identity, %Req.Response{
+                 headers: weekly_headers("100")
+               })
+
+      assert redemption_phase(identity) == "reblocked"
+    end
+
+    test "usable weekly headers confirm a pending reset immediately" do
+      identity = pending_reset_identity()
+
+      assert :ok =
+               RateLimitObserver.record_headers(identity, %Req.Response{
+                 headers: weekly_headers("4")
+               })
+
+      assert redemption_phase(identity) == "confirmed_by_quota"
+    end
+
+    test "identities without a pending lifecycle are untouched" do
+      identity = active_upstream_assignment_fixture().identity
+
+      assert :ok =
+               RateLimitObserver.record_headers(identity, %Req.Response{
+                 headers: weekly_headers("100")
+               })
+
+      persisted = Repo.reload!(identity)
+      refute Map.has_key?(persisted.metadata || %{}, "saved_reset_redemption")
+    end
+
+    test "websocket frame headers drive the same convergence" do
+      identity = pending_reset_identity()
+
+      assert :ok =
+               RateLimitObserver.record_websocket_frame_headers(
+                 identity,
+                 Map.new(weekly_headers("100"))
+               )
+
+      assert redemption_phase(identity) == "reblocked"
+    end
+  end
+
   describe "observer failure logging" do
     test "records header and error failures with sanitized metadata" do
       identity = %UpstreamIdentity{id: Ecto.UUID.generate()}
@@ -282,6 +330,47 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserverTest do
         }
       }
     }
+  end
+
+  defp pending_reset_identity do
+    consumed_at =
+      DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.truncate(:microsecond)
+
+    active_upstream_assignment_fixture(pool_fixture(), %{
+      metadata: %{
+        "saved_reset_redemption" => %{
+          "status" => "redeeming",
+          "phase" => "consumed_pending_probe",
+          "attempt_id" => Ecto.UUID.generate(),
+          "generation" => 3,
+          "trigger_kind" => "gateway_auto",
+          "consumed_at" => DateTime.to_iso8601(consumed_at),
+          "deadline_at" => consumed_at |> DateTime.add(15, :minute) |> DateTime.to_iso8601(),
+          "result" => %{"code" => "reset", "applied" => true}
+        }
+      }
+    }).identity
+  end
+
+  defp redemption_phase(identity) do
+    identity
+    |> Repo.reload!()
+    |> Map.get(:metadata)
+    |> Kernel.||(%{})
+    |> get_in(["saved_reset_redemption", "phase"])
+  end
+
+  defp weekly_headers(used_percent) do
+    reset_at =
+      DateTime.utc_now()
+      |> DateTime.add(3, :day)
+      |> DateTime.truncate(:second)
+
+    [
+      {"x-codex-secondary-used-percent", [used_percent]},
+      {"x-codex-secondary-window-minutes", ["10080"]},
+      {"x-codex-secondary-reset-at", [DateTime.to_iso8601(reset_at)]}
+    ]
   end
 
   defp reset_bearing_headers do

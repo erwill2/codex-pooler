@@ -35,6 +35,18 @@ defmodule CodexPooler.Upstreams.SavedResets.Convergence do
 
   @type outcome :: :confirmed_by_quota | :reblocked | :expired | :unchanged
 
+  @doc """
+  Cheap metadata-only pre-filter: whether the identity carries a lifecycle that
+  `converge/2` could act on. Lets hot paths (per-request evidence observers)
+  skip the locking transaction for the overwhelmingly common no-lifecycle case.
+  """
+  @spec pending_lifecycle?(UpstreamIdentity.t() | term()) :: boolean()
+  def pending_lifecycle?(%UpstreamIdentity{metadata: metadata}) do
+    RedemptionLifecycle.phase((metadata || %{})["saved_reset_redemption"]) in @convergeable_phases
+  end
+
+  def pending_lifecycle?(_identity), do: false
+
   @spec converge(UpstreamIdentity.t() | Ecto.UUID.t()) :: {:ok, outcome()} | {:error, term()}
   @spec converge(UpstreamIdentity.t() | Ecto.UUID.t(), DateTime.t()) ::
           {:ok, outcome()} | {:error, term()}
