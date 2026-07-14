@@ -660,9 +660,17 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
   defp present_supported_windows({limit, rate_limit}) when is_map(limit),
     do: present_supported_windows(rate_limit)
 
+  # While the provider's anchored 5h windows are suspended (announced as
+  # temporary on 2026-07-13), the usage payload declares the missing window as
+  # an explicit `"secondary_window" => null` alongside the weekly
+  # `primary_window`. A declared-null window is an explicit absence — there is
+  # nothing to parse and nothing that can be mis-parsed — so it must not veto
+  # coverage of the sibling windows that did parse. Malformed non-null windows
+  # still fail validation and cover nothing, and if the 5h windows return both
+  # windows are non-null maps and validate exactly as before.
   defp present_supported_windows(rate_limit) when is_map(rate_limit) do
     for field <- ~w(primary_window primary secondary_window secondary),
-        Map.has_key?(rate_limit, field),
+        not is_nil(Map.get(rate_limit, field)),
         do: {field, Map.get(rate_limit, field)}
   end
 
