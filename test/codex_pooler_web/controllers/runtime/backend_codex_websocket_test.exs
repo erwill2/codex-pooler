@@ -36,6 +36,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.CodexClientIdentity
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
@@ -5713,6 +5714,92 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexWebsocketTest do
     refute metadata_text =~ setup.authorization
     refute metadata_text =~ "refresh-token-ws-handshake-do-not-leak"
     refute metadata_text =~ "upstream-token-refreshed"
+  end
+
+  @tag :feature_websocket_terminal_auth_refresh
+  test "websocket auth failure under a replaced credential epoch skips the provider refresh" do
+    release_ref = make_ref()
+
+    # No /oauth/token entry in the sequence: a provider refresh would consume
+    # the retry success payload and fail the test loudly.
+    upstream =
+      start_upstream(
+        {:sequence,
+         [
+           FakeUpstream.websocket_upgrade_error(
+             %{"error" => %{"code" => "invalid_api_key"}},
+             status: 401,
+             headers: [{"x-openai-authorization-error", "invalid_api_key"}],
+             notify: self(),
+             release_ref: release_ref
+           ),
+           FakeUpstream.json_response(websocket_auth_retry_success_payload("stale_epoch"))
+         ]}
+      )
+
+    setup = gateway_setup(upstream)
+    original_epoch = CredentialFencing.credential_epoch(setup.identity)
+
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    parent = self()
+
+    client =
+      Task.async(fn ->
+        Sandbox.allow(Repo, parent, self())
+
+        execute_websocket_response(
+          auth,
+          websocket_auth_refresh_payload(setup, "stale-epoch"),
+          %{request_id: "ws-auth-stale-epoch"},
+          fn frame -> send(parent, {:websocket_frame, frame}) end
+        )
+      end)
+
+    # The dispatch has connected with the original credentials; rotate them
+    # before the 401 is delivered, as a concurrent refresh would.
+    assert_receive {:fake_upstream_timeout_barrier, :before_headers, upstream_pid, ^release_ref},
+                   5_000
+
+    identity = Repo.get!(UpstreamIdentity, setup.identity.id)
+
+    identity
+    |> Ecto.Changeset.change(%{metadata: CredentialFencing.advance_credential_epoch(identity)})
+    |> Repo.update!()
+
+    assert {:ok, _secret} =
+             Upstreams.store_encrypted_secret(identity, %{
+               secret_kind: "access_token",
+               plaintext: "rotated-ws-token-do-not-leak"
+             })
+
+    send(upstream_pid, {:fake_upstream_release_timeout, release_ref})
+
+    assert :ok = Task.await(client, 5_000)
+
+    assert_received {:websocket_frame, frame}
+    assert %{"id" => "resp_ws_auth_retry_stale_epoch"} = Jason.decode!(frame)
+
+    # The stale 401 never reached the provider: no OAuth request, and the
+    # retry ran with the rotated token stored by the concurrent refresh.
+    # The rejected upgrade never records a request row, so the sole entry is
+    # the retried connection.
+    requests = FakeUpstream.requests(upstream)
+    refute Enum.any?(requests, &(&1.path == "/oauth/token"))
+
+    assert [retried] = requests
+    assert retried.method == "WEBSOCKET"
+    assert Map.new(retried.headers)["authorization"] == "Bearer rotated-ws-token-do-not-leak"
+
+    persisted = Repo.get!(UpstreamIdentity, setup.identity.id)
+    assert CredentialFencing.credential_epoch(persisted) == original_epoch + 1
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.retry_count == 1
+    assert request.request_metadata["auth_refresh"]["status"] == "succeeded"
+
+    metadata_text = inspect(request.request_metadata)
+    refute metadata_text =~ "rotated-ws-token-do-not-leak"
   end
 
   for auth_code <- ["invalid_api_key", "invalid_authentication"] do

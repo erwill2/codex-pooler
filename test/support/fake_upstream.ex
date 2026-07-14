@@ -36,7 +36,8 @@ defmodule CodexPooler.FakeUpstream do
           | {:timeout_after_sse_headers, pid() | nil, reference()}
           | {:timeout_mid_stream, String.t(), pid() | nil, reference()}
           | {:websocket_upgrade_timeout, pid() | nil, reference()}
-          | {:websocket_upgrade_error, non_neg_integer(), map(), [{String.t(), String.t()}]}
+          | {:websocket_upgrade_error, non_neg_integer(), map(), [{String.t(), String.t()}],
+             pid() | nil, reference() | nil}
 
   @doc "Starts a local fake upstream server for the given response mode."
   def start_link(mode, opts \\ []) do
@@ -237,7 +238,7 @@ defmodule CodexPooler.FakeUpstream do
 
   def websocket_upgrade_error(payload, opts \\ []) when is_map(payload) and is_list(opts) do
     {:websocket_upgrade_error, Keyword.get(opts, :status, 401), payload,
-     Keyword.get(opts, :headers, [])}
+     Keyword.get(opts, :headers, []), Keyword.get(opts, :notify), Keyword.get(opts, :release_ref)}
   end
 
   def handle(pid, conn) do
@@ -261,11 +262,19 @@ defmodule CodexPooler.FakeUpstream do
     )
   end
 
-  defp handle_websocket(pid, conn, {:websocket_upgrade_error, status, payload, headers}) do
+  defp handle_websocket(
+         pid,
+         conn,
+         {:websocket_upgrade_error, status, payload, headers, notify, release_ref}
+       ) do
     Agent.update(pid, fn state ->
       {_mode, next_mode} = next_response_mode(state.mode)
       %{state | mode: next_mode}
     end)
+
+    if is_pid(notify) do
+      wait_for_timeout_release(:before_headers, notify, release_ref)
+    end
 
     conn =
       Enum.reduce(headers, conn, fn {key, value}, conn ->
@@ -280,7 +289,8 @@ defmodule CodexPooler.FakeUpstream do
   defp handle_websocket(
          pid,
          conn,
-         {:sequence, [{:websocket_upgrade_error, _status, _payload, _headers} = mode | _rest]}
+         {:sequence,
+          [{:websocket_upgrade_error, _status, _payload, _headers, _notify, _ref} = mode | _rest]}
        ) do
     handle_websocket(pid, conn, mode)
   end

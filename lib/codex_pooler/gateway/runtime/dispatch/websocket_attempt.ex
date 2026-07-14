@@ -13,6 +13,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt do
   alias CodexPooler.Gateway.Transports.UpstreamDispatch.Request, as: DispatchRequest
   alias CodexPooler.Gateway.Websocket
   alias CodexPooler.Upstreams.Auth.TokenRefresh
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Secrets
 
   @access_token_secret_kind "access_token"
@@ -387,9 +388,15 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt do
     })
   end
 
+  # The 401 was produced by the credentials this dispatch connected with:
+  # carrying their epoch lets a late follower skip the provider refresh when
+  # another caller already rotated, and retry with the returned identity.
+  # At token expiry every in-flight request on the identity fails auth at
+  # once, so this is the highest-frequency duplicate-refresh source.
   defp refresh_websocket_auth(context) do
     case TokenRefresh.refresh_access_token(context.identity,
-           trigger_kind: @auth_refresh_trigger_kind
+           trigger_kind: @auth_refresh_trigger_kind,
+           expected_credential_epoch: CredentialFencing.credential_epoch(context.identity)
          ) do
       {:ok, %{status: :active, identity: refreshed_identity}} ->
         {:ok, %{"status" => "succeeded", "trigger_kind" => @auth_refresh_trigger_kind},
