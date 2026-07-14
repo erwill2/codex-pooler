@@ -306,17 +306,20 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     end
   end
 
-  # After the provider retired the anchored 5h windows, a restarted weekly
-  # account arrives from the usage endpoint as a weak zero whose full-window
-  # relative reset is recomputed at response time, so reset_at slides forward in
-  # step with each observation. A blocked account receives no traffic, so the
-  # runtime corroboration demanded above can never materialize — quarantining
-  # genuine restarts (and post-redemption resets) forever. Distinct live
-  # responses are still distinguishable from a cached or replayed body: the
-  # floating reset advances with observation time, while a cached body keeps a
-  # fixed reset. Accept the zero only when a stored candidate and the incoming
-  # observation prove that sliding-live shape across the confirmation span;
-  # otherwise keep the exhausted row and let the candidate age or restart.
+  # While the provider's anchored 5h windows are suspended (announced as
+  # temporary on 2026-07-13), a restarted weekly account arrives from the usage
+  # endpoint as a weak zero whose full-window relative reset is recomputed at
+  # response time, so reset_at slides forward in step with each observation. A
+  # blocked account receives no traffic, so the runtime corroboration demanded
+  # above can never materialize — quarantining genuine restarts (and
+  # post-redemption resets) forever. Distinct live responses are still
+  # distinguishable from a cached or replayed body: the floating reset advances
+  # with observation time, while a cached body keeps a fixed reset. Accept the
+  # zero only when a stored candidate and the incoming observation prove that
+  # sliding-live shape across the confirmation span; otherwise keep the
+  # exhausted row and let the candidate age or restart. Anchored resets (the 5h
+  # shape, should it return) never slide, so they keep taking the pre-existing
+  # anchored + corroboration path untouched.
   defp sliding_restart_attrs(existing, attrs, evidence, timestamp) do
     metadata = existing.metadata || %{}
 

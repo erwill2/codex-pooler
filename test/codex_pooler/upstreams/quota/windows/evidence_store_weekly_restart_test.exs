@@ -7,11 +7,12 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Quota.Windows
 
-  # Production shape after the provider retired anchored 5h windows: a restarted
-  # weekly account arrives from the usage endpoint as a weak zero (no active
-  # limit or credits) whose relative reset is recomputed at response time, so
-  # reset_at slides forward in step with each observation. A cached or replayed
-  # body keeps a fixed reset_at instead.
+  # Production shape while the provider's anchored 5h windows are suspended
+  # (announced as temporary on 2026-07-13): a restarted weekly account arrives
+  # from the usage endpoint as a weak zero (no active limit or credits) whose
+  # relative reset is recomputed at response time, so reset_at slides forward in
+  # step with each observation. A cached or replayed body keeps a fixed reset_at
+  # instead.
 
   @window_seconds 10_080 * 60
 
@@ -97,12 +98,16 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
 
     t1 = DateTime.add(t0, 300, :second)
     fixed_reset = DateTime.add(t1, @window_seconds, :second)
-    assert {:ok, _row} = Windows.record_evidence(identity, floating_zero(t1, reset_at: fixed_reset), t1)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(identity, floating_zero(t1, reset_at: fixed_reset), t1)
 
     # Same cached reset_at minutes later: delta_reset stays zero while time
     # advanced — not live, must stay quarantined.
     t2 = DateTime.add(t1, 240, :second)
-    assert {:ok, _row} = Windows.record_evidence(identity, floating_zero(t2, reset_at: fixed_reset), t2)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(identity, floating_zero(t2, reset_at: fixed_reset), t2)
 
     row = account_row(identity)
     assert Decimal.compare(row.used_percent, Decimal.new("100")) == :eq
