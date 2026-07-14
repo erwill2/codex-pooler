@@ -93,23 +93,25 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
     assert DateTime.compare(row.observed_at, t2) == :eq
   end
 
-  test "a cached body with a fixed reset never clears the exhausted row" do
+  test "a cached same-cycle body never clears the exhausted row" do
     t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
     identity = identity!()
+    # Existing exhausted cycle resets in 5 days.
     assert {:ok, _row} = exhausted_row!(identity, t0)
 
+    # A cached/replayed body carries the OLD cycle's reset: a zero that claims
+    # the account restarted while still pointing at the current cycle's reset
+    # is contradictory and must stay quarantined no matter how often it repeats.
+    same_cycle_reset = DateTime.add(t0, 5, :day)
     t1 = DateTime.add(t0, 300, :second)
-    fixed_reset = DateTime.add(t1, @window_seconds, :second)
 
     assert {:ok, _row} =
-             Windows.record_evidence(identity, floating_zero(t1, reset_at: fixed_reset), t1)
+             Windows.record_evidence(identity, floating_zero(t1, reset_at: same_cycle_reset), t1)
 
-    # Same cached reset_at minutes later: delta_reset stays zero while time
-    # advanced — not live, must stay quarantined.
     t2 = DateTime.add(t1, 240, :second)
 
     assert {:ok, _row} =
-             Windows.record_evidence(identity, floating_zero(t2, reset_at: fixed_reset), t2)
+             Windows.record_evidence(identity, floating_zero(t2, reset_at: same_cycle_reset), t2)
 
     row = account_row(identity)
     assert Decimal.compare(row.used_percent, Decimal.new("100")) == :eq
@@ -165,25 +167,44 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
     assert Decimal.compare(row.used_percent, Decimal.new("0")) == :eq
   end
 
-  test "anchored zeros stay quarantined while the exhausted cycle is still running" do
+  test "a forward-anchored new cycle converges while the exhausted cycle has not ended" do
+    # Production shape once the restarted window anchors (first request of the
+    # new cycle, often from another deployment sharing the account): the reset
+    # is fixed BEYOND the exhausted row's own reset. Only the provider can mint
+    # that anchor after the new cycle began, so a zero holding the same forward
+    # anchor across the span converges even though nothing slides.
     t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
     identity = identity!()
-    # Reset still days away: an anchored (non-sliding) zero must not converge.
+    # Existing exhausted cycle would reset in 5 days.
     assert {:ok, _row} = exhausted_row!(identity, t0)
 
     t1 = DateTime.add(t0, 300, :second)
-    anchored_reset = DateTime.add(t1, @window_seconds, :second)
+    forward_anchor = DateTime.add(t1, @window_seconds, :second)
 
     assert {:ok, _row} =
-             Windows.record_evidence(identity, floating_zero(t1, reset_at: anchored_reset), t1)
-
-    t2 = DateTime.add(t1, 240, :second)
-
-    assert {:ok, _row} =
-             Windows.record_evidence(identity, floating_zero(t2, reset_at: anchored_reset), t2)
+             Windows.record_evidence(identity, floating_zero(t1, reset_at: forward_anchor), t1)
 
     row = account_row(identity)
     assert Decimal.compare(row.used_percent, Decimal.new("100")) == :eq
+
+    # Same anchor one minute later: span not reached, candidate must be kept.
+    t2 = DateTime.add(t1, 60, :second)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(identity, floating_zero(t2, reset_at: forward_anchor), t2)
+
+    row = account_row(identity)
+    assert Decimal.compare(row.used_percent, Decimal.new("100")) == :eq
+
+    # Same anchor past the confirmation span: the new cycle is confirmed.
+    t3 = DateTime.add(t1, 240, :second)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(identity, floating_zero(t3, reset_at: forward_anchor), t3)
+
+    row = account_row(identity)
+    assert Decimal.compare(row.used_percent, Decimal.new("0")) == :eq
+    assert DateTime.compare(row.reset_at, forward_anchor) == :eq
   end
 
   test "a non-exhausted row is untouched by the restart path" do

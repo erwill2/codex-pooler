@@ -3,6 +3,8 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
 
   import Ecto.Query
 
+  require Logger
+
   alias CodexPooler.Quotas.Evidence
   alias CodexPooler.Repo
 
@@ -322,8 +324,10 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   # anchored + corroboration path untouched.
   defp sliding_restart_attrs(existing, attrs, evidence, timestamp) do
     metadata = existing.metadata || %{}
+    decision = restart_candidate_decision(metadata, existing, evidence, timestamp)
+    log_restart_decision(decision, existing, evidence, metadata, timestamp)
 
-    case restart_candidate_decision(metadata, existing, evidence, timestamp) do
+    case decision do
       :accept ->
         accepted_snapshot_attrs(existing, attrs, timestamp)
 
@@ -346,14 +350,10 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
           not newer_observation?(evidence.observed_at, candidate.observed_at) ->
             :keep
 
-          confirmed_sliding_restart?(candidate, evidence, timestamp) ->
+          restart_confirmed?(candidate, evidence, existing, timestamp) ->
             :accept
 
-          confirmed_expired_cycle_restart?(candidate, evidence, existing, timestamp) ->
-            :accept
-
-          consistent_sliding_candidate?(candidate, evidence, timestamp) or
-              expired_cycle_zero_candidate?(candidate, existing, timestamp) ->
+          restart_candidate_progressing?(candidate, evidence, existing, timestamp) ->
             # Consistent but still inside the confirmation span: keep the
             # original candidate so minute-by-minute observations cannot reset
             # the clock and starve the confirmation forever.
@@ -368,20 +368,70 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     end
   end
 
-  defp confirmed_sliding_restart?(candidate, evidence, timestamp) do
-    consistent_sliding_candidate?(candidate, evidence, timestamp) and
+  defp restart_confirmed?(candidate, evidence, existing, timestamp) do
+    restart_candidate_progressing?(candidate, evidence, existing, timestamp) and
       confirmation_span_reached?(candidate, evidence)
   end
 
-  # Once the exhausted canonical's own reset time has passed, the cycle ended by
-  # the canonical's own declaration, so a zero confirmed across the span may
-  # converge it even when the reset does not slide — the anchored window shape
-  # (suspended 2026-07-13, announced as temporary) confirms through this path
-  # when it returns, without another debugging round.
-  defp confirmed_expired_cycle_restart?(candidate, evidence, existing, timestamp) do
-    expired_cycle_zero_candidate?(candidate, existing, timestamp) and
-      confirmation_span_reached?(candidate, evidence)
+  # The three restart proofs, each evidence-driven and cache-safe: a live
+  # floating reset slides with observation time, an expired canonical declared
+  # its own cycle over, and a forward anchor can only be minted by the provider
+  # after the new cycle genuinely began.
+  defp restart_candidate_progressing?(candidate, evidence, existing, timestamp) do
+    consistent_sliding_candidate?(candidate, evidence, timestamp) or
+      expired_cycle_zero_candidate?(candidate, existing, timestamp) or
+      forward_anchor_zero_candidate?(candidate, evidence, existing, timestamp)
   end
+
+  # Sanitized decision telemetry: identifiers, window identity, and second
+  # deltas only — no tokens, payloads, or account identities. One line per
+  # quarantined-zero merge, so a stuck account is diagnosable from logs alone.
+  defp log_restart_decision(decision, existing, evidence, metadata, timestamp) do
+    candidate_age =
+      case parse_candidate(metadata) do
+        {:ok, %{observed_at: observed_at}} ->
+          DateTime.diff(evidence.observed_at, observed_at, :second)
+
+        :none ->
+          nil
+      end
+
+    Logger.info(
+      "quota_restart_decision decision=#{decision} " <>
+        "upstream_identity_id=#{existing.upstream_identity_id} " <>
+        "quota_key=#{evidence.quota_key} window_kind=#{evidence.window_kind} " <>
+        "candidate_age_s=#{inspect(candidate_age)} " <>
+        "existing_reset_at=#{inspect(existing.reset_at)} " <>
+        "incoming_reset_at=#{inspect(evidence.reset_at)} " <>
+        "observed_at=#{inspect(evidence.observed_at)} merged_at=#{inspect(timestamp)}"
+    )
+  end
+
+  # A floating window anchors as soon as the new cycle sees its first request —
+  # often from another deployment sharing the same provider account — and an
+  # anchored reset never slides, so the sliding proof cannot fire. The anchor
+  # itself is the evidence instead: a reset lying beyond the exhausted
+  # canonical's own reset can only be minted by the provider after the new
+  # cycle genuinely began (a body cached before exhaustion still carries the
+  # old cycle's reset), so a zero holding the same forward anchor across the
+  # confirmation span converges. Zeros carrying the old cycle's reset stay
+  # quarantined no matter how often they repeat.
+  defp forward_anchor_zero_candidate?(candidate, evidence, existing, timestamp) do
+    candidate_valid?(candidate, timestamp) and
+      zero_candidate?(candidate) and
+      reset_times_equivalent?(candidate.reset_at, evidence.reset_at) and
+      forward_of_existing_cycle?(evidence, existing)
+  end
+
+  defp forward_of_existing_cycle?(
+         %Evidence{reset_at: %DateTime{} = incoming_reset},
+         %Quota.AccountQuotaWindow{reset_at: %DateTime{} = existing_reset}
+       ) do
+    DateTime.diff(incoming_reset, existing_reset, :second) >
+      @usage_reset_forward_tolerance_seconds
+  end
+
+  defp forward_of_existing_cycle?(_evidence, _existing), do: false
 
   defp expired_cycle_zero_candidate?(candidate, existing, timestamp) do
     Evidence.expired?(existing, timestamp) and
