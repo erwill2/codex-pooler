@@ -28,9 +28,13 @@ defmodule CodexPooler.Upstreams.SavedResets.Convergence do
   alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
+  # `expired` is convergeable too: fresh provider evidence remains the only way
+  # out of an elapsed confirmation window, otherwise a single expiry would
+  # disable saved resets on the identity forever.
   @convergeable_phases [
     RedemptionLifecycle.consumed_pending_probe(),
-    RedemptionLifecycle.confirmed_by_upstream()
+    RedemptionLifecycle.confirmed_by_upstream(),
+    RedemptionLifecycle.expired()
   ]
 
   @type outcome :: :confirmed_by_quota | :reblocked | :expired | :unchanged

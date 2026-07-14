@@ -215,20 +215,33 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
   end
 
   # A redeemed identity is routeable-by-lifecycle only when its post-reset phase
-  # says so (confirmed_by_upstream within the window, or confirmed_by_quota) AND
-  # the sole quota block is weekly account exhaustion. Any other exclusion
-  # (auth, circuit, missing reset) still excludes it — fail-closed.
+  # says so (a confirmed redemption within its bounded window) AND the sole
+  # quota block is ACCOUNT weekly exhaustion — the only window a saved reset
+  # actually resets. A model-scoped weekly block (e.g. a Spark limit) or any
+  # other exclusion (auth, circuit, missing reset) still excludes — fail-closed.
   defp reset_probe_routeable?(identity, reasons) do
     weekly_exhaustion_only?(reasons) and
       RedemptionLifecycle.routeable?(redemption_metadata(identity), now())
   end
 
   # Reached only from the exclusion clause, where `reasons` is a non-empty list
-  # of quota exclusion reasons. All must be exhaustion for the reset probe to
-  # override — any other block (auth, circuit, stale) still excludes.
+  # of quota exclusion reasons. All must be account-weekly exhaustion for the
+  # reset probe to override — any other block still excludes.
   defp weekly_exhaustion_only?(reasons) do
-    Enum.all?(reasons, &quota_exhaustion_reason?/1)
+    Enum.all?(reasons, &account_weekly_exhaustion_reason?/1)
   end
+
+  defp account_weekly_exhaustion_reason?(%{} = reason) do
+    reason_field(reason, :quota_key) == "account" and
+      reason_field(reason, :quota_scope) == "account" and
+      reason_field(reason, :quota_family) == "account" and
+      reason_field(reason, :window_kind) == "secondary" and
+      quota_exhaustion_reason?(reason)
+  end
+
+  defp account_weekly_exhaustion_reason?(_reason), do: false
+
+  defp reason_field(reason, key), do: Map.get(reason, key) || Map.get(reason, Atom.to_string(key))
 
   defp redemption_metadata(%{metadata: %{} = metadata}), do: metadata["saved_reset_redemption"]
   defp redemption_metadata(_identity), do: nil

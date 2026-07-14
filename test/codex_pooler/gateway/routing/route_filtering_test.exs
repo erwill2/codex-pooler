@@ -183,6 +183,47 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
       assert options.routing.quota_decision["routing_state"] == "reset_probe"
     end
 
+    test "a model-scoped weekly block is not overridden by a confirmed reset probe" do
+      # A saved reset only resets the ACCOUNT weekly window: an identity blocked
+      # by a model quota (e.g. Spark) must stay excluded even while its reset
+      # lifecycle is confirmed and inside the window.
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      consumed_at =
+        DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.truncate(:microsecond)
+
+      %{identity: identity, assignment: assignment} =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: reset_probe_redemption("confirmed_by_upstream", consumed_at)
+        })
+
+      now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 %{
+                   quota_key: "codex_spark",
+                   window_kind: "secondary",
+                   window_minutes: 10_080,
+                   used_percent: Decimal.new("100"),
+                   reset_at: DateTime.add(now, 2, :hour),
+                   observed_at: now,
+                   last_sync_at: now,
+                   source: "codex_usage_api",
+                   source_precision: "observed",
+                   quota_scope: "model",
+                   quota_family: "codex_model",
+                   model: "gpt-5.3-codex-spark",
+                   freshness_state: "fresh"
+                 }
+               ])
+
+      filter_input = filter_input(pool, api_key, assignment, identity, "spark-blocked")
+
+      assert {:error, %{code: code}} = RouteFiltering.filter_candidates(filter_input)
+      assert code in ["quota_exhausted", "quota_evidence_unavailable"]
+    end
+
     test "does not route an exhausted account that is only pending probe confirmation" do
       %{pool: pool, api_key: api_key} = active_api_key_fixture()
 

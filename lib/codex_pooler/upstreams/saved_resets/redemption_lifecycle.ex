@@ -67,7 +67,9 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
 
   # Allowed compare-and-set transitions. A transition is valid only from one of
   # the listed predecessor phases; every other move (including a repeat of the
-  # same phase or a jump from a terminal phase) is rejected.
+  # same phase) is rejected. `expired` is terminal for the probe but not for the
+  # record: fresh provider evidence may still settle it, otherwise one elapsed
+  # confirmation window would disable saved resets on the identity forever.
   @transitions %{
     @consuming => [@consumed_pending_probe, @reblocked, @expired],
     @consumed_pending_probe => [
@@ -76,7 +78,8 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
       @reblocked,
       @expired
     ],
-    @confirmed_by_upstream => [@confirmed_by_quota, @reblocked, @expired]
+    @confirmed_by_upstream => [@confirmed_by_quota, @reblocked, @expired],
+    @expired => [@confirmed_by_quota, @reblocked]
   }
 
   @type phase :: String.t()
@@ -155,32 +158,39 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
   Whether the identity must be held out of any further credit consumption or
   probe because a prior redemption is unconfirmed or fail-closed.
 
-  Fail-closed by construction: nonterminal phases block, an elapsed pending
-  window blocks (the credit is spent but unconfirmed), the terminal `expired`
-  phase blocks (recovery is only via fresh evidence), and an unrecognized phase
-  blocks. Legacy records without a phase return `false` here and are governed by
-  the pre-existing freshness logic.
+  Fail-closed by construction: a consumed-but-unconfirmed credit blocks even
+  past its window, the `expired` phase blocks (recovery is only via fresh
+  evidence through convergence), and an unrecognized phase blocks. The
+  `consuming` phase is deliberately NOT blocked here: it keeps the legacy
+  `redeeming` status, so the pre-existing freshness gates govern the in-flight
+  window and the stale-recovery path can resume the attempt after a crash.
+  Legacy records without a phase also return `false` for the same reason.
   """
   @spec blocks_new_redemption?(redemption() | term(), DateTime.t()) :: boolean()
   def blocks_new_redemption?(redemption, %DateTime{} = _now) do
     case phase(redemption) do
-      phase when phase in @nonterminal -> true
+      @consumed_pending_probe -> true
       @expired -> true
       :unknown -> true
-      _absent_or_settled -> false
+      _absent_in_flight_or_settled -> false
     end
   end
 
   @doc """
   Whether the identity is currently routeable on the strength of the lifecycle
-  alone: a successful probe within its window, or quota-confirmed recovery.
+  alone: a confirmed redemption within its bounded window. Outside the window
+  the lifecycle grants nothing — routing must rest on quota evidence again, or
+  an identity that ever redeemed successfully would bypass a later genuine
+  exhaustion forever.
   """
   @spec routeable?(redemption() | term(), DateTime.t()) :: boolean()
   def routeable?(redemption, %DateTime{} = now) do
     case phase(redemption) do
-      @confirmed_by_quota -> true
-      @confirmed_by_upstream -> not expired?(redemption, now)
-      _other -> false
+      phase when phase in [@confirmed_by_quota, @confirmed_by_upstream] ->
+        not expired?(redemption, now)
+
+      _other ->
+        false
     end
   end
 

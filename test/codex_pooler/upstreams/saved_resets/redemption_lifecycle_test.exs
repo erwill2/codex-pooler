@@ -72,12 +72,15 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycleTest do
   end
 
   describe "blocks_new_redemption?/2" do
-    test "blocks while consuming or pending, even past the window" do
-      assert Lifecycle.blocks_new_redemption?(consumed("consuming"), @base)
+    test "blocks a consumed pending credit, even past the window" do
       assert Lifecycle.blocks_new_redemption?(consumed("consumed_pending_probe"), @base)
 
       elapsed = DateTime.add(@base, 30, :minute)
       assert Lifecycle.blocks_new_redemption?(consumed("consumed_pending_probe"), elapsed)
+    end
+
+    test "does not block the in-flight consuming phase (legacy freshness gates govern it)" do
+      refute Lifecycle.blocks_new_redemption?(consumed("consuming"), @base)
     end
 
     test "blocks an expired lifecycle so recovery only comes from fresh evidence" do
@@ -97,12 +100,17 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycleTest do
   end
 
   describe "routeable?/2" do
-    test "quota-confirmed is routeable, upstream-confirmed only within the window" do
-      assert Lifecycle.routeable?(consumed("confirmed_by_quota"), DateTime.add(@base, 1, :hour))
+    test "confirmed phases are routeable only within their bounded window" do
+      for phase <- ~w(confirmed_by_quota confirmed_by_upstream) do
+        record = consumed(phase)
 
-      probe = consumed("confirmed_by_upstream")
-      assert Lifecycle.routeable?(probe, DateTime.add(@base, 10, :minute))
-      refute Lifecycle.routeable?(probe, DateTime.add(@base, 16, :minute))
+        assert Lifecycle.routeable?(record, DateTime.add(@base, 10, :minute))
+        # Outside the window the lifecycle grants nothing: routing must rest on
+        # quota evidence again, or a past redemption would bypass a later
+        # genuine exhaustion forever.
+        refute Lifecycle.routeable?(record, DateTime.add(@base, 16, :minute))
+        refute Lifecycle.routeable?(record, DateTime.add(@base, 1, :hour))
+      end
     end
 
     test "pending, reblocked, expired, and legacy records are not routeable" do
@@ -140,14 +148,26 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycleTest do
       refute Lifecycle.can_transition?(from, "consumed_pending_probe", 3, "attempt-1")
     end
 
-    test "terminal phases cannot transition further" do
-      for terminal <- ~w(confirmed_by_quota reblocked expired) do
+    test "settled phases cannot transition further" do
+      for terminal <- ~w(confirmed_by_quota reblocked) do
         from = consumed(terminal)
 
         for to <- Lifecycle.phases() do
           refute Lifecycle.can_transition?(from, to, 3, "attempt-1"),
                  "expected #{terminal} -> #{to} to be rejected"
         end
+      end
+    end
+
+    test "expired can only settle through fresh evidence" do
+      from = consumed("expired")
+
+      assert Lifecycle.can_transition?(from, "confirmed_by_quota", 3, "attempt-1")
+      assert Lifecycle.can_transition?(from, "reblocked", 3, "attempt-1")
+
+      for to <- ~w(consuming consumed_pending_probe confirmed_by_upstream expired) do
+        refute Lifecycle.can_transition?(from, to, 3, "attempt-1"),
+               "expected expired -> #{to} to be rejected"
       end
     end
 

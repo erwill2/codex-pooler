@@ -111,6 +111,28 @@ defmodule CodexPooler.Upstreams.SavedResets.ConvergenceTest do
     assert redemption(identity)["status"] == "failed"
   end
 
+  test "an expired lifecycle recovers through fresh usable evidence" do
+    consumed_at =
+      DateTime.utc_now() |> DateTime.add(-30, :minute) |> DateTime.truncate(:microsecond)
+
+    identity = identity_with_pending(consumed_at, phase: "expired")
+    upsert_account_window!(identity, Decimal.new("0"))
+
+    assert {:ok, :confirmed_by_quota} = Convergence.converge(identity)
+    assert redemption(identity)["phase"] == "confirmed_by_quota"
+  end
+
+  test "an expired lifecycle reblocks through fresh exhausted evidence" do
+    consumed_at =
+      DateTime.utc_now() |> DateTime.add(-30, :minute) |> DateTime.truncate(:microsecond)
+
+    identity = identity_with_pending(consumed_at, phase: "expired")
+    upsert_account_window!(identity, Decimal.new("100"))
+
+    assert {:ok, :reblocked} = Convergence.converge(identity)
+    assert redemption(identity)["phase"] == "reblocked"
+  end
+
   test "a legacy record without a phase is never converged" do
     consumed_at =
       DateTime.utc_now() |> DateTime.add(-30, :minute) |> DateTime.truncate(:microsecond)

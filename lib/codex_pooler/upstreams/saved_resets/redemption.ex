@@ -345,7 +345,11 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          "admin_manual",
          started_at
        ) do
-    if stale_redemption?(redemption) do
+    # A stale record still in the `consuming` phase crashed inside the consume
+    # POST window: the provider may already have applied it, so it must not be
+    # marked failed and re-keyed — the claim below resumes the same attempt and
+    # generation, reproducing the same provider idempotency key.
+    if stale_redemption?(redemption) and resumable_consume_crash?(redemption) == false do
       mark_stale_redemption_failed!(locked_identity, redemption, started_at).metadata || %{}
     else
       metadata
@@ -369,12 +373,12 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
          receive_timeout,
          started_at
        ) do
-    attempt_id = Ecto.UUID.generate()
-    generation = next_generation(metadata)
+    {attempt_id, generation} = claim_attempt_identity(metadata)
 
     claimed_identity =
       update_redemption_metadata!(locked_identity, metadata, %{
         "status" => "redeeming",
+        "phase" => RedemptionLifecycle.consuming(),
         "attempt_id" => attempt_id,
         "generation" => generation,
         "trigger_kind" => trigger_kind,
@@ -954,6 +958,28 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       _generation -> 1
     end
   end
+
+  # A crash inside the consume POST window leaves a `consuming` record whose
+  # provider call may or may not have landed. Resuming that attempt reuses its
+  # persisted attempt id and generation, so the derived redeem_request_id is
+  # byte-identical and the provider can deduplicate instead of consuming a
+  # second credit. Every other shape claims a fresh attempt.
+  defp claim_attempt_identity(metadata) do
+    redemption = get_in(metadata || %{}, ["saved_reset_redemption"])
+
+    if resumable_consume_crash?(redemption) do
+      {redemption["attempt_id"], redemption["generation"]}
+    else
+      {Ecto.UUID.generate(), next_generation(metadata)}
+    end
+  end
+
+  defp resumable_consume_crash?(%{} = redemption) do
+    RedemptionLifecycle.phase(redemption) == RedemptionLifecycle.consuming() and
+      is_binary(redemption["attempt_id"]) and is_integer(redemption["generation"])
+  end
+
+  defp resumable_consume_crash?(_redemption), do: false
 
   defp non_negative_truncated_integer(value) when is_integer(value), do: {:ok, max(value, 0)}
 

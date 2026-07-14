@@ -7,6 +7,7 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
 
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.SavedResets.Convergence
+  alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @max_event_buffer_bytes 16_384
@@ -22,8 +23,8 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
            identity,
            response.headers
          ) do
-      {:ok, _windows} ->
-        maybe_converge_saved_reset(identity)
+      {:ok, windows} ->
+        maybe_converge_saved_reset(identity, windows)
 
       {:error, reason} ->
         log_failure("rate_limit_headers", identity_metadata(identity), reason)
@@ -35,8 +36,8 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   def record_websocket_frame_headers(%UpstreamIdentity{} = identity, headers)
       when is_map(headers) and map_size(headers) > 0 do
     case QuotaWindows.upsert_quota_windows_from_codex_headers(identity, headers) do
-      {:ok, _windows} ->
-        maybe_converge_saved_reset(identity)
+      {:ok, windows} ->
+        maybe_converge_saved_reset(identity, windows)
 
       {:error, reason} ->
         log_failure("rate_limit_websocket_frame_headers", identity_metadata(identity), reason)
@@ -72,24 +73,24 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
 
   @spec record_error(UpstreamIdentity.t() | term(), binary() | term()) :: observer_result()
   def record_error(%UpstreamIdentity{} = identity, body) when is_binary(body) do
-    persisted_any? =
+    persisted =
       body
       |> rate_limit_error_payloads()
-      |> Enum.reduce(false, fn payload, persisted_any? ->
+      |> Enum.flat_map(fn payload ->
         case QuotaWindows.upsert_quota_windows_from_codex_rate_limit_error(
                identity,
                payload
              ) do
-          {:ok, _windows} ->
-            true
+          {:ok, windows} ->
+            windows
 
           {:error, reason} ->
             log_failure("rate_limit_error", identity_metadata(identity), reason)
-            persisted_any?
+            []
         end
       end)
 
-    if persisted_any?, do: maybe_converge_saved_reset(identity), else: :ok
+    maybe_converge_saved_reset(identity, persisted)
   end
 
   def record_error(_identity, _body), do: :ok
@@ -134,8 +135,8 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
            identity,
            event
          ) do
-      {:ok, _windows} ->
-        maybe_converge_saved_reset(identity)
+      {:ok, windows} ->
+        maybe_converge_saved_reset(identity, windows)
 
       {:error, reason} ->
         log_failure("rate_limit_event", identity_metadata(identity), reason)
@@ -145,10 +146,13 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   # Runtime evidence is the transport-agnostic seam for probe outcomes: a
   # confirmed quota-exhaustion error or exhausted headers reblock a pending
   # saved-reset lifecycle immediately, and usable evidence confirms it, without
-  # waiting for the next reconciliation pass. The metadata pre-filter keeps the
-  # per-request hot path free of extra transactions.
-  defp maybe_converge_saved_reset(%UpstreamIdentity{} = identity) do
-    if Convergence.pending_lifecycle?(identity) do
+  # waiting for the next reconciliation pass. Two cheap pre-filters keep the
+  # per-request hot path free of extra locking transactions: convergence runs
+  # only when this write actually persisted account evidence, and only for the
+  # short pre-confirmation phase — a probe-confirmed lifecycle settles to
+  # quota-confirmed on the reconciliation cadence instead of per response.
+  defp maybe_converge_saved_reset(%UpstreamIdentity{} = identity, persisted_windows) do
+    if persisted_account_evidence?(persisted_windows) and awaiting_probe?(identity) do
       case Convergence.converge(identity) do
         {:ok, _outcome} ->
           :ok
@@ -162,6 +166,15 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   rescue
     exception in [DBConnection.ConnectionError, Ecto.QueryError, Postgrex.Error] ->
       log_failure("saved_reset_convergence", identity_metadata(identity), exception)
+  end
+
+  # Upsert results are always lists of persisted windows.
+  defp persisted_account_evidence?(windows),
+    do: Enum.any?(windows, &(&1.quota_key == "account"))
+
+  defp awaiting_probe?(%UpstreamIdentity{metadata: metadata}) do
+    RedemptionLifecycle.phase((metadata || %{})["saved_reset_redemption"]) ==
+      RedemptionLifecycle.consumed_pending_probe()
   end
 
   defp normalize_event_state(%{buffer: buffer}) when is_binary(buffer), do: %{buffer: buffer}

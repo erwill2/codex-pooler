@@ -156,6 +156,58 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       assert is_binary(redemption["deadline_at"])
     end
 
+    test "a stale consume-window crash resumes the same attempt and provider key" do
+      {:ok, fake} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" => {200, usage_payload(0)}
+           }}
+        )
+
+      stale_started_at =
+        DateTime.utc_now() |> DateTime.add(-5, :minute) |> DateTime.truncate(:microsecond)
+
+      crashed_attempt_id = Ecto.UUID.generate()
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api",
+          redemption: %{
+            "status" => "redeeming",
+            "phase" => "consuming",
+            "attempt_id" => crashed_attempt_id,
+            "generation" => 5,
+            "trigger_kind" => "admin_manual",
+            "started_at" => DateTime.to_iso8601(stale_started_at),
+            "finished_at" => nil,
+            "result" => nil
+          }
+        )
+
+      assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} =
+               SavedResetRedemption.redeem(assignment)
+
+      # The resumed attempt reuses the crashed attempt's identity, so the
+      # provider receives the byte-identical redeem_request_id and can
+      # deduplicate instead of consuming a second credit.
+      [consume | _] = FakeUpstream.requests(fake)
+
+      expected_key =
+        :sha256
+        |> :crypto.hash("saved_reset_redeem:#{crashed_attempt_id}:5")
+        |> binary_part(0, 16)
+        |> then(fn raw -> elem(Ecto.UUID.load(raw), 1) end)
+
+      assert consume.json["redeem_request_id"] == expected_key
+
+      persisted = Repo.reload!(identity)
+      assert get_in(persisted.metadata, ["saved_reset_redemption", "generation"]) == 5
+
+      assert get_in(persisted.metadata, ["saved_reset_redemption", "attempt_id"]) ==
+               crashed_attempt_id
+    end
+
     test "a consumed pending reset blocks a second credit even after the stale window" do
       {:ok, fake} =
         FakeUpstream.start_link(
