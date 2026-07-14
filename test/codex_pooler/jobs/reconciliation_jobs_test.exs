@@ -460,7 +460,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert result.status == :succeeded
       assert result.quota.status == :succeeded
       assert result.quota.code == "quota_reused_fresh"
-      assert result.quota.details["window_count"] == 1
+      assert result.quota.details["window_count"] == 2
 
       windows = QuotaWindows.list_quota_windows(identity)
       assert length(windows) == 2
@@ -524,7 +524,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert result.status == :succeeded
       assert result.quota.status == :succeeded
       assert result.quota.code == "quota_reused_fresh"
-      assert result.quota.details["window_count"] == 1
+      assert result.quota.details["window_count"] == 2
 
       windows = QuotaWindows.list_quota_windows(identity)
       assert length(windows) == 2
@@ -675,7 +675,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert window.observed_at == observed_at
     end
 
-    test "does not reuse fresh persisted quota when live usage returns 429" do
+    test "reuses fresh persisted quota when live usage returns 429" do
       observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
       upstream =
@@ -707,10 +707,12 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
                  }
                ])
 
+      # Being told to slow down does not invalidate a usable snapshot.
       assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
-      assert result.status == :partial
-      assert result.quota.status == :failed
-      assert result.quota.code == "quota_refresh_unavailable"
+      assert result.status == :succeeded
+      assert result.quota.status == :succeeded
+      assert result.quota.code == "quota_reused_fresh"
+      assert result.quota.details["window_count"] == 1
 
       [window] = QuotaWindows.list_quota_windows(identity)
       assert window.observed_at == observed_at
@@ -720,7 +722,52 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
              ]
     end
 
-    test "scheduled worker does not reuse stale expired resetless exhausted or weekly-only persisted quota" do
+    test "scheduled worker reuses fresh weekly-only persisted quota when live usage is unavailable" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      window_attrs =
+        persisted_account_primary_window_attrs(observed_at, %{
+          window_kind: "secondary",
+          window_minutes: 10_080,
+          quota_family: "account"
+        })
+
+      upstream = start_upstream(unavailable_usage_paths())
+
+      {pool, assignment} = active_assignment_fixture(%{"base_url" => FakeUpstream.url(upstream)})
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+      persist_quota_windows!(identity, [window_attrs])
+
+      assert {:ok, job} =
+               Jobs.enqueue_account_reconciliation(pool, assignment, trigger_kind: "scheduled")
+
+      assert %{success: 1, discard: 0} = Oban.drain_queue(queue: :jobs)
+
+      completed_job = Repo.get!(Oban.Job, job.id)
+      assert completed_job.state == "completed"
+      assert completed_job.errors == []
+
+      assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      assert assignment.metadata["last_reconciliation"]["status"] == "succeeded"
+
+      assert [
+               %{
+                 "status" => "succeeded",
+                 "code" => "quota_reused_fresh",
+                 "details" => %{"window_count" => 1}
+               }
+             ] =
+               Enum.filter(
+                 assignment.metadata["last_reconciliation"]["steps"],
+                 &(&1["code"] == "quota_reused_fresh")
+               )
+
+      assert [window] = QuotaWindows.list_quota_windows(identity)
+      assert window.observed_at == observed_at
+    end
+
+    test "scheduled worker does not reuse stale expired resetless or exhausted persisted quota" do
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
       scenarios = [
@@ -734,13 +781,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
          })},
         {"resetless", persisted_account_primary_window_attrs(now, %{reset_at: nil})},
         {"exhausted",
-         persisted_account_primary_window_attrs(now, %{used_percent: Decimal.new("100")})},
-        {"weekly_only",
-         persisted_account_primary_window_attrs(now, %{
-           window_kind: "secondary",
-           window_minutes: 10_080,
-           quota_family: "account"
-         })}
+         persisted_account_primary_window_attrs(now, %{used_percent: Decimal.new("100")})}
       ]
 
       for {_name, window_attrs} <- scenarios do
@@ -824,7 +865,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       end
     end
 
-    test "scheduled worker does not reuse fresh persisted quota after 429" do
+    test "scheduled worker reuses fresh persisted quota after 429" do
       observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
       upstream =
@@ -839,7 +880,17 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
       persist_quota_windows!(identity, [persisted_account_primary_window_attrs(observed_at)])
 
-      assert_scheduled_worker_quota_failure(pool, assignment, "quota_refresh_unavailable")
+      assert {:ok, job} =
+               Jobs.enqueue_account_reconciliation(pool, assignment, trigger_kind: "scheduled")
+
+      assert %{success: 1, discard: 0} = Oban.drain_queue(queue: :jobs)
+
+      completed_job = Repo.get!(Oban.Job, job.id)
+      assert completed_job.state == "completed"
+      assert completed_job.errors == []
+
+      assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      assert assignment.metadata["last_reconciliation"]["status"] == "succeeded"
 
       [window] = QuotaWindows.list_quota_windows(identity)
       assert window.observed_at == observed_at

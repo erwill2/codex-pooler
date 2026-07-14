@@ -19,7 +19,12 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   @eligible PoolUpstreamAssignment.eligible_status()
   @assignment_ineligible PoolUpstreamAssignment.ineligible_status()
   @health_active PoolUpstreamAssignment.active_health_status()
-  @fallback_denied_usage_statuses [401, 403, 429, :auth_rejected]
+  # Auth-shaped rejections must surface instead of silently reusing
+  # persisted windows. A 429 is deliberately absent: being told to slow
+  # down does not invalidate a snapshot refreshed within its usable window,
+  # and the minute-aligned reconciliation fan-out makes transient 429s
+  # expected.
+  @fallback_denied_usage_statuses [401, 403, :auth_rejected]
 
   @type lifecycle_error :: %{required(:code) => atom(), required(:message) => String.t()}
   @type lifecycle_result :: {:ok, map()} | {:error, lifecycle_error()}
@@ -176,8 +181,12 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
       {:definitive_provider_auth_rejected, fence} ->
         promote_definitive_provider_auth_rejection(identity, fence)
 
-      :usage_unavailable ->
-        step_result(:failed, "quota_refresh_unavailable", "quota windows were not available")
+      {:usage_unavailable, reason} ->
+        step_result(
+          :failed,
+          "quota_refresh_unavailable",
+          "quota windows were not available (#{safe_unavailable_reason(reason)})"
+        )
 
       {:persisted_windows, windows} ->
         step_result(:succeeded, "quota_reused_fresh", "fresh quota windows reused", %{
@@ -450,13 +459,13 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   end
 
   defp maybe_reuse_persisted_quota_windows(
-         {:usage_unavailable, {:upstream_status, status}},
+         {:usage_unavailable, {:upstream_status, status}} = unavailable,
          _identity
        )
        when status in @fallback_denied_usage_statuses,
-       do: :usage_unavailable
+       do: unavailable
 
-  defp maybe_reuse_persisted_quota_windows({:usage_unavailable, _reason}, identity) do
+  defp maybe_reuse_persisted_quota_windows({:usage_unavailable, reason} = unavailable, identity) do
     timestamp = now()
 
     windows =
@@ -467,16 +476,28 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     if windows != [] do
       {:persisted_windows, windows}
     else
-      :usage_unavailable
+      _ = reason
+      unavailable
     end
   end
 
   defp maybe_reuse_persisted_quota_windows(result, _identity), do: result
 
+  # The weekly account window counts as reusable: since the provider
+  # suspended the anchored 5h windows (announced as temporary), it is the
+  # primary quota signal, and a transient probe failure must not fail the
+  # cycle while a usable snapshot exists.
   defp reusable_persisted_quota_window?(window, timestamp) do
-    (WindowClassifier.primary_5h?(window) or WindowClassifier.monthly_primary?(window)) and
+    (WindowClassifier.primary_5h?(window) or WindowClassifier.monthly_primary?(window) or
+       WindowClassifier.weekly_secondary?(window)) and
       Quota.Windows.usable_window?(window, timestamp)
   end
+
+  defp safe_unavailable_reason({:upstream_status, status}), do: "upstream_status_#{status}"
+  defp safe_unavailable_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
+
+  defp safe_unavailable_reason(reason),
+    do: reason |> safe_error_message() |> String.slice(0, 80)
 
   defp identity_attrs_from_codex_usage_payload(%{"plan_type" => plan_type})
        when is_binary(plan_type) do
