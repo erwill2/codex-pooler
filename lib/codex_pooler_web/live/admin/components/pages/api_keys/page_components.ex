@@ -255,19 +255,17 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         id={"api-key-pool-group-#{group.dom_id}"}
         class="grid min-w-0 overflow-visible border border-base-300 bg-base-100 xl:grid-cols-[13rem_minmax(0,1fr)]"
       >
-        <header class="flex flex-wrap items-center justify-between gap-3 border-b border-base-300 bg-primary/5 p-4 xl:content-start xl:border-r xl:border-b-0">
-          <div class="grid min-w-0 gap-2">
-            <span class="grid size-9 place-items-center rounded-field border border-primary/30 bg-primary/15 text-primary">
-              <.icon name="hero-server-stack" class="size-4" />
-            </span>
-            <div class="min-w-0">
-              <p class="text-xs font-medium text-base-content/55">Pool registry</p>
-              <h2 class="break-words text-lg font-bold leading-6 text-base-content">{group.name}</h2>
-            </div>
+        <header class="flex min-w-0 flex-wrap content-start items-center gap-3 border-b border-base-300 bg-primary/5 p-4 xl:justify-between xl:border-r xl:border-b-0">
+          <span class="grid size-9 shrink-0 place-items-center rounded-field border border-primary/30 bg-primary/15 text-primary">
+            <.icon name="hero-server-stack" class="size-4" />
+          </span>
+          <div class="min-w-0 flex-1 xl:order-last xl:basis-full">
+            <p class="text-xs font-medium text-base-content/55">Pool registry</p>
+            <h2 class="break-words text-lg font-bold leading-6 text-base-content">{group.name}</h2>
           </div>
           <span
             id={"api-key-pool-group-#{group.dom_id}-count"}
-            class={AdminBadges.count_chip_class()}
+            class={[AdminBadges.count_chip_class(), "shrink-0"]}
           >
             {group.count_label}
           </span>
