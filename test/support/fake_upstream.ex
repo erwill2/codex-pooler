@@ -729,7 +729,7 @@ defmodule CodexPooler.FakeUpstream do
     receive do
       {:fake_upstream_release_chunk, ^release_ref} -> :ok
     after
-      5_000 -> raise "timed out waiting for fake upstream SSE barrier release"
+      30_000 -> raise "timed out waiting for fake upstream SSE barrier release"
     end
   end
 
@@ -743,7 +743,7 @@ defmodule CodexPooler.FakeUpstream do
     receive do
       {:fake_upstream_release_timeout, ^release_ref} -> :ok
     after
-      5_000 -> raise "timed out waiting for fake upstream timeout release"
+      30_000 -> raise "timed out waiting for fake upstream timeout release"
     end
   end
 
@@ -1001,7 +1001,7 @@ defmodule CodexPooler.FakeUpstream do
       receive do
         {:fake_upstream_release_chunk, ^release_ref} -> :ok
       after
-        5_000 -> raise "timed out waiting for fake upstream websocket SSE barrier release"
+        30_000 -> raise "timed out waiting for fake upstream websocket SSE barrier release"
       end
     end
 

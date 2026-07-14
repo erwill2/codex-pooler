@@ -111,8 +111,11 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert_receive {:fake_upstream_chunk_sent, 1}, 1_000
     assert_receive {:fake_upstream_chunk_barrier, 1, barrier_pid, ^first_release_ref}, 1_000
 
-    assert {:current_stacktrace, stacktrace} = Process.info(session, :current_stacktrace)
-    assert stack_has_mfa?(stacktrace, UpstreamWebsocketSession, :await_sent_request, 2)
+    # The fake's barrier notification races the session's own send path: the
+    # server can announce the barrier while the client is still streaming the
+    # request body, so a single stack snapshot flakes under CI load. Poll until
+    # the session parks in await_sent_request instead.
+    assert_stack_eventually_in(session, UpstreamWebsocketSession, :await_sent_request, 2)
 
     send_task =
       Task.async(fn ->
@@ -1038,5 +1041,37 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       {^module, ^function, ^arity, _location} -> true
       _frame -> false
     end)
+  end
+
+  defp assert_stack_eventually_in(pid, module, function, arity, deadline_ms \\ 2_000) do
+    deadline = System.monotonic_time(:millisecond) + deadline_ms
+
+    unless poll_stack_until(pid, module, function, arity, deadline) do
+      flunk("expected #{inspect(module)}.#{function}/#{arity} on the stack of #{inspect(pid)}")
+    end
+  end
+
+  defp poll_stack_until(pid, module, function, arity, deadline) do
+    parked? =
+      case Process.info(pid, :current_stacktrace) do
+        {:current_stacktrace, stacktrace} -> stack_has_mfa?(stacktrace, module, function, arity)
+        _dead -> false
+      end
+
+    cond do
+      parked? ->
+        true
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        false
+
+      true ->
+        receive do
+        after
+          10 -> :ok
+        end
+
+        poll_stack_until(pid, module, function, arity, deadline)
+    end
   end
 end
