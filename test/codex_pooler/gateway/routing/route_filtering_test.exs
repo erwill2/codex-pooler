@@ -162,6 +162,61 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
       assert [] = FakeUpstream.requests(upstream)
     end
 
+    test "routes an exhausted account confirmed by a guarded reset probe within its window" do
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      consumed_at =
+        DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.truncate(:microsecond)
+
+      %{identity: identity, assignment: assignment} =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: reset_probe_redemption("confirmed_by_upstream", consumed_at)
+        })
+
+      upsert_weekly_exhausted_quota!(identity)
+      filter_input = filter_input(pool, api_key, assignment, identity, "reset-probe-confirmed")
+
+      assert {:ok, [{routed_assignment, _identity}], options} =
+               RouteFiltering.filter_candidates(filter_input)
+
+      assert routed_assignment.id == assignment.id
+      assert options.routing.quota_decision["routing_state"] == "reset_probe"
+    end
+
+    test "does not route an exhausted account that is only pending probe confirmation" do
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      consumed_at =
+        DateTime.utc_now() |> DateTime.add(-60, :second) |> DateTime.truncate(:microsecond)
+
+      %{identity: identity, assignment: assignment} =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: reset_probe_redemption("consumed_pending_probe", consumed_at)
+        })
+
+      upsert_weekly_exhausted_quota!(identity)
+      filter_input = filter_input(pool, api_key, assignment, identity, "reset-probe-pending")
+
+      assert {:error, %{code: "quota_exhausted"}} = RouteFiltering.filter_candidates(filter_input)
+    end
+
+    test "does not route an exhausted account whose reset-probe window has elapsed" do
+      %{pool: pool, api_key: api_key} = active_api_key_fixture()
+
+      consumed_at =
+        DateTime.utc_now() |> DateTime.add(-30, :minute) |> DateTime.truncate(:microsecond)
+
+      %{identity: identity, assignment: assignment} =
+        active_upstream_assignment_fixture(pool, %{
+          metadata: reset_probe_redemption("confirmed_by_upstream", consumed_at)
+        })
+
+      upsert_weekly_exhausted_quota!(identity)
+      filter_input = filter_input(pool, api_key, assignment, identity, "reset-probe-expired")
+
+      assert {:error, %{code: "quota_exhausted"}} = RouteFiltering.filter_candidates(filter_input)
+    end
+
     test "auto redemption ignores stale in-progress redemption until manual recovery" do
       {:ok, upstream} =
         FakeUpstream.start_link(
@@ -872,6 +927,21 @@ defmodule CodexPooler.Gateway.Routing.RouteFilteringTest do
     %{
       "usage_base_url" => FakeUpstream.url(upstream),
       "saved_resets" => saved_resets
+    }
+  end
+
+  defp reset_probe_redemption(phase, %DateTime{} = consumed_at) do
+    %{
+      "saved_reset_redemption" => %{
+        "status" => "succeeded",
+        "phase" => phase,
+        "attempt_id" => Ecto.UUID.generate(),
+        "generation" => 2,
+        "trigger_kind" => "gateway_auto",
+        "consumed_at" => DateTime.to_iso8601(consumed_at),
+        "deadline_at" => consumed_at |> DateTime.add(15, :minute) |> DateTime.to_iso8601(),
+        "result" => %{"code" => "reset", "applied" => true}
+      }
     }
   end
 

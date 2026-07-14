@@ -7,6 +7,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
 
   @spec filter_quota_eligible_candidates(FilterInput.t()) ::
           CodexPooler.Gateway.Routing.CandidateEligibility.quota_filter_result()
@@ -122,19 +123,21 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
   end
 
   defp classify_quota_candidates(%Model{} = model, candidates, route_state) do
-    {precise_candidates, credit_backed_probe_candidates, weekly_probe_candidates, exclusions,
-     refreshable_candidates} =
-      Enum.reduce(candidates, {[], [], [], [], []}, fn {assignment, identity} = candidate,
-                                                       {precise, credit_backed, weekly_probes,
-                                                        excluded, refreshable} ->
+    {precise_candidates, credit_backed_probe_candidates, weekly_probe_candidates,
+     reset_probe_candidates, exclusions, refreshable_candidates} =
+      Enum.reduce(candidates, {[], [], [], [], [], []}, fn {assignment, identity} = candidate,
+                                                           {precise, credit_backed, weekly_probes,
+                                                            reset_probes, excluded, refreshable} ->
         identity
         |> routing_quota_eligibility(model, route_state)
         |> add_classified_quota_candidate(
           candidate,
           assignment,
+          identity,
           precise,
           credit_backed,
           weekly_probes,
+          reset_probes,
           excluded,
           refreshable
         )
@@ -143,7 +146,11 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
     precise_candidates = Enum.reverse(precise_candidates)
     credit_backed_probe_candidates = Enum.reverse(credit_backed_probe_candidates)
     weekly_probe_candidates = Enum.reverse(weekly_probe_candidates)
-    candidates = precise_candidates ++ credit_backed_probe_candidates ++ weekly_probe_candidates
+    reset_probe_candidates = Enum.reverse(reset_probe_candidates)
+
+    candidates =
+      precise_candidates ++
+        credit_backed_probe_candidates ++ weekly_probe_candidates ++ reset_probe_candidates
 
     case candidates do
       [] ->
@@ -155,7 +162,8 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
            candidates,
            precise_candidates,
            credit_backed_probe_candidates,
-           weekly_probe_candidates
+           weekly_probe_candidates,
+           reset_probe_candidates
          )}
     end
   end
@@ -174,56 +182,92 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
          %{routing_state: :precise},
          candidate,
          _assignment,
+         _identity,
          precise,
          credit_backed,
          weekly_probes,
+         reset_probes,
          excluded,
          refreshable
        ) do
-    {[candidate | precise], credit_backed, weekly_probes, excluded, refreshable}
+    {[candidate | precise], credit_backed, weekly_probes, reset_probes, excluded, refreshable}
   end
 
   defp add_classified_quota_candidate(
          %{routing_state: :credit_backed_probe},
          candidate,
          _assignment,
+         _identity,
          precise,
          credit_backed,
          weekly_probes,
+         reset_probes,
          excluded,
          refreshable
        ) do
-    {precise, [candidate | credit_backed], weekly_probes, excluded, refreshable}
+    {precise, [candidate | credit_backed], weekly_probes, reset_probes, excluded, refreshable}
   end
 
   defp add_classified_quota_candidate(
          %{routing_state: :weekly_only_probe},
          candidate,
          _assignment,
+         _identity,
          precise,
          credit_backed,
          weekly_probes,
+         reset_probes,
          excluded,
          refreshable
        ) do
-    {precise, credit_backed, [candidate | weekly_probes], excluded, refreshable}
+    {precise, credit_backed, [candidate | weekly_probes], reset_probes, excluded, refreshable}
   end
 
   defp add_classified_quota_candidate(
          %{exclusions: reasons},
          {_, identity} = candidate,
          assignment,
+         identity,
          precise,
          credit_backed,
          weekly_probes,
+         reset_probes,
          excluded,
          refreshable
        ) do
-    exclusion = quota_candidate_exclusion(assignment, identity, reasons)
-    refreshable = maybe_add_refreshable_quota_candidate(refreshable, candidate, reasons)
+    if reset_probe_routeable?(identity, reasons) do
+      # The quota window still reads exhausted, but this identity holds a
+      # post-reset lifecycle that a successful probe or fresh quota already
+      # confirmed as temporarily routeable. Route it as a guarded reset probe
+      # instead of excluding it — this is what sustainably breaks the deadlock.
+      {precise, credit_backed, weekly_probes, [candidate | reset_probes], excluded, refreshable}
+    else
+      exclusion = quota_candidate_exclusion(assignment, identity, reasons)
+      refreshable = maybe_add_refreshable_quota_candidate(refreshable, candidate, reasons)
 
-    {precise, credit_backed, weekly_probes, [exclusion | excluded], refreshable}
+      {precise, credit_backed, weekly_probes, reset_probes, [exclusion | excluded], refreshable}
+    end
   end
+
+  # A redeemed identity is routeable-by-lifecycle only when its post-reset phase
+  # says so (confirmed_by_upstream within the window, or confirmed_by_quota) AND
+  # the sole quota block is weekly account exhaustion. Any other exclusion
+  # (auth, circuit, missing reset) still excludes it — fail-closed.
+  defp reset_probe_routeable?(identity, reasons) do
+    weekly_exhaustion_only?(reasons) and
+      RedemptionLifecycle.routeable?(redemption_metadata(identity), now())
+  end
+
+  defp weekly_exhaustion_only?(reasons) when is_list(reasons) do
+    reasons != [] and Enum.all?(reasons, &quota_exhaustion_reason?/1)
+  end
+
+  defp weekly_exhaustion_only?(_reasons), do: false
+
+  defp redemption_metadata(%{metadata: %{} = metadata}), do: metadata["saved_reset_redemption"]
+  defp redemption_metadata(_identity), do: nil
+
+  defp now, do: DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
   defp maybe_add_refreshable_quota_candidate(refreshable, candidate, reasons) do
     if stale_quota_refreshable?(reasons), do: [candidate | refreshable], else: refreshable
@@ -300,7 +344,8 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
          candidates,
          precise_candidates,
          credit_backed_probe_candidates,
-         weekly_probe_candidates
+         weekly_probe_candidates,
+         reset_probe_candidates
        ) do
     %{
       "allowed" => true,
@@ -308,26 +353,37 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
         quota_decision_summary(
           precise_candidates,
           credit_backed_probe_candidates,
-          weekly_probe_candidates
+          weekly_probe_candidates,
+          reset_probe_candidates
         ),
       "routing_state" =>
         quota_decision_state(
           precise_candidates,
           credit_backed_probe_candidates,
-          weekly_probe_candidates
+          weekly_probe_candidates,
+          reset_probe_candidates
         ),
       "precise_candidate_count" => length(precise_candidates),
       "credit_backed_probe_candidate_count" => length(credit_backed_probe_candidates),
       "weekly_probe_candidate_count" => length(weekly_probe_candidates),
+      "reset_probe_candidate_count" => length(reset_probe_candidates),
       "eligible_candidate_count" => length(candidates)
     }
   end
 
-  defp quota_decision_state([_ | _], _credit_backed_candidates, _weekly_probe_candidates),
-    do: "precise"
+  defp quota_decision_state([_ | _], _credit_backed, _weekly_probes, _reset_probes), do: "precise"
 
-  defp quota_decision_state([], [_ | _], _weekly_probe_candidates), do: "credit_backed_probe"
-  defp quota_decision_state([], [], [_ | _]), do: "weekly_only_probe"
+  defp quota_decision_state([], [_ | _], _weekly_probes, _reset_probes),
+    do: "credit_backed_probe"
+
+  defp quota_decision_state([], [], [_ | _], _reset_probes), do: "weekly_only_probe"
+  defp quota_decision_state([], [], [], [_ | _]), do: "reset_probe"
+
+  defp quota_decision_summary([], [], [], [_ | _]),
+    do: "allowed by post-reset guarded probe lifecycle"
+
+  defp quota_decision_summary(precise, credit_backed, weekly_probes, _reset_probes),
+    do: quota_decision_summary(precise, credit_backed, weekly_probes)
 
   defp quota_decision_summary([], [], [_ | _]), do: "allowed by weekly quota evidence"
 
