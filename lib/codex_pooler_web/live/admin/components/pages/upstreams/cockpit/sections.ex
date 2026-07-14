@@ -300,6 +300,22 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
         </div>
       </div>
       <div
+        :if={@cockpit.saved_resets.reset_lifecycle}
+        id="cockpit-saved-reset-lifecycle"
+        class="mx-4 mb-4 grid gap-1 rounded-box border border-base-300 bg-base-200/30 p-4"
+      >
+        <h3 class="text-sm font-semibold text-base-content">Reset confirmation</h3>
+        <p id="cockpit-saved-reset-lifecycle-label" class="text-xs leading-5 text-base-content/60">
+          {@cockpit.saved_resets.reset_lifecycle.label}
+        </p>
+        <p
+          :if={@cockpit.saved_resets.reset_lifecycle.deadline_at}
+          class="text-xs leading-5 text-base-content/50"
+        >
+          Confirmation window until {@cockpit.saved_resets.reset_lifecycle.deadline_at}
+        </p>
+      </div>
+      <div
         :if={@cockpit.saved_resets.available?}
         id="cockpit-saved-reset-expiration-summary"
         class="mx-4 mb-4 grid gap-3 rounded-box border border-base-300 bg-base-200/30 p-4"

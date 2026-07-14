@@ -8,6 +8,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
 
   @usable_refresh_statuses ~w(succeeded imported refreshing)
 
+  # Human-readable phase labels for operators. Deliberately omits any token,
+  # idempotency key, or raw provider detail.
+  @lifecycle_labels %{
+    "consuming" => "Redeeming",
+    "consumed_pending_probe" => "Reset consumed — confirming",
+    "confirmed_by_upstream" => "Reset confirmed by probe",
+    "confirmed_by_quota" => "Reset confirmed by quota",
+    "reblocked" => "Still blocked after reset",
+    "expired" => "Reset confirmation expired"
+  }
+
   @type action :: %{
           required(:available?) => boolean(),
           required(:reason) => String.t() | nil
@@ -36,7 +47,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
           required(:expires_reported?) => boolean(),
           required(:in_progress?) => boolean(),
           required(:redemption_stale?) => boolean(),
-          required(:last_redemption) => map() | nil
+          required(:last_redemption) => map() | nil,
+          required(:reset_lifecycle) => reset_lifecycle() | nil
+        }
+  @type reset_lifecycle :: %{
+          required(:phase) => String.t(),
+          required(:label) => String.t(),
+          required(:consumed_at) => String.t() | nil,
+          required(:deadline_at) => String.t() | nil,
+          required(:terminal_reason) => String.t() | nil
         }
 
   @spec snapshot(UpstreamIdentity.t() | map() | nil, DateTimeDisplay.preferences()) :: snapshot()
@@ -45,9 +64,40 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetProjection do
 
     Map.merge(snapshot, %{
       next_expires_label: next_expires_label(snapshot, datetime_preferences),
-      next_expires_title: next_expires_title(snapshot, datetime_preferences)
+      next_expires_title: next_expires_title(snapshot, datetime_preferences),
+      last_redemption: sanitize_last_redemption(snapshot.last_redemption),
+      reset_lifecycle: reset_lifecycle(snapshot.last_redemption, datetime_preferences)
     })
   end
+
+  # Never surface the probe correlation token or any raw provider detail to
+  # operators; keep only the safe accounting fields.
+  defp sanitize_last_redemption(nil), do: nil
+  defp sanitize_last_redemption(%{} = redemption), do: Map.drop(redemption, ["probe"])
+  defp sanitize_last_redemption(_redemption), do: nil
+
+  defp reset_lifecycle(%{"phase" => phase} = redemption, datetime_preferences)
+       when is_map_key(@lifecycle_labels, phase) do
+    %{
+      phase: phase,
+      label: Map.fetch!(@lifecycle_labels, phase),
+      consumed_at: format_lifecycle_datetime(redemption["consumed_at"], datetime_preferences),
+      deadline_at: format_lifecycle_datetime(redemption["deadline_at"], datetime_preferences),
+      terminal_reason: string_or_nil(redemption["terminal_reason"])
+    }
+  end
+
+  defp reset_lifecycle(_redemption, _datetime_preferences), do: nil
+
+  defp format_lifecycle_datetime(value, datetime_preferences) do
+    case Formatting.parse_datetime(value) do
+      %DateTime{} = datetime -> DateTimeDisplay.format_datetime(datetime, datetime_preferences)
+      nil -> nil
+    end
+  end
+
+  defp string_or_nil(value) when is_binary(value), do: value
+  defp string_or_nil(_value), do: nil
 
   @spec policy(map()) :: SavedResets.auto_policy_projection()
   def policy(identity), do: SavedResets.auto_policy(identity)
