@@ -185,6 +185,29 @@ defmodule CodexPooler.Upstreams.SavedResets.RedemptionLifecycle do
   end
 
   @doc """
+  The correlation token currently holding the one-shot probe claim, or `nil`.
+  """
+  @spec probe_holder(redemption() | term()) :: String.t() | nil
+  def probe_holder(%{"probe" => %{"token" => token}}) when is_binary(token), do: token
+  def probe_holder(_redemption), do: nil
+
+  @doc "True when `token` holds the probe claim on this redemption."
+  @spec holds_probe?(redemption() | term(), String.t()) :: boolean()
+  def holds_probe?(redemption, token) when is_binary(token), do: probe_holder(redemption) == token
+  def holds_probe?(_redemption, _token), do: false
+
+  @doc """
+  Whether a fresh probe claim can still be made: the redemption is pending, no
+  token holds the probe yet, and the bounded window has not elapsed. Irreversible
+  by design — a claimed or expired probe is never re-claimable.
+  """
+  @spec probe_claimable?(redemption() | term(), DateTime.t()) :: boolean()
+  def probe_claimable?(redemption, %DateTime{} = now) do
+    phase(redemption) == @consumed_pending_probe and probe_holder(redemption) == nil and
+      not expired?(redemption, now)
+  end
+
+  @doc """
   Compare-and-set guard for a lifecycle transition. The move is permitted only
   when the record still matches the expected `generation` and `attempt_id` and
   the target phase is a declared successor of the current phase. A record
