@@ -257,6 +257,13 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
 
   defp reconcile_catalog(pool_id, _trigger_kind) do
     case Catalog.sync_pool_catalog(pool_id, trigger_kind: "reconcile") do
+      {:ok, %{partial?: true}} ->
+        step(
+          :succeeded,
+          "catalog_sync_partial",
+          "catalog sync completed with unreachable sources"
+        )
+
       {:ok, _result} ->
         step(:succeeded, "catalog_refreshed", "catalog sync completed")
 

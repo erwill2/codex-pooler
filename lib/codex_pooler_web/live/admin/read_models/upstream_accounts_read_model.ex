@@ -112,6 +112,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     "catalog_refreshed" => "catalog refreshed",
     "catalog_sync_failed" => "catalog sync failed",
     "catalog_sync_in_progress" => "catalog sync in progress",
+    "catalog_sync_partial" => "catalog sync partially completed",
     "catalog_sync_skipped" => "catalog sync skipped",
     "health_preserved" => "assignment health preserved",
     "health_refreshed" => "assignment health refreshed",

@@ -13,20 +13,43 @@ defmodule CodexPooler.Catalog.Sync.Discovery do
 
   @type catalog_error :: %{required(:code) => atom(), required(:message) => String.t()}
 
-  @spec discover_models([map()], (map() -> {:ok, [map()]} | {:error, term()})) ::
-          {:ok, [map()]} | {:error, term()}
-  def discover_models(assignments, fetcher) do
-    Enum.reduce_while(assignments, {:ok, []}, fn source, {:ok, discovered} ->
-      case fetcher.(source) do
-        {:ok, models} when is_list(models) ->
-          source_models = Enum.map(models, &Map.put(normalize_model_attrs(&1), :source, source))
-          {:cont, {:ok, discovered ++ source_models}}
+  @type source_failure :: {map(), term()}
 
-        {:error, reason} ->
-          {:halt, {:error, reason}}
+  @spec discover_models([map()], (map() -> {:ok, [map()]} | {:error, term()})) ::
+          {:ok, [map()], [source_failure()], [map()]} | {:error, term()}
+  def discover_models(assignments, fetcher) do
+    results =
+      Enum.map(assignments, fn source ->
+        case fetcher.(source) do
+          {:ok, models} when is_list(models) ->
+            source_models = Enum.map(models, &Map.put(normalize_model_attrs(&1), :source, source))
+            {:ok, source, source_models}
+
+          {:error, reason} ->
+            {:error, source, reason}
+        end
+      end)
+
+    successes = Enum.filter(results, &match?({:ok, _source, _models}, &1))
+
+    failures =
+      for {:error, source, reason} <- results do
+        {source, reason}
       end
-    end)
+
+    case successes do
+      [] ->
+        all_failed_result(failures)
+
+      _successful_results ->
+        successful_assignments = Enum.map(successes, &elem(&1, 1))
+        discovered_models = Enum.flat_map(successes, &elem(&1, 2))
+        {:ok, successful_assignments, failures, discovered_models}
+    end
   end
+
+  defp all_failed_result([]), do: {:ok, [], [], []}
+  defp all_failed_result([{_source, reason} | _rest]), do: {:error, reason}
 
   @spec fetch_models_for_assignment(map()) :: {:ok, [map()]} | {:error, catalog_error() | term()}
   def fetch_models_for_assignment(%{assignment: assignment, identity: identity}) do

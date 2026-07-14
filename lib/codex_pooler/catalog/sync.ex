@@ -104,6 +104,7 @@ defmodule CodexPooler.Catalog.Sync do
     Events.broadcast_model_sync(pool_id, "model_sync_completed", %{
       trigger_kind: trigger_kind,
       status: "succeeded",
+      partial?: Map.get(result, :partial?, false),
       model_count: length(Map.get(result, :models, []))
     })
   end
@@ -161,8 +162,17 @@ defmodule CodexPooler.Catalog.Sync do
 
   defp discover_and_persist_catalog(run, assignments, fetcher) do
     case Discovery.discover_models(assignments, fetcher) do
-      {:ok, discovered} -> Persistence.persist_catalog(run, assignments, discovered)
-      {:error, reason} -> Persistence.fail_sync_run(run, reason)
+      {:ok, successful_assignments, failed_sources, discovered} ->
+        Persistence.persist_catalog(
+          run,
+          assignments,
+          successful_assignments,
+          failed_sources,
+          discovered
+        )
+
+      {:error, reason} ->
+        Persistence.fail_sync_run(run, reason)
     end
   end
 

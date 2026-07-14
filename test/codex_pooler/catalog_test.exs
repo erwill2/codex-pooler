@@ -430,6 +430,126 @@ defmodule CodexPooler.CatalogTest do
       assert masterkain_only.metadata["source_assignment_ids"] == [masterkain_assignment.id]
     end
 
+    test "persists successful assignment results when another assignment fails" do
+      pool = pool_fixture()
+
+      {_pool, successful_assignment} =
+        active_assignment_fixture(pool, %{}, %{
+          account_label: "Successful catalog source",
+          assignment_label: "Successful assignment"
+        })
+
+      {_pool, failed_assignment} =
+        active_assignment_fixture(pool, %{}, %{
+          account_label: "Failed catalog source",
+          assignment_label: "Failed assignment"
+        })
+
+      failed_only =
+        model_fixture(pool, %{
+          exposed_model_id: "gpt-failed-only",
+          metadata: %{
+            "source_assignment_ids" => [failed_assignment.id],
+            "source_assignment_models" => %{
+              failed_assignment.id => %{"source_marker" => "failed-existing"}
+            }
+          }
+        })
+
+      successful_only_removed =
+        model_fixture(pool, %{
+          exposed_model_id: "gpt-success-removed",
+          metadata: %{
+            "source_assignment_ids" => [successful_assignment.id],
+            "source_assignment_models" => %{
+              successful_assignment.id => %{"source_marker" => "successful-removed"}
+            }
+          }
+        })
+
+      model_fixture(pool, %{
+        exposed_model_id: "gpt-partial-shared",
+        source_assignment_count: 2,
+        metadata: %{
+          "source_assignment_ids" => Enum.sort([successful_assignment.id, failed_assignment.id]),
+          "source_assignment_models" => %{
+            successful_assignment.id => %{"source_marker" => "successful-existing"},
+            failed_assignment.id => %{"source_marker" => "failed-existing"}
+          }
+        }
+      })
+
+      successful_assignment_id = successful_assignment.id
+      failed_assignment_id = failed_assignment.id
+
+      fetcher = fn %{assignment: assignment} ->
+        case assignment.id do
+          ^successful_assignment_id ->
+            {:ok,
+             [
+               %{"id" => "gpt-success-only"},
+               %{"id" => "gpt-partial-shared", "source_marker" => "successful-current"}
+             ]}
+
+          ^failed_assignment_id ->
+            {:error, %{message: "upstream assignment unavailable"}}
+        end
+      end
+
+      assert {:ok, %{models: models, sync_run: sync_run, partial?: true}} =
+               Catalog.sync_pool_catalog(pool, fetcher: fetcher)
+
+      assert Enum.sort(Enum.map(models, & &1.exposed_model_id)) == [
+               "gpt-partial-shared",
+               "gpt-success-only"
+             ]
+
+      assert sync_run.status == "succeeded"
+      assert sync_run.stale_marked_count == 1
+
+      assert sync_run.stats == %{
+               "source_assignment_count" => 2,
+               "successful_source_assignment_count" => 1,
+               "failed_source_assignment_count" => 1,
+               "failed_assignments" => [
+                 %{
+                   "assignment_id" => failed_assignment.id,
+                   "reason" => "upstream assignment unavailable"
+                 }
+               ]
+             }
+
+      assert %DateTime{} = Repo.reload!(successful_assignment).last_successful_sync_at
+      assert is_nil(Repo.reload!(failed_assignment).last_successful_sync_at)
+
+      persisted_failed_only = Repo.reload!(failed_only)
+      assert persisted_failed_only.status == "active"
+      assert persisted_failed_only.last_sync_run_id == failed_only.last_sync_run_id
+      assert persisted_failed_only.last_seen_at == failed_only.last_seen_at
+
+      persisted_successful_only_removed = Repo.reload!(successful_only_removed)
+      assert persisted_successful_only_removed.status == "stale"
+      assert persisted_successful_only_removed.last_sync_run_id == sync_run.id
+
+      assert {:ok, %{partial?: true}} = Catalog.sync_pool_catalog(pool, fetcher: fetcher)
+
+      shared = Catalog.get_model_by_exposed_id(pool, "gpt-partial-shared")
+      assert shared.source_assignment_count == 2
+
+      assert shared.metadata["source_assignment_ids"] ==
+               Enum.sort([successful_assignment.id, failed_assignment.id])
+
+      assert shared.metadata["source_assignment_models"][successful_assignment.id][
+               "source_marker"
+             ] == "successful-current"
+
+      assert shared.metadata["source_assignment_models"][failed_assignment.id]["source_marker"] ==
+               "failed-existing"
+
+      assert shared.metadata["source_assignment_missing_sync_run_ids"] == %{}
+      assert Repo.reload!(failed_only).status == "active"
+    end
+
     test "preserves an active absent source for one successful sync before retiring it" do
       pool = pool_fixture()
 
