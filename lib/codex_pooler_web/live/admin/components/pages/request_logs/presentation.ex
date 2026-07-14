@@ -44,7 +44,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
       id="admin-request-logs"
       class={[
         "min-w-0",
-<<<<<<< HEAD
         @request_logs.items != [] &&
           "overflow-hidden rounded-box border border-base-300 bg-base-100"
       ]}
