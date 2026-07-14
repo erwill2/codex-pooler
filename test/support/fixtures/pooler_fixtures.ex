@@ -401,6 +401,33 @@ defmodule CodexPooler.PoolerFixtures do
     request
   end
 
+  @doc """
+  Runs accounting lifecycle writes against an already-terminal request (for
+  example a metadata request) as if it were still dispatchable, restoring the
+  terminal fields afterwards.
+
+  Historical log scenarios attach attempts to requests that production would
+  have finalized already; the terminal-request fence in RequestLifecycle
+  rightly rejects that, so these tests replay the writes inside the window
+  where the request was still open.
+  """
+  def with_dispatchable_request(%Request{} = request, fun) when is_function(fun, 1) do
+    original = %{status: request.status, completed_at: request.completed_at}
+
+    open =
+      request
+      |> Ecto.Changeset.change(%{status: "in_progress", completed_at: nil})
+      |> Repo.update!()
+
+    result = fun.(open)
+
+    open
+    |> Ecto.Changeset.change(original)
+    |> Repo.update!()
+
+    result
+  end
+
   def attempt_fixture(request, assignment, attrs \\ %{}) do
     attempt =
       %Attempt{

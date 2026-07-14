@@ -558,6 +558,14 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketAttempt do
              allow_retry?: false
          }}
 
+      {:error, %{code: :request_already_finalized}} ->
+        {:error,
+         %{
+           status: 499,
+           code: "request_already_finalized",
+           message: "request lifecycle completed before upstream dispatch"
+         }}
+
       {:error, reason} ->
         FailureResponse.accounting_failure(
           :create_same_assignment_websocket_retry_attempt,

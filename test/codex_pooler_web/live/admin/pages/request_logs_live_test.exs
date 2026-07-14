@@ -1454,22 +1454,24 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
              })
 
     assert {:ok, _token_attempt} =
-             Accounting.create_attempt(token_request, assignment, %{
-               status: "succeeded",
-               response_metadata:
-                 ui_compression_metadata(%{
-                   route_class: "proxy_http",
-                   transport: "http_json",
-                   original_bytes: 4096,
-                   compressed_bytes: 1024,
-                   original_tokens: 1000,
-                   compressed_tokens: 400,
-                   tokenizer_input_skipped_count: 1,
-                   raw_candidate: sentinel,
-                   original_output: sentinel,
-                   compressed_output: compressed_sentinel
-                 })
-             })
+             with_dispatchable_request(token_request, fn token_request ->
+               Accounting.create_attempt(token_request, assignment, %{
+                 status: "succeeded",
+                 response_metadata:
+                   ui_compression_metadata(%{
+                     route_class: "proxy_http",
+                     transport: "http_json",
+                     original_bytes: 4096,
+                     compressed_bytes: 1024,
+                     original_tokens: 1000,
+                     compressed_tokens: 400,
+                     tokenizer_input_skipped_count: 1,
+                     raw_candidate: sentinel,
+                     original_output: sentinel,
+                     compressed_output: compressed_sentinel
+                   })
+               })
+             end)
 
     ledger_entry_fixture(token_request, %{
       input_tokens: 80,
@@ -1491,19 +1493,21 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
              })
 
     assert {:ok, _byte_attempt} =
-             Accounting.create_attempt(byte_request, assignment, %{
-               status: "succeeded",
-               response_metadata:
-                 ui_compression_metadata(%{
-                   route_class: "proxy_websocket",
-                   transport: "websocket",
-                   original_bytes: 8192,
-                   compressed_bytes: 4096,
-                   raw_candidate: sentinel,
-                   original_output: sentinel,
-                   compressed_output: compressed_sentinel
-                 })
-             })
+             with_dispatchable_request(byte_request, fn byte_request ->
+               Accounting.create_attempt(byte_request, assignment, %{
+                 status: "succeeded",
+                 response_metadata:
+                   ui_compression_metadata(%{
+                     route_class: "proxy_websocket",
+                     transport: "websocket",
+                     original_bytes: 8192,
+                     compressed_bytes: 4096,
+                     raw_candidate: sentinel,
+                     original_output: sentinel,
+                     compressed_output: compressed_sentinel
+                   })
+               })
+             end)
 
     ledger_entry_fixture(byte_request, %{
       input_tokens: 40,
@@ -1524,19 +1528,21 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
              })
 
     assert {:ok, _zero_attempt} =
-             Accounting.create_attempt(zero_request, assignment, %{
-               status: "succeeded",
-               response_metadata:
-                 ui_compression_metadata(%{
-                   route_class: "proxy_http",
-                   transport: "http_json",
-                   original_bytes: 4096,
-                   compressed_bytes: 4096,
-                   raw_candidate: sentinel,
-                   original_output: sentinel,
-                   compressed_output: compressed_sentinel
-                 })
-             })
+             with_dispatchable_request(zero_request, fn zero_request ->
+               Accounting.create_attempt(zero_request, assignment, %{
+                 status: "succeeded",
+                 response_metadata:
+                   ui_compression_metadata(%{
+                     route_class: "proxy_http",
+                     transport: "http_json",
+                     original_bytes: 4096,
+                     compressed_bytes: 4096,
+                     raw_candidate: sentinel,
+                     original_output: sentinel,
+                     compressed_output: compressed_sentinel
+                   })
+               })
+             end)
 
     ledger_entry_fixture(zero_request, %{
       input_tokens: 30,

@@ -49,19 +49,26 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
                correlation_id: "facts-attempts"
              })
 
-    assert {:ok, first_attempt} = Accounting.create_attempt(request, assignment)
-    assert {:ok, second_attempt} = Accounting.create_attempt(request, assignment)
+    {first_attempt, second_attempt} =
+      with_dispatchable_request(request, fn request ->
+        assert {:ok, first_attempt} = Accounting.create_attempt(request, assignment)
+        assert {:ok, second_attempt} = Accounting.create_attempt(request, assignment)
 
-    assert {:ok, _first_attempt} =
-             Accounting.record_retryable_attempt_failure(first_attempt, %{
-               attempt_status: "retryable_failed",
-               response_status_code: 429,
-               last_error_code: "older_retry_failed",
-               latency_ms: 999,
-               attempt_metadata: %{
-                 "response_metadata" => "should not affect request log facts"
-               }
-             })
+        assert {:ok, _first_attempt} =
+                 Accounting.record_retryable_attempt_failure(first_attempt, %{
+                   attempt_status: "retryable_failed",
+                   response_status_code: 429,
+                   last_error_code: "older_retry_failed",
+                   latency_ms: 999,
+                   attempt_metadata: %{
+                     "response_metadata" => "should not affect request log facts"
+                   }
+                 })
+
+        {first_attempt, second_attempt}
+      end)
+
+    _ = first_attempt
 
     fact = Repo.get!(RequestLogFact, request.id)
     assert fact.latest_attempt_id == second_attempt.id
@@ -404,23 +411,25 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
                }
              })
 
-    assert {:ok, attempt} = Accounting.create_attempt(request, assignment)
+    with_dispatchable_request(request, fn request ->
+      assert {:ok, attempt} = Accounting.create_attempt(request, assignment)
 
-    assert {:ok, _attempt} =
-             Accounting.record_retryable_attempt_failure(attempt, %{
-               attempt_status: "failed",
-               response_status_code: 502,
-               last_error_code: "safe_network_code",
-               error_message: "raw upstream body #{sentinel}",
-               latency_ms: 44,
-               attempt_metadata: %{
-                 "response_metadata" => sentinel,
-                 "prompt" => sentinel,
-                 "authorization" => "Bearer #{sentinel}",
-                 "cookie" => "session=#{sentinel}",
-                 "websocket_frame" => sentinel
-               }
-             })
+      assert {:ok, _attempt} =
+               Accounting.record_retryable_attempt_failure(attempt, %{
+                 attempt_status: "failed",
+                 response_status_code: 502,
+                 last_error_code: "safe_network_code",
+                 error_message: "raw upstream body #{sentinel}",
+                 latency_ms: 44,
+                 attempt_metadata: %{
+                   "response_metadata" => sentinel,
+                   "prompt" => sentinel,
+                   "authorization" => "Bearer #{sentinel}",
+                   "cookie" => "session=#{sentinel}",
+                   "websocket_frame" => sentinel
+                 }
+               })
+    end)
 
     fact = Repo.get!(RequestLogFact, request.id)
     rendered_fact = inspect(Map.from_struct(fact))
@@ -1800,24 +1809,26 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
              })
 
     assert {:ok, http_attempt} =
-             Accounting.create_attempt(http_request, assignment, %{
-               status: "succeeded",
-               response_metadata:
-                 compression_metadata(%{
-                   route_class: "proxy_http",
-                   transport: "http_json",
-                   candidate_count: 2,
-                   compressed_count: 1,
-                   skipped_count: 1,
-                   original_bytes: 4096,
-                   compressed_bytes: 1024,
-                   original_tokens: 1000,
-                   compressed_tokens: 400,
-                   raw_candidate: sentinel,
-                   original_output: sentinel,
-                   compressed_output: compressed_sentinel
-                 })
-             })
+             with_dispatchable_request(http_request, fn http_request ->
+               Accounting.create_attempt(http_request, assignment, %{
+                 status: "succeeded",
+                 response_metadata:
+                   compression_metadata(%{
+                     route_class: "proxy_http",
+                     transport: "http_json",
+                     candidate_count: 2,
+                     compressed_count: 1,
+                     skipped_count: 1,
+                     original_bytes: 4096,
+                     compressed_bytes: 1024,
+                     original_tokens: 1000,
+                     compressed_tokens: 400,
+                     raw_candidate: sentinel,
+                     original_output: sentinel,
+                     compressed_output: compressed_sentinel
+                   })
+               })
+             end)
 
     assert {:ok, %{request: websocket_request}} =
              Accounting.record_metadata_request(%{pool: pool, api_key: api_key}, %{
@@ -1832,22 +1843,24 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
              })
 
     assert {:ok, websocket_attempt} =
-             Accounting.create_attempt(websocket_request, assignment, %{
-               status: "succeeded",
-               response_metadata:
-                 compression_metadata(%{
-                   route_class: "proxy_websocket",
-                   transport: "websocket",
-                   candidate_count: 1,
-                   compressed_count: 1,
-                   skipped_count: 0,
-                   original_bytes: 8192,
-                   compressed_bytes: 4096,
-                   raw_candidate: sentinel,
-                   original_output: sentinel,
-                   compressed_output: compressed_sentinel
-                 })
-             })
+             with_dispatchable_request(websocket_request, fn websocket_request ->
+               Accounting.create_attempt(websocket_request, assignment, %{
+                 status: "succeeded",
+                 response_metadata:
+                   compression_metadata(%{
+                     route_class: "proxy_websocket",
+                     transport: "websocket",
+                     candidate_count: 1,
+                     compressed_count: 1,
+                     skipped_count: 0,
+                     original_bytes: 8192,
+                     compressed_bytes: 4096,
+                     raw_candidate: sentinel,
+                     original_output: sentinel,
+                     compressed_output: compressed_sentinel
+                   })
+               })
+             end)
 
     persisted_text =
       inspect({
@@ -1908,24 +1921,26 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
              })
 
     assert {:ok, skipped_attempt} =
-             Accounting.create_attempt(skipped_request, assignment, %{
-               status: "succeeded",
-               response_metadata: %{
-                 "payload_compression" => %{
-                   "enabled" => true,
-                   "attempted" => true,
-                   "status" => "skipped",
-                   "reason" => "tokenizer_input_limit",
-                   "route_class" => "proxy_compact",
-                   "transport" => "http_compact_json",
-                   "candidate_count" => 2,
-                   "compressed_count" => 0,
-                   "skipped_count" => 2,
-                   "tokenizer_input_skipped_count" => 2,
-                   "raw_reason" => sentinel
+             with_dispatchable_request(skipped_request, fn skipped_request ->
+               Accounting.create_attempt(skipped_request, assignment, %{
+                 status: "succeeded",
+                 response_metadata: %{
+                   "payload_compression" => %{
+                     "enabled" => true,
+                     "attempted" => true,
+                     "status" => "skipped",
+                     "reason" => "tokenizer_input_limit",
+                     "route_class" => "proxy_compact",
+                     "transport" => "http_compact_json",
+                     "candidate_count" => 2,
+                     "compressed_count" => 0,
+                     "skipped_count" => 2,
+                     "tokenizer_input_skipped_count" => 2,
+                     "raw_reason" => sentinel
+                   }
                  }
-               }
-             })
+               })
+             end)
 
     assert Repo.get!(Attempt, skipped_attempt.id).response_metadata["payload_compression"][
              "tokenizer_input_skipped_count"
@@ -1942,23 +1957,25 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
              })
 
     assert {:ok, _attempt} =
-             Accounting.create_attempt(failure_request, assignment, %{
-               status: "failed",
-               response_metadata: %{
-                 "payload_compression" => %{
-                   "enabled" => true,
-                   "attempted" => true,
-                   "status" => "error_passthrough",
-                   "reason" => "compression_error",
-                   "route_class" => "proxy_http",
-                   "transport" => "http_json",
-                   "candidate_count" => 0,
-                   "compressed_count" => 0,
-                   "skipped_count" => 0,
-                   "error_message" => sentinel
+             with_dispatchable_request(failure_request, fn failure_request ->
+               Accounting.create_attempt(failure_request, assignment, %{
+                 status: "failed",
+                 response_metadata: %{
+                   "payload_compression" => %{
+                     "enabled" => true,
+                     "attempted" => true,
+                     "status" => "error_passthrough",
+                     "reason" => "compression_error",
+                     "route_class" => "proxy_http",
+                     "transport" => "http_json",
+                     "candidate_count" => 0,
+                     "compressed_count" => 0,
+                     "skipped_count" => 0,
+                     "error_message" => sentinel
+                   }
                  }
-               }
-             })
+               })
+             end)
 
     assert %{items: logs, total: 2} =
              Accounting.list_request_logs(pool, filters: [model: "compression-"])
@@ -2757,21 +2774,23 @@ defmodule CodexPooler.Accounting.RequestLogsTest do
              CodexPooler.RouteClass.proxy_http()
 
     attempt =
-      request
-      |> attempt_fixture(assignment)
-      |> Accounting.record_retryable_attempt_failure(%{
-        attempt_status: "failed",
-        response_status_code: 502,
-        last_error_code: "upstream_status",
-        attempt_metadata: %{
-          "message" => "Bearer client-secret",
-          "error_body" => "analytics-secret-payload",
-          "cookie" => "session=secret",
-          "sdp" => "v=0",
-          "idempotency_key" => "raw-idempotency-key-secret"
-        }
-      })
-      |> then(fn {:ok, attempt} -> attempt end)
+      with_dispatchable_request(request, fn request ->
+        request
+        |> attempt_fixture(assignment, %{status: "in_progress", completed_at: nil})
+        |> Accounting.record_retryable_attempt_failure(%{
+          attempt_status: "failed",
+          response_status_code: 502,
+          last_error_code: "upstream_status",
+          attempt_metadata: %{
+            "message" => "Bearer client-secret",
+            "error_body" => "analytics-secret-payload",
+            "cookie" => "session=secret",
+            "sdp" => "v=0",
+            "idempotency_key" => "raw-idempotency-key-secret"
+          }
+        })
+        |> then(fn {:ok, attempt} -> attempt end)
+      end)
 
     assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
     assert log.id == request.id

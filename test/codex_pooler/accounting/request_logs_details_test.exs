@@ -272,30 +272,32 @@ defmodule CodexPooler.Accounting.RequestLogsDetailsTest do
       })
 
     assert {:ok, _attempt} =
-             Accounting.create_attempt(request, assignment, %{
-               status: "succeeded",
-               response_metadata: %{
-                 "payload_compression" => %{
-                   "enabled" => true,
-                   "attempted" => true,
-                   "status" => "compressed",
-                   "reason" => "rewritten",
-                   "route_class" => "proxy_http",
-                   "transport" => "http_json",
-                   "candidate_count" => 3,
-                   "compressed_count" => 2,
-                   "skipped_count" => 1,
-                   "original_bytes" => 12_000,
-                   "compressed_bytes" => 3_000,
-                   "original_tokens" => 900,
-                   "compressed_tokens" => 300,
-                   "strategies" => ["log_output", "diff"],
-                   "raw_candidate" => sentinel,
-                   "original_output" => sentinel,
-                   "compressed_output" => compressed_sentinel
+             with_dispatchable_request(request, fn request ->
+               Accounting.create_attempt(request, assignment, %{
+                 status: "succeeded",
+                 response_metadata: %{
+                   "payload_compression" => %{
+                     "enabled" => true,
+                     "attempted" => true,
+                     "status" => "compressed",
+                     "reason" => "rewritten",
+                     "route_class" => "proxy_http",
+                     "transport" => "http_json",
+                     "candidate_count" => 3,
+                     "compressed_count" => 2,
+                     "skipped_count" => 1,
+                     "original_bytes" => 12_000,
+                     "compressed_bytes" => 3_000,
+                     "original_tokens" => 900,
+                     "compressed_tokens" => 300,
+                     "strategies" => ["log_output", "diff"],
+                     "raw_candidate" => sentinel,
+                     "original_output" => sentinel,
+                     "compressed_output" => compressed_sentinel
+                   }
                  }
-               }
-             })
+               })
+             end)
 
     assert %{items: [log], total: 1} = Accounting.list_request_logs(pool)
     assert log.id == request.id
