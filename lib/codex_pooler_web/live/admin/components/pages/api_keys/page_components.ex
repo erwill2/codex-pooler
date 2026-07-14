@@ -303,7 +303,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                 </div>
                 <div class="flex min-w-0 items-baseline gap-1.5 xl:grid xl:gap-0.5">
                   <dt class="text-xs font-medium text-base-content/50">Prefix</dt>
-                  <dd class="min-w-0 truncate text-xs leading-5 text-base-content/60">
+                  <dd class="min-w-0 truncate">
                     {api_key.key_prefix}
                   </dd>
                 </div>
