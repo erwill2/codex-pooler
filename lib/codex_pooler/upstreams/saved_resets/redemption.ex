@@ -10,6 +10,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.EndpointMetadata
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.SavedResets.AutoEligibility
@@ -36,6 +37,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           optional(:available_count_before) => non_neg_integer(),
           optional(:available_count_after) => non_neg_integer(),
           optional(:http_status) => non_neg_integer(),
+          optional(:provider_confirmed_at) => DateTime.t(),
           optional(:reason) => String.t()
         }
 
@@ -59,6 +61,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           required(:assignment) => PoolUpstreamAssignment.t(),
           required(:attempt_id) => Ecto.UUID.t(),
           required(:generation) => non_neg_integer(),
+          required(:credential_epoch) => pos_integer(),
           required(:trigger_kind) => trigger_kind(),
           required(:started_at) => DateTime.t(),
           required(:receive_timeout) => non_neg_integer()
@@ -333,12 +336,14 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
        ) do
     attempt_id = Ecto.UUID.generate()
     generation = next_generation(metadata)
+    credential_epoch = CredentialFencing.credential_epoch(locked_identity)
 
     claimed_identity =
       update_redemption_metadata!(locked_identity, metadata, %{
         "status" => "redeeming",
         "attempt_id" => attempt_id,
         "generation" => generation,
+        "credential_epoch" => credential_epoch,
         "trigger_kind" => trigger_kind,
         "started_at" => DateTime.to_iso8601(started_at),
         "finished_at" => nil,
@@ -350,6 +355,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       assignment: assignment,
       attempt_id: attempt_id,
       generation: generation,
+      credential_epoch: credential_epoch,
       trigger_kind: trigger_kind,
       started_at: started_at,
       receive_timeout: receive_timeout
@@ -537,8 +543,16 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
   defp result_from_response(code, status, available_count_before, identity, assignment, claim) do
     cond do
       code == "reset" ->
-        case PoolReconciliation.refresh_quota_from_usage(identity, assignment,
-               receive_timeout: claim.receive_timeout
+        provider_confirmed_at = now()
+
+        confirmed_identity =
+          record_provider_reset_confirmation(identity, claim, provider_confirmed_at)
+
+        case PoolReconciliation.refresh_quota_from_usage(confirmed_identity, assignment,
+               receive_timeout: claim.receive_timeout,
+               weekly_restart_corroboration:
+                 {:saved_reset_redemption, claim.credential_epoch, claim.started_at,
+                  provider_confirmed_at}
              ) do
           {:ok, refreshed_identity} ->
             available_count_after = SavedResets.snapshot(refreshed_identity).available_count
@@ -549,7 +563,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
               code: code,
               available_count_before: available_count_before,
               available_count_after: available_count_after,
-              http_status: status
+              http_status: status,
+              provider_confirmed_at: provider_confirmed_at
             }
 
           {:error, _reason} ->
@@ -559,6 +574,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
               code: "post_reset_usage_refresh_failed",
               available_count_before: available_count_before,
               http_status: status,
+              provider_confirmed_at: provider_confirmed_at,
               reason: "quota refresh after saved reset failed"
             }
         end
@@ -582,6 +598,44 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
           reason: "saved reset redemption failed"
         }
     end
+  end
+
+  # Publish the provider confirmation before starting the usage refresh. A
+  # scheduled probe may be allocated after this refresh and win the credential
+  # fence; persisting the marker lets that winning probe apply the same bounded
+  # corroboration instead of quarantining the provider's zero again.
+  defp record_provider_reset_confirmation(identity, claim, provider_confirmed_at) do
+    Repo.transaction(fn ->
+      locked_identity = lock_identity!(identity.id)
+      metadata = locked_identity.metadata || %{}
+      redemption = metadata["saved_reset_redemption"] || %{}
+
+      if current_provider_confirmation_claim?(redemption, locked_identity, claim) do
+        update_redemption_metadata!(
+          locked_identity,
+          metadata,
+          Map.put(
+            redemption,
+            "provider_confirmed_at",
+            DateTime.to_iso8601(provider_confirmed_at)
+          )
+        )
+      else
+        locked_identity
+      end
+    end)
+    |> case do
+      {:ok, confirmed_identity} -> confirmed_identity
+      {:error, _reason} -> identity
+    end
+  end
+
+  defp current_provider_confirmation_claim?(redemption, locked_identity, claim) do
+    redemption["status"] == "redeeming" and
+      redemption["attempt_id"] == claim.attempt_id and
+      redemption["generation"] == claim.generation and
+      redemption["credential_epoch"] == claim.credential_epoch and
+      CredentialFencing.credential_epoch(locked_identity) == claim.credential_epoch
   end
 
   defp response_code(body, status, endpoint_kind) do
@@ -681,7 +735,9 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       redemption = metadata["saved_reset_redemption"] || %{}
 
       if redemption["attempt_id"] == claim.attempt_id and
-           redemption["generation"] == claim.generation do
+           redemption["generation"] == claim.generation and
+           redemption["credential_epoch"] == claim.credential_epoch and
+           CredentialFencing.credential_epoch(identity) == claim.credential_epoch do
         finished_at = now()
         final_status = Atom.to_string(result.status)
 
@@ -690,6 +746,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
             "status" => final_status,
             "attempt_id" => claim.attempt_id,
             "generation" => claim.generation,
+            "credential_epoch" => claim.credential_epoch,
             "trigger_kind" => claim.trigger_kind,
             "started_at" => DateTime.to_iso8601(claim.started_at),
             "finished_at" => DateTime.to_iso8601(finished_at),
@@ -723,7 +780,13 @@ defmodule CodexPooler.Upstreams.SavedResetRedemption do
       "available_count_after" => Map.get(result, :available_count_after),
       "http_status" => Map.get(result, :http_status)
     }
+    |> maybe_put_provider_confirmed_at(Map.get(result, :provider_confirmed_at))
   end
+
+  defp maybe_put_provider_confirmed_at(result, %DateTime{} = datetime),
+    do: Map.put(result, "provider_confirmed_at", DateTime.to_iso8601(datetime))
+
+  defp maybe_put_provider_confirmed_at(result, _datetime), do: result
 
   defp noop_result(identity, assignment, code) when is_binary(code) do
     %{

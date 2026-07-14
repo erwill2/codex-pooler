@@ -14,6 +14,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   @weekly_restart_anchor_margin_seconds 60 * 60
   @usage_reset_reanchor_min_shift_seconds 60 * 60
   @restart_corroboration_reset_tolerance_seconds 5 * 60
+  @saved_reset_corroboration_max_age_seconds 24 * 60 * 60
   @relative_reset_refresh_tolerance_seconds 5
   @account_snapshot_reset_tolerance_seconds 5
   @candidate_metadata_key "__quota_confirmed_candidate_v1"
@@ -49,24 +50,39 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
           {:ok, Quota.AccountQuotaWindow.t()}
           | {:error, Ecto.Changeset.t() | Evidence.errors() | map()}
   def record_evidence(identity_or_id, attrs, observed_at) do
-    record_evidence(identity_or_id, attrs, observed_at, now())
+    record_evidence(identity_or_id, attrs, observed_at, now(), [])
   end
 
   @spec record_evidence(identity_ref(), map(), DateTime.t(), DateTime.t()) ::
           {:ok, Quota.AccountQuotaWindow.t()}
           | {:error, Ecto.Changeset.t() | Evidence.errors() | map()}
-  def record_evidence(identity_or_id, attrs, observed_at, timestamp) do
+  def record_evidence(identity_or_id, attrs, observed_at, %DateTime{} = timestamp) do
+    record_evidence(identity_or_id, attrs, observed_at, timestamp, [])
+  end
+
+  @spec record_evidence(identity_ref(), map(), DateTime.t(), keyword()) ::
+          {:ok, Quota.AccountQuotaWindow.t()}
+          | {:error, Ecto.Changeset.t() | Evidence.errors() | map()}
+  def record_evidence(identity_or_id, attrs, observed_at, opts) when is_list(opts) do
+    record_evidence(identity_or_id, attrs, observed_at, now(), opts)
+  end
+
+  @spec record_evidence(identity_ref(), map(), DateTime.t(), DateTime.t(), keyword()) ::
+          {:ok, Quota.AccountQuotaWindow.t()}
+          | {:error, Ecto.Changeset.t() | Evidence.errors() | map()}
+  def record_evidence(identity_or_id, attrs, observed_at, timestamp, opts)
+      when is_struct(timestamp, DateTime) and is_list(opts) do
     if Repo.in_transaction?() do
-      record_evidence_in_transaction(identity_or_id, attrs, observed_at, timestamp)
+      record_evidence_in_transaction(identity_or_id, attrs, observed_at, timestamp, opts)
     else
-      record_evidence_in_new_transaction(identity_or_id, attrs, observed_at, timestamp)
+      record_evidence_in_new_transaction(identity_or_id, attrs, observed_at, timestamp, opts)
     end
   end
 
-  defp record_evidence_in_new_transaction(identity_or_id, attrs, observed_at, timestamp) do
+  defp record_evidence_in_new_transaction(identity_or_id, attrs, observed_at, timestamp, opts) do
     Repo.transaction(fn ->
       identity_or_id
-      |> record_evidence_in_transaction(attrs, observed_at, timestamp)
+      |> record_evidence_in_transaction(attrs, observed_at, timestamp, opts)
       |> unwrap_record_evidence_transaction()
     end)
   end
@@ -74,7 +90,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   defp unwrap_record_evidence_transaction({:ok, window}), do: window
   defp unwrap_record_evidence_transaction({:error, reason}), do: Repo.rollback(reason)
 
-  defp record_evidence_in_transaction(identity_or_id, attrs, observed_at, timestamp) do
+  defp record_evidence_in_transaction(identity_or_id, attrs, observed_at, timestamp, opts) do
     with {:ok, evidence} <- Evidence.new(attrs, observed_at),
          identity_id when is_binary(identity_id) <- evidence_identity_id(identity_or_id, attrs) do
       advisory_lock_evidence_identity(identity_id)
@@ -85,7 +101,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
         |> Map.put(:upstream_identity_id, identity_id)
 
       with {:ok, existing} <- get_existing_evidence(identity_id, evidence) do
-        timestamped_attrs = merge_attrs(existing, attrs, evidence, timestamp)
+        timestamped_attrs = merge_attrs(existing, attrs, evidence, timestamp, opts)
 
         result =
           existing
@@ -288,21 +304,192 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       optional_string(window.raw_metered_feature) == optional_string(evidence.raw_metered_feature)
   end
 
-  defp merge_attrs(%Quota.AccountQuotaWindow{id: nil} = existing, attrs, _evidence, _timestamp),
-    do: put_timestamps(attrs, existing)
+  defp merge_attrs(
+         %Quota.AccountQuotaWindow{id: nil} = existing,
+         attrs,
+         _evidence,
+         _timestamp,
+         _opts
+       ),
+       do: put_timestamps(attrs, existing)
 
   defp merge_attrs(
          %Quota.AccountQuotaWindow{} = existing,
          attrs,
          %Evidence{} = evidence,
-         timestamp
+         timestamp,
+         opts
        ) do
-    if uncorroborated_zero_reenable_attempt?(evidence, existing, timestamp) do
-      rejected_snapshot_attrs(existing, evidence, timestamp)
-    else
-      merge_attrs_by_decision(existing, attrs, evidence, timestamp)
+    cond do
+      saved_reset_weekly_restart_corroborated?(evidence, existing, timestamp, opts) ->
+        accepted_snapshot_attrs(existing, attrs, timestamp)
+
+      uncorroborated_zero_reenable_attempt?(evidence, existing, timestamp) ->
+        rejected_snapshot_attrs(existing, evidence, timestamp)
+
+      true ->
+        merge_attrs_by_decision(existing, attrs, evidence, timestamp)
     end
   end
+
+  # A saved-reset consume response is an independent provider assertion that
+  # the account weekly cycle restarted. Evidence observed before the provider
+  # response is causally older than that confirmation even when its database
+  # write lands later. Runtime evidence observed after confirmation remains an
+  # independent contradiction and keeps the ordinary fail-closed guard active.
+  defp saved_reset_weekly_restart_corroborated?(
+         %Evidence{
+           source: "codex_usage_api",
+           used_percent: %Decimal{} = incoming_percent,
+           reset_at: %DateTime{}
+         } = evidence,
+         %Quota.AccountQuotaWindow{used_percent: %Decimal{}} = existing,
+         timestamp,
+         opts
+       ) do
+    case Keyword.get(opts, :weekly_restart_corroboration) do
+      {:saved_reset_redemption, credential_epoch, %DateTime{} = started_at,
+       %DateTime{} = confirmed_at}
+      when is_integer(credential_epoch) and credential_epoch > 0 ->
+        saved_reset_weekly_snapshot_transition?(
+          evidence,
+          existing,
+          incoming_percent,
+          timestamp
+        ) and
+          saved_reset_confirmation_allows_transition?(
+            evidence,
+            existing,
+            started_at,
+            confirmed_at,
+            timestamp
+          )
+
+      _corroboration ->
+        false
+    end
+  end
+
+  defp saved_reset_weekly_restart_corroborated?(
+         _evidence,
+         _existing,
+         _timestamp,
+         _opts
+       ),
+       do: false
+
+  defp saved_reset_weekly_snapshot_transition?(
+         evidence,
+         existing,
+         incoming_percent,
+         timestamp
+       ) do
+    account_weekly_evidence?(evidence) and
+      same_evidence_identity?(evidence, existing) and
+      zero_percent?(incoming_percent) and
+      exhausted_by_used_percent?(existing) and
+      Evidence.current_freshness_state(evidence, timestamp) == "fresh" and
+      not Evidence.expired?(evidence, timestamp) and
+      saved_reset_forward_weekly_cycle?(evidence, existing)
+  end
+
+  defp saved_reset_confirmation_allows_transition?(
+         evidence,
+         existing,
+         started_at,
+         confirmed_at,
+         timestamp
+       ) do
+    saved_reset_precedes_transition?(
+      existing,
+      evidence,
+      started_at,
+      confirmed_at,
+      timestamp
+    ) and
+      not runtime_evidence_after_saved_reset?(
+        evidence,
+        existing,
+        confirmed_at,
+        timestamp
+      )
+  end
+
+  defp saved_reset_forward_weekly_cycle?(
+         %Evidence{
+           window_minutes: 10_080,
+           reset_at: %DateTime{} = incoming_reset,
+           observed_at: %DateTime{} = incoming_observed_at
+         },
+         %Quota.AccountQuotaWindow{reset_at: %DateTime{} = existing_reset}
+       ) do
+    window_seconds = 10_080 * 60
+    remaining_seconds = DateTime.diff(incoming_reset, incoming_observed_at, :second)
+
+    DateTime.diff(incoming_reset, existing_reset, :second) >
+      @usage_reset_forward_tolerance_seconds and
+      remaining_seconds > 0 and
+      remaining_seconds <= window_seconds + @usage_reset_forward_tolerance_seconds
+  end
+
+  defp saved_reset_forward_weekly_cycle?(_evidence, _existing), do: false
+
+  defp saved_reset_precedes_transition?(
+         %Quota.AccountQuotaWindow{},
+         %Evidence{observed_at: %DateTime{} = incoming_observed_at},
+         %DateTime{} = started_at,
+         %DateTime{} = confirmed_at,
+         %DateTime{} = timestamp
+       ) do
+    corroboration_age_seconds = DateTime.diff(timestamp, confirmed_at, :second)
+
+    DateTime.compare(started_at, confirmed_at) != :gt and
+      DateTime.compare(confirmed_at, timestamp) != :gt and
+      DateTime.compare(incoming_observed_at, confirmed_at) != :lt and
+      corroboration_age_seconds >= 0 and
+      corroboration_age_seconds <= @saved_reset_corroboration_max_age_seconds
+  end
+
+  defp saved_reset_precedes_transition?(
+         _existing,
+         _evidence,
+         _started_at,
+         _confirmed_at,
+         _timestamp
+       ),
+       do: false
+
+  defp runtime_evidence_after_saved_reset?(
+         %Evidence{} = evidence,
+         %Quota.AccountQuotaWindow{upstream_identity_id: identity_id},
+         %DateTime{} = confirmed_at,
+         %DateTime{} = timestamp
+       )
+       when is_binary(identity_id) do
+    Repo.exists?(
+      from window in Quota.AccountQuotaWindow,
+        where: window.upstream_identity_id == ^identity_id,
+        where: window.source in ^@runtime_quota_sources,
+        where: window.quota_key == ^evidence.quota_key,
+        where: fragment("COALESCE(?, 'account')", window.quota_scope) == ^evidence.quota_scope,
+        where: fragment("COALESCE(?, 'account')", window.quota_family) == ^evidence.quota_family,
+        where: fragment("COALESCE(lower(?), '')", window.model) == ^lower_string(evidence.model),
+        where:
+          fragment("COALESCE(lower(?), '')", window.upstream_model) ==
+            ^lower_string(evidence.upstream_model),
+        where: window.window_kind == ^evidence.window_kind,
+        where: window.window_minutes == ^evidence.window_minutes,
+        where: window.observed_at >= ^confirmed_at and window.observed_at <= ^timestamp
+    )
+  end
+
+  defp runtime_evidence_after_saved_reset?(
+         _evidence,
+         _existing,
+         _confirmed_at,
+         _timestamp
+       ),
+       do: false
 
   # A usage-endpoint zero must never re-enable exhausted weekly quota on its
   # own: without this chokepoint guard, an expired or stale canonical takes

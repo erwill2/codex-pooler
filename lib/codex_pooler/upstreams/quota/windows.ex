@@ -56,6 +56,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
     delete_missing? = Keyword.fetch!(opts, :delete_missing?)
     covered_descriptors = Keyword.get(opts, :covered_descriptors, MapSet.new())
     broadcast? = Keyword.get(opts, :broadcast?, true)
+    evidence_opts = Keyword.take(opts, [:weekly_restart_corroboration])
 
     windows =
       Enum.map(windows, fn attrs ->
@@ -76,7 +77,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
         Multi.run(multi, {:quota_window, Evidence.identity_key(attrs)}, fn _repo, _changes ->
           # Reason: Multi callback normalizes quota evidence errors at the boundary.
           # credo:disable-for-next-line Credo.Check.Refactor.Nesting
-          case EvidenceStore.record_evidence(identity, attrs, now()) do
+          case EvidenceStore.record_evidence(identity, attrs, now(), evidence_opts) do
             {:ok, window} -> {:ok, window}
             {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
             {:error, errors} -> {:error, quota_window_error_changeset(identity, attrs, errors)}

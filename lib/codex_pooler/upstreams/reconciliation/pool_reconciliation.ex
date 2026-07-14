@@ -266,7 +266,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
             observed_at,
             usage_url,
             covered_descriptors,
-            false
+            broadcast?: false
           )
         end)
         |> case do
@@ -288,7 +288,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
           observed_at,
           usage_url,
           covered_descriptors,
-          true
+          broadcast?: true
         )
       end
 
@@ -331,10 +331,18 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         opts \\ []
       ) do
     observed_at = now()
+    probe_opts = Keyword.drop(opts, [:weekly_restart_corroboration])
+    weekly_restart_corroboration = Keyword.get(opts, :weekly_restart_corroboration)
 
-    case UsageProbe.fetch_from_identity(identity, assignment, observed_at, opts) do
+    case UsageProbe.fetch_from_identity(identity, assignment, observed_at, probe_opts) do
       {:ok, %UsageProbe.Result{credential_fence: fence} = probe} when not is_nil(fence) ->
-        apply_refresh_usage_success(identity, probe, observed_at, fence)
+        apply_refresh_usage_success(
+          identity,
+          probe,
+          observed_at,
+          fence,
+          weekly_restart_corroboration
+        )
 
       {:error, {:definitive_provider_auth_rejected, fence}} ->
         apply_refresh_usage_rejection(identity, fence)
@@ -344,7 +352,13 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     end
   end
 
-  defp apply_refresh_usage_success(identity, probe, observed_at, fence) do
+  defp apply_refresh_usage_success(
+         identity,
+         probe,
+         observed_at,
+         fence,
+         weekly_restart_corroboration
+       ) do
     CredentialFencing.apply_usage_success(identity, fence, fn locked_identity ->
       persist_reconciliation_quota(
         locked_identity,
@@ -354,7 +368,8 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
         observed_at,
         probe.usage_url,
         probe.covered_descriptors,
-        false
+        broadcast?: false,
+        weekly_restart_corroboration: weekly_restart_corroboration
       )
     end)
     |> case do
@@ -380,13 +395,22 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
          observed_at,
          usage_url,
          covered_descriptors,
-         broadcast?
+         opts
        ) do
+    broadcast? = Keyword.fetch!(opts, :broadcast?)
+
+    weekly_restart_corroboration =
+      validate_saved_reset_weekly_restart_corroboration(
+        identity,
+        Keyword.get(opts, :weekly_restart_corroboration)
+      ) || saved_reset_weekly_restart_corroboration(identity)
+
     case Quota.Windows.upsert_quota_windows(identity, windows,
            delete_missing?: true,
            covered_descriptors: covered_descriptors,
            identity_attrs: identity_attrs,
-           broadcast?: broadcast?
+           broadcast?: broadcast?,
+           weekly_restart_corroboration: weekly_restart_corroboration
          ) do
       {:ok, refreshed} ->
         if is_map(payload), do: maybe_update_identity_plan(identity, payload)
@@ -421,6 +445,91 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
   defp maybe_update_saved_reset_snapshot(identity, _payload, _observed_at, _usage_url),
     do: identity
+
+  defp saved_reset_weekly_restart_corroboration(%UpstreamIdentity{metadata: metadata} = identity) do
+    with current_epoch when is_integer(current_epoch) and current_epoch > 0 <-
+           CredentialFencing.credential_epoch(identity),
+         %{"started_at" => started_at} = redemption <-
+           (metadata || %{})["saved_reset_redemption"],
+         {:ok, ^current_epoch} <- redemption_credential_epoch(redemption, current_epoch),
+         {:ok, %DateTime{} = started_at} <- parse_redemption_datetime(started_at),
+         {:ok, %DateTime{} = confirmed_at} <- provider_confirmation_time(redemption) do
+      {:saved_reset_redemption, current_epoch, started_at, confirmed_at}
+    else
+      _redemption -> nil
+    end
+  end
+
+  defp validate_saved_reset_weekly_restart_corroboration(
+         %UpstreamIdentity{} = identity,
+         {:saved_reset_redemption, credential_epoch, %DateTime{} = started_at,
+          %DateTime{} = confirmed_at} = corroboration
+       )
+       when is_integer(credential_epoch) and credential_epoch > 0 do
+    if CredentialFencing.current_credential_epoch?(identity, credential_epoch) and
+         DateTime.compare(started_at, confirmed_at) != :gt do
+      corroboration
+    end
+  end
+
+  defp validate_saved_reset_weekly_restart_corroboration(_identity, _corroboration), do: nil
+
+  defp redemption_credential_epoch(%{"credential_epoch" => credential_epoch}, _current_epoch)
+       when is_integer(credential_epoch) and credential_epoch > 0,
+       do: {:ok, credential_epoch}
+
+  # Compatibility for saved-reset successes written before credential epochs
+  # were attached to redemption metadata. Epoch one has never crossed a
+  # credential replacement boundary; later epochs must always match explicitly.
+  defp redemption_credential_epoch(
+         %{
+           "status" => "succeeded",
+           "result" => %{"applied" => true, "code" => "reset"}
+         },
+         1
+       ),
+       do: {:ok, 1}
+
+  defp redemption_credential_epoch(_redemption, _current_epoch), do: :error
+
+  defp provider_confirmation_time(%{
+         "status" => "redeeming",
+         "provider_confirmed_at" => provider_confirmed_at
+       }) do
+    parse_redemption_datetime(provider_confirmed_at)
+  end
+
+  defp provider_confirmation_time(%{
+         "result" => %{"provider_confirmed_at" => provider_confirmed_at}
+       })
+       when is_binary(provider_confirmed_at) do
+    parse_redemption_datetime(provider_confirmed_at)
+  end
+
+  # Compatibility for successful redemptions persisted before the explicit
+  # provider confirmation timestamp was introduced. Their completion time is
+  # a conservative upper bound for the already-finished consume response.
+  defp provider_confirmation_time(%{
+         "status" => "succeeded",
+         "finished_at" => finished_at,
+         "result" => %{"applied" => true, "code" => "reset"}
+       }) do
+    parse_redemption_datetime(finished_at)
+  end
+
+  defp provider_confirmation_time(_redemption), do: :error
+
+  defp parse_redemption_datetime(datetime) when is_binary(datetime) do
+    case DateTime.from_iso8601(datetime) do
+      {:ok, %DateTime{} = parsed, _offset} ->
+        {:ok, DateTime.truncate(parsed, :microsecond)}
+
+      _invalid ->
+        :error
+    end
+  end
+
+  defp parse_redemption_datetime(_datetime), do: :error
 
   defp metadata_quota_windows(identity, assignment) do
     identity_windows = Quota.Windows.quota_windows_from_metadata(identity.metadata)

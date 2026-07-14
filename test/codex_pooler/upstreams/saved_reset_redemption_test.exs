@@ -6,6 +6,7 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
   alias CodexPooler.Upstreams.SavedResetRedemption
   alias CodexPooler.Upstreams.SavedResets.AutoEligibility
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
@@ -56,6 +57,15 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
 
       persisted = Repo.reload!(identity)
       assert get_in(persisted.metadata, ["saved_reset_redemption", "result", "code"]) == "reset"
+
+      assert is_binary(
+               get_in(persisted.metadata, [
+                 "saved_reset_redemption",
+                 "result",
+                 "provider_confirmed_at"
+               ])
+             )
+
       metadata_json = Jason.encode!(persisted.metadata)
       refute metadata_json =~ "credit_1"
       refute metadata_json =~ redeem_request_id
@@ -86,6 +96,304 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
       assert %{"redeem_request_id" => redeem_request_id} = body
       assert is_binary(redeem_request_id)
       refute Map.has_key?(body, "credit_id")
+    end
+
+    test "confirmed redemption replaces exhausted weekly usage and restores routing" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      previous_reset_at = DateTime.add(observed_at, 5, :day)
+      restarted_reset_at = DateTime.add(observed_at, 7, :day)
+
+      {:ok, fake} =
+        FakeUpstream.start_link(
+          {:path_json,
+           %{
+             "/api/codex/rate-limit-reset-credits/consume" => {200, %{"code" => "reset"}},
+             "/api/codex/usage" =>
+               {200,
+                usage_payload(0,
+                  secondary_window: %{
+                    "used_percent" => 0,
+                    "limit_window_seconds" => 604_800,
+                    "reset_at" => DateTime.to_iso8601(restarted_reset_at)
+                  }
+                )}
+           }}
+        )
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+      for source <- ["codex_usage_api", "codex_response_headers", "codex_rate_limit_event"] do
+        upsert_weekly_exhausted_quota!(identity,
+          source: source,
+          reset_at: previous_reset_at,
+          observed_at: observed_at,
+          last_sync_at: observed_at
+        )
+      end
+
+      assert %{eligible?: false, routing_state: :blocked} =
+               QuotaWindows.routing_quota_eligibility(identity, at: observed_at)
+
+      assert {:ok, %{status: :succeeded, applied?: true, code: "reset"}} =
+               SavedResetRedemption.redeem(assignment)
+
+      weekly_usage =
+        identity
+        |> QuotaWindows.list_evidence()
+        |> Enum.find(&(&1.source == "codex_usage_api" and &1.window_kind == "secondary"))
+
+      assert Decimal.equal?(weekly_usage.used_percent, Decimal.new(0))
+      assert DateTime.compare(weekly_usage.reset_at, restarted_reset_at) == :eq
+
+      assert %{
+               eligible?: true,
+               selection: %{secondary: %{id: weekly_usage_id, source: "codex_usage_api"}}
+             } = QuotaWindows.routing_quota_eligibility(identity)
+
+      assert weekly_usage_id == weekly_usage.id
+    end
+
+    test "persisted successful redemption self-heals a pre-existing stale weekly snapshot" do
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:second)
+      observed_at = DateTime.add(timestamp, -2, :minute)
+      confirmed_at = DateTime.add(timestamp, -1, :minute)
+      previous_reset_at = DateTime.add(timestamp, 5, :day)
+      restarted_reset_at = DateTime.add(timestamp, 7, :day)
+
+      {:ok, fake} = weekly_zero_usage_fake(restarted_reset_at)
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+      for source <- ["codex_usage_api", "codex_response_headers", "codex_rate_limit_event"] do
+        upsert_weekly_exhausted_quota!(identity,
+          source: source,
+          reset_at: previous_reset_at,
+          observed_at: observed_at,
+          last_sync_at: observed_at
+        )
+      end
+
+      redeemed_identity =
+        update_redemption!(identity, succeeded_redemption_metadata(confirmed_at))
+
+      assert {:ok, _identity} =
+               PoolReconciliation.refresh_quota_from_usage(redeemed_identity, assignment)
+
+      weekly_usage = usage_weekly_evidence(redeemed_identity)
+
+      assert Decimal.equal?(weekly_usage.used_percent, Decimal.new(0))
+      assert DateTime.compare(weekly_usage.reset_at, restarted_reset_at) == :eq
+      assert %{eligible?: true} = QuotaWindows.routing_quota_eligibility(redeemed_identity)
+    end
+
+    test "a provider-confirmed in-progress redemption lets the newer concurrent probe converge" do
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:second)
+      observed_at = DateTime.add(timestamp, -3, :minute)
+      started_at = DateTime.add(timestamp, -2, :minute)
+      confirmed_at = DateTime.add(timestamp, -1, :minute)
+      previous_reset_at = DateTime.add(timestamp, 5, :day)
+      restarted_reset_at = DateTime.add(timestamp, 7, :day)
+
+      {:ok, fake} = weekly_zero_usage_fake(restarted_reset_at)
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+      upsert_weekly_exhausted_quota!(identity,
+        reset_at: previous_reset_at,
+        observed_at: observed_at,
+        last_sync_at: observed_at
+      )
+
+      confirmed_identity =
+        update_redemption!(
+          identity,
+          provider_confirmed_in_progress_metadata(started_at, confirmed_at)
+        )
+
+      # This is the deterministic form of the fence race: a scheduled probe
+      # that was allocated after the redemption refresh may apply first. It
+      # sees the persisted in-progress provider confirmation while holding the
+      # identity lock and is therefore able to converge the weekly snapshot.
+      assert {:ok, _identity} =
+               PoolReconciliation.refresh_quota_from_usage(confirmed_identity, assignment)
+
+      assert Decimal.equal?(
+               usage_weekly_evidence(confirmed_identity).used_percent,
+               Decimal.new(0)
+             )
+
+      assert %{eligible?: true} = QuotaWindows.routing_quota_eligibility(confirmed_identity)
+    end
+
+    test "provider confirmation supersedes runtime evidence observed while consume was in flight" do
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:second)
+      observed_at = DateTime.add(timestamp, -4, :minute)
+      started_at = DateTime.add(timestamp, -3, :minute)
+      runtime_at = DateTime.add(timestamp, -2, :minute)
+      confirmed_at = DateTime.add(timestamp, -1, :minute)
+      previous_reset_at = DateTime.add(timestamp, 5, :day)
+      restarted_reset_at = DateTime.add(timestamp, 7, :day)
+
+      {:ok, fake} = weekly_zero_usage_fake(restarted_reset_at)
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+      upsert_weekly_exhausted_quota!(identity,
+        reset_at: previous_reset_at,
+        observed_at: observed_at,
+        last_sync_at: observed_at
+      )
+
+      confirmed_identity =
+        update_redemption!(
+          identity,
+          provider_confirmed_in_progress_metadata(started_at, confirmed_at)
+        )
+
+      upsert_weekly_exhausted_quota!(confirmed_identity,
+        source: "codex_rate_limit_event",
+        reset_at: previous_reset_at,
+        observed_at: runtime_at,
+        last_sync_at: runtime_at
+      )
+
+      assert {:ok, _identity} =
+               PoolReconciliation.refresh_quota_from_usage(confirmed_identity, assignment)
+
+      assert Decimal.equal?(
+               usage_weekly_evidence(confirmed_identity).used_percent,
+               Decimal.new(0)
+             )
+
+      assert %{eligible?: true} =
+               QuotaWindows.routing_quota_eligibility(confirmed_identity)
+    end
+
+    test "lagging old-cycle usage cannot strand a confirmed reset zero" do
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:second)
+      observed_at = DateTime.add(timestamp, -4, :minute)
+      confirmed_at = DateTime.add(timestamp, -2, :minute)
+      lagging_at = DateTime.add(timestamp, -1, :minute)
+      previous_reset_at = DateTime.add(timestamp, 5, :day)
+      restarted_reset_at = DateTime.add(timestamp, 7, :day)
+
+      {:ok, fake} = weekly_zero_usage_fake(restarted_reset_at)
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+      upsert_weekly_exhausted_quota!(identity,
+        reset_at: previous_reset_at,
+        observed_at: observed_at,
+        last_sync_at: observed_at
+      )
+
+      redeemed_identity =
+        update_redemption!(identity, succeeded_redemption_metadata(confirmed_at))
+
+      upsert_weekly_exhausted_quota!(redeemed_identity,
+        reset_at: previous_reset_at,
+        observed_at: lagging_at,
+        last_sync_at: lagging_at
+      )
+
+      assert DateTime.compare(usage_weekly_evidence(redeemed_identity).observed_at, lagging_at) ==
+               :eq
+
+      assert {:ok, _identity} =
+               PoolReconciliation.refresh_quota_from_usage(redeemed_identity, assignment)
+
+      weekly_usage = usage_weekly_evidence(redeemed_identity)
+      assert Decimal.equal?(weekly_usage.used_percent, Decimal.new(0))
+      assert DateTime.compare(weekly_usage.reset_at, restarted_reset_at) == :eq
+      assert %{eligible?: true} = QuotaWindows.routing_quota_eligibility(redeemed_identity)
+    end
+
+    test "redemption from an earlier credential epoch cannot clear current quota" do
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:second)
+      observed_at = DateTime.add(timestamp, -3, :minute)
+      confirmed_at = DateTime.add(timestamp, -2, :minute)
+      previous_reset_at = DateTime.add(timestamp, 5, :day)
+      restarted_reset_at = DateTime.add(timestamp, 7, :day)
+
+      {:ok, fake} = weekly_zero_usage_fake(restarted_reset_at)
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+      upsert_weekly_exhausted_quota!(identity,
+        reset_at: previous_reset_at,
+        observed_at: observed_at,
+        last_sync_at: observed_at
+      )
+
+      current_identity =
+        update_identity!(identity, %{
+          metadata: Map.put(identity.metadata || %{}, "credential_epoch", 2)
+        })
+
+      stale_redemption =
+        confirmed_at
+        |> succeeded_redemption_metadata()
+        |> Map.put("credential_epoch", 1)
+
+      current_identity = update_redemption!(current_identity, stale_redemption)
+
+      assert {:ok, _identity} =
+               PoolReconciliation.refresh_quota_from_usage(current_identity, assignment)
+
+      assert Decimal.equal?(
+               usage_weekly_evidence(current_identity).used_percent,
+               Decimal.new(100)
+             )
+
+      assert %{eligible?: false, routing_state: :blocked} =
+               QuotaWindows.routing_quota_eligibility(current_identity)
+    end
+
+    test "post-redemption runtime evidence prevents stale success from authorizing a later zero" do
+      timestamp = DateTime.utc_now() |> DateTime.truncate(:second)
+      observed_at = DateTime.add(timestamp, -3, :minute)
+      confirmed_at = DateTime.add(timestamp, -2, :minute)
+      runtime_at = DateTime.add(timestamp, -1, :minute)
+      previous_reset_at = DateTime.add(timestamp, 5, :day)
+      restarted_reset_at = DateTime.add(timestamp, 7, :day)
+
+      {:ok, fake} = weekly_zero_usage_fake(restarted_reset_at)
+
+      %{identity: identity, assignment: assignment} =
+        assignment_with_fake(fake, "/api/codex/usage", "codex_api")
+
+      upsert_weekly_exhausted_quota!(identity,
+        reset_at: previous_reset_at,
+        observed_at: observed_at,
+        last_sync_at: observed_at
+      )
+
+      redeemed_identity =
+        update_redemption!(identity, succeeded_redemption_metadata(confirmed_at))
+
+      upsert_weekly_exhausted_quota!(redeemed_identity,
+        source: "codex_rate_limit_event",
+        reset_at: previous_reset_at,
+        observed_at: runtime_at,
+        last_sync_at: runtime_at
+      )
+
+      assert {:ok, _identity} =
+               PoolReconciliation.refresh_quota_from_usage(redeemed_identity, assignment)
+
+      assert Decimal.equal?(
+               usage_weekly_evidence(redeemed_identity).used_percent,
+               Decimal.new(100)
+             )
+
+      assert %{eligible?: false, routing_state: :blocked} =
+               QuotaWindows.routing_quota_eligibility(redeemed_identity)
     end
 
     test "does not consume when no ChatGPT credit is usable and preserves expiration metadata" do
@@ -570,6 +878,23 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     )
   end
 
+  defp weekly_zero_usage_fake(restarted_reset_at) do
+    FakeUpstream.start_link(
+      {:path_json,
+       %{
+         "/api/codex/usage" =>
+           {200,
+            usage_payload(0,
+              secondary_window: %{
+                "used_percent" => 0,
+                "limit_window_seconds" => 604_800,
+                "reset_at" => DateTime.to_iso8601(restarted_reset_at)
+              }
+            )}
+       }}
+    )
+  end
+
   defp assignment_with_fake(fake, usage_path, path_style, opts \\ []) do
     saved_resets =
       Keyword.get(opts, :saved_resets, %{
@@ -712,6 +1037,44 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     }
   end
 
+  defp succeeded_redemption_metadata(finished_at) do
+    %{
+      "status" => "succeeded",
+      "attempt_id" => Ecto.UUID.generate(),
+      "generation" => 1,
+      "trigger_kind" => "admin_manual",
+      "started_at" => finished_at |> DateTime.add(-5, :second) |> DateTime.to_iso8601(),
+      "finished_at" => DateTime.to_iso8601(finished_at),
+      "result" => %{
+        "code" => "reset",
+        "applied" => true,
+        "available_count_before" => 1,
+        "available_count_after" => 0,
+        "http_status" => 200
+      }
+    }
+  end
+
+  defp provider_confirmed_in_progress_metadata(started_at, confirmed_at) do
+    %{
+      "status" => "redeeming",
+      "attempt_id" => Ecto.UUID.generate(),
+      "generation" => 1,
+      "credential_epoch" => 1,
+      "trigger_kind" => "admin_manual",
+      "started_at" => DateTime.to_iso8601(started_at),
+      "finished_at" => nil,
+      "provider_confirmed_at" => DateTime.to_iso8601(confirmed_at),
+      "result" => nil
+    }
+  end
+
+  defp usage_weekly_evidence(identity) do
+    identity
+    |> QuotaWindows.list_evidence()
+    |> Enum.find(&(&1.source == "codex_usage_api" and &1.window_kind == "secondary"))
+  end
+
   defp upsert_weekly_exhausted_quota!(identity, overrides \\ []) do
     assert {:ok, [_window]} =
              QuotaWindows.upsert_quota_windows(identity, [
@@ -746,8 +1109,8 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
     )
   end
 
-  defp usage_payload(available_count) do
-    %{
+  defp usage_payload(available_count, opts \\ []) do
+    payload = %{
       "plan_type" => "pro",
       "rate_limit_reset_credits" => %{"available_count" => available_count},
       "rate_limit" => %{
@@ -758,5 +1121,13 @@ defmodule CodexPooler.Upstreams.SavedResetRedemptionTest do
         }
       }
     }
+
+    case Keyword.get(opts, :secondary_window) do
+      %{} = secondary_window ->
+        put_in(payload, ["rate_limit", "secondary_window"], secondary_window)
+
+      _secondary_window ->
+        payload
+    end
   end
 end
