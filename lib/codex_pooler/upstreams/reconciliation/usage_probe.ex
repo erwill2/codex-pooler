@@ -79,7 +79,13 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
           {:usage_rejected, fenced_identity, fence}
 
         {:error, {:upstream_status, status}} when status in [401, 403] ->
-          maybe_retry_after_token_refresh(identity, assignment, observed_at, opts)
+          maybe_retry_after_token_refresh(
+            identity,
+            assignment,
+            observed_at,
+            opts,
+            fence.credential_epoch
+          )
 
         {:error, reason} ->
           {:usage_unavailable, reason}
@@ -179,18 +185,22 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
 
   defp metadata_usage_path(_metadata), do: nil
 
-  defp maybe_retry_after_token_refresh(identity, assignment, observed_at, opts) do
+  defp maybe_retry_after_token_refresh(identity, assignment, observed_at, opts, credential_epoch) do
     if access_token_refresh_due_after_usage_auth_failure?(identity, observed_at) do
-      retry_after_token_refresh(identity, assignment, opts)
+      retry_after_token_refresh(identity, assignment, opts, credential_epoch)
     else
       {:usage_unavailable, {:upstream_status, :auth_rejected}}
     end
   end
 
-  defp retry_after_token_refresh(identity, assignment, opts) do
+  # The expected epoch is the one the failed probe ran under: if credentials
+  # rotated meanwhile, the refresh skips the provider call and hands back the
+  # current active identity, and the usage fetch retries with its token.
+  defp retry_after_token_refresh(identity, assignment, opts, credential_epoch) do
     case TokenRefresh.refresh_access_token(identity,
            trigger_kind: "account_reconciliation",
-           receive_timeout: Keyword.get(opts, :receive_timeout, 30_000)
+           receive_timeout: Keyword.get(opts, :receive_timeout, 30_000),
+           expected_credential_epoch: credential_epoch
          ) do
       {:ok, %{status: :active, identity: refreshed_identity}} ->
         fetch_after_successful_token_refresh(refreshed_identity, assignment, opts)

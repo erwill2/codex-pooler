@@ -51,11 +51,18 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
     trigger_kind = opts |> Keyword.get(:trigger_kind, "manual") |> safe_trigger_kind()
     receive_timeout_ms = receive_timeout_ms(opts)
     stale_after_ms = stale_after_ms(receive_timeout_ms)
+    expected_credential_epoch = expected_credential_epoch(opts)
 
     with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
          :ok <- IdentityLifecycle.guard_workspace_slot_mutation(identity, %{}),
          {:ok, refreshing_identity, refresh_token, attempt} <-
-           begin_token_refresh(identity, trigger_kind, receive_timeout_ms, stale_after_ms) do
+           begin_token_refresh(
+             identity,
+             trigger_kind,
+             receive_timeout_ms,
+             stale_after_ms,
+             expected_credential_epoch
+           ) do
       refreshing_identity
       |> perform_token_refresh(refresh_token, receive_timeout_ms)
       |> finalize_token_refresh(refreshing_identity.id, trigger_kind, attempt)
@@ -80,12 +87,18 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          %UpstreamIdentity{} = identity,
          trigger_kind,
          receive_timeout_ms,
-         stale_after_ms
+         stale_after_ms,
+         expected_credential_epoch
        ) do
     Repo.transaction(fn ->
       identity.id
       |> lock_upstream_identity_with_timestamp()
-      |> begin_token_refresh_from_lock(trigger_kind, receive_timeout_ms, stale_after_ms)
+      |> begin_token_refresh_from_lock(
+        trigger_kind,
+        receive_timeout_ms,
+        stale_after_ms,
+        expected_credential_epoch
+      )
     end)
     |> case do
       {:ok, {:refresh, identity, refresh_token, attempt}} ->
@@ -106,7 +119,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          {%UpstreamIdentity{status: status} = locked, _timestamp},
          _trigger_kind,
          _receive_timeout_ms,
-         _stale_after_ms
+         _stale_after_ms,
+         _expected_credential_epoch
        )
        when status in @token_refresh_terminal_statuses do
     token_refresh_result(:noop, locked, retryable?: false, reason: "account is #{status}")
@@ -116,7 +130,8 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          {%UpstreamIdentity{status: status} = locked, _timestamp},
          _trigger_kind,
          _receive_timeout_ms,
-         _stale_after_ms
+         _stale_after_ms,
+         _expected_credential_epoch
        )
        when status not in @token_refresh_candidate_statuses do
     token_refresh_result(:noop, locked, retryable?: false, reason: "account is #{status}")
@@ -126,20 +141,58 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
          {%UpstreamIdentity{} = locked, timestamp},
          trigger_kind,
          receive_timeout_ms,
-         stale_after_ms
+         stale_after_ms,
+         expected_credential_epoch
        ) do
-    begin_refreshable_identity(
-      locked,
-      trigger_kind,
-      receive_timeout_ms,
-      stale_after_ms,
-      timestamp
+    if stale_expected_credential_epoch?(locked, expected_credential_epoch) do
+      stale_epoch_refresh_result(locked)
+    else
+      begin_refreshable_identity(
+        locked,
+        trigger_kind,
+        receive_timeout_ms,
+        stale_after_ms,
+        timestamp
+      )
+    end
+  end
+
+  defp begin_token_refresh_from_lock(
+         nil,
+         _trigger_kind,
+         _receive_timeout_ms,
+         _stale_after_ms,
+         _expected_credential_epoch
+       ) do
+    Repo.rollback(
+      lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")
     )
   end
 
-  defp begin_token_refresh_from_lock(nil, _trigger_kind, _receive_timeout_ms, _stale_after_ms) do
-    Repo.rollback(
-      lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")
+  # A caller carrying an expected credential epoch observed its auth failure
+  # under credentials that have since been replaced: the failure is stale
+  # evidence, so the provider refresh endpoint must not be called again for
+  # it. Checked under the identity row lock — a pre-call check at the caller
+  # would leave a time-of-check/time-of-use gap. Callers that supply no
+  # expected epoch (manual, worker, websocket) are unchanged.
+  defp stale_expected_credential_epoch?(_locked, nil), do: false
+
+  defp stale_expected_credential_epoch?(%UpstreamIdentity{} = locked, expected_credential_epoch)
+       when is_integer(expected_credential_epoch) do
+    CredentialFencing.credential_epoch(locked) != expected_credential_epoch
+  end
+
+  defp stale_epoch_refresh_result(%UpstreamIdentity{status: @active} = locked) do
+    token_refresh_result(:active, locked,
+      retryable?: false,
+      reason: "credential epoch advanced"
+    )
+  end
+
+  defp stale_epoch_refresh_result(%UpstreamIdentity{} = locked) do
+    token_refresh_result(:noop, locked,
+      retryable?: false,
+      reason: "credential epoch advanced"
     )
   end
 
@@ -572,6 +625,13 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefresh do
 
   defp stale_after_ms(receive_timeout_ms) do
     receive_timeout_ms + @stale_slack_ms
+  end
+
+  defp expected_credential_epoch(opts) do
+    case Keyword.get(opts, :expected_credential_epoch) do
+      epoch when is_integer(epoch) and epoch > 0 -> epoch
+      _absent_or_invalid -> nil
+    end
   end
 
   defp positive_integer_or_default(value, _default) when is_integer(value) and value > 0,

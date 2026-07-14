@@ -11,6 +11,7 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefreshTest do
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.Auth.CodexAuth
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
   alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
@@ -184,6 +185,77 @@ defmodule CodexPooler.Upstreams.Auth.TokenRefreshTest do
 
       assert {:ok, ^new_access_token} =
                Secrets.decrypt_active_secret(identity, "access_token")
+    end
+
+    test "a stale credential epoch skips the provider refresh and hands back the rotated identity" do
+      refresh_token = secret("refresh", "epoch-fence")
+      rotated_access_token = secret("access", "epoch-fence")
+
+      upstream =
+        start_path_upstream(%{
+          "/oauth/token" => {200, %{"access_token" => rotated_access_token, "expires_in" => 3600}}
+        })
+
+      identity =
+        refreshable_identity_fixture("active", %{"base_url" => FakeUpstream.url(upstream)})
+
+      store_secret!(identity, "refresh_token", refresh_token)
+
+      original_epoch = CredentialFencing.credential_epoch(identity)
+
+      # Probe A refreshes under the epoch it observed; rotation advances it.
+      assert {:ok, %{status: :active}} =
+               TokenRefresh.refresh_access_token(identity,
+                 trigger_kind: "account_reconciliation",
+                 expected_credential_epoch: original_epoch
+               )
+
+      assert FakeUpstream.count(upstream) == 1
+
+      rotated = Repo.get!(UpstreamIdentity, identity.id)
+      assert CredentialFencing.credential_epoch(rotated) == original_epoch + 1
+
+      # Probe B's auth failure was produced under the replaced credentials:
+      # the provider must not be called again for stale evidence, and the
+      # caller gets the current active identity to retry usage with.
+      assert {:ok,
+              %{
+                status: :active,
+                retryable?: false,
+                reason: "credential epoch advanced",
+                identity: current
+              }} =
+               TokenRefresh.refresh_access_token(identity,
+                 trigger_kind: "account_reconciliation",
+                 expected_credential_epoch: original_epoch
+               )
+
+      assert FakeUpstream.count(upstream) == 1
+      assert current.id == identity.id
+      assert {:ok, ^rotated_access_token} = Secrets.decrypt_active_secret(current, "access_token")
+
+      # A stale-epoch caller against a non-active identity gets a noop
+      # instead of pretending the account can serve.
+      rotated
+      |> Ecto.Changeset.change(%{status: "refresh_due"})
+      |> Repo.update!()
+
+      assert {:ok, %{status: :noop, reason: "credential epoch advanced"}} =
+               TokenRefresh.refresh_access_token(identity,
+                 trigger_kind: "account_reconciliation",
+                 expected_credential_epoch: original_epoch
+               )
+
+      assert FakeUpstream.count(upstream) == 1
+
+      # A caller carrying the current epoch still performs a normal refresh.
+      assert {:ok, %{status: :active}} =
+               TokenRefresh.refresh_access_token(identity,
+                 trigger_kind: "account_reconciliation",
+                 expected_credential_epoch: original_epoch + 1
+               )
+
+      assert FakeUpstream.count(upstream) == 2
     end
 
     test "active non-stale attempt returns in-progress without decrypting secrets or provider I/O" do
