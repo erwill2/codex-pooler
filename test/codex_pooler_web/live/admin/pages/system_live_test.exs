@@ -363,7 +363,7 @@ defmodule CodexPoolerWeb.Admin.SystemLiveTest do
       |> render_click()
 
     assert html =~ "Sample data imported"
-    assert has_element?(view, "#instance-settings-development-action-status", "2 pools")
+    assert has_element?(view, "#instance-settings-development-action-status", "3 pools")
 
     assert Repo.aggregate(
              from(pool in Pool, where: pool.slug in ["dev-primary", "dev-disabled"]),

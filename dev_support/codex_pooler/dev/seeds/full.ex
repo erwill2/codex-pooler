@@ -617,8 +617,8 @@ defmodule CodexPooler.Dev.Seeds.Full do
         reasoning_tokens: tokens.reasoning,
         total_tokens: tokens.total,
         request_count: 1,
-        estimated_cost_micros: Decimal.new(index * 1000),
-        settled_cost_micros: Decimal.new(index * 1000),
+        estimated_cost_micros: Decimal.new(ledger_cost_micros(spec, index)),
+        settled_cost_micros: Decimal.new(ledger_cost_micros(spec, index)),
         occurred_at: timestamp,
         created_at: timestamp,
         details: %{"dev_seed" => @seed_key, "pricing_status" => "priced"}
@@ -1105,6 +1105,10 @@ defmodule CodexPooler.Dev.Seeds.Full do
       total: 1520 * index
     }
   end
+
+  # Roughly $6 per million tokens keeps the seeded cost column plausible.
+  defp ledger_cost_micros(%{total_tokens: total}, _index) when is_integer(total), do: total * 6
+  defp ledger_cost_micros(_spec, index), do: index * 1000
 
   defp attempt_status("succeeded"), do: "succeeded"
   defp attempt_status("failed"), do: "failed"
