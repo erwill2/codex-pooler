@@ -36,7 +36,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     :ok
   end
 
-  test "reconciliation status renders one recovery region for a blocked summary" do
+  test "reconciliation status renders one attention region for a blocked summary" do
     html =
       render_component(&ReconciliationStatus.reconciliation_status/1, %{
         id_prefix: "blocked-reconciliation",
@@ -47,13 +47,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
             message: "quota refresh authentication unavailable"
           }
         },
-        reauth_required?: false,
-        recovery_href: "/admin/upstreams",
-        recovery_label: "Open recovery actions"
+        reauth_required?: false
       })
 
     assert_occurrences(html, ~s(data-role="upstream-reconciliation-status"), 1)
-    assert_occurrences(html, ~s(id="blocked-reconciliation-reconciliation-recovery"), 1)
+    assert html =~ "quota refresh authentication unavailable"
+    refute html =~ "reconciliation-recovery"
     refute html =~ "reauth-warning"
   end
 
@@ -153,7 +152,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         "quota refresh authentication unavailable"
       )
 
-      assert_single_element(view, "##{prefix}-reconciliation-recovery", "Open recovery actions")
+      refute has_element?(view, "##{prefix}-reconciliation-recovery")
       assert has_element?(view, "##{prefix}-last-successful-refresh")
       assert has_element?(view, "##{prefix}-quota-evidence-age")
       refute has_element?(view, "##{prefix}-reauth-warning")
@@ -257,7 +256,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
         "Quota reconciliation needs attention"
       )
 
-      assert_single_element(view, "##{prefix}-reconciliation-recovery", "Open recovery actions")
+      refute has_element?(view, "##{prefix}-reconciliation-recovery")
       refute has_element?(view, "##{prefix}-reauth-warning")
     end
   end

@@ -3872,7 +3872,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(view, reconciliation_selector, "upstream OAuth refresh failed")
     assert has_element?(view, reconciliation_selector, "codex_oauth_refresh_failed")
-    assert_single_element(view, "#upstream-account-#{identity.id}-reconciliation-recovery")
+    refute has_element?(view, "#upstream-account-#{identity.id}-reconciliation-recovery")
     refute has_element?(view, "#upstream-account-#{identity.id}-refresh-failed-warning")
 
     assert has_element?(
@@ -3948,7 +3948,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              "quota refresh authentication unavailable"
            )
 
-    assert_single_element(view, "##{prefix}-reconciliation-recovery", "Open recovery actions")
+    refute has_element?(view, "##{prefix}-reconciliation-recovery")
     assert has_element?(view, "##{prefix}-last-successful-refresh")
     assert has_element?(view, "##{prefix}-quota-evidence-age")
     refute has_element?(view, "##{prefix}-reauth-warning")
@@ -5399,7 +5399,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     reconciliation_selector = "#upstream-account-#{reauth_identity.id}-reconciliation-status"
     assert has_element?(view, reconciliation_selector, "Reauthentication required")
-    assert has_element?(view, "#upstream-account-#{reauth_identity.id}-reconciliation-recovery")
+    refute has_element?(view, "#upstream-account-#{reauth_identity.id}-reconciliation-recovery")
     refute has_element?(view, "#upstream-account-#{reauth_identity.id}-reauth-warning")
   end
 
@@ -5591,7 +5591,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, reconciliation_selector, "excluded from routing")
     assert has_element?(view, reconciliation_selector, "Refresh token was revoked or expired")
     assert has_element?(view, reconciliation_selector, "refresh_token_revoked")
-    assert has_element?(view, "#upstream-account-#{reauth.id}-reconciliation-recovery")
+    refute has_element?(view, "#upstream-account-#{reauth.id}-reconciliation-recovery")
     refute has_element?(view, "#upstream-account-#{reauth.id}-reauth-warning")
   end
 

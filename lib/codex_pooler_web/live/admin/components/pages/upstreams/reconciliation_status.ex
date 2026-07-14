@@ -7,8 +7,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus do
   attr :identity_observability, :map, required: true
   attr :reauth_required?, :boolean, required: true
   attr :lifecycle_warning, :map, default: nil
-  attr :recovery_href, :string, required: true
-  attr :recovery_label, :string, required: true
 
   def reconciliation_status(assigns) do
     assigns =
@@ -25,59 +23,49 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus do
       data-role="upstream-reconciliation-status"
       data-reconciliation-status={@state.reconciliation_status}
       class={[
-        "grid gap-2 rounded-box border p-3 text-sm",
+        "flex items-start gap-2 rounded-box border p-3 text-sm",
         tone_class(@state.tone)
       ]}
     >
-      <div class="flex flex-wrap items-start justify-between gap-2">
-        <div class="flex min-w-0 items-start gap-2">
-          <.icon name={tone_icon(@state.tone)} class={tone_icon_class(@state.tone)} />
-          <div class="grid min-w-0 gap-1">
-            <h3 id={"#{@id_prefix}-reconciliation-title"} class={tone_title_class(@state.tone)}>
-              {@state.title}
-            </h3>
-            <p id={"#{@id_prefix}-reconciliation-summary"} class="text-base-content/80">
-              {@state.summary}
-            </p>
-          </div>
+      <.icon name={tone_icon(@state.tone)} class={tone_icon_class(@state.tone)} />
+      <div class="grid min-w-0 flex-1 gap-1">
+        <div class="flex min-w-0 flex-wrap items-baseline justify-between gap-x-3">
+          <h3 id={"#{@id_prefix}-reconciliation-title"} class={tone_title_class(@state.tone)}>
+            {@state.title}
+          </h3>
+          <span
+            :if={@state.attempt_age}
+            id={"#{@id_prefix}-reconciliation-attempt-age"}
+            class="text-xs text-base-content/65"
+          >
+            latest attempt {@state.attempt_age}
+          </span>
         </div>
-        <span
-          :if={@state.attempt_age}
-          id={"#{@id_prefix}-reconciliation-attempt-age"}
-          class="shrink-0 text-xs text-base-content/65"
+        <p id={"#{@id_prefix}-reconciliation-summary"} class="text-base-content/80">
+          {@state.summary}
+        </p>
+        <p
+          :if={@state.reason}
+          id={"#{@id_prefix}-reconciliation-reason"}
+          class="text-xs text-base-content/70"
         >
-          latest attempt {@state.attempt_age}
-        </span>
+          {@state.reason}
+        </p>
+        <dl class="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-base-content/60">
+          <div>
+            <dt class="sr-only">Last successful refresh</dt>
+            <dd id={"#{@id_prefix}-last-successful-refresh"}>
+              {age_label("Last successful quota refresh", @state.last_successful_refresh_age)}
+            </dd>
+          </div>
+          <div>
+            <dt class="sr-only">Quota evidence age</dt>
+            <dd id={"#{@id_prefix}-quota-evidence-age"}>
+              {age_label("Quota evidence", @state.quota_evidence_age)}
+            </dd>
+          </div>
+        </dl>
       </div>
-      <p
-        :if={@state.reason}
-        id={"#{@id_prefix}-reconciliation-reason"}
-        class="text-xs text-base-content/70"
-      >
-        {@state.reason}
-      </p>
-      <dl class="grid gap-1 text-xs text-base-content/70 sm:grid-cols-2">
-        <div>
-          <dt class="sr-only">Last successful refresh</dt>
-          <dd id={"#{@id_prefix}-last-successful-refresh"}>
-            {age_label("Last successful quota refresh", @state.last_successful_refresh_age)}
-          </dd>
-        </div>
-        <div>
-          <dt class="sr-only">Quota evidence age</dt>
-          <dd id={"#{@id_prefix}-quota-evidence-age"}>
-            {age_label("Quota evidence", @state.quota_evidence_age)}
-          </dd>
-        </div>
-      </dl>
-      <.link
-        :if={@state.recovery_needed?}
-        id={"#{@id_prefix}-reconciliation-recovery"}
-        href={@recovery_href}
-        class="link link-primary w-fit text-xs font-semibold"
-      >
-        {@recovery_label}
-      </.link>
     </section>
     """
   end
@@ -87,24 +75,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus do
     reconciliation_status = Map.get(reconciliation, :status)
     reconciliation_reason = Map.get(reconciliation, :message) || Map.get(reconciliation, :code)
 
-    {tone, title, summary, reason, recovery_needed?} =
+    {tone, title, summary, reason} =
       cond do
         is_map(lifecycle_warning) ->
           {:error, Map.fetch!(lifecycle_warning, :title), Map.fetch!(lifecycle_warning, :body),
-           Map.get(lifecycle_warning, :reason) || reconciliation_reason, true}
+           Map.get(lifecycle_warning, :reason) || reconciliation_reason}
 
         reauth_required? ->
           {:error, "Reauthentication required",
-           "Credentials need recovery before this account can route.", reconciliation_reason,
-           true}
+           "Credentials need recovery before this account can route.", reconciliation_reason}
 
         reconciliation_status in ["failed", "partial", "blocked"] ->
           {:error, "Quota reconciliation needs attention",
-           "The latest reconciliation did not complete successfully.", reconciliation_reason,
-           true}
+           reconciliation_reason || "The latest reconciliation did not complete successfully.",
+           nil}
 
         true ->
-          {:neutral, nil, nil, nil, false}
+          {:neutral, nil, nil, nil}
       end
 
     %{
@@ -116,8 +103,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus do
       reconciliation_status: reconciliation_status || "unavailable",
       attempt_age: Map.get(reconciliation, :attempt_age),
       last_successful_refresh_age: Map.get(observability, :last_successful_quota_refresh_age),
-      quota_evidence_age: Map.get(observability, :quota_evidence_age),
-      recovery_needed?: recovery_needed?
+      quota_evidence_age: Map.get(observability, :quota_evidence_age)
     }
   end
 

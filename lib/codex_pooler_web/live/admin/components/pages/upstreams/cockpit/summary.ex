@@ -225,8 +225,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
       id_prefix="upstream-cockpit"
       identity_observability={@cockpit.header.identity_observability}
       reauth_required?={@cockpit.flags.reauth_required?}
-      recovery_href="#upstream-actions"
-      recovery_label="Open recovery actions"
     />
     """
   end

@@ -347,8 +347,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
           identity_observability={@account.identity_observability}
           reauth_required?={@account.reauth_required?}
           lifecycle_warning={@lifecycle_warning}
-          recovery_href={~p"/admin/upstreams/#{@account.identity.id}"}
-          recovery_label="Open recovery actions"
         />
       </div>
       <footer
