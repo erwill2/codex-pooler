@@ -656,7 +656,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
 
   # A leaderboard of the account's models over the trailing five minutes: one
   # row per distinct exposed model advertised by any routing lane or settled in
-  # the window, ranked by settled tokens. Bars are relative to the leader.
+  # the window, ranked by settled tokens. Bars are relative to the leader. Ties
+  # fall back to descending name so newer model generations surface first.
   defp token_leaderboard(account) do
     usage_by_label =
       account
@@ -676,7 +677,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     leader_tokens = rows |> Enum.map(& &1.tokens) |> Enum.max(fn -> 0 end)
 
     rows
-    |> Enum.sort_by(&{-&1.tokens, &1.label})
+    |> Enum.sort_by(&{&1.tokens, &1.label}, :desc)
     |> Enum.map(fn row ->
       Map.merge(row, %{
         dom_id: model_dom_id(row.label),

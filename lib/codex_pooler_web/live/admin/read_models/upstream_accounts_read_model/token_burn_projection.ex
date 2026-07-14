@@ -77,7 +77,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.TokenBurnProjection do
         cost_micros: rows |> Enum.map(& &1.settled_cost_micros) |> Enum.sum()
       }
     end)
-    |> Enum.sort_by(&{-&1.tokens, &1.label})
+    |> Enum.sort_by(&{&1.tokens, &1.label}, :desc)
   end
 
   defp summary(recent_tokens, recent_requests, baseline_tokens, recent_models) do

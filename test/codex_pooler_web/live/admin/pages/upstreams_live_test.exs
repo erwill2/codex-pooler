@@ -251,6 +251,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       }
     })
 
+    model_fixture(first_pool, %{
+      exposed_model_id: "gpt-example-ancient",
+      metadata: %{
+        "source_assignment_models" => %{
+          first_assignment.id => %{"supports_responses" => true}
+        }
+      }
+    })
+
     %{api_key: api_key} = api_key_fixture(first_pool)
 
     request =
@@ -347,16 +356,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "##{tokens_panel_id} ##{card_id}-tokens-summary",
-             "1.4k tokens, 2 models"
+             "1.4k tokens, 3 models"
            )
 
-    # The leaderboard ranks by usage: the busy model renders before the quiet
-    # one even though it sorts after it alphabetically.
+    # The leaderboard ranks by usage first, then descending name: the busy
+    # model leads despite sorting after the others alphabetically, and among
+    # the zero rows the higher name (newer generation) comes before the lower.
     panel_html = view |> element("##{tokens_panel_id}") |> render()
 
     busy_position = :binary.match(panel_html, "token-model-gpt-example-busy") |> elem(0)
     quiet_position = :binary.match(panel_html, "token-model-gpt-example-quiet") |> elem(0)
+    ancient_position = :binary.match(panel_html, "token-model-gpt-example-ancient") |> elem(0)
     assert busy_position < quiet_position
+    assert quiet_position < ancient_position
 
     # The old capability/serving-signal chip noise stays gone.
     refute render(view) =~ "Unverified"
