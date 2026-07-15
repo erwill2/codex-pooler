@@ -201,7 +201,13 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-token-cost-chart-plot[data-chart-value-kinds]")
       assert has_element?(view, "#stats-token-cost-chart-plot[data-chart-yaxis]")
       refute has_element?(view, "#stats-token-chart")
-      assert has_element?(view, "#stats-api-key-surface > header p", "Top API keys by token usage")
+
+      assert has_element?(
+               view,
+               "#stats-api-key-surface > header p",
+               "Top API keys by token usage"
+             )
+
       refute has_element?(view, "#stats-api-key-surface > header > span")
       assert has_element?(view, "#stats-api-key-surface", "Leaderboard")
       assert has_element?(view, "#stats-api-key-podium-1", "Stats UI key")
@@ -211,6 +217,28 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-api-key-podium-1 .hero-trophy")
       refute has_element?(view, "#stats-api-key-podium-2")
       refute has_element?(view, "#stats-api-key-runners")
+      assert has_element?(view, "#stats-api-key-sort-tokens[aria-pressed='true']")
+      refute has_element?(view, "#stats-api-key-sort-cost[aria-pressed='true']")
+
+      view |> element("#stats-api-key-sort-cost") |> render_click()
+
+      assert has_element?(
+               view,
+               "#stats-api-key-surface > header p",
+               "Top API keys by settled cost"
+             )
+
+      assert has_element?(view, "#stats-api-key-sort-cost[aria-pressed='true']")
+      refute has_element?(view, "#stats-api-key-sort-tokens[aria-pressed='true']")
+      assert has_element?(view, "#stats-api-key-podium-1", "$0.75")
+
+      view |> element("#stats-api-key-sort-tokens") |> render_click()
+
+      assert has_element?(
+               view,
+               "#stats-api-key-surface > header p",
+               "Top API keys by token usage"
+             )
       refute has_element?(view, "#stats-upstream-surface > header p")
       refute has_element?(view, "#stats-upstream-surface > header > span")
       refute has_element?(view, "#stats-upstream-table .font-mono")

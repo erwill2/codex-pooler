@@ -31,6 +31,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
        filter_form: to_form(%{"pool_id" => "", "window" => "24h"}, as: :filters),
        filter_error: nil,
        pool_filter_options: [],
+       leaderboard_sort: :tokens,
        subscribed_pool_ids: MapSet.new()
      )}
   end
@@ -56,6 +57,12 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
 
     {:noreply, push_patch(socket, to: ~p"/admin/stats?#{query_params(params)}")}
   end
+
+  def handle_event("set_leaderboard_sort", %{"sort" => sort}, socket) when sort in ~w(tokens cost) do
+    {:noreply, assign(socket, :leaderboard_sort, String.to_existing_atom(sort))}
+  end
+
+  def handle_event("set_leaderboard_sort", _params, socket), do: {:noreply, socket}
 
   @impl true
   def handle_info({Events, %{pool_id: pool_id, topics: topics}}, socket) do
@@ -172,7 +179,10 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
           />
 
           <section class="grid min-w-0 gap-4 2xl:grid-cols-2">
-            <StatsPresentation.top_api_keys_table rows={@dashboard.tables.top_api_keys} />
+            <StatsPresentation.top_api_keys_table
+              rows={@dashboard.tables.top_api_keys}
+              sort={@leaderboard_sort}
+            />
             <StatsPresentation.upstreams_table rows={@dashboard.tables.upstreams} />
           </section>
         <% else %>

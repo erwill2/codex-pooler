@@ -135,6 +135,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :header, :boolean, default: true
   attr :overflow, :atom, default: :hidden, values: [:hidden, :visible]
 
+  slot :header_actions
   slot :toolbar
   slot :inner_block, required: true
   slot :footer
@@ -162,6 +163,7 @@ defmodule CodexPoolerWeb.Admin.Components do
         >
           {@count}
         </span>
+        {render_slot(@header_actions)}
       </header>
 
       <div :if={@toolbar != []} class="border-b border-base-300/70 bg-base-100 p-4">

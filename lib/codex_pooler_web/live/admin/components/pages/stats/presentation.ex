@@ -103,19 +103,41 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   end
 
   attr :rows, :list, required: true
+  attr :sort, :atom, default: :tokens, values: [:tokens, :cost]
 
   def top_api_keys_table(assigns) do
+    ranked = leaderboard_ranking(assigns.rows, assigns.sort)
+
     assigns =
       assigns
-      |> assign(:podium, Enum.take(assigns.rows, 3))
-      |> assign(:runners, Enum.drop(assigns.rows, 3))
+      |> assign(:podium, Enum.take(ranked, 3))
+      |> assign(:runners, Enum.drop(ranked, 3))
 
     ~H"""
     <AdminComponents.admin_surface
       id="stats-api-key-surface"
       title="Leaderboard"
-      description="Top API keys by token usage in the selected window"
+      description={leaderboard_description(@sort)}
     >
+      <:header_actions>
+        <div
+          class="flex shrink-0 items-center gap-0.5 rounded-full border border-base-300 bg-base-200/60 p-0.5"
+          role="group"
+          aria-label="Leaderboard ranking"
+        >
+          <button
+            :for={{label, sort} <- [{"Tokens", :tokens}, {"Cost", :cost}]}
+            id={"stats-api-key-sort-#{sort}"}
+            type="button"
+            class={leaderboard_sort_button_class(@sort == sort)}
+            aria-pressed={to_string(@sort == sort)}
+            phx-click="set_leaderboard_sort"
+            phx-value-sort={Atom.to_string(sort)}
+          >
+            {label}
+          </button>
+        </div>
+      </:header_actions>
       <p
         :if={@rows == []}
         id="stats-api-key-empty-card"
@@ -150,11 +172,19 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
             </p>
           </div>
           <p class="font-mono text-lg font-semibold tabular-nums leading-tight text-base-content">
-            {Format.token_count(row.total_tokens)}
-            <span class="text-xs font-medium text-base-content/50">tokens</span>
+            <%= if @sort == :cost do %>
+              {format_micros(row.settled_cost_micros)}
+            <% else %>
+              {Format.token_count(row.total_tokens)}
+              <span class="text-xs font-medium text-base-content/50">tokens</span>
+            <% end %>
           </p>
           <p class="text-[11px] leading-4 text-base-content/55">
-            {format_integer(row.requests)} req · {format_micros(row.settled_cost_micros)}
+            <%= if @sort == :cost do %>
+              {format_integer(row.requests)} req · {Format.token_count(row.total_tokens)} tokens
+            <% else %>
+              {format_integer(row.requests)} req · {format_micros(row.settled_cost_micros)}
+            <% end %>
           </p>
         </li>
       </ol>
@@ -183,17 +213,55 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
           </div>
           <div class="grid shrink-0 justify-items-end gap-0.5 text-right">
             <span class="font-mono text-sm font-semibold tabular-nums text-base-content">
-              {Format.token_count(row.total_tokens)}
-              <span class="text-[11px] font-medium text-base-content/50">tokens</span>
+              <%= if @sort == :cost do %>
+                {format_micros(row.settled_cost_micros)}
+              <% else %>
+                {Format.token_count(row.total_tokens)}
+                <span class="text-[11px] font-medium text-base-content/50">tokens</span>
+              <% end %>
             </span>
             <span class="text-[11px] leading-4 tabular-nums text-base-content/50">
-              {format_integer(row.requests)} req · {format_micros(row.settled_cost_micros)}
+              <%= if @sort == :cost do %>
+                {format_integer(row.requests)} req · {Format.token_count(row.total_tokens)} tokens
+              <% else %>
+                {format_integer(row.requests)} req · {format_micros(row.settled_cost_micros)}
+              <% end %>
             </span>
           </div>
         </li>
       </ol>
     </AdminComponents.admin_surface>
     """
+  end
+
+  defp leaderboard_ranking(rows, :cost) do
+    rows
+    |> Enum.sort_by(&{&1.settled_cost_micros, &1.total_tokens}, :desc)
+    |> Enum.take(5)
+  end
+
+  defp leaderboard_ranking(rows, _sort) do
+    rows
+    |> Enum.sort_by(&{&1.total_tokens, &1.requests}, :desc)
+    |> Enum.take(5)
+  end
+
+  defp leaderboard_description(:cost), do: "Top API keys by settled cost in the selected window"
+
+  defp leaderboard_description(_sort),
+    do: "Top API keys by token usage in the selected window"
+
+  # Segmented pill: the active option reads as a raised thumb, the inactive
+  # ones stay muted text. Both carry a border so the thumb never shifts layout.
+  defp leaderboard_sort_button_class(active?) do
+    [
+      "cursor-pointer rounded-full border px-2.5 py-0.5 text-[11px] font-medium leading-4 transition-colors",
+      "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+      if(active?,
+        do: "border-base-300 bg-base-100 text-base-content",
+        else: "border-transparent text-base-content/45 hover:text-base-content/75"
+      )
+    ]
   end
 
   @podium_cell_base "grid h-full min-w-0 content-start gap-2 rounded-box border p-3 text-center"

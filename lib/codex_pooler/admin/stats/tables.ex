@@ -9,27 +9,36 @@ defmodule CodexPooler.Admin.Stats.Tables do
   @spec top_api_keys([map()], [map()]) :: [map()]
   def top_api_keys([], _pools), do: []
 
+  # Returns the union of the top keys by token usage and by settled cost, so
+  # the leaderboard can re-rank by either dimension without missing a key
+  # that is expensive but light on tokens (or vice versa).
   def top_api_keys(settlements, pools) do
     key_ids = settlements |> Enum.map(& &1.api_key_id) |> Enum.reject(&is_nil/1) |> Enum.uniq()
     keys_by_id = AccessReporting.api_keys_by_id(key_ids)
     pool_names_by_id = Map.new(pools, &{&1.id, &1.name})
 
-    settlements
-    |> Enum.group_by(& &1.api_key_id)
-    |> Enum.map(fn {api_key_id, entries} ->
-      api_key = Map.get(keys_by_id, api_key_id)
+    rows =
+      settlements
+      |> Enum.group_by(& &1.api_key_id)
+      |> Enum.map(fn {api_key_id, entries} ->
+        api_key = Map.get(keys_by_id, api_key_id)
 
-      %{
-        api_key_id: api_key_id,
-        display_name: api_key && api_key.display_name,
-        pool_name: usage_pool_name(entries, pool_names_by_id),
-        requests: Aggregates.sum_integer(entries, :request_count),
-        total_tokens: Aggregates.sum_integer(entries, :total_tokens),
-        settled_cost_micros: Aggregates.sum_decimal_integer(entries, :settled_cost_micros)
-      }
-    end)
-    |> Enum.sort_by(&{&1.total_tokens, &1.requests}, :desc)
-    |> Enum.take(5)
+        %{
+          api_key_id: api_key_id,
+          display_name: api_key && api_key.display_name,
+          pool_name: usage_pool_name(entries, pool_names_by_id),
+          requests: Aggregates.sum_integer(entries, :request_count),
+          total_tokens: Aggregates.sum_integer(entries, :total_tokens),
+          settled_cost_micros: Aggregates.sum_decimal_integer(entries, :settled_cost_micros)
+        }
+      end)
+
+    top_by_tokens = rows |> Enum.sort_by(&{&1.total_tokens, &1.requests}, :desc) |> Enum.take(5)
+
+    top_by_cost =
+      rows |> Enum.sort_by(&{&1.settled_cost_micros, &1.total_tokens}, :desc) |> Enum.take(5)
+
+    Enum.uniq_by(top_by_tokens ++ top_by_cost, & &1.api_key_id)
   end
 
   @spec upstream_table([map()], [map()]) :: [map()]
