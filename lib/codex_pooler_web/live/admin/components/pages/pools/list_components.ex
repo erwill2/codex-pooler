@@ -371,7 +371,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     ~H"""
     <div
       id="pools-grid"
-      class="grid min-w-0 gap-3 overflow-visible lg:grid-cols-2 2xl:grid-cols-3 [@media(width>=112rem)]:grid-cols-4"
+      class="grid min-w-0 items-start gap-3 overflow-visible lg:grid-cols-2 2xl:grid-cols-3 [@media(width>=112rem)]:grid-cols-4"
     >
       <.pool_card
         :for={pool_row <- @pools}
