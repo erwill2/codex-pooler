@@ -84,7 +84,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
       active_nav={:stats}
       alert_notification_center={@alert_notification_center}
     >
-      <section id="admin-stats" class="mx-auto grid w-full max-w-[100rem] min-w-0 gap-4 lg:gap-5">
+      <section id="admin-stats" class="grid w-full min-w-0 gap-4 lg:gap-5">
         <div class="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(24rem,34rem)] xl:items-end">
           <AdminComponents.page_header
             id="stats-page-header"

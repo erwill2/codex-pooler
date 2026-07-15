@@ -201,16 +201,16 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-token-cost-chart-plot[data-chart-value-kinds]")
       assert has_element?(view, "#stats-token-cost-chart-plot[data-chart-yaxis]")
       refute has_element?(view, "#stats-token-chart")
-      refute has_element?(view, "#stats-api-key-surface > header p")
+      assert has_element?(view, "#stats-api-key-surface > header p", "Top API keys by token usage")
       refute has_element?(view, "#stats-api-key-surface > header > span")
       assert has_element?(view, "#stats-api-key-surface", "Leaderboard")
-      refute has_element?(view, "#stats-api-key-table .font-mono")
-      refute has_element?(view, "#stats-api-key-card-0 .font-mono")
-      assert has_element?(view, "#stats-api-key-table", "Stats UI key")
-      assert has_element?(view, "#stats-api-key-table thead th", "Pool")
-      assert has_element?(view, "#stats-api-key-row-0 td:nth-child(2)", "Stats Live")
-      refute has_element?(view, "#stats-api-key-row-0 td:nth-child(2)", "stats-live")
-      assert has_element?(view, "#stats-api-key-table", "$0.75")
+      assert has_element?(view, "#stats-api-key-podium-1", "Stats UI key")
+      assert has_element?(view, "#stats-api-key-podium-1", "Stats Live")
+      refute has_element?(view, "#stats-api-key-podium-1", "stats-live")
+      assert has_element?(view, "#stats-api-key-podium-1", "$0.75")
+      assert has_element?(view, "#stats-api-key-podium-1 .hero-trophy")
+      refute has_element?(view, "#stats-api-key-podium-2")
+      refute has_element?(view, "#stats-api-key-runners")
       refute has_element?(view, "#stats-upstream-surface > header p")
       refute has_element?(view, "#stats-upstream-surface > header > span")
       refute has_element?(view, "#stats-upstream-table .font-mono")
@@ -229,7 +229,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       refute has_element?(view, "#stats-recent-activity")
       refute has_element?(view, "#stats-quota-table")
 
-      refute has_element?(view, "#stats-api-key-table", other_setup.api_key.display_name)
+      refute has_element?(view, "#stats-api-key-surface", other_setup.api_key.display_name)
       refute has_element?(view, "#stats-traffic-chart", "33 tokens")
 
       traffic_chart_html = view |> element("#stats-traffic-chart-plot") |> render()
@@ -467,9 +467,9 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-kpi-requests", "2")
       assert has_element?(view, "#stats-kpi-tokens", "30")
       assert has_element?(view, "#stats-traffic-chart", "30 tokens")
-      assert has_element?(view, "#stats-api-key-table", "Scoped A key")
-      assert has_element?(view, "#stats-api-key-table", "Scoped B key")
-      refute has_element?(view, "#stats-api-key-table", "Hidden C key")
+      assert has_element?(view, "#stats-api-key-surface", "Scoped A key")
+      assert has_element?(view, "#stats-api-key-surface", "Scoped B key")
+      refute has_element?(view, "#stats-api-key-surface", "Hidden C key")
 
       view
       |> element("#stats-pool-filter-control button[data-pool-id='#{pool_b.id}']")
@@ -478,9 +478,9 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert_patch(view, ~p"/admin/stats?pool_id=#{pool_b.id}&window=24h")
       assert has_element?(view, "#stats-pool-filter[value='#{pool_b.id}']")
       assert has_element?(view, "#stats-kpi-tokens", "20")
-      assert has_element?(view, "#stats-api-key-table", "Scoped B key")
-      refute has_element?(view, "#stats-api-key-table", "Scoped A key")
-      refute has_element?(view, "#stats-api-key-table", "Hidden C key")
+      assert has_element?(view, "#stats-api-key-surface", "Scoped B key")
+      refute has_element?(view, "#stats-api-key-surface", "Scoped A key")
+      refute has_element?(view, "#stats-api-key-surface", "Hidden C key")
       refute render(view) =~ assigned_a.raw_key
       refute render(view) =~ assigned_b.raw_key
       refute render(view) =~ hidden_c.raw_key
@@ -491,7 +491,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(blocked_view, "#stats-filter-error", "pool filter is not available")
       refute has_element?(blocked_view, "#stats-kpis")
       refute has_element?(blocked_view, "#stats-pool-filter-control", "Stats Scope C")
-      refute has_element?(blocked_view, "#stats-api-key-table", "Hidden C key")
+      refute has_element?(blocked_view, "#stats-api-key-surface", "Hidden C key")
       refute render(blocked_view) =~ hidden_c.raw_key
     end
 
@@ -566,7 +566,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-kpi-tokens", "0")
       assert has_element?(view, "#stats-traffic-chart", "0 tokens / 0 requests")
       assert has_element?(view, "#stats-token-cost-chart", "0 tokens / $0.00")
-      refute has_element?(view, "#stats-api-key-table", "Unassigned hidden key")
+      refute has_element?(view, "#stats-api-key-surface", "Unassigned hidden key")
 
       state = :sys.get_state(view.pid)
       assert state.socket.assigns.subscribed_pool_ids == MapSet.new()
@@ -653,7 +653,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert_reload_telemetry(:executed, window: "24h", scope: "selected_pool")
       assert has_element?(view, "#stats-kpi-tokens", "42")
       assert has_element?(view, "#stats-traffic-chart", "42 tokens")
-      assert has_element?(view, "#stats-api-key-table", "Stats usage key")
+      assert has_element?(view, "#stats-api-key-surface", "Stats usage key")
     end
 
     test "events for non-selected Pools do not update the selected dashboard", %{
@@ -694,7 +694,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       refute_reload_telemetry(:scheduled)
       assert has_element?(view, "#stats-kpi-tokens", "11")
       refute has_element?(view, "#stats-traffic-chart", "77 tokens")
-      refute has_element?(view, "#stats-api-key-table", other.api_key.display_name)
+      refute has_element?(view, "#stats-api-key-surface", other.api_key.display_name)
       refute render(view) =~ selected.raw_key
       refute render(view) =~ other.raw_key
     end

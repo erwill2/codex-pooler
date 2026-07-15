@@ -105,93 +105,128 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   attr :rows, :list, required: true
 
   def top_api_keys_table(assigns) do
+    assigns =
+      assigns
+      |> assign(:podium, Enum.take(assigns.rows, 3))
+      |> assign(:runners, Enum.drop(assigns.rows, 3))
+
     ~H"""
     <AdminComponents.admin_surface
       id="stats-api-key-surface"
       title="Leaderboard"
+      description="Top API keys by token usage in the selected window"
     >
-      <div class="divide-y divide-base-300 md:hidden">
-        <p
-          :if={@rows == []}
-          id="stats-api-key-empty-card"
-          class="px-3 py-4 text-center text-sm text-base-content/60"
+      <p
+        :if={@rows == []}
+        id="stats-api-key-empty-card"
+        class="px-4 py-10 text-center text-sm text-base-content/60"
+      >
+        No settled API-key usage for this period.
+      </p>
+
+      <ol
+        :if={@podium != []}
+        id="stats-api-key-podium"
+        class="grid list-none gap-2 p-3 sm:grid-cols-3 sm:items-end sm:gap-3 sm:p-4"
+      >
+        <li
+          :for={{row, index} <- Enum.with_index(@podium)}
+          id={"stats-api-key-podium-#{index + 1}"}
+          data-role="leaderboard-podium-place"
+          class={podium_cell_class(index + 1)}
         >
-          No settled API-key usage for this period.
-        </p>
-        <article
-          :for={{row, index} <- Enum.with_index(@rows)}
-          id={"stats-api-key-card-#{index}"}
-          class="grid gap-2 px-3 py-3"
-        >
-          <div class="flex min-w-0 items-start justify-between gap-3">
-            <div class="grid min-w-0 gap-1">
-              <h3 class="truncate text-sm font-semibold text-base-content">
-                {row.display_name || "API key not recorded"}
-              </h3>
-              <p class="truncate text-xs text-base-content/60">
-                {row.pool_name || "Pool not available"}
-              </p>
-            </div>
-            <span class="shrink-0 text-sm font-semibold tabular-nums">
-              {format_micros(row.settled_cost_micros)}
+          <div class="flex justify-center">
+            <span class={podium_medallion_class(index + 1)} aria-label={"Rank #{index + 1}"}>
+              <.icon :if={index == 0} name="hero-trophy" class="size-4" />
+              <span :if={index > 0} class="font-mono text-sm font-bold">{index + 1}</span>
             </span>
           </div>
-          <dl class="grid grid-cols-2 gap-2 text-xs">
-            <div>
-              <dt class="text-base-content/50">Requests</dt>
-              <dd class="font-semibold tabular-nums">
-                {format_integer(row.requests)}
-              </dd>
-            </div>
-            <div>
-              <dt class="text-base-content/50">Tokens</dt>
-              <dd class="font-semibold tabular-nums">
-                {Format.token_count(row.total_tokens)}
-              </dd>
-            </div>
-          </dl>
-        </article>
-      </div>
-      <div class="hidden overflow-x-auto md:block">
-        <table id="stats-api-key-table" class="table table-zebra table-sm">
-          <thead>
-            <tr>
-              <th>API key</th>
-              <th>Pool</th>
-              <th class="text-right">Requests</th>
-              <th class="text-right">Tokens</th>
-              <th class="text-right">Cost</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr :if={@rows == []} id="stats-api-key-empty-row">
-              <td colspan="5" class="text-center text-sm text-base-content/60">
-                No settled API-key usage for this period.
-              </td>
-            </tr>
-            <tr :for={{row, index} <- Enum.with_index(@rows)} id={"stats-api-key-row-#{index}"}>
-              <td class="min-w-44 font-semibold">
-                {row.display_name || "API key not recorded"}
-              </td>
-              <td class="min-w-36 text-base-content/80">
-                {row.pool_name || "Pool not available"}
-              </td>
-              <td class="text-right tabular-nums">
-                {format_integer(row.requests)}
-              </td>
-              <td class="text-right tabular-nums">
-                {Format.token_count(row.total_tokens)}
-              </td>
-              <td class="text-right tabular-nums">
-                {format_micros(row.settled_cost_micros)}
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
+          <div class="min-w-0">
+            <p class="truncate text-sm font-semibold text-base-content" title={row.display_name}>
+              {row.display_name || "API key not recorded"}
+            </p>
+            <p class="truncate text-xs text-base-content/55">
+              {row.pool_name || "Pool not available"}
+            </p>
+          </div>
+          <p class="font-mono text-lg font-semibold tabular-nums leading-tight text-base-content">
+            {Format.token_count(row.total_tokens)}
+            <span class="text-xs font-medium text-base-content/50">tokens</span>
+          </p>
+          <p class="text-[11px] leading-4 text-base-content/55">
+            {format_integer(row.requests)} req · {format_micros(row.settled_cost_micros)}
+          </p>
+        </li>
+      </ol>
+
+      <ol
+        :if={@runners != []}
+        id="stats-api-key-runners"
+        class="list-none divide-y divide-base-300/70 border-t border-base-300/70"
+      >
+        <li
+          :for={{row, index} <- Enum.with_index(@runners)}
+          id={"stats-api-key-row-#{index + 3}"}
+          data-role="leaderboard-runner-row"
+          class="flex min-w-0 items-center gap-3 px-4 py-2.5"
+        >
+          <span class="grid size-6 shrink-0 place-items-center rounded-full bg-base-200 font-mono text-xs font-semibold tabular-nums text-base-content/60">
+            {index + 4}
+          </span>
+          <div class="grid min-w-0 flex-1">
+            <p class="truncate text-sm font-medium text-base-content">
+              {row.display_name || "API key not recorded"}
+            </p>
+            <p class="truncate text-xs text-base-content/50">
+              {row.pool_name || "Pool not available"}
+            </p>
+          </div>
+          <div class="grid shrink-0 justify-items-end gap-0.5 text-right">
+            <span class="font-mono text-sm font-semibold tabular-nums text-base-content">
+              {Format.token_count(row.total_tokens)}
+              <span class="text-[11px] font-medium text-base-content/50">tokens</span>
+            </span>
+            <span class="text-[11px] leading-4 tabular-nums text-base-content/50">
+              {format_integer(row.requests)} req · {format_micros(row.settled_cost_micros)}
+            </span>
+          </div>
+        </li>
+      </ol>
     </AdminComponents.admin_surface>
     """
   end
+
+  @podium_cell_base "grid h-full min-w-0 content-start gap-2 rounded-box border p-3 text-center"
+
+  defp podium_cell_class(1),
+    do: [
+      @podium_cell_base,
+      "sm:order-2 sm:py-5",
+      "border-[oklch(0.78_0.13_85_/_0.45)] bg-[oklch(0.78_0.13_85_/_0.07)]"
+    ]
+
+  defp podium_cell_class(2),
+    do: [@podium_cell_base, "sm:order-1", "border-base-300 bg-base-200/30"]
+
+  defp podium_cell_class(3),
+    do: [@podium_cell_base, "sm:order-3", "border-base-300 bg-base-200/30"]
+
+  @podium_medallion_base "grid size-9 shrink-0 place-items-center rounded-full border"
+
+  defp podium_medallion_class(1),
+    do: [
+      @podium_medallion_base,
+      "border-[oklch(0.78_0.13_85_/_0.6)] bg-[oklch(0.78_0.13_85_/_0.2)] text-[oklch(0.62_0.13_85)]"
+    ]
+
+  defp podium_medallion_class(2),
+    do: [@podium_medallion_base, "border-base-300 bg-base-200 text-base-content/60"]
+
+  defp podium_medallion_class(3),
+    do: [
+      @podium_medallion_base,
+      "border-[oklch(0.62_0.11_55_/_0.5)] bg-[oklch(0.62_0.11_55_/_0.16)] text-[oklch(0.55_0.11_55)]"
+    ]
 
   attr :rows, :list, required: true
 

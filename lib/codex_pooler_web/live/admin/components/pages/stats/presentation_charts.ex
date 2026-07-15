@@ -20,27 +20,28 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
       |> assign(:model_usage_chart, model_usage_chart_model(model_usage))
 
     ~H"""
-    <section class="grid min-w-0 gap-3 lg:gap-4 2xl:grid-cols-2">
+    <section class="grid min-w-0 gap-3 lg:gap-4 xl:grid-cols-2 2xl:grid-cols-3">
       <section
         id="stats-traffic-chart"
-        class="min-w-0 rounded-box border border-base-300 bg-base-100 p-3 shadow-sm sm:p-4 2xl:col-span-2"
+        class="min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100 xl:col-span-2 2xl:col-span-1"
       >
-        <div class="flex flex-wrap items-start justify-between gap-2">
-          <div class="grid gap-1">
-            <h2 id="stats-traffic-chart-heading" class="text-base font-semibold text-base-content">
-              Traffic over time
-            </h2>
-          </div>
+        <header class="flex flex-wrap items-center justify-between gap-2 border-b border-base-300 bg-base-200/35 px-4 py-3">
+          <h2
+            id="stats-traffic-chart-heading"
+            class="text-base font-semibold leading-5 text-base-content"
+          >
+            Traffic over time
+          </h2>
           <span
             id="stats-traffic-chart-total"
-            class="text-right text-xs font-semibold tabular-nums sm:text-sm"
+            class="text-right text-xs font-semibold tabular-nums text-base-content/70"
           >
             {@traffic_chart.total_label}
           </span>
-        </div>
+        </header>
         <div
           id="stats-traffic-chart-scroll"
-          class="mt-3 min-w-0 overflow-x-auto overscroll-x-contain pb-1"
+          class="min-w-0 overflow-x-auto overscroll-x-contain p-3 pb-2 sm:p-4 sm:pb-2"
           data-role="chart-scroll-region"
         >
           <div
@@ -75,24 +76,25 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
 
       <section
         id="stats-token-cost-chart"
-        class="min-w-0 rounded-box border border-base-300 bg-base-100 p-3 shadow-sm sm:p-4"
+        class="min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100"
       >
-        <div class="flex flex-wrap items-start justify-between gap-2">
-          <div class="grid gap-1">
-            <h2 id="stats-token-cost-chart-heading" class="text-base font-semibold text-base-content">
-              Tokens vs cost
-            </h2>
-          </div>
+        <header class="flex flex-wrap items-center justify-between gap-2 border-b border-base-300 bg-base-200/35 px-4 py-3">
+          <h2
+            id="stats-token-cost-chart-heading"
+            class="text-base font-semibold leading-5 text-base-content"
+          >
+            Tokens vs cost
+          </h2>
           <span
             id="stats-token-cost-chart-total"
-            class="text-right text-xs font-semibold tabular-nums sm:text-sm"
+            class="text-right text-xs font-semibold tabular-nums text-base-content/70"
           >
             {@token_cost_chart.total_label}
           </span>
-        </div>
+        </header>
         <div
           id="stats-token-cost-chart-scroll"
-          class="mt-3 min-w-0 overflow-x-auto overscroll-x-contain pb-1"
+          class="min-w-0 overflow-x-auto overscroll-x-contain p-3 pb-2 sm:p-4 sm:pb-2"
           data-role="chart-scroll-region"
         >
           <div
@@ -131,24 +133,25 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
 
       <section
         id="stats-model-usage-chart"
-        class="min-w-0 rounded-box border border-base-300 bg-base-100 p-3 shadow-sm sm:p-4"
+        class="min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100"
       >
-        <div class="flex flex-wrap items-start justify-between gap-2">
-          <div class="grid gap-1">
-            <h2 id="stats-model-usage-chart-heading" class="text-base font-semibold text-base-content">
-              Model usage
-            </h2>
-          </div>
+        <header class="flex flex-wrap items-center justify-between gap-2 border-b border-base-300 bg-base-200/35 px-4 py-3">
+          <h2
+            id="stats-model-usage-chart-heading"
+            class="text-base font-semibold leading-5 text-base-content"
+          >
+            Model usage
+          </h2>
           <span
             id="stats-model-usage-chart-total"
-            class="text-right text-xs font-semibold tabular-nums sm:text-sm"
+            class="text-right text-xs font-semibold tabular-nums text-base-content/70"
           >
             {@model_usage_chart.total_label}
           </span>
-        </div>
+        </header>
         <div
           id="stats-model-usage-chart-scroll"
-          class="mt-3 min-w-0 overflow-x-auto overscroll-x-contain pb-1"
+          class="min-w-0 overflow-x-auto overscroll-x-contain p-3 pb-2 sm:p-4 sm:pb-2"
           data-role="chart-scroll-region"
         >
           <div class={["relative", @model_usage_chart.points == [] && "min-h-[260px]"]}>

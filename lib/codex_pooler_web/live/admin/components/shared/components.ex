@@ -91,49 +91,39 @@ defmodule CodexPoolerWeb.Admin.Components do
       id={@id}
       data-density={if @compact_mobile, do: "compact", else: "regular"}
       class={[
-        "grid items-center rounded-box border border-base-300 bg-base-100 shadow-sm",
-        @compact_mobile &&
-          "min-h-16 grid-cols-1 gap-1 px-3 py-2 lg:min-h-20 lg:grid-cols-[auto_minmax(0,1fr)] lg:gap-3 lg:px-4 lg:py-3",
-        !@compact_mobile &&
-          "min-h-20 grid-cols-[auto_minmax(0,1fr)] gap-3 px-4 py-3"
+        "grid min-w-0 content-start rounded-box border border-base-300 bg-base-100",
+        @compact_mobile && "gap-0.5 px-3 py-2.5 lg:gap-1 lg:px-4 lg:py-3",
+        !@compact_mobile && "gap-1 px-4 py-3"
       ]}
     >
-      <span class={[metric_icon_class(@tone), @compact_mobile && "hidden lg:grid"]}>
-        <.icon name={@icon} class="size-5" />
-      </span>
-      <div class={[
-        "grid min-w-0",
-        @compact_mobile && "gap-1 lg:gap-0.5",
-        !@compact_mobile && "gap-0.5"
-      ]}>
-        <p class={[
-          "min-w-0 font-medium text-base-content/60",
-          @compact_mobile && "line-clamp-2 text-[0.68rem] leading-3 lg:text-xs lg:leading-normal",
-          !@compact_mobile && "truncate text-xs"
-        ]}>
+      <div class="flex min-w-0 items-center justify-between gap-2">
+        <p class="min-w-0 truncate text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
           {@label}
         </p>
-        <p
-          class={[
-            "min-w-0 max-w-full overflow-hidden break-words font-mono font-semibold tabular-nums text-base-content",
-            @compact_mobile && "text-lg leading-tight lg:text-xl",
-            !@compact_mobile && "text-xl leading-none"
-          ]}
-          data-role="metric-card-value"
-        >
-          {@value}
-        </p>
-        <p
-          :if={@description}
-          class={[
-            "min-w-0 text-xs text-base-content/55",
-            @compact_mobile && "line-clamp-2",
-            !@compact_mobile && "text-xs"
-          ]}
-        >
-          {@description}
-        </p>
+        <.icon
+          name={@icon}
+          class={["size-3.5 shrink-0", metric_icon_class(@tone), @compact_mobile && "hidden lg:block"]}
+        />
       </div>
+      <p
+        class={[
+          "min-w-0 max-w-full overflow-hidden break-words font-mono font-semibold tabular-nums text-base-content",
+          @compact_mobile && "text-lg leading-tight lg:text-xl",
+          !@compact_mobile && "text-xl leading-tight"
+        ]}
+        data-role="metric-card-value"
+      >
+        {@value}
+      </p>
+      <p
+        :if={@description}
+        class={[
+          "min-w-0 text-xs text-base-content/55",
+          @compact_mobile && "line-clamp-2"
+        ]}
+      >
+        {@description}
+      </p>
     </article>
     """
   end
@@ -154,21 +144,21 @@ defmodule CodexPoolerWeb.Admin.Components do
     <section
       id={@id}
       class={[
-        "min-w-0 rounded-box border border-base-300 bg-base-100 shadow-sm",
+        "min-w-0 rounded-box border border-base-300 bg-base-100",
         admin_surface_overflow_class(@overflow)
       ]}
     >
       <header
         :if={@header}
-        class="flex flex-wrap items-center justify-between gap-3 border-b border-base-300 p-4"
+        class="flex flex-wrap items-center justify-between gap-3 border-b border-base-300 bg-base-200/35 px-4 py-3"
       >
-        <div class="grid min-w-0 gap-1">
-          <h2 class="text-lg font-semibold text-base-content">{@title}</h2>
-          <p :if={@description} class="text-sm leading-6 text-base-content/70">{@description}</p>
+        <div class="grid min-w-0 gap-0.5">
+          <h2 class="text-base font-semibold leading-5 text-base-content">{@title}</h2>
+          <p :if={@description} class="text-xs leading-5 text-base-content/60">{@description}</p>
         </div>
         <span
           :if={@count}
-          class="inline-flex shrink-0 items-center rounded-box border border-base-300 bg-base-200 px-3 py-1.5 text-sm font-semibold tabular-nums text-base-content"
+          class="inline-flex shrink-0 items-center rounded-box border border-base-300 bg-base-200 px-2.5 py-1 text-xs font-semibold tabular-nums text-base-content"
         >
           {@count}
         </span>
@@ -675,20 +665,11 @@ defmodule CodexPoolerWeb.Admin.Components do
   defp action_button_class(:danger, _size), do: "btn btn-error btn-outline btn-sm gap-2"
   defp action_button_class(_variant, _size), do: "btn btn-secondary btn-sm gap-2"
 
-  defp metric_icon_class(:primary),
-    do: "grid size-10 place-items-center rounded-box bg-primary/10 text-primary"
-
-  defp metric_icon_class(:success),
-    do: "grid size-10 place-items-center rounded-box bg-success/10 text-success"
-
-  defp metric_icon_class(:warning),
-    do: "grid size-10 place-items-center rounded-box bg-warning/10 text-warning"
-
-  defp metric_icon_class(:error),
-    do: "grid size-10 place-items-center rounded-box bg-error/10 text-error"
-
-  defp metric_icon_class(_tone),
-    do: "grid size-10 place-items-center rounded-box bg-base-200 text-base-content/60"
+  defp metric_icon_class(:primary), do: "text-primary"
+  defp metric_icon_class(:success), do: "text-success"
+  defp metric_icon_class(:warning), do: "text-warning"
+  defp metric_icon_class(:error), do: "text-error"
+  defp metric_icon_class(_tone), do: "text-base-content/35"
 
   defp filter_fields_class(true, _mobile_single_column, _single_row, _control_size) do
     "grid min-w-0 flex-1 grid-cols-1 items-end gap-2 sm:grid-cols-[minmax(14rem,1fr)_12rem] [&_.fieldset]:mb-0 [&_.input]:input-sm [&_.input]:h-8 [&_.label]:sr-only [&_.select]:h-8 [&_.select]:select-sm"
