@@ -329,6 +329,12 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
             <ApiKeyWizardComponents.api_key_models_step
               form={@api_key_form}
               selector_state={@api_key_model_selector_state}
+            />
+          </:models>
+          <:enforcement>
+            <ApiKeyWizardComponents.api_key_enforcement_step
+              form={@api_key_form}
+              selector_state={@api_key_model_selector_state}
               enforced_model_options={
                 ApiKeyPolicyForm.enforced_model_options(
                   @api_key_model_selector_state,
@@ -338,7 +344,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLive do
               reasoning_effort_options={ApiKeyPolicyForm.reasoning_effort_options()}
               service_tier_options={ApiKeyPolicyForm.service_tier_options()}
             />
-          </:models>
+          </:enforcement>
           <:limits>
             <Limits.api_key_limits_step
               form={@api_key_form}

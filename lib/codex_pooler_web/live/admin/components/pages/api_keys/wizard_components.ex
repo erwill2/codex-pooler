@@ -11,7 +11,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
 
   @steps [
     %{id: :basics, label: "Basics", description: "Name and state"},
-    %{id: :models, label: "Models", description: "Catalog and enforcement"},
+    %{id: :models, label: "Models", description: "Model access"},
+    %{id: :enforcement, label: "Enforcement", description: "Enforced request fields"},
     %{id: :limits, label: "Limits", description: "Policy caps"},
     %{id: :review, label: "Review", description: "Effective policy"}
   ]
@@ -90,17 +91,21 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
 
   attr :form, :any, required: true
   attr :selector_state, :map, required: true
-  attr :enforced_model_options, :list, required: true
-  attr :reasoning_effort_options, :list, required: true
-  attr :service_tier_options, :list, required: true
 
   def api_key_models_step(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :sorted_model_options,
+        Enum.sort_by(assigns.selector_state.options, & &1.identifier, :desc)
+      )
+
     ~H"""
     <section id="api-key-step-models-panel" class="grid min-w-0 gap-5">
       <div class="grid gap-1">
-        <h3 class="text-lg font-semibold text-base-content">Models and enforced request fields</h3>
+        <h3 class="text-lg font-semibold text-base-content">Model access</h3>
         <p class="text-sm leading-6 text-base-content/65">
-          Choose model scope and optional enforced request values.
+          Choose which models this key may use.
         </p>
       </div>
 
@@ -128,98 +133,125 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
         />
       </div>
 
-      <div class="min-w-0 rounded-box border border-base-300 bg-base-100 p-4">
-        <div class="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h4 class="font-semibold text-base-content">Catalog models</h4>
-            <p class="text-sm text-base-content/60">
-              {catalog_status_label(@selector_state.catalog)}
-            </p>
+      <input type="hidden" name={field_array_name(@form[:allowed_model_identifiers])} value="" />
+      <div
+        id="api-key-model-selection"
+        class={[
+          "grid min-w-0 gap-5",
+          field_string_value(@form[:model_mode]) != "selected_models" && "hidden"
+        ]}
+      >
+        <div class="grid min-w-0 gap-3">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="grid gap-1">
+              <h3 class="text-lg font-semibold text-base-content">Catalog models</h3>
+              <p class="text-sm leading-6 text-base-content/65">
+                Routable models from this Pool's catalog, newest first.
+              </p>
+            </div>
+            <span class={AdminBadges.count_chip_class()}>
+              {length(@selector_state.options)} options
+            </span>
           </div>
-          <span class={AdminBadges.count_chip_class()}>
-            {length(@selector_state.options)} options
-          </span>
-        </div>
 
-        <input type="hidden" name={field_array_name(@form[:allowed_model_identifiers])} value="" />
-        <div id="api-key-model-options" class="mt-4 grid max-h-[13rem] gap-2 overflow-y-auto">
-          <label
-            :for={option <- @selector_state.options}
-            id={"api-key-model-option-#{dom_token(option.identifier)}"}
-            class="flex min-h-12 min-w-0 cursor-pointer items-center gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-2 transition-colors hover:border-primary/50 hover:bg-primary/5"
+          <p
+            :if={catalog_attention_label(@selector_state.catalog)}
+            id="api-key-catalog-status"
+            class="text-sm font-medium text-warning"
           >
-            <input
-              type="checkbox"
-              class="checkbox checkbox-primary checkbox-sm shrink-0"
-              name={field_array_name(@form[:allowed_model_identifiers])}
-              value={option.identifier}
-              checked={selected_value?(@form[:allowed_model_identifiers].value, option.identifier)}
-            />
-            <span class="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-x-3 gap-y-0.5">
-              <span class="min-w-0 truncate text-sm font-medium text-base-content">
-                {option.display_name || option.identifier}
-              </span>
-              <span class="flex min-w-0 shrink items-center gap-2">
+            {catalog_attention_label(@selector_state.catalog)}
+          </p>
+
+          <div id="api-key-model-options" class="grid max-h-[13rem] gap-2 overflow-y-auto">
+            <label
+              :for={option <- @sorted_model_options}
+              id={"api-key-model-option-#{dom_token(option.identifier)}"}
+              class="flex min-h-12 min-w-0 cursor-pointer items-center gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-2 transition-colors hover:border-primary/50 hover:bg-primary/5"
+            >
+              <input
+                type="checkbox"
+                class="checkbox checkbox-primary checkbox-sm shrink-0"
+                name={field_array_name(@form[:allowed_model_identifiers])}
+                value={option.identifier}
+                checked={selected_value?(@form[:allowed_model_identifiers].value, option.identifier)}
+              />
+              <span class="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-x-3 gap-y-0.5">
+                <span class="min-w-0 truncate text-sm font-medium text-base-content">
+                  {option.display_name || option.identifier}
+                </span>
                 <span class="truncate font-mono text-xs text-base-content/50">
                   {option.identifier}
                 </span>
-                <span
-                  class="inline-flex shrink-0 items-center rounded-box bg-base-200 px-2 py-0.5 text-xs font-semibold tabular-nums text-base-content/70"
-                  title={"#{option.source_assignment_count} upstream assignments route this model"}
-                >
-                  {option.source_assignment_count}
-                </span>
               </span>
-            </span>
-          </label>
-          <p :if={@selector_state.options == []} class="text-sm text-base-content/60">
-            No routable catalog models are available for this Pool.
-          </p>
+            </label>
+            <p :if={@selector_state.options == []} class="text-sm text-base-content/60">
+              No routable catalog models are available for this Pool.
+            </p>
+          </div>
+
+          <div :if={@selector_state.selected_unavailable_chips != []} class="grid gap-2">
+            <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
+              Saved unavailable models
+            </p>
+            <label
+              :for={chip <- @selector_state.selected_unavailable_chips}
+              id={"api-key-stale-model-#{dom_token(chip.identifier)}"}
+              class="flex min-w-0 cursor-pointer items-start gap-3 rounded-box border border-warning/30 bg-warning/10 p-3 text-sm"
+            >
+              <input
+                type="checkbox"
+                class="checkbox checkbox-warning checkbox-sm mt-1"
+                name={field_array_name(@form[:allowed_model_identifiers])}
+                value={chip.identifier}
+                checked={selected_value?(@form[:allowed_model_identifiers].value, chip.identifier)}
+              />
+              <span class="grid min-w-0 gap-1">
+                <span class="break-all font-mono font-semibold text-base-content">{chip.label}</span>
+                <span class="text-base-content/65">{chip.warning}</span>
+              </span>
+            </label>
+          </div>
         </div>
 
-        <div :if={@selector_state.selected_unavailable_chips != []} class="mt-4 grid gap-2">
-          <p class="text-xs font-semibold uppercase tracking-wide text-base-content/60">
-            Saved unavailable models
-          </p>
-          <label
-            :for={chip <- @selector_state.selected_unavailable_chips}
-            id={"api-key-stale-model-#{dom_token(chip.identifier)}"}
-            class="flex min-w-0 cursor-pointer items-start gap-3 rounded-box border border-warning/30 bg-warning/10 p-3 text-sm"
+        <.input
+          field={@form[:manual_model_identifiers_text]}
+          type="textarea"
+          label="Manual model identifiers"
+          rows="3"
+          placeholder="custom/manual-test-model"
+        />
+
+        <div
+          :if={@selector_state.manual_chips != []}
+          id="api-key-manual-model-chips"
+          class="flex flex-wrap gap-2"
+        >
+          <span
+            :for={chip <- @selector_state.manual_chips}
+            class={AdminBadges.metadata_chip_class(:primary)}
           >
-            <input
-              type="checkbox"
-              class="checkbox checkbox-warning checkbox-sm mt-1"
-              name={field_array_name(@form[:allowed_model_identifiers])}
-              value={chip.identifier}
-              checked={selected_value?(@form[:allowed_model_identifiers].value, chip.identifier)}
-            />
-            <span class="grid min-w-0 gap-1">
-              <span class="break-all font-mono font-semibold text-base-content">{chip.label}</span>
-              <span class="text-base-content/65">{chip.warning}</span>
-            </span>
-          </label>
+            {chip.label}
+          </span>
         </div>
       </div>
+    </section>
+    """
+  end
 
-      <.input
-        field={@form[:manual_model_identifiers_text]}
-        type="textarea"
-        label="Manual model identifiers"
-        rows="3"
-        placeholder="custom/manual-test-model"
-      />
+  attr :form, :any, required: true
+  attr :selector_state, :map, required: true
+  attr :enforced_model_options, :list, required: true
+  attr :reasoning_effort_options, :list, required: true
+  attr :service_tier_options, :list, required: true
 
-      <div
-        :if={@selector_state.manual_chips != []}
-        id="api-key-manual-model-chips"
-        class="flex flex-wrap gap-2"
-      >
-        <span
-          :for={chip <- @selector_state.manual_chips}
-          class={AdminBadges.metadata_chip_class(:primary)}
-        >
-          {chip.label}
-        </span>
+  def api_key_enforcement_step(assigns) do
+    ~H"""
+    <section id="api-key-step-enforcement-panel" class="grid min-w-0 gap-5">
+      <div class="grid gap-1">
+        <h3 class="text-lg font-semibold text-base-content">Enforced request fields</h3>
+        <p class="text-sm leading-6 text-base-content/65">
+          Optionally pin the model and service tier sent upstream, regardless of request values.
+        </p>
       </div>
 
       <div class="grid gap-4 md:grid-cols-2">
@@ -236,16 +268,32 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           options={@service_tier_options}
         />
       </div>
-      <fieldset
-        id="api-key-reasoning-policy"
-        aria-describedby="api-key-reasoning-policy-help"
-        class="grid gap-3 rounded-box border border-base-300 bg-base-100 p-4"
+
+      <div
+        :if={@selector_state.enforced_unavailable_warning}
+        id="api-key-enforced-model-warning"
+        class="alert alert-warning items-start"
       >
-        <legend class="px-1 font-semibold text-base-content">Reasoning effort policy</legend>
-        <p id="api-key-reasoning-policy-help" class="text-sm leading-6 text-base-content/60">
-          Leave requests unchanged, set a ceiling, or always send one effort.
-        </p>
-        <div class="grid gap-2 sm:grid-cols-3">
+        <.icon name="hero-exclamation-triangle" class="size-5" />
+        <div class="grid gap-1">
+          <p class="font-semibold">Enforced model unavailable</p>
+          <p class="text-sm">{@selector_state.enforced_unavailable_warning.message}</p>
+        </div>
+      </div>
+
+      <div
+        id="api-key-reasoning-policy"
+        role="radiogroup"
+        aria-describedby="api-key-reasoning-policy-help"
+        class="grid min-w-0 gap-5"
+      >
+        <div class="grid gap-1">
+          <h3 class="text-lg font-semibold text-base-content">Reasoning effort policy</h3>
+          <p id="api-key-reasoning-policy-help" class="text-sm leading-6 text-base-content/65">
+            Leave requests unchanged, set a ceiling, or always send one effort.
+          </p>
+        </div>
+        <div class="grid gap-3 md:grid-cols-3">
           <.reasoning_policy_mode
             id="api_key_reasoning_policy_mode_unrestricted"
             field={@form[:reasoning_policy_mode]}
@@ -282,18 +330,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           label="Enforced reasoning effort"
           options={@reasoning_effort_options}
         />
-      </fieldset>
-      <div
-        :if={@selector_state.enforced_unavailable_warning}
-        id="api-key-enforced-model-warning"
-        class="alert alert-warning items-start"
-      >
-        <.icon name="hero-exclamation-triangle" class="size-5" />
-        <div class="grid gap-1">
-          <p class="font-semibold">Enforced model unavailable</p>
-          <p class="text-sm">{@selector_state.enforced_unavailable_warning.message}</p>
-        </div>
       </div>
+
       <p class="text-sm leading-6 text-base-content/60">
         Reasoning "None" is an enforced upstream value; it is different from leaving the field unset.
         Minimal is sent upstream as low, and Ultra is sent upstream as max for backend Codex
@@ -313,6 +351,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
   attr :disabled, :boolean, default: false
   slot :basics, required: true
   slot :models, required: true
+  slot :enforcement, required: true
   slot :limits, required: true
   slot :review, required: true
 
@@ -364,6 +403,14 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           class={step_panel_class(@current_step, "models")}
         >
           {render_slot(@models)}
+        </div>
+        <div
+          id="api-key-section-enforcement"
+          role="tabpanel"
+          aria-labelledby="api-key-tab-enforcement"
+          class={step_panel_class(@current_step, "enforcement")}
+        >
+          {render_slot(@enforcement)}
         </div>
         <div
           id="api-key-section-limits"
@@ -499,9 +546,15 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
     [{"Active", "active"}, {"Paused", "paused"}]
   end
 
-  defp catalog_status_label(%{message: nil, status: status}), do: "Catalog #{status}"
-  defp catalog_status_label(%{message: message}), do: message
-  defp catalog_status_label(_catalog), do: "Catalog unavailable"
+  defp catalog_attention_label(%{status: status, message: message}) do
+    cond do
+      status in [:synced, nil] -> nil
+      is_binary(message) and message != "" -> message
+      true -> "Catalog #{status}"
+    end
+  end
+
+  defp catalog_attention_label(_catalog), do: "Catalog unavailable"
 
   defp field_array_name(field), do: "#{field.name}[]"
   defp field_string_value(field), do: to_string(field.value || "")
