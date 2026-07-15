@@ -58,7 +58,10 @@ defmodule CodexPooler.Gateway.RequestCompression.ResponsesLiveZone do
   @external_retrieval_name <<104, 101, 97, 100, 114, 111, 111, 109, 95, 114, 101, 116, 114, 105,
                              101, 118, 101>>
   @external_retrieval_suffix <<95, 95>> <> @external_retrieval_name
-  @default_excluded_function_tool_name_list ~w(Read Glob Grep Write Edit read glob grep write edit)
+  @default_excluded_function_tool_name_list ~w(
+    Read Glob Grep Write Edit WebSearch WebFetch
+    read glob grep write edit web_search web_fetch
+  )
 
   @type opts :: keyword() | map()
   @type plan :: %{

@@ -225,6 +225,35 @@ defmodule CodexPooler.Gateway.RequestCompression.ResponsesLiveZoneTest do
                )
     end
 
+    test "protects web retrieval function outputs from candidate planning" do
+      input =
+        ["WebSearch", "WebFetch", "web_search", "web_fetch"]
+        |> Enum.with_index()
+        |> Enum.flat_map(fn {tool_name, index} ->
+          call_id = "call_web_#{index}"
+
+          [
+            %{
+              "type" => "function_call",
+              "call_id" => call_id,
+              "name" => tool_name
+            },
+            %{
+              "type" => "function_call_output",
+              "call_id" => call_id,
+              "output" => large_web_reference_output()
+            }
+          ]
+        end)
+
+      assert {:ok,
+              %{
+                candidates: [],
+                candidate_count: 0,
+                protected_tool_output_skipped_count: 4
+              }} = ResponsesLiveZone.plan(encode_request(input), min_bytes: @min_candidate_bytes)
+    end
+
     test "does not retain external retrieval state between calls" do
       blocked_json =
         encode_request([
@@ -459,6 +488,20 @@ defmodule CodexPooler.Gateway.RequestCompression.ResponsesLiveZoneTest do
     error: example failure without private details
     """
     |> String.duplicate(30)
+  end
+
+  defp large_web_reference_output do
+    %{
+      "results" =>
+        Enum.map(1..24, fn index ->
+          %{
+            "rank" => index,
+            "title" => "synthetic web result #{index}",
+            "url" => "https://example.com/results/#{index}"
+          }
+        end)
+    }
+    |> Jason.encode!(pretty: true)
   end
 
   defp external_retrieval_tool_name(prefix \\ "") do

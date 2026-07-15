@@ -252,11 +252,22 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert feature.contract =~ "combined unified diffs"
       assert feature.contract =~ "long-preamble diffs"
       assert feature.contract =~ "protected exact-output function tool outputs"
+      assert feature.contract =~ "WebSearch, WebFetch, web_search, web_fetch"
       assert feature.contract =~ "external retrieval"
       assert feature.contract =~ "output-only function tool results fail closed"
 
       assert fixture.protected_tool_outputs == %{
-               default_function_names: ["Read", "Glob", "Grep", "Write", "Edit"],
+               default_function_names: [
+                 "Read",
+                 "Glob",
+                 "Grep",
+                 "Write",
+                 "Edit",
+                 "WebSearch",
+                 "WebFetch",
+                 "web_search",
+                 "web_fetch"
+               ],
                lowercase_variants: true,
                external_retrieval: true,
                unknown_function_output_behavior: "protected_original_output_preserved",

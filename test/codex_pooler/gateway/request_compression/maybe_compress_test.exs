@@ -198,6 +198,51 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       refute inspect(metadata) =~ "call_excluded_read"
     end
 
+    test "preserves web retrieval function outputs verbatim" do
+      original_output = web_reference_fixture()
+
+      for tool_name <- ["WebSearch", "WebFetch", "web_search", "web_fetch"] do
+        call_id = "call_#{tool_name}"
+
+        body =
+          Jason.encode!(%{
+            "model" => @supported_model,
+            "input" => [
+              %{
+                "type" => "function_call",
+                "call_id" => call_id,
+                "name" => tool_name,
+                "arguments" => "{}"
+              },
+              %{
+                "type" => "function_call_output",
+                "call_id" => call_id,
+                "output" => original_output
+              }
+            ]
+          })
+
+        {context, request_options} = request_context(body)
+
+        assert {compressed_body, compressed_options} =
+                 RequestCompression.maybe_compress(body, context, request_options)
+
+        assert compressed_body == body
+        assert first_output(compressed_body) == original_output
+
+        assert %{
+                 "status" => "skipped",
+                 "reason" => "protected_tool_outputs",
+                 "candidate_count" => 0,
+                 "compressed_count" => 0,
+                 "skipped_count" => 0,
+                 "protected_tool_output_skipped_count" => 1
+               } = metadata = compressed_options.runtime.payload_compression
+
+        refute inspect(metadata) =~ call_id
+      end
+    end
+
     test "preserves output-only function tool results before compression" do
       omitted_sentinel = "output only omitted sentinel"
       original_output = compression_log_fixture(omitted_sentinel)
@@ -985,6 +1030,20 @@ defmodule CodexPooler.Gateway.RequestCompression.MaybeCompressTest do
       "context after final"
     ])
     |> Enum.join("\n")
+  end
+
+  defp web_reference_fixture do
+    %{
+      "results" =>
+        Enum.map(1..24, fn index ->
+          %{
+            "rank" => index,
+            "title" => "synthetic web result #{index}",
+            "url" => "https://example.com/results/#{index}"
+          }
+        end)
+    }
+    |> Jason.encode!(pretty: true)
   end
 
   defp oversized_log_fixture(kind, omitted_sentinel) do

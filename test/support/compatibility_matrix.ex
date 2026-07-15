@@ -371,7 +371,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :request_compression,
       contract:
-        "Request compression is Pool-gated by request_compression_enabled, request-side only, fail-open to the original upstream request when scanning, token counting, rewriting, or limits fail, and metadata-only through safe payload_compression request-log metadata; eligible routes are backend Responses, backend /v1 Responses/chat aliases, public /v1 Responses/chat translations, backend compact routes, and backend or narrow public websocket response.create dispatches; protected exact-output function tool outputs for Read, Glob, Grep, Write, Edit, and external retrieval are skipped before rewriting with aggregate-only skip counts; output-only function tool results fail closed as protected when their tool name is unavailable; search-result compression covers classic path-line matches, grouped heading matches, and portable NUL-delimited matches, diff compression covers hunk-based additions-only, deletions-only, replacement, minimal unified diffs, combined unified diffs, and long-preamble diffs, and log-output compression preserves every failure block when a summary reports failure/error counts; ordinary prose remains outside diff/search/log compression shapes; public /v1/responses/compact remains unsupported with no upstream compact dispatch or compression eligibility"
+        "Request compression is Pool-gated by request_compression_enabled, request-side only, fail-open to the original upstream request when scanning, token counting, rewriting, or limits fail, and metadata-only through safe payload_compression request-log metadata; eligible routes are backend Responses, backend /v1 Responses/chat aliases, public /v1 Responses/chat translations, backend compact routes, and backend or narrow public websocket response.create dispatches; protected exact-output function tool outputs for Read, Glob, Grep, Write, Edit, WebSearch, WebFetch, web_search, web_fetch, and external retrieval are skipped before rewriting with aggregate-only skip counts; output-only function tool results fail closed as protected when their tool name is unavailable; search-result compression covers classic path-line matches, grouped heading matches, and portable NUL-delimited matches, diff compression covers hunk-based additions-only, deletions-only, replacement, minimal unified diffs, combined unified diffs, and long-preamble diffs, and log-output compression preserves every failure block when a summary reports failure/error counts; ordinary prose remains outside diff/search/log compression shapes; public /v1/responses/compact remains unsupported with no upstream compact dispatch or compression eligibility"
     },
     %{
       slug: :upstream_websocket_bridge,
@@ -853,7 +853,17 @@ defmodule CodexPooler.CompatibilityMatrix do
         metadata_only: true
       },
       protected_tool_outputs: %{
-        default_function_names: ["Read", "Glob", "Grep", "Write", "Edit"],
+        default_function_names: [
+          "Read",
+          "Glob",
+          "Grep",
+          "Write",
+          "Edit",
+          "WebSearch",
+          "WebFetch",
+          "web_search",
+          "web_fetch"
+        ],
         lowercase_variants: true,
         external_retrieval: true,
         unknown_function_output_behavior: "protected_original_output_preserved",
