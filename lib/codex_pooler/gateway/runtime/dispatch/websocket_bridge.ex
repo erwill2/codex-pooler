@@ -31,8 +31,6 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.WebsocketBridge do
 
   @preflight_timeout_ms 15_000
 
-  @type dispatch_fun :: (Req.Response.t(), PreparedContext.t() -> term())
-
   @spec eligible?(PreparedContext.t()) :: boolean()
   def eligible?(%PreparedContext{context: context}) do
     opts = context.request_options

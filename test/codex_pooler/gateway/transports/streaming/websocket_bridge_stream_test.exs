@@ -161,6 +161,47 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStreamTest do
     refute_receive {^ref, {:data, _data}}, 100
   end
 
+  test "a failure-coded incomplete terminal before visible output falls back" do
+    stream = start_armed(blocking_submit())
+    ref = stream.ref
+
+    owner_frame(
+      stream,
+      {:data,
+       Jason.encode!(%{
+         "type" => "response.incomplete",
+         "response" => %{
+           "status" => "incomplete",
+           "incomplete_details" => %{"reason" => "context_length_exceeded"}
+         }
+       })}
+    )
+
+    assert_receive {^ref, {:preflight, {:fallback, :bridge_failed_before_visible}}}, 2_000
+    refute_receive {^ref, {:data, _data}}, 100
+  end
+
+  test "an ordinary incomplete terminal remains downstream-visible" do
+    stream = start_armed(blocking_submit())
+    ref = stream.ref
+
+    owner_frame(
+      stream,
+      {:data,
+       Jason.encode!(%{
+         "type" => "response.incomplete",
+         "response" => %{
+           "status" => "incomplete",
+           "incomplete_details" => %{"reason" => "max_output_tokens"}
+         }
+       })}
+    )
+
+    assert_receive {^ref, {:preflight, :stream}}, 2_000
+    assert_receive {^ref, {:data, data}}, 2_000
+    assert data =~ "response.incomplete"
+  end
+
   test "a completion with no data falls back instead of committing" do
     stream = start_armed(blocking_submit())
     ref = stream.ref

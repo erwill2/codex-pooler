@@ -411,6 +411,47 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketBridgeTest do
     assert settled_count(request) == 1
   end
 
+  test "a failure-coded incomplete websocket terminal falls back to HTTP pre-visible", %{
+    conn: conn
+  } do
+    failed_incomplete =
+      {"response.incomplete",
+       %{
+         "type" => "response.incomplete",
+         "response" => %{
+           "id" => "resp_failed_incomplete",
+           "status" => "incomplete",
+           "incomplete_details" => %{"reason" => "context_length_exceeded"}
+         }
+       }}
+
+    upstream =
+      start_upstream(
+        {:sequence,
+         [
+           FakeUpstream.sse_stream([failed_incomplete]),
+           FakeUpstream.sse_stream([completed_event("resp_incomplete_fallback")])
+         ]}
+      )
+
+    setup = gateway_setup(upstream)
+    enable_bridge!(setup.pool)
+    session = "incomplete-fallback-session-#{System.unique_integer([:positive])}"
+
+    response = post_stream(conn, setup, session, stream_payload(setup, "fallback incomplete"))
+
+    assert response.status == 200
+    assert completed_id(response.resp_body) == "resp_incomplete_fallback"
+    refute response.resp_body =~ "resp_failed_incomplete"
+
+    request = latest_request(setup.pool)
+    assert request.status == "succeeded"
+    assert [attempt] = attempts_for(request)
+    assert attempt.transport == "http_sse"
+    refute attempt.response_metadata["upstream_websocket_bridge"]
+    assert settled_count(request) == 1
+  end
+
   test "a compact completed-only turn bridges with the synthesized visible prefix", %{conn: conn} do
     # Compact shape: the whole turn arrives as one response.completed event
     # carrying the output text. The bridge must commit on the terminal (it is

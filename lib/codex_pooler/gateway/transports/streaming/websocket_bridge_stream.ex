@@ -21,6 +21,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
   event reports a fallback instead.
   """
 
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
 
@@ -38,10 +39,6 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
   @type part :: {:data, binary()} | :done | {:bridge_error, term()}
 
   @default_settle_timeout_ms 5_000
-
-  # Upstream failure terminals: committing on one would hand downstream a
-  # failed turn that the pre-visible HTTP fallback could still retry.
-  @failure_event_types ["response.failed", "error"]
 
   @spec start(String.t(), keyword()) :: t()
   def start(correlation_id, opts \\ []) when is_binary(correlation_id) do
@@ -382,9 +379,9 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
   # pre-visible HTTP fallback. Upstream failure terminals fall back outright.
   defp preflight_class(text) do
     case Jason.decode(text) do
-      {:ok, %{"type" => type}} when is_binary(type) and type != "" ->
+      {:ok, %{"type" => type} = decoded} when is_binary(type) and type != "" ->
         cond do
-          type in @failure_event_types -> :failure
+          failed_terminal?(type, decoded) -> :failure
           String.starts_with?(type, "codex.") -> :internal
           true -> :visible
         end
@@ -392,6 +389,10 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketBridgeStream do
       _other ->
         :internal
     end
+  end
+
+  defp failed_terminal?(type, decoded) do
+    match?({:ok, %{kind: :failed}}, StreamProtocol.terminal_outcome(type, decoded))
   end
 
   defp owner_error_reason(error) when is_atom(error), do: error
