@@ -3,9 +3,25 @@ defmodule CodexPoolerWeb.Plugs.ForwardedSSL do
 
   import Plug.Conn, only: [get_req_header: 2]
 
+  @doc """
+  Plug.SSL exclude callback.
+
+  Returns true when force SSL redirects should be skipped:
+  - `DISABLE_FORCE_SSL=true|1` (LAN/self-host plain HTTP)
+  - WebSocket upgrades already marked as `wss` via `x-forwarded-proto`
+  """
+  @spec force_ssl_excluded?(Plug.Conn.t()) :: boolean()
+  def force_ssl_excluded?(conn) do
+    disable_force_ssl?() or websocket_over_forwarded_ssl?(conn)
+  end
+
   @spec websocket_over_forwarded_ssl?(Plug.Conn.t()) :: boolean()
   def websocket_over_forwarded_ssl?(conn) do
     forwarded_proto?(conn, "wss") && websocket_upgrade?(conn)
+  end
+
+  defp disable_force_ssl? do
+    System.get_env("DISABLE_FORCE_SSL") in ~w(true 1)
   end
 
   defp forwarded_proto?(conn, expected) do

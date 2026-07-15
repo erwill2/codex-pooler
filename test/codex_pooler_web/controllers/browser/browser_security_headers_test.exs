@@ -11,6 +11,9 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
   setup do
     previous_csp_sources = Application.get_env(:codex_pooler, :browser_csp_extra_sources)
     previous_dev_features_enabled = Application.get_env(:codex_pooler, :dev_features_enabled)
+    previous_disable_force_ssl = System.get_env("DISABLE_FORCE_SSL")
+
+    System.delete_env("DISABLE_FORCE_SSL")
 
     Repo.delete_all(Settings)
     InstanceSettings.reset_cache_for_test()
@@ -18,6 +21,12 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     on_exit(fn ->
       restore_env(:browser_csp_extra_sources, previous_csp_sources)
       restore_env(:dev_features_enabled, previous_dev_features_enabled)
+
+      case previous_disable_force_ssl do
+        nil -> System.delete_env("DISABLE_FORCE_SSL")
+        value -> System.put_env("DISABLE_FORCE_SSL", value)
+      end
+
       InstanceSettings.reset_cache_for_test()
     end)
 
@@ -149,7 +158,7 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
         rewrite_on: [:x_forwarded_host, :x_forwarded_port, :x_forwarded_proto],
         exclude: [
           hosts: ["localhost", "127.0.0.1"],
-          conn: {CodexPoolerWeb.Plugs.ForwardedSSL, :websocket_over_forwarded_ssl?, []}
+          conn: {CodexPoolerWeb.Plugs.ForwardedSSL, :force_ssl_excluded?, []}
         ]
       )
 
@@ -184,7 +193,7 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
         rewrite_on: [:x_forwarded_host, :x_forwarded_port, :x_forwarded_proto],
         exclude: [
           hosts: ["localhost", "127.0.0.1"],
-          conn: {CodexPoolerWeb.Plugs.ForwardedSSL, :websocket_over_forwarded_ssl?, []}
+          conn: {CodexPoolerWeb.Plugs.ForwardedSSL, :force_ssl_excluded?, []}
         ]
       )
 
@@ -201,6 +210,29 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     assert ["https://codex-pooler.icorete.ch/admin/pools"] = get_resp_header(conn, "location")
   end
 
+  test "DISABLE_FORCE_SSL skips Plug.SSL redirects for plain HTTP deployments" do
+    previous = System.get_env("DISABLE_FORCE_SSL")
+    System.put_env("DISABLE_FORCE_SSL", "true")
+
+    try do
+      opts = Plug.SSL.init(production_force_ssl_options!())
+
+      conn =
+        build_conn(:get, "/healthz")
+        |> Map.put(:host, "pooler.lan")
+
+      conn = Plug.SSL.call(conn, opts)
+
+      refute conn.halted
+      refute conn.status == 301
+    after
+      case previous do
+        nil -> System.delete_env("DISABLE_FORCE_SSL")
+        value -> System.put_env("DISABLE_FORCE_SSL", value)
+      end
+    end
+  end
+
   test "browser root layout does not include local live helper scaffolding", %{conn: conn} do
     conn = get(conn, ~p"/login")
 
@@ -211,7 +243,8 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
   test "robots.txt disallows crawling the whole site", %{conn: conn} do
     conn = get(conn, ~p"/robots.txt")
 
-    assert response(conn, 200) == "User-agent: *\nDisallow: /\n"
+    assert conn |> response(200) |> String.replace("\r\n", "\n") ==
+             "User-agent: *\nDisallow: /\n"
   end
 
   test "tracked top-level static assets are served without a digest manifest", %{conn: conn} do
@@ -228,7 +261,8 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
       assert asset_conn.status == 200
 
       if logical_path == "robots.txt" do
-        assert response(asset_conn, 200) == "User-agent: *\nDisallow: /\n"
+        assert asset_conn |> response(200) |> String.replace("\r\n", "\n") ==
+                 "User-agent: *\nDisallow: /\n"
       end
     end
   end

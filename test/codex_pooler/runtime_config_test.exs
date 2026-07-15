@@ -4,6 +4,9 @@ defmodule CodexPooler.RuntimeConfigTest do
   @required_env %{
     "DATABASE_URL" => "ecto://user:pass@example.invalid/db",
     "SECRET_KEY_BASE" => String.duplicate("a", 64),
+    "PHX_HOST" => "example.invalid",
+    "PHX_PORT" => "443",
+    "PHX_SCHEME" => "https",
     "PHX_SERVER" => "false",
     "PORT" => "4101",
     "CODEX_POOLER_TOTP_ENCRYPTION_KEY" => "example-totp-key",
@@ -17,6 +20,24 @@ defmodule CodexPooler.RuntimeConfigTest do
 
       assert endpoint_config[:http][:port] == 4101
       assert endpoint_config[:http][:ip] == {0, 0, 0, 0}
+      assert endpoint_config[:url][:scheme] == "https"
+      assert endpoint_config[:url][:port] == 443
+      refute Keyword.has_key?(endpoint_config, :force_ssl)
+    end)
+  end
+
+  test "PHX_SCHEME and PHX_PORT configure plain HTTP URL generation" do
+    env =
+      @required_env
+      |> Map.put("PHX_SCHEME", "http")
+      |> Map.put("PHX_PORT", "4000")
+      |> Map.put("PHX_HOST", "pooler.lan")
+
+    with_env(env, fn ->
+      config = Config.Reader.read!("config/runtime.exs", env: :prod)
+      endpoint_config = config[:codex_pooler][CodexPoolerWeb.Endpoint]
+
+      assert endpoint_config[:url] == [host: "pooler.lan", port: 4000, scheme: "http"]
     end)
   end
 

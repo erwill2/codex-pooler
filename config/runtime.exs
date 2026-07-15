@@ -94,11 +94,20 @@ if config_env() == :prod do
       """
 
   host = System.get_env("PHX_HOST") || "example.com"
+  scheme = System.get_env("PHX_SCHEME") || "https"
+
+  port =
+    case System.get_env("PHX_PORT") do
+      nil -> if scheme == "https", do: 443, else: 80
+      value -> String.to_integer(value)
+    end
 
   config :codex_pooler, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 
+  # force_ssl is compile-time in Phoenix; DISABLE_FORCE_SSL is honored at runtime
+  # via CodexPoolerWeb.Plugs.ForwardedSSL.force_ssl_excluded?/1.
   config :codex_pooler, CodexPoolerWeb.Endpoint,
-    url: [host: host, port: 443, scheme: "https"],
+    url: [host: host, port: port, scheme: scheme],
     http: [
       port: String.to_integer(System.get_env("PORT", "4000")),
       ip: {0, 0, 0, 0},
