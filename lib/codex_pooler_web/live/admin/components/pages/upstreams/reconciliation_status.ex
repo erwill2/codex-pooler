@@ -17,31 +17,36 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus do
       )
 
     ~H"""
-    <section
+    <details
       :if={@state.visible?}
       id={"#{@id_prefix}-reconciliation-status"}
       data-role="upstream-reconciliation-status"
       data-reconciliation-status={@state.reconciliation_status}
-      class={[
-        "flex items-start gap-2 rounded-box border p-3 text-sm",
-        tone_class(@state.tone)
-      ]}
+      data-preserve-open
+      class="group min-w-0 rounded-box border border-base-300 bg-base-200/40"
     >
-      <.icon name={tone_icon(@state.tone)} class={tone_icon_class(@state.tone)} />
-      <div class="grid min-w-0 flex-1 gap-1">
-        <div class="flex min-w-0 flex-wrap items-baseline justify-between gap-x-3">
-          <h3 id={"#{@id_prefix}-reconciliation-title"} class={tone_title_class(@state.tone)}>
-            {@state.title}
-          </h3>
-          <span
-            :if={@state.attempt_age}
-            id={"#{@id_prefix}-reconciliation-attempt-age"}
-            class="text-xs text-base-content/65"
-          >
-            latest attempt {@state.attempt_age}
-          </span>
-        </div>
-        <p id={"#{@id_prefix}-reconciliation-summary"} class="text-base-content/80">
+      <summary class="flex min-w-0 cursor-pointer list-none items-center gap-2 rounded-box px-3 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary [&::-webkit-details-marker]:hidden">
+        <span class={tone_dot_class(@state.tone)} aria-hidden="true"></span>
+        <h3
+          id={"#{@id_prefix}-reconciliation-title"}
+          class="min-w-0 flex-1 truncate text-sm font-semibold text-base-content"
+        >
+          {@state.title}
+        </h3>
+        <span
+          :if={@state.attempt_age}
+          id={"#{@id_prefix}-reconciliation-attempt-age"}
+          class="shrink-0 text-xs text-base-content/55"
+        >
+          latest attempt {@state.attempt_age}
+        </span>
+        <.icon
+          name="hero-chevron-right"
+          class="size-3 shrink-0 text-base-content/40 transition-transform group-open:rotate-90"
+        />
+      </summary>
+      <div class="grid min-w-0 gap-1 border-t border-base-300/70 px-3 py-2.5 text-sm">
+        <p id={"#{@id_prefix}-reconciliation-summary"} class="text-base-content/75">
           {@state.summary}
         </p>
         <p
@@ -51,7 +56,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus do
         >
           {@state.reason}
         </p>
-        <dl class="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-base-content/60">
+        <dl class="flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-base-content/55">
           <div>
             <dt class="sr-only">Last successful refresh</dt>
             <dd id={"#{@id_prefix}-last-successful-refresh"}>
@@ -66,7 +71,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus do
           </div>
         </dl>
       </div>
-    </section>
+    </details>
     """
   end
 
@@ -110,15 +115,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus do
   defp age_label(label, age) when is_binary(age) and age != "", do: "#{label} #{age}"
   defp age_label(label, _age), do: "#{label} not reported"
 
-  defp tone_class(:error), do: "border-error/30 bg-error/10"
-  defp tone_class(_tone), do: "border-base-300 bg-base-200/30"
+  defp tone_dot_class(:error),
+    do: "size-2 shrink-0 rounded-full bg-error ring-[3px] ring-error/15"
 
-  defp tone_icon(:error), do: "hero-exclamation-triangle"
-  defp tone_icon(_tone), do: "hero-information-circle"
-
-  defp tone_icon_class(:error), do: "mt-0.5 size-5 shrink-0 text-error"
-  defp tone_icon_class(_tone), do: "mt-0.5 size-5 shrink-0 text-base-content/60"
-
-  defp tone_title_class(:error), do: "font-semibold text-error"
-  defp tone_title_class(_tone), do: "font-semibold text-base-content"
+  defp tone_dot_class(_tone),
+    do: "size-2 shrink-0 rounded-full bg-base-content/40 ring-[3px] ring-base-content/10"
 end

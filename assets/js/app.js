@@ -849,6 +849,16 @@ document.addEventListener("keydown", dismissTopAdminDialogFromEscape, true)
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 8000,
   params: {_csrf_token: csrfToken},
+  dom: {
+    // Client-toggled disclosure state lives only in the DOM; without this,
+    // any LiveView patch of the surrounding card would fold the element
+    // shut again.
+    onBeforeElUpdated(from, to) {
+      if (from.hasAttribute("data-preserve-open") && from.hasAttribute("open")) {
+        to.setAttribute("open", "")
+      }
+    },
+  },
   hooks: {
     ...colocatedHooks,
     AdminFilterDropdowns,
