@@ -12,7 +12,15 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
   alias CodexPooler.Gateway.Websocket, as: Gateway
 
+  @epmd_ready_timeout_ms 2_000
+  @epmd_ready_poll_ms 10
   @frame "synthetic-frame"
+
+  setup_all do
+    started_epmd? = ensure_epmd_started!()
+    on_exit(fn -> if started_epmd?, do: stop_epmd!() end)
+    :ok
+  end
 
   setup do
     reset_bootstrap_state_fixture!()
@@ -759,19 +767,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
   defp ensure_test_distribution_started!, do: start_test_distribution!(node())
 
   defp start_test_distribution!(:nonode@nohost) do
-    started_epmd? = ensure_epmd_started!()
     node_name = String.to_atom("codex_pooler_test_#{System.unique_integer([:positive])}")
     assert {:ok, _pid} = :net_kernel.start([node_name, :shortnames])
 
-    on_exit(fn -> stop_test_distribution!(started_epmd?) end)
+    on_exit(fn -> assert :ok = :net_kernel.stop() end)
   end
 
   defp start_test_distribution!(_distributed_node), do: :ok
-
-  defp stop_test_distribution!(started_epmd?) do
-    assert :ok = :net_kernel.stop()
-    if started_epmd?, do: stop_epmd!()
-  end
 
   defp ensure_epmd_started! do
     case :erl_epmd.names() do
@@ -780,8 +782,26 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
 
       {:error, _reason} ->
         assert {_output, 0} = System.cmd("epmd", ["-daemon"], stderr_to_stdout: true)
-        assert {:ok, _names} = :erl_epmd.names()
+        await_epmd!(System.monotonic_time(:millisecond) + @epmd_ready_timeout_ms)
         true
+    end
+  end
+
+  defp await_epmd!(deadline) do
+    case :erl_epmd.names() do
+      {:ok, _names} -> :ok
+      {:error, _reason} = error -> retry_epmd_readiness!(error, deadline)
+    end
+  end
+
+  defp retry_epmd_readiness!(error, deadline) do
+    if System.monotonic_time(:millisecond) < deadline do
+      receive do
+      after
+        @epmd_ready_poll_ms -> await_epmd!(deadline)
+      end
+    else
+      flunk("EPMD did not become ready: #{inspect(error)}")
     end
   end
 
