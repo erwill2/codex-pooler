@@ -142,25 +142,33 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
         </div>
 
         <input type="hidden" name={field_array_name(@form[:allowed_model_identifiers])} value="" />
-        <div id="api-key-model-options" class="mt-4 grid gap-2">
+        <div id="api-key-model-options" class="mt-4 grid max-h-[13rem] gap-2 overflow-y-auto">
           <label
             :for={option <- @selector_state.options}
             id={"api-key-model-option-#{dom_token(option.identifier)}"}
-            class="flex min-w-0 cursor-pointer items-start gap-3 rounded-box border border-base-300 bg-base-200/40 p-3 transition-colors hover:bg-base-200"
+            class="flex min-h-12 min-w-0 cursor-pointer items-center gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-2 transition-colors hover:border-primary/50 hover:bg-primary/5"
           >
             <input
               type="checkbox"
-              class="checkbox checkbox-primary checkbox-sm mt-1"
+              class="checkbox checkbox-primary checkbox-sm shrink-0"
               name={field_array_name(@form[:allowed_model_identifiers])}
               value={option.identifier}
               checked={selected_value?(@form[:allowed_model_identifiers].value, option.identifier)}
             />
-            <span class="grid min-w-0 gap-1">
-              <span class="font-medium text-base-content">
+            <span class="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-x-3 gap-y-0.5">
+              <span class="min-w-0 truncate text-sm font-medium text-base-content">
                 {option.display_name || option.identifier}
               </span>
-              <span class="break-all font-mono text-xs text-base-content/60">
-                {option.identifier} · {option.source_assignment_count} assignments
+              <span class="flex min-w-0 shrink items-center gap-2">
+                <span class="truncate font-mono text-xs text-base-content/50">
+                  {option.identifier}
+                </span>
+                <span
+                  class="inline-flex shrink-0 items-center rounded-box bg-base-200 px-2 py-0.5 text-xs font-semibold tabular-nums text-base-content/70"
+                  title={"#{option.source_assignment_count} upstream assignments route this model"}
+                >
+                  {option.source_assignment_count}
+                </span>
               </span>
             </span>
           </label>
