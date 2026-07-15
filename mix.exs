@@ -103,6 +103,7 @@ defmodule CodexPooler.MixProject do
   defp aliases do
     [
       setup: ["deps.get", "ecto.setup", "assets.setup", "assets.build"],
+      dev: ["cmd npm install --prefix assets", "phx.server"],
       "ecto.setup": [
         "ecto.create",
         "ecto.migrate",
