@@ -468,21 +468,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
   end
 
   test "a real peer running the previous attach API accepts native arity and rejects bridge arity" do
-    started_distribution? = node() == :nonode@nohost
-
-    if started_distribution? do
-      node_name = String.to_atom("codex_pooler_test_#{System.unique_integer([:positive])}")
-      assert {:ok, _pid} = :net_kernel.start([node_name, :shortnames])
-    end
+    ensure_test_distribution_started!()
 
     peer_name = String.to_atom("old_owner_#{System.unique_integer([:positive])}")
     assert {:ok, peer_pid, peer_node} = :peer.start_link(%{name: peer_name})
     Process.unlink(peer_pid)
 
-    on_exit(fn ->
-      stop_peer(peer_pid)
-      if started_distribution?, do: :net_kernel.stop()
-    end)
+    on_exit(fn -> stop_peer(peer_pid) end)
 
     module = WebsocketOwnerForwarder
     {:ok, ^module, beam} = previous_release_forwarder_beam(module)
@@ -513,21 +505,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
   end
 
   test "guarded bridge attach and request relay across a real current-release peer" do
-    started_distribution? = node() == :nonode@nohost
-
-    if started_distribution? do
-      node_name = String.to_atom("codex_pooler_test_#{System.unique_integer([:positive])}")
-      assert {:ok, _pid} = :net_kernel.start([node_name, :shortnames])
-    end
+    ensure_test_distribution_started!()
 
     peer_name = String.to_atom("current_owner_#{System.unique_integer([:positive])}")
     assert {:ok, peer_pid, peer_node} = :peer.start_link(%{name: peer_name})
     Process.unlink(peer_pid)
 
-    on_exit(fn ->
-      stop_peer(peer_pid)
-      if started_distribution?, do: :net_kernel.stop()
-    end)
+    on_exit(fn -> stop_peer(peer_pid) end)
 
     assert :ok = :erpc.call(peer_node, :code, :add_paths, [:code.get_path()])
 
@@ -770,6 +754,40 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
     true
   rescue
     ArgumentError -> false
+  end
+
+  defp ensure_test_distribution_started!, do: start_test_distribution!(node())
+
+  defp start_test_distribution!(:nonode@nohost) do
+    started_epmd? = ensure_epmd_started!()
+    node_name = String.to_atom("codex_pooler_test_#{System.unique_integer([:positive])}")
+    assert {:ok, _pid} = :net_kernel.start([node_name, :shortnames])
+
+    on_exit(fn -> stop_test_distribution!(started_epmd?) end)
+  end
+
+  defp start_test_distribution!(_distributed_node), do: :ok
+
+  defp stop_test_distribution!(started_epmd?) do
+    assert :ok = :net_kernel.stop()
+    if started_epmd?, do: stop_epmd!()
+  end
+
+  defp ensure_epmd_started! do
+    case :erl_epmd.names() do
+      {:ok, _names} ->
+        false
+
+      {:error, _reason} ->
+        assert {_output, 0} = System.cmd("epmd", ["-daemon"], stderr_to_stdout: true)
+        assert {:ok, _names} = :erl_epmd.names()
+        true
+    end
+  end
+
+  defp stop_epmd! do
+    assert {_output, 0} = System.cmd("epmd", ["-kill"], stderr_to_stdout: true)
+    :ok
   end
 
   defp previous_release_forwarder_beam(module) do
