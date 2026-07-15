@@ -146,7 +146,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
             <div class="grid gap-1">
               <h3 class="text-lg font-semibold text-base-content">Catalog models</h3>
               <p class="text-sm leading-6 text-base-content/65">
-                Routable models from this Pool's catalog, newest first.
+                Routable models from this Pool's catalog.
               </p>
             </div>
             <span class={AdminBadges.count_chip_class()}>
@@ -247,40 +247,6 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
   def api_key_enforcement_step(assigns) do
     ~H"""
     <section id="api-key-step-enforcement-panel" class="grid min-w-0 gap-5">
-      <div class="grid gap-1">
-        <h3 class="text-lg font-semibold text-base-content">Enforced request fields</h3>
-        <p class="text-sm leading-6 text-base-content/65">
-          Optionally pin the model and service tier sent upstream, regardless of request values.
-        </p>
-      </div>
-
-      <div class="grid gap-4 md:grid-cols-2">
-        <.input
-          field={@form[:enforced_model_identifier]}
-          type="select"
-          label="Enforced model"
-          options={@enforced_model_options}
-        />
-        <.input
-          field={@form[:enforced_service_tier]}
-          type="select"
-          label="Enforced service tier"
-          options={@service_tier_options}
-        />
-      </div>
-
-      <div
-        :if={@selector_state.enforced_unavailable_warning}
-        id="api-key-enforced-model-warning"
-        class="alert alert-warning items-start"
-      >
-        <.icon name="hero-exclamation-triangle" class="size-5" />
-        <div class="grid gap-1">
-          <p class="font-semibold">Enforced model unavailable</p>
-          <p class="text-sm">{@selector_state.enforced_unavailable_warning.message}</p>
-        </div>
-      </div>
-
       <div
         id="api-key-reasoning-policy"
         role="radiogroup"
@@ -330,6 +296,40 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           label="Enforced reasoning effort"
           options={@reasoning_effort_options}
         />
+      </div>
+
+      <div class="grid gap-1">
+        <h3 class="text-lg font-semibold text-base-content">Enforced request fields</h3>
+        <p class="text-sm leading-6 text-base-content/65">
+          Optionally pin the model and service tier sent upstream, regardless of request values.
+        </p>
+      </div>
+
+      <div class="grid gap-4 md:grid-cols-2">
+        <.input
+          field={@form[:enforced_model_identifier]}
+          type="select"
+          label="Enforced model"
+          options={@enforced_model_options}
+        />
+        <.input
+          field={@form[:enforced_service_tier]}
+          type="select"
+          label="Enforced service tier"
+          options={@service_tier_options}
+        />
+      </div>
+
+      <div
+        :if={@selector_state.enforced_unavailable_warning}
+        id="api-key-enforced-model-warning"
+        class="alert alert-warning items-start"
+      >
+        <.icon name="hero-exclamation-triangle" class="size-5" />
+        <div class="grid gap-1">
+          <p class="font-semibold">Enforced model unavailable</p>
+          <p class="text-sm">{@selector_state.enforced_unavailable_warning.message}</p>
+        </div>
       </div>
 
       <p class="text-sm leading-6 text-base-content/60">
