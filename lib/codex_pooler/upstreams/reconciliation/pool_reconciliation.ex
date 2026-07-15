@@ -6,6 +6,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Quotas.WindowClassifier
   alias CodexPooler.Repo
+  alias CodexPooler.TransportFailureReason
   alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Reconciliation.UsageProbe
@@ -19,6 +20,8 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   @eligible PoolUpstreamAssignment.eligible_status()
   @assignment_ineligible PoolUpstreamAssignment.ineligible_status()
   @health_active PoolUpstreamAssignment.active_health_status()
+  @refresh_failed UpstreamIdentity.refresh_failed_status()
+  @reauth_required UpstreamIdentity.reauth_required_status()
   # Auth-shaped rejections must surface instead of silently reusing
   # persisted windows. A 429 is deliberately absent: being told to slow
   # down does not invalidate a snapshot refreshed within its usable window,
@@ -28,6 +31,19 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
   @type lifecycle_error :: %{required(:code) => atom(), required(:message) => String.t()}
   @type lifecycle_result :: {:ok, map()} | {:error, lifecycle_error()}
+  @typep quota_refresh_context :: %{
+           required(:identity) => UpstreamIdentity.t(),
+           required(:assignment) => PoolUpstreamAssignment.t(),
+           required(:quota) => %{
+             required(:windows) => list(),
+             required(:identity_attrs) => map(),
+             required(:payload) => map() | nil,
+             required(:usage_url) => String.t() | nil,
+             required(:covered_descriptors) => MapSet.t()
+           },
+           required(:credential_fence) => map() | nil,
+           required(:expected_credential_epoch) => pos_integer() | nil
+         }
 
   @spec reconcile_pool_account(
           Pool.t() | Ecto.UUID.t() | term(),
@@ -42,41 +58,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     case load_active_assignment_with_identity(pool_id, assignment_id) do
       {%PoolUpstreamAssignment{} = assignment, %UpstreamIdentity{} = identity} ->
         quota_step = refresh_reconciliation_quota(identity, assignment, opts)
-        result_identity = step_identity(quota_step, identity)
-
-        if identity_conflict_step?(quota_step) do
-          assignment =
-            record_identity_conflict!(assignment, quota_step.details["identity_conflict"])
-
-          health_step =
-            step_result(:skipped, "health_skipped", "assignment health was not refreshed")
-
-          {:ok,
-           %{
-             status: :failed,
-             assignment: assignment,
-             identity: result_identity,
-             health: health_step,
-             quota: quota_step
-           }}
-        else
-          health_step = record_reconciliation_health!(assignment, quota_step)
-          status = summarize_reconciliation_status([health_step, quota_step])
-
-          assignment =
-            assignment
-            |> Repo.reload!()
-            |> maybe_record_reconciliation_summary(status, [health_step, quota_step], opts)
-
-          {:ok,
-           %{
-             status: status,
-             assignment: assignment,
-             identity: result_identity,
-             health: health_step,
-             quota: quota_step
-           }}
-        end
+        finalize_reconciliation(assignment, identity, quota_step, opts)
 
       nil ->
         {:error,
@@ -103,6 +85,222 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
 
   defp load_active_assignment_with_identity(_pool_id, _assignment_id), do: nil
 
+  defp finalize_reconciliation(
+         assignment,
+         identity,
+         %{credential_fence: fence} = quota_step,
+         opts
+       ) do
+    identity
+    |> CredentialFencing.guard_active_usage_probe_completion(
+      fence,
+      probe_completion_mode(quota_step),
+      fn locked_identity ->
+        finalize_locked_assignment(assignment.id, locked_identity, quota_step, opts)
+      end
+    )
+    |> finish_fenced_reconciliation(assignment, identity, quota_step)
+  end
+
+  defp finalize_reconciliation(
+         assignment,
+         identity,
+         %{expected_credential_epoch: expected_credential_epoch} = quota_step,
+         opts
+       ) do
+    identity
+    |> CredentialFencing.guard_active_reconciliation_epoch(
+      expected_credential_epoch,
+      fn locked_identity ->
+        finalize_locked_assignment(assignment.id, locked_identity, quota_step, opts)
+      end
+    )
+    |> finish_unfenced_reconciliation(assignment, identity)
+  end
+
+  defp finalize_reconciliation(assignment, identity, quota_step, opts) do
+    identity
+    |> CredentialFencing.guard_active_reconciliation(fn locked_identity ->
+      finalize_locked_assignment(assignment.id, locked_identity, quota_step, opts)
+    end)
+    |> finish_unfenced_reconciliation(assignment, identity)
+  end
+
+  defp finalize_locked_assignment(assignment_id, identity, quota_step, opts) do
+    case Repo.get(PoolUpstreamAssignment, assignment_id) do
+      %PoolUpstreamAssignment{status: @assignment_active} = assignment ->
+        {:ok, {:finalized, finalize_active_assignment(assignment, identity, quota_step, opts)}}
+
+      %PoolUpstreamAssignment{} = assignment ->
+        {:ok, {:assignment_superseded, assignment}}
+
+      nil ->
+        {:ok, {:assignment_superseded, nil}}
+    end
+  end
+
+  defp finish_fenced_reconciliation(
+         {:ok, :applied, identity, {:finalized, result}},
+         _assignment,
+         _initial_identity,
+         _quota_step
+       ) do
+    {:ok, put_result_identity(result, identity)}
+  end
+
+  defp finish_fenced_reconciliation(
+         {:ok, :applied, identity, {:assignment_superseded, current_assignment}},
+         assignment,
+         _initial_identity,
+         _quota_step
+       ) do
+    {:ok, superseded_reconciliation_result(current_assignment || assignment, identity)}
+  end
+
+  defp finish_fenced_reconciliation(
+         {:ok, :superseded, identity, nil},
+         assignment,
+         _initial_identity,
+         %{code: "quota_refresh_auth_unavailable"} = quota_step
+       ) do
+    current_assignment = Repo.get(PoolUpstreamAssignment, assignment.id) || assignment
+
+    if current_auth_failure?(identity, quota_step) do
+      {:ok, preserved_rejection_result(current_assignment, identity, quota_step)}
+    else
+      {:ok, superseded_reconciliation_result(current_assignment, identity)}
+    end
+  end
+
+  defp finish_fenced_reconciliation(
+         {:ok, :superseded, identity, nil},
+         assignment,
+         _initial_identity,
+         _quota_step
+       ) do
+    current_assignment = Repo.get(PoolUpstreamAssignment, assignment.id) || assignment
+    {:ok, superseded_reconciliation_result(current_assignment, identity)}
+  end
+
+  defp finish_fenced_reconciliation({:error, reason}, assignment, identity, _quota_step) do
+    health_step = step_result(:skipped, "health_skipped", "assignment health was not refreshed")
+    failed_quota_step = step_result(:failed, "quota_refresh_failed", safe_error_message(reason))
+
+    {:ok,
+     %{
+       status: :failed,
+       assignment: Repo.get(PoolUpstreamAssignment, assignment.id) || assignment,
+       identity: Repo.get(UpstreamIdentity, identity.id) || identity,
+       health: health_step,
+       quota: failed_quota_step
+     }}
+  end
+
+  defp finish_unfenced_reconciliation(
+         {:ok, :applied, current_identity, {:finalized, result}},
+         _assignment,
+         _identity
+       ) do
+    {:ok, put_result_identity(result, current_identity)}
+  end
+
+  defp finish_unfenced_reconciliation(
+         {:ok, :applied, current_identity, {:assignment_superseded, current_assignment}},
+         assignment,
+         _identity
+       ) do
+    {:ok, superseded_reconciliation_result(current_assignment || assignment, current_identity)}
+  end
+
+  defp finish_unfenced_reconciliation(
+         {:ok, :superseded, current_identity, nil},
+         assignment,
+         _identity
+       ) do
+    current_assignment = Repo.get(PoolUpstreamAssignment, assignment.id) || assignment
+    {:ok, superseded_reconciliation_result(current_assignment, current_identity)}
+  end
+
+  defp finish_unfenced_reconciliation({:error, reason}, assignment, identity) do
+    finish_fenced_reconciliation({:error, reason}, assignment, identity, %{})
+  end
+
+  defp finalize_active_assignment(assignment, identity, quota_step, opts) do
+    if identity_conflict_step?(quota_step) do
+      assignment =
+        record_identity_conflict!(assignment, quota_step.details["identity_conflict"])
+
+      health_step =
+        step_result(:skipped, "health_skipped", "assignment health was not refreshed")
+
+      %{
+        status: :failed,
+        assignment: assignment,
+        identity: step_identity(quota_step, identity),
+        health: health_step,
+        quota: quota_step
+      }
+    else
+      health_step = record_reconciliation_health!(assignment, quota_step)
+      status = summarize_reconciliation_status([health_step, quota_step])
+
+      assignment =
+        assignment
+        |> Repo.reload!()
+        |> maybe_record_reconciliation_summary(status, [health_step, quota_step], opts)
+
+      %{
+        status: status,
+        assignment: assignment,
+        identity: step_identity(quota_step, identity),
+        health: health_step,
+        quota: quota_step
+      }
+    end
+  end
+
+  defp superseded_reconciliation_result(assignment, identity) do
+    quota_step =
+      step_result(:skipped, "quota_refresh_superseded", "quota refresh was superseded")
+      |> Map.put(:identity, identity)
+
+    health_step = record_reconciliation_health!(assignment, quota_step)
+
+    %{
+      status: summarize_reconciliation_status([health_step, quota_step]),
+      assignment: assignment,
+      identity: identity,
+      health: health_step,
+      quota: quota_step
+    }
+  end
+
+  defp preserved_rejection_result(assignment, identity, quota_step) do
+    quota_step = Map.put(quota_step, :identity, identity)
+    health_step = record_reconciliation_health!(assignment, quota_step)
+
+    %{
+      status: summarize_reconciliation_status([health_step, quota_step]),
+      assignment: assignment,
+      identity: identity,
+      health: health_step,
+      quota: quota_step
+    }
+  end
+
+  defp current_auth_failure?(
+         %UpstreamIdentity{status: status} = identity,
+         %{credential_fence: %{credential_epoch: credential_epoch}}
+       )
+       when status in [@refresh_failed, @reauth_required],
+       do: CredentialFencing.current_credential_epoch?(identity, credential_epoch)
+
+  defp current_auth_failure?(_identity, _quota_step), do: false
+
+  defp put_result_identity(result, identity) do
+    %{result | identity: identity, quota: Map.put(result.quota, :identity, identity)}
+  end
+
   defp maybe_record_reconciliation_summary(assignment, status, steps, opts) do
     if Keyword.get(opts, :record_summary?, true) and not superseded_quota_step?(steps) do
       record_reconciliation_summary!(assignment, status, steps)
@@ -115,13 +313,9 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     Enum.any?(steps, &(&1.code == "quota_refresh_superseded"))
   end
 
-  defp record_reconciliation_health!(
-         %PoolUpstreamAssignment{},
-         %{
-           code: "quota_refresh_auth_unavailable",
-           identity: %UpstreamIdentity{status: "reauth_required"}
-         }
-       ) do
+  defp record_reconciliation_health!(%PoolUpstreamAssignment{}, %{
+         code: "quota_refresh_auth_unavailable"
+       }) do
     step_result(
       :succeeded,
       "health_preserved",
@@ -178,44 +372,71 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
           "quota refresh requires account reauthentication"
         )
 
+      {:auth_unavailable, fence} ->
+        step_result(
+          :failed,
+          "quota_refresh_auth_unavailable",
+          "quota refresh requires account reauthentication"
+        )
+        |> put_credential_fence(fence)
+
       {:definitive_provider_auth_rejected, fence} ->
         promote_definitive_provider_auth_rejection(identity, fence)
 
-      {:usage_unavailable, reason} ->
+      {:usage_unavailable, reason, fence} ->
         step_result(
           :failed,
           "quota_refresh_unavailable",
           "quota windows were not available (#{safe_unavailable_reason(reason)})"
         )
+        |> put_credential_fence(fence)
 
-      {:persisted_windows, windows} ->
+      {:persisted_windows, windows, fence} ->
         step_result(:succeeded, "quota_reused_fresh", "fresh quota windows reused", %{
           "window_count" => length(windows)
         })
+        |> put_credential_fence(fence)
 
-      {:windows, windows, identity_attrs} ->
-        upsert_reconciliation_quota(identity, windows, identity_attrs, nil, nil, MapSet.new())
+      {:windows, windows, identity_attrs, expected_credential_epoch} ->
+        upsert_reconciliation_quota(%{
+          identity: identity,
+          assignment: assignment,
+          quota: %{
+            windows: windows,
+            identity_attrs: identity_attrs,
+            payload: nil,
+            usage_url: nil,
+            covered_descriptors: MapSet.new()
+          },
+          credential_fence: nil,
+          expected_credential_epoch: expected_credential_epoch
+        })
 
       {:usage, %UpstreamIdentity{} = usage_identity, %UsageProbe.Result{} = probe} ->
-        upsert_reconciliation_quota(
-          usage_identity,
-          probe.windows,
-          identity_attrs_from_codex_usage_payload(probe.payload),
-          probe.payload,
-          probe.usage_url,
-          probe.covered_descriptors,
-          probe.credential_fence
-        )
+        upsert_reconciliation_quota(%{
+          identity: usage_identity,
+          assignment: assignment,
+          quota: %{
+            windows: probe.windows,
+            identity_attrs: identity_attrs_from_codex_usage_payload(probe.payload),
+            payload: probe.payload,
+            usage_url: probe.usage_url,
+            covered_descriptors: probe.covered_descriptors
+          },
+          credential_fence: probe.credential_fence,
+          expected_credential_epoch: nil
+        })
     end
   end
 
   defp reconciliation_quota_source(identity, assignment, opts) do
     cond do
       Keyword.has_key?(opts, :quota_windows) ->
-        {:windows, Keyword.get(opts, :quota_windows), Keyword.get(opts, :identity_attrs, %{})}
+        {:windows, Keyword.get(opts, :quota_windows), Keyword.get(opts, :identity_attrs, %{}),
+         CredentialFencing.credential_epoch(identity)}
 
       windows = metadata_quota_windows(identity, assignment) ->
-        {:windows, windows, %{}}
+        {:windows, windows, %{}, CredentialFencing.credential_epoch(identity)}
 
       true ->
         identity
@@ -233,6 +454,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
           "quota refresh requires account reauthentication"
         )
         |> Map.put(:identity, reauth_identity)
+        |> put_credential_fence(fence)
 
       {:ok, :superseded, current_identity} ->
         step_result(:skipped, "quota_refresh_superseded", "quota refresh was superseded")
@@ -243,24 +465,19 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
     end
   end
 
+  @spec upsert_reconciliation_quota(quota_refresh_context()) :: map()
   defp upsert_reconciliation_quota(
-         identity,
-         windows,
-         identity_attrs,
-         payload,
-         usage_url,
-         covered_descriptors,
-         credential_fence \\ nil
-       )
-
-  defp upsert_reconciliation_quota(
-         identity,
-         windows,
-         identity_attrs,
-         payload,
-         usage_url,
-         covered_descriptors,
-         credential_fence
+         %{
+           identity: identity,
+           quota: %{
+             windows: windows,
+             identity_attrs: identity_attrs,
+             payload: payload,
+             usage_url: usage_url,
+             covered_descriptors: covered_descriptors
+           },
+           credential_fence: credential_fence
+         } = context
        )
        when is_list(windows) do
     observed_at = now()
@@ -290,52 +507,107 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
             {:error, reason}
         end
       else
-        persist_reconciliation_quota(
-          identity,
-          windows,
-          identity_attrs,
-          payload,
-          observed_at,
-          usage_url,
-          covered_descriptors,
-          true
-        )
+        persist_unfenced_reconciliation_quota(context, observed_at)
       end
 
-    case result do
-      {:ok, %{windows: refreshed, identity: updated_identity}} ->
-        # Fresh quota is now persisted: converge any pending saved-reset
-        # redemption on this identity from that evidence (self-healing). Best
-        # effort and a no-op for identities without a pending lifecycle.
-        Convergence.converge(updated_identity, observed_at)
+    result =
+      case result do
+        {:ok, %{windows: refreshed, identity: updated_identity}} ->
+          # Fresh quota is now persisted: converge any pending saved-reset
+          # redemption on this identity from that evidence (self-healing). Best
+          # effort and a no-op for identities without a pending lifecycle.
+          Convergence.converge(updated_identity, observed_at)
 
-        step_result(:succeeded, "quota_refreshed", "quota windows refreshed", %{
-          "window_count" => length(refreshed)
-        })
-        |> Map.put(:identity, updated_identity)
+          step_result(:succeeded, "quota_refreshed", "quota windows refreshed", %{
+            "window_count" => length(refreshed)
+          })
+          |> Map.put(:identity, updated_identity)
+          |> put_credential_fence(credential_fence)
 
-      {:error, {:identity_conflict, :workspace_identity_mismatch, conflict}} ->
-        identity_conflict_step(conflict)
+        {:error, {:identity_conflict, :workspace_identity_mismatch, conflict}} ->
+          conflict
+          |> identity_conflict_step()
+          |> put_credential_fence(credential_fence)
 
-      {:error, reason} ->
-        step_result(:failed, "quota_refresh_failed", safe_error_message(reason))
+        {:error, reason} ->
+          step_result(:failed, "quota_refresh_failed", safe_error_message(reason))
+          |> put_credential_fence(credential_fence)
 
-      {:superseded, current_identity} ->
-        step_result(:skipped, "quota_refresh_superseded", "quota refresh was superseded")
-        |> Map.put(:identity, current_identity)
-    end
+        {:superseded, current_identity} ->
+          step_result(:skipped, "quota_refresh_superseded", "quota refresh was superseded")
+          |> Map.put(:identity, current_identity)
+      end
+
+    put_expected_credential_epoch(result, context.expected_credential_epoch)
   end
 
-  defp upsert_reconciliation_quota(
-         _identity,
-         _windows,
-         _identity_attrs,
-         _payload,
-         _usage_url,
-         _covered_descriptors,
-         _credential_fence
-       ),
-       do: step_result(:failed, "quota_refresh_unavailable", "quota windows were not available")
+  defp upsert_reconciliation_quota(%{
+         credential_fence: credential_fence,
+         expected_credential_epoch: expected_credential_epoch
+       }),
+       do:
+         step_result(:failed, "quota_refresh_unavailable", "quota windows were not available")
+         |> put_credential_fence(credential_fence)
+         |> put_expected_credential_epoch(expected_credential_epoch)
+
+  @spec persist_unfenced_reconciliation_quota(quota_refresh_context(), DateTime.t()) ::
+          {:ok, map()} | {:superseded, UpstreamIdentity.t()} | {:error, term()}
+  defp persist_unfenced_reconciliation_quota(
+         %{
+           identity: identity,
+           assignment: assignment,
+           quota: %{
+             windows: windows,
+             identity_attrs: identity_attrs,
+             payload: payload,
+             usage_url: usage_url,
+             covered_descriptors: covered_descriptors
+           },
+           expected_credential_epoch: expected_credential_epoch
+         },
+         observed_at
+       ) do
+    identity
+    |> CredentialFencing.guard_active_reconciliation(fn locked_identity ->
+      case {CredentialFencing.current_credential_epoch?(
+              locked_identity,
+              expected_credential_epoch
+            ), Repo.get(PoolUpstreamAssignment, assignment.id)} do
+        {true, %PoolUpstreamAssignment{status: @assignment_active}} ->
+          persist_reconciliation_quota(
+            locked_identity,
+            windows,
+            identity_attrs,
+            payload,
+            observed_at,
+            usage_url,
+            covered_descriptors,
+            false
+          )
+
+        {false, _assignment} ->
+          {:ok, :credential_superseded}
+
+        {_current_epoch, _assignment} ->
+          {:ok, :assignment_superseded}
+      end
+    end)
+    |> case do
+      {:ok, :applied, updated_identity, %{windows: _windows} = persisted} ->
+        Quota.Windows.broadcast_quota_update(updated_identity)
+        {:ok, %{persisted | identity: updated_identity}}
+
+      {:ok, :applied, current_identity, superseded}
+      when superseded in [:assignment_superseded, :credential_superseded] ->
+        {:superseded, current_identity}
+
+      {:ok, :superseded, current_identity, nil} ->
+        {:superseded, current_identity}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   @doc false
   @spec refresh_quota_from_usage(UpstreamIdentity.t(), PoolUpstreamAssignment.t(), keyword()) ::
@@ -459,13 +731,22 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   end
 
   defp maybe_reuse_persisted_quota_windows(
-         {:usage_unavailable, {:upstream_status, status}} = unavailable,
+         {:usage_unavailable, {:upstream_status, status}, _fence} = unavailable,
          _identity
        )
        when status in @fallback_denied_usage_statuses,
        do: unavailable
 
-  defp maybe_reuse_persisted_quota_windows({:usage_unavailable, reason} = unavailable, identity) do
+  defp maybe_reuse_persisted_quota_windows(
+         {:usage_unavailable, {:mixed_auth_rejection, _reason}, _fence} = unavailable,
+         _identity
+       ),
+       do: unavailable
+
+  defp maybe_reuse_persisted_quota_windows(
+         {:usage_unavailable, _reason, fence} = unavailable,
+         identity
+       ) do
     timestamp = now()
 
     windows =
@@ -474,9 +755,8 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
       |> Enum.filter(&reusable_persisted_quota_window?(&1, timestamp))
 
     if windows != [] do
-      {:persisted_windows, windows}
+      {:persisted_windows, windows, fence}
     else
-      _ = reason
       unavailable
     end
   end
@@ -493,11 +773,19 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
       Quota.Windows.usable_window?(window, timestamp)
   end
 
-  defp safe_unavailable_reason({:upstream_status, status}), do: "upstream_status_#{status}"
+  defp safe_unavailable_reason({:upstream_status, status})
+       when is_integer(status) or is_atom(status),
+       do: "upstream_status_#{status}"
+
   defp safe_unavailable_reason(reason) when is_atom(reason), do: Atom.to_string(reason)
 
-  defp safe_unavailable_reason(reason),
-    do: reason |> safe_error_message() |> String.slice(0, 80)
+  defp safe_unavailable_reason(%{__struct__: _module, reason: reason}),
+    do: safe_unavailable_reason(reason)
+
+  defp safe_unavailable_reason(reason) when is_tuple(reason),
+    do: TransportFailureReason.safe_reason(reason) || "unknown"
+
+  defp safe_unavailable_reason(_reason), do: "unknown"
 
   defp identity_attrs_from_codex_usage_payload(%{"plan_type" => plan_type})
        when is_binary(plan_type) do
@@ -596,6 +884,17 @@ defmodule CodexPooler.Upstreams.Reconciliation.PoolReconciliation do
   defp step_result(status, code, message, details \\ %{}) do
     %{status: status, code: code, message: message, details: details}
   end
+
+  defp put_credential_fence(step, nil), do: step
+  defp put_credential_fence(step, fence), do: Map.put(step, :credential_fence, fence)
+
+  defp put_expected_credential_epoch(step, nil), do: step
+
+  defp put_expected_credential_epoch(step, expected_credential_epoch),
+    do: Map.put(step, :expected_credential_epoch, expected_credential_epoch)
+
+  defp probe_completion_mode(%{code: "quota_refresh_auth_unavailable"}), do: :auth_failure
+  defp probe_completion_mode(_quota_step), do: :active_only
 
   defp step_to_metadata(step) do
     %{

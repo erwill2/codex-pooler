@@ -8,7 +8,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
   alias CodexPooler.Pools
   alias CodexPooler.Repo
 
-  alias CodexPooler.Upstreams.Lifecycle.AccountAudit
+  alias CodexPooler.Upstreams.Lifecycle.{AccountAudit, CredentialFencing}
   alias CodexPooler.Upstreams.Secrets
 
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
@@ -86,17 +86,22 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
         timestamp = Map.get(attrs, :paused_at, now())
 
         Repo.transaction(fn ->
+          locked_identity = CredentialFencing.lock_credential_replacement(identity.id)
+
           paused_identity =
-            identity
+            locked_identity
             |> UpstreamIdentity.changeset(%{
               status: @paused,
               disabled_at: timestamp,
               updated_at: timestamp,
-              metadata: lifecycle_metadata(identity.metadata, "paused", attrs, timestamp)
+              metadata:
+                locked_identity
+                |> CredentialFencing.advance_credential_epoch()
+                |> lifecycle_metadata("paused", attrs, timestamp)
             })
             |> Repo.update!()
 
-          update_assignments_for_identity(identity.id, %{
+          update_assignments_for_identity(locked_identity.id, %{
             status: @paused,
             health_status: @health_disabled,
             eligibility_status: @ineligible,
@@ -128,56 +133,72 @@ defmodule CodexPooler.Upstreams.Lifecycle.AccountLifecycle do
 
   @spec reactivate_account(identity_ref(), map()) :: lifecycle_result()
   defp reactivate_account(identity_or_id, attrs) do
-    with %UpstreamIdentity{} = identity <- normalize_identity(identity_or_id),
+    case normalize_identity(identity_or_id) do
+      %UpstreamIdentity{} = identity ->
+        attrs = atomize_attrs(attrs)
+        timestamp = Map.get(attrs, :reactivated_at, now())
+
+        Repo.transaction(fn -> reactivate_locked_account(identity.id, attrs, timestamp) end)
+        |> tap_upstream_change("upstream_account_reactivated")
+
+      nil ->
+        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
+    end
+  end
+
+  defp reactivate_locked_account(identity_id, attrs, timestamp) do
+    identity = CredentialFencing.lock_credential_replacement(identity_id)
+
+    with %UpstreamIdentity{} = identity <- identity,
          :ok <- ensure_reactivatable_identity(identity),
          :ok <- ensure_reactivation_secret(identity),
          [_ | _] = assignments <- reactivatable_assignments(identity) do
-      attrs = atomize_attrs(attrs)
-      timestamp = Map.get(attrs, :reactivated_at, now())
+      active_identity =
+        identity
+        |> UpstreamIdentity.changeset(%{
+          status: @active,
+          auth_verified_at: Map.get(attrs, :auth_verified_at, timestamp),
+          auth_fresh_at: Map.get(attrs, :auth_fresh_at, timestamp),
+          disabled_at: nil,
+          updated_at: timestamp,
+          metadata:
+            identity
+            |> CredentialFencing.advance_credential_epoch()
+            |> lifecycle_metadata("reactivated", attrs, timestamp)
+        })
+        |> Repo.update!()
 
-      Repo.transaction(fn ->
-        active_identity =
-          identity
-          |> UpstreamIdentity.changeset(%{
-            status: @assignment_active,
-            auth_verified_at: Map.get(attrs, :auth_verified_at, timestamp),
-            auth_fresh_at: Map.get(attrs, :auth_fresh_at, timestamp),
-            disabled_at: nil,
-            updated_at: timestamp,
-            metadata: lifecycle_metadata(identity.metadata, "reactivated", attrs, timestamp)
-          })
-          |> Repo.update!()
+      assignment_ids = Enum.map(assignments, & &1.id)
 
-        assignment_ids = Enum.map(assignments, & &1.id)
+      Repo.update_all(
+        from(assignment in PoolUpstreamAssignment, where: assignment.id in ^assignment_ids),
+        set: [
+          status: @active,
+          health_status: @health_active,
+          eligibility_status: @eligible,
+          cooldown_until: nil,
+          disabled_at: nil,
+          updated_at: timestamp
+        ]
+      )
 
-        Repo.update_all(
-          from(assignment in PoolUpstreamAssignment, where: assignment.id in ^assignment_ids),
-          set: [
-            status: @active,
-            health_status: @health_active,
-            eligibility_status: @eligible,
-            cooldown_until: nil,
-            disabled_at: nil,
-            updated_at: timestamp
-          ]
-        )
-
-        lifecycle_result(:active, active_identity)
-      end)
-      |> tap_upstream_change("upstream_account_reactivated")
+      lifecycle_result(:active, active_identity)
     else
       nil ->
-        {:error, lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")}
+        Repo.rollback(
+          lifecycle_error(:upstream_identity_not_found, "upstream identity was not found")
+        )
 
       [] ->
-        {:error,
-         lifecycle_error(
-           :upstream_assignment_not_reactivatable,
-           "at least one preserved assignment is required before reactivation"
-         )}
+        Repo.rollback(
+          lifecycle_error(
+            :upstream_assignment_not_reactivatable,
+            "at least one preserved assignment is required before reactivation"
+          )
+        )
 
-      {:error, _reason} = error ->
-        error
+      {:error, reason} ->
+        Repo.rollback(reason)
     end
   end
 

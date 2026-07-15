@@ -42,6 +42,18 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
     end
   end
 
+  @doc false
+  @spec broadcast_quota_update(identity_ref()) :: :ok
+  def broadcast_quota_update(identity_or_id) do
+    case normalize_identity(identity_or_id) do
+      %UpstreamIdentity{} = identity ->
+        broadcast_upstream_change_after_commit(identity, "upstream_quota_windows_updated")
+
+      nil ->
+        :ok
+    end
+  end
+
   defp guarded_upsert_quota_windows(%UpstreamIdentity{} = identity, windows, opts) do
     with :ok <-
            IdentityLifecycle.guard_workspace_slot_mutation(
@@ -484,8 +496,27 @@ defmodule CodexPooler.Upstreams.Quota.Windows do
     |> Enum.each(&broadcast_upstream_assignment(&1, identity, reason))
   end
 
+  defp broadcast_upstream_change_after_commit(%UpstreamIdentity{} = identity, reason) do
+    identity.id
+    |> assignments_for_identity()
+    |> Enum.each(&broadcast_upstream_assignment_after_commit(&1, identity, reason))
+  end
+
   defp broadcast_upstream_assignment(%PoolUpstreamAssignment{} = assignment, identity, reason) do
     Events.broadcast_upstreams(assignment.pool_id, reason, %{
+      assignment_id: assignment.id,
+      upstream_identity_id: assignment.upstream_identity_id,
+      upstream_status: identity.status,
+      assignment_status: assignment.status
+    })
+  end
+
+  defp broadcast_upstream_assignment_after_commit(
+         %PoolUpstreamAssignment{} = assignment,
+         identity,
+         reason
+       ) do
+    Events.broadcast_upstreams_after_commit(assignment.pool_id, reason, %{
       assignment_id: assignment.id,
       upstream_identity_id: assignment.upstream_identity_id,
       upstream_status: identity.status,

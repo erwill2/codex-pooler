@@ -117,8 +117,17 @@ defmodule CodexPooler.Events do
     broadcast_pool_event(pool_or_id, [@upstreams], reason, payload)
   end
 
+  @spec broadcast_upstreams_after_commit(pool_ref(), reason(), payload()) :: broadcast_result()
+  def broadcast_upstreams_after_commit(pool_or_id, reason, payload \\ %{}) do
+    broadcast_pool_event(pool_or_id, [@upstreams], reason, payload, :after_commit)
+  end
+
   @spec broadcast_pool_event(pool_ref(), topics(), reason(), payload()) :: broadcast_result()
   def broadcast_pool_event(pool_or_id, topics, reason, payload \\ %{}) do
+    broadcast_pool_event(pool_or_id, topics, reason, payload, :immediate)
+  end
+
+  defp broadcast_pool_event(pool_or_id, topics, reason, payload, delivery) do
     with pool_id when is_binary(pool_id) <- pool_id(pool_or_id),
          {:ok, topics} <- normalize_topics(topics),
          {:ok, reason} <- normalize_reason(reason) do
@@ -132,10 +141,7 @@ defmodule CodexPooler.Events do
         payload: normalize_payload(payload)
       }
 
-      with :ok <- broadcast_local_event(event),
-           :ok <- broadcast_postgres_event(event) do
-        {:ok, event}
-      end
+      broadcast_event(event, delivery)
     else
       nil -> {:error, :pool_id_required}
       {:error, reason} -> {:error, reason}
@@ -208,10 +214,14 @@ defmodule CodexPooler.Events do
 
   @spec event_to_postgres_payload(Event.t()) :: {:ok, String.t()} | {:error, term()}
   def event_to_postgres_payload(%Event{} = event) do
+    event_to_postgres_payload(event, origin_id())
+  end
+
+  defp event_to_postgres_payload(%Event{} = event, event_origin_id) do
     event
     |> Map.from_struct()
     |> Map.update!(:emitted_at, &DateTime.to_iso8601/1)
-    |> Map.put(:origin_id, origin_id())
+    |> Map.put(:origin_id, event_origin_id)
     |> Jason.encode()
   end
 
@@ -229,6 +239,29 @@ defmodule CodexPooler.Events do
   end
 
   defp normalize_payload(_payload), do: %{}
+
+  defp broadcast_event(%Event{} = event, :after_commit) do
+    if Repo.in_transaction?() do
+      broadcast_transactional_event(event)
+    else
+      broadcast_immediate_event(event)
+    end
+  end
+
+  defp broadcast_event(%Event{} = event, :immediate), do: broadcast_immediate_event(event)
+
+  defp broadcast_transactional_event(%Event{} = event) do
+    with :ok <- broadcast_postgres_event(event, "transaction:" <> event.id) do
+      {:ok, event}
+    end
+  end
+
+  defp broadcast_immediate_event(%Event{} = event) do
+    with :ok <- broadcast_local_event(event),
+         :ok <- broadcast_postgres_event(event, origin_id()) do
+      {:ok, event}
+    end
+  end
 
   defp pool_id(%{id: id}) when is_binary(id), do: id
   defp pool_id(id) when is_binary(id), do: String.trim(id)
@@ -267,8 +300,8 @@ defmodule CodexPooler.Events do
 
   defp scoped_pubsub_topic(pool_id, topic), do: pubsub_topic(pool_id) <> ":" <> topic
 
-  defp broadcast_postgres_event(%Event{} = event) do
-    with {:ok, payload} <- event_to_postgres_payload(event),
+  defp broadcast_postgres_event(%Event{} = event, event_origin_id) do
+    with {:ok, payload} <- event_to_postgres_payload(event, event_origin_id),
          {:ok, _result} <-
            SQL.query(Repo, "SELECT pg_notify($1, $2)", [@postgres_channel, payload]) do
       :ok

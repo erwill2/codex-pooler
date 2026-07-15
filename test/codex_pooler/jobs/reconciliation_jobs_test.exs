@@ -2,6 +2,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   use CodexPooler.DataCase, async: false
 
   alias CodexPooler.Accounts.Scope
+  alias CodexPooler.Accounts.User
   alias CodexPooler.Catalog
   alias CodexPooler.Catalog.SyncRun
   alias CodexPooler.Events
@@ -13,6 +14,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
   alias CodexPooler.Jobs.AccountReconciliationEnqueueWorker
   alias CodexPooler.Jobs.AccountReconciliationWorker
   alias CodexPooler.Jobs.TokenRefreshWorker
+  alias CodexPooler.Pools.Membership
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
@@ -718,8 +720,134 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert window.observed_at == observed_at
 
       assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
-               "/backend-api/wham/usage"
+               "/backend-api/wham/usage",
+               "/backend-api/codex/usage"
              ]
+    end
+
+    test "does not reuse persisted quota when a 429 follows an auth-shaped rejection" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      future_expiry = observed_at |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+
+      for auth_status <- [401, 403] do
+        upstream =
+          start_upstream(
+            {:path_json,
+             %{
+               "/backend-api/wham/usage" => {auth_status, %{"error" => "rejected"}},
+               "/backend-api/codex/usage" => {429, %{"error" => "busy"}}
+             }}
+          )
+
+        {pool, assignment} =
+          active_assignment_fixture(
+            %{"base_url" => FakeUpstream.url(upstream)},
+            identity_metadata: %{
+              "base_url" => FakeUpstream.url(upstream),
+              "access_token_expires_at" => future_expiry
+            }
+          )
+
+        identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+        persist_quota_windows!(identity, [persisted_account_primary_window_attrs(observed_at)])
+
+        assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+        assert result.status == :partial
+        assert result.quota.status == :failed
+        assert result.quota.code == "quota_refresh_unavailable"
+
+        assert result.quota.message ==
+                 "quota windows were not available (mixed_auth_rejection_upstream_status_429)"
+
+        assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+                 "/backend-api/wham/usage",
+                 "/backend-api/codex/usage"
+               ]
+      end
+    end
+
+    test "does not reuse persisted quota when an auth-shaped rejection follows a 429" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+      future_expiry = observed_at |> DateTime.add(10, :day) |> DateTime.to_iso8601()
+
+      for auth_status <- [401, 403] do
+        upstream =
+          start_upstream(
+            {:path_json,
+             %{
+               "/backend-api/wham/usage" => {429, %{"error" => "busy"}},
+               "/backend-api/codex/usage" => {auth_status, %{"error" => "rejected"}}
+             }}
+          )
+
+        {pool, assignment} =
+          active_assignment_fixture(
+            %{"base_url" => FakeUpstream.url(upstream)},
+            identity_metadata: %{
+              "base_url" => FakeUpstream.url(upstream),
+              "access_token_expires_at" => future_expiry
+            }
+          )
+
+        identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+        persist_quota_windows!(identity, [persisted_account_primary_window_attrs(observed_at)])
+
+        assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+        assert result.status == :partial
+        assert result.quota.status == :failed
+        assert result.quota.code == "quota_refresh_unavailable"
+
+        assert result.quota.message ==
+                 "quota windows were not available (mixed_auth_rejection_upstream_status_429)"
+
+        assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
+                 "/backend-api/wham/usage",
+                 "/backend-api/codex/usage"
+               ]
+      end
+    end
+
+    test "does not lose auth-shaped rejection before an invalid payload and later 429" do
+      observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+      paths = [
+        "/api/codex/usage",
+        "/backend-api/codex/usage",
+        "/backend-api/wham/usage"
+      ]
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {401, %{"error" => "rejected"}},
+             "/backend-api/codex/usage" => {200, []},
+             "/backend-api/wham/usage" => {429, %{"error" => "busy"}}
+           }}
+        )
+
+      {pool, assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(upstream)},
+          identity_metadata: %{
+            "base_url" => FakeUpstream.url(upstream),
+            "access_token_expires_at" =>
+              observed_at |> DateTime.add(10, :day) |> DateTime.to_iso8601(),
+            "saved_resets" => %{"usage_path" => "/api/codex/usage"}
+          }
+        )
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+      persist_quota_windows!(identity, [persisted_account_primary_window_attrs(observed_at)])
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.status == :partial
+      assert result.quota.code == "quota_refresh_unavailable"
+
+      assert result.quota.message ==
+               "quota windows were not available (mixed_auth_rejection_upstream_status_429)"
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == paths
     end
 
     test "scheduled worker reuses fresh weekly-only persisted quota when live usage is unavailable" do
@@ -770,6 +898,16 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
     test "scheduled worker does not reuse stale expired resetless or exhausted persisted quota" do
       now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
+      weekly_window = fn observed_at, attrs ->
+        persisted_account_primary_window_attrs(
+          observed_at,
+          Map.merge(
+            %{window_kind: "secondary", window_minutes: 10_080, quota_family: "account"},
+            attrs
+          )
+        )
+      end
+
       scenarios = [
         {"stale",
          persisted_account_primary_window_attrs(DateTime.add(now, -3_600, :second), %{
@@ -781,7 +919,14 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
          })},
         {"resetless", persisted_account_primary_window_attrs(now, %{reset_at: nil})},
         {"exhausted",
-         persisted_account_primary_window_attrs(now, %{used_percent: Decimal.new("100")})}
+         persisted_account_primary_window_attrs(now, %{used_percent: Decimal.new("100")})},
+        {"weekly_stale",
+         weekly_window.(DateTime.add(now, -3_600, :second), %{
+           reset_at: DateTime.add(now, 3_600, :second)
+         })},
+        {"weekly_expired", weekly_window.(now, %{reset_at: DateTime.add(now, -60, :second)})},
+        {"weekly_resetless", weekly_window.(now, %{reset_at: nil})},
+        {"weekly_exhausted", weekly_window.(now, %{used_percent: Decimal.new("100")})}
       ]
 
       for {_name, window_attrs} <- scenarios do
@@ -896,7 +1041,8 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert window.observed_at == observed_at
 
       assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == [
-               "/backend-api/wham/usage"
+               "/backend-api/wham/usage",
+               "/backend-api/codex/usage"
              ]
     end
 
@@ -1225,7 +1371,7 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
              ]
     end
 
-    test "decoded auth rejection plus weekly-only success remains non-definitive after all paths" do
+    test "decoded auth rejection followed by weekly-only success fails closed" do
       paths = [
         "/api/codex/usage",
         "/backend-api/codex/usage",
@@ -1250,9 +1396,88 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
 
       assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
-      assert result.identity.status == "active"
-      assert Repo.get!(UpstreamIdentity, identity.id).status == "active"
-      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) == paths
+      assert result.identity.status == "reauth_required"
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "reauth_required"
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) ==
+               Enum.take(paths, 2)
+    end
+
+    test "weekly-only success followed by decoded auth rejection fails closed" do
+      paths = [
+        "/api/codex/usage",
+        "/backend-api/codex/usage",
+        "/backend-api/wham/usage"
+      ]
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {200, weekly_usage_payload()},
+             "/backend-api/codex/usage" => {403, %{"error" => "rejected"}},
+             "/backend-api/wham/usage" => {404, %{}}
+           }}
+        )
+
+      {pool, assignment} =
+        active_usage_probe_assignment(upstream, %{
+          "saved_resets" => %{"usage_path" => "/api/codex/usage"}
+        })
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, result} = Upstreams.reconcile_pool_account(pool, assignment)
+      assert result.identity.status == "reauth_required"
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "reauth_required"
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) ==
+               Enum.take(paths, 2)
+    end
+
+    test "weekly-only success cannot mask decoded 401 when token refresh is due" do
+      paths = [
+        "/api/codex/usage",
+        "/backend-api/codex/usage",
+        "/backend-api/wham/usage"
+      ]
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/api/codex/usage" => {200, weekly_usage_payload()},
+             "/backend-api/codex/usage" => {401, %{"error" => "rejected"}},
+             "/backend-api/wham/usage" => {404, %{}}
+           }}
+        )
+
+      {_pool, assignment} =
+        active_assignment_fixture(
+          %{
+            "base_url" => FakeUpstream.url(upstream),
+            "saved_resets" => %{"usage_path" => "/api/codex/usage"}
+          },
+          identity_metadata: %{
+            "base_url" => FakeUpstream.url(upstream),
+            "access_token_expires_at" =>
+              DateTime.utc_now() |> DateTime.add(60, :second) |> DateTime.to_iso8601()
+          }
+        )
+
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:error, {:upstream_status, 401}} =
+               UsageProbe.fetch(
+                 identity,
+                 assignment,
+                 "synthetic-access-token",
+                 DateTime.utc_now(),
+                 []
+               )
+
+      assert Enum.map(FakeUpstream.requests(upstream), & &1.path) ==
+               Enum.take(paths, 2)
     end
 
     test "one invalid auth body prevents promotion despite decoded auth objects on other paths" do
@@ -1395,6 +1620,18 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
                )
 
       assert transport_result.identity.status == "active"
+      assert transport_result.quota.code == "quota_refresh_unavailable"
+
+      assert transport_result.quota.message ==
+               "quota windows were not available (econnrefused)"
+
+      transport_assignment = Repo.reload!(transport_assignment)
+
+      assert [%{"message" => "quota windows were not available (econnrefused)"}] =
+               Enum.filter(
+                 transport_assignment.metadata["last_reconciliation"]["steps"],
+                 &(&1["code"] == "quota_refresh_unavailable")
+               )
     end
 
     test "successful refresh followed by all-path decoded JSON auth rejection requires reauth" do
@@ -1506,6 +1743,1286 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert result.identity.status == "reauth_required"
       assert result.quota.code == "quota_refresh_auth_unavailable"
       assert Repo.get!(UpstreamIdentity, identity.id).status == "reauth_required"
+    end
+
+    test "older persisted quota fallback cannot reactivate an assignment after a newer auth rejection" do
+      fallback_release_ref = make_ref()
+      rejection_release_ref = make_ref()
+
+      fallback_upstream =
+        start_upstream(
+          FakeUpstream.barrier_json_response(%{"error" => "busy"},
+            status: 429,
+            notify: self(),
+            release_ref: fallback_release_ref
+          )
+        )
+
+      rejection_upstream =
+        start_upstream(rejection_barrier_paths(self(), rejection_release_ref))
+
+      {fallback_pool, fallback_assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(fallback_upstream)},
+          identity_metadata: fresh_access_token_metadata(FakeUpstream.url(fallback_upstream))
+        )
+
+      identity = Upstreams.get_upstream_identity(fallback_assignment.upstream_identity_id)
+      rejection_pool = pool_fixture()
+
+      assert {:ok, rejection_assignment} =
+               PoolAssignments.create_pool_assignment(rejection_pool, identity, %{
+                 status: "active",
+                 health_status: "active",
+                 eligibility_status: "eligible",
+                 metadata: %{"base_url" => FakeUpstream.url(rejection_upstream)}
+               })
+
+      persist_quota_windows!(identity, [
+        persisted_account_primary_window_attrs(DateTime.utc_now())
+      ])
+
+      fallback_task =
+        start_allowed_task(fn ->
+          Upstreams.reconcile_pool_account(fallback_pool, fallback_assignment)
+        end)
+
+      fallback_barrier = await_upstream_barrier(fallback_release_ref)
+
+      rejection_task =
+        start_allowed_task(fn ->
+          Upstreams.reconcile_pool_account(rejection_pool, rejection_assignment)
+        end)
+
+      rejection_first_barrier = await_upstream_barrier(rejection_release_ref)
+      release_upstream_barrier(rejection_first_barrier, rejection_release_ref)
+      rejection_second_barrier = await_upstream_barrier(rejection_release_ref)
+      release_upstream_barrier(rejection_second_barrier, rejection_release_ref)
+
+      assert {:ok, rejection_result} = Task.await(rejection_task)
+      assert rejection_result.identity.status == "reauth_required"
+
+      release_upstream_barrier(fallback_barrier, fallback_release_ref)
+      second_fallback_barrier = await_upstream_barrier(fallback_release_ref)
+      release_upstream_barrier(second_fallback_barrier, fallback_release_ref)
+      assert {:ok, fallback_result} = Task.await(fallback_task)
+      assert fallback_result.quota.code == "quota_refresh_superseded"
+
+      current_identity = Repo.get!(UpstreamIdentity, identity.id)
+      current_assignment = Repo.get!(PoolUpstreamAssignment, fallback_assignment.id)
+      assert current_identity.status == "reauth_required"
+      assert current_assignment.health_status == "disabled"
+      assert current_assignment.eligibility_status == "ineligible"
+    end
+
+    test "older unavailable probe cannot reactivate an assignment after a newer auth rejection" do
+      unavailable_release_ref = make_ref()
+      rejection_release_ref = make_ref()
+
+      unavailable_upstream =
+        start_upstream(
+          FakeUpstream.barrier_json_response(%{"error" => "busy"},
+            status: 429,
+            notify: self(),
+            release_ref: unavailable_release_ref
+          )
+        )
+
+      rejection_upstream =
+        start_upstream(rejection_barrier_paths(self(), rejection_release_ref))
+
+      {unavailable_pool, unavailable_assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(unavailable_upstream)},
+          identity_metadata: fresh_access_token_metadata(FakeUpstream.url(unavailable_upstream))
+        )
+
+      identity = Upstreams.get_upstream_identity(unavailable_assignment.upstream_identity_id)
+      rejection_pool = pool_fixture()
+
+      assert {:ok, rejection_assignment} =
+               PoolAssignments.create_pool_assignment(rejection_pool, identity, %{
+                 status: "active",
+                 health_status: "active",
+                 eligibility_status: "eligible",
+                 metadata: %{"base_url" => FakeUpstream.url(rejection_upstream)}
+               })
+
+      unavailable_task =
+        start_allowed_task(fn ->
+          Upstreams.reconcile_pool_account(unavailable_pool, unavailable_assignment)
+        end)
+
+      unavailable_barrier = await_upstream_barrier(unavailable_release_ref)
+
+      rejection_task =
+        start_allowed_task(fn ->
+          Upstreams.reconcile_pool_account(rejection_pool, rejection_assignment)
+        end)
+
+      rejection_first_barrier = await_upstream_barrier(rejection_release_ref)
+      release_upstream_barrier(rejection_first_barrier, rejection_release_ref)
+      rejection_second_barrier = await_upstream_barrier(rejection_release_ref)
+      release_upstream_barrier(rejection_second_barrier, rejection_release_ref)
+
+      assert {:ok, rejection_result} = Task.await(rejection_task)
+      assert rejection_result.identity.status == "reauth_required"
+
+      release_upstream_barrier(unavailable_barrier, unavailable_release_ref)
+      second_unavailable_barrier = await_upstream_barrier(unavailable_release_ref)
+      release_upstream_barrier(second_unavailable_barrier, unavailable_release_ref)
+      assert {:ok, unavailable_result} = Task.await(unavailable_task)
+      assert unavailable_result.quota.code == "quota_refresh_superseded"
+
+      current_identity = Repo.get!(UpstreamIdentity, identity.id)
+      current_assignment = Repo.get!(PoolUpstreamAssignment, unavailable_assignment.id)
+      assert current_identity.status == "reauth_required"
+      assert current_identity.metadata["usage_probe_applied_sequence"] == 2
+      assert current_assignment.health_status == "disabled"
+      assert current_assignment.eligibility_status == "ineligible"
+    end
+
+    test "newer unavailable completion cannot suppress an older definitive auth rejection" do
+      rejection_release_ref = make_ref()
+
+      rejection_upstream =
+        start_upstream(rejection_barrier_paths(self(), rejection_release_ref))
+
+      unavailable_upstream =
+        start_upstream(FakeUpstream.json_response(%{"error" => "busy"}, 429))
+
+      {rejection_pool, rejection_assignment} =
+        active_assignment_fixture(
+          %{"base_url" => FakeUpstream.url(rejection_upstream)},
+          identity_metadata: fresh_access_token_metadata(FakeUpstream.url(rejection_upstream))
+        )
+
+      identity = Upstreams.get_upstream_identity(rejection_assignment.upstream_identity_id)
+      unavailable_pool = pool_fixture()
+
+      assert {:ok, unavailable_assignment} =
+               PoolAssignments.create_pool_assignment(unavailable_pool, identity, %{
+                 status: "active",
+                 health_status: "active",
+                 eligibility_status: "eligible",
+                 metadata: %{"base_url" => FakeUpstream.url(unavailable_upstream)}
+               })
+
+      rejection_task =
+        start_allowed_task(fn ->
+          Upstreams.reconcile_pool_account(rejection_pool, rejection_assignment)
+        end)
+
+      rejection_first_barrier = await_upstream_barrier(rejection_release_ref)
+
+      assert {:ok, unavailable_result} =
+               Upstreams.reconcile_pool_account(unavailable_pool, unavailable_assignment)
+
+      assert unavailable_result.quota.code == "quota_refresh_unavailable"
+
+      release_upstream_barrier(rejection_first_barrier, rejection_release_ref)
+      rejection_second_barrier = await_upstream_barrier(rejection_release_ref)
+      release_upstream_barrier(rejection_second_barrier, rejection_release_ref)
+
+      assert {:ok, rejection_result} = Task.await(rejection_task)
+      assert rejection_result.quota.code == "quota_refresh_auth_unavailable"
+
+      current_identity = Repo.get!(UpstreamIdentity, identity.id)
+      assert current_identity.status == "reauth_required"
+      assert current_identity.metadata["usage_probe_applied_sequence"] == 1
+      assert current_identity.metadata["usage_probe_completed_sequence"] == 2
+
+      for assignment <- [rejection_assignment, unavailable_assignment] do
+        current_assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+        assert current_assignment.health_status == "disabled"
+        assert current_assignment.eligibility_status == "ineligible"
+      end
+    end
+
+    test "unavailable probe cannot mutate an assignment disabled while the request is in flight" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.barrier_json_response(%{"error" => "busy"},
+            status: 429,
+            notify: self(),
+            release_ref: release_ref
+          )
+        )
+
+      {pool, assignment} = active_usage_probe_assignment(upstream)
+
+      task =
+        start_allowed_task(fn ->
+          Upstreams.reconcile_pool_account(pool, assignment)
+        end)
+
+      barrier = await_upstream_barrier(release_ref)
+      assert {:ok, disabled_assignment} = PoolAssignments.disable_pool_assignment(assignment)
+      disabled_before = Repo.get!(PoolUpstreamAssignment, disabled_assignment.id)
+
+      release_upstream_barrier(barrier, release_ref)
+      second_barrier = await_upstream_barrier(release_ref)
+      release_upstream_barrier(second_barrier, release_ref)
+      assert {:ok, result} = Task.await(task)
+      assert result.quota.code == "quota_refresh_superseded"
+      assert Repo.get!(PoolUpstreamAssignment, assignment.id) == disabled_before
+    end
+
+    test "unavailable probe cannot mutate an assignment deleted while the request is in flight" do
+      release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          FakeUpstream.barrier_json_response(%{"error" => "busy"},
+            status: 429,
+            notify: self(),
+            release_ref: release_ref
+          )
+        )
+
+      {pool, assignment} = active_usage_probe_assignment(upstream)
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+      sibling_pool = pool_fixture()
+
+      assert {:ok, _sibling_assignment} =
+               PoolAssignments.create_pool_assignment(sibling_pool, identity, %{
+                 status: "active",
+                 health_status: "active",
+                 eligibility_status: "eligible"
+               })
+
+      task =
+        start_allowed_task(fn ->
+          Upstreams.reconcile_pool_account(pool, assignment)
+        end)
+
+      barrier = await_upstream_barrier(release_ref)
+
+      assert {:ok, %{assignment: deleted_assignment}} =
+               PoolAssignments.delete_pool_assignment(pool, assignment)
+
+      deleted_before = Repo.get!(PoolUpstreamAssignment, deleted_assignment.id)
+
+      release_upstream_barrier(barrier, release_ref)
+      second_barrier = await_upstream_barrier(release_ref)
+      release_upstream_barrier(second_barrier, release_ref)
+      assert {:ok, result} = Task.await(task)
+      assert result.quota.code == "quota_refresh_superseded"
+      assert Repo.get!(PoolUpstreamAssignment, assignment.id) == deleted_before
+    end
+
+    test "failing reconciliation cannot write priming after an independent disable" do
+      release_ref = make_ref()
+      parent = self()
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/backend-api/wham/usage" =>
+               FakeUpstream.barrier_json_response(%{"error" => "busy"},
+                 status: 429,
+                 notify: self(),
+                 release_ref: release_ref
+               ),
+             "/api/codex/usage" => {429, %{"error" => "busy"}},
+             "/backend-api/codex/usage" => {429, %{"error" => "busy"}},
+             "/wham/usage" => {429, %{"error" => "busy"}}
+           }}
+        )
+
+      {pool, assignment} = committed_active_usage_probe_assignment(upstream)
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+            send(parent, {:failing_reconciliation_connection, release_ref, backend_pid})
+            AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+          end)
+        end)
+
+      assert_receive {:failing_reconciliation_connection, ^release_ref, reconciliation_backend}
+      first_barrier = await_upstream_barrier(release_ref)
+
+      {lifecycle_backend, disabled_before} =
+        Sandbox.unboxed_run(Repo, fn ->
+          backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+          assert {:ok, disabled_assignment} = PoolAssignments.disable_pool_assignment(assignment)
+          {backend_pid, Repo.reload!(disabled_assignment)}
+        end)
+
+      assert lifecycle_backend != reconciliation_backend
+      release_upstream_barrier(first_barrier, release_ref)
+
+      assert {:ok, _result} = Task.await(reconciliation, 10_000)
+
+      current_assignment =
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.get!(PoolUpstreamAssignment, assignment.id)
+        end)
+
+      assert current_assignment == disabled_before
+    end
+
+    test "priming events are published only after the fencing transaction commits" do
+      {pool, _identity, assignment} = committed_metadata_reconciliation_fixture()
+      release_ref = make_ref()
+      parent = self()
+      handler_id = {__MODULE__, :priming_commit, release_ref}
+
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:codex_pooler, :repo, :query],
+          &__MODULE__.handle_blocking_terminal_priming_update_event/4,
+          {handler_id, parent, release_ref}
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+          end)
+        end)
+
+      assert_receive {Events,
+                      %{
+                        reason: "quota_priming_updated",
+                        payload: %{
+                          "assignment_id" => assignment_id,
+                          "quota_priming_status" => "refreshing"
+                        }
+                      }}
+
+      assert assignment_id == assignment.id
+
+      assert_receive {:terminal_priming_update_before_commit, ^release_ref, query_pid}
+
+      refute_receive {Events,
+                      %{
+                        reason: "quota_priming_updated",
+                        payload: %{"quota_priming_status" => "known"}
+                      }},
+                     100
+
+      persisted_before_commit =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(PoolUpstreamAssignment, assignment.id) end)
+
+      assert persisted_before_commit.metadata["quota_priming"]["status"] == "refreshing"
+      assert persisted_before_commit.metadata["quota_priming"]["credential_epoch"] == 1
+
+      send(query_pid, {:release_assignment_update, release_ref})
+      assert {:ok, _result} = Task.await(reconciliation)
+
+      assert_receive {Events,
+                      %{
+                        reason: "quota_priming_updated",
+                        payload: %{
+                          "assignment_id" => ^assignment_id,
+                          "quota_priming_status" => "known"
+                        }
+                      }}
+
+      persisted_after_commit =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(PoolUpstreamAssignment, assignment.id) end)
+
+      assert persisted_after_commit.metadata["quota_priming"]["status"] == "known"
+
+      refute_receive {Events,
+                      %{
+                        reason: "quota_priming_updated",
+                        payload: %{"quota_priming_status" => "known"}
+                      }},
+                     100
+    end
+
+    test "rolled back terminal priming publishes no event" do
+      {pool, assignment} =
+        active_assignment_fixture(%{
+          "quota_windows" => [
+            %{
+              "window_kind" => "primary",
+              "window_minutes" => 300,
+              "active_limit" => 100,
+              "credits" => 75,
+              "reset_at" =>
+                DateTime.utc_now() |> DateTime.add(3_600, :second) |> DateTime.to_iso8601(),
+              "source" => "local_reconciliation",
+              "freshness_state" => "fresh"
+            }
+          ]
+        })
+
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      assert {:error, :forced_rollback} =
+               Repo.transaction(fn ->
+                 assert Repo.in_transaction?()
+
+                 assert {:ok, %{status: :succeeded}} =
+                          AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+
+                 refute_receive {Events,
+                                 %{
+                                   reason: "quota_priming_updated",
+                                   payload: %{"quota_priming_status" => "known"}
+                                 }}
+
+                 Repo.rollback(:forced_rollback)
+               end)
+
+      refute_receive {Events,
+                      %{
+                        reason: "quota_priming_updated",
+                        payload: %{"quota_priming_status" => "known"}
+                      }}
+
+      current_assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      assert is_nil(current_assignment.metadata["quota_priming"])
+      assert is_nil(current_assignment.metadata["last_reconciliation"])
+    end
+
+    test "terminal priming committed first cannot be overwritten by stale cleanup" do
+      {pool, _identity, assignment} = committed_stale_priming_fixture()
+      release_ref = make_ref()
+      parent = self()
+      handler_id = {__MODULE__, :terminal_before_cleanup, release_ref}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:codex_pooler, :repo, :query],
+          &__MODULE__.handle_blocking_terminal_priming_update_event/4,
+          {handler_id, parent, release_ref}
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+          end)
+        end)
+
+      assert_receive {:terminal_priming_update_before_commit, ^release_ref, query_pid}
+
+      cleanup =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+            send(parent, {:stale_cleanup_connection_ready, release_ref, backend_pid})
+
+            AccountReconciliation.cleanup_stale_state(DateTime.add(DateTime.utc_now(), 2, :hour))
+          end)
+        end)
+
+      assert_receive {:stale_cleanup_connection_ready, ^release_ref, cleanup_backend}
+      assert_backend_waiting_on_db_lock!(cleanup_backend)
+
+      send(query_pid, {:release_assignment_update, release_ref})
+
+      assert {:ok, %{status: :succeeded}} = Task.await(reconciliation)
+
+      assert {:ok, %{stale_account_reconciliations_failed: 0}} =
+               Task.await(cleanup)
+
+      current_assignment =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(PoolUpstreamAssignment, assignment.id) end)
+
+      assert current_assignment.metadata["quota_priming"]["status"] == "known"
+    end
+
+    test "stale cleanup committed first cannot overwrite later terminal priming" do
+      {pool, _identity, assignment} = committed_stale_priming_fixture()
+      release_ref = make_ref()
+      parent = self()
+      handler_id = {__MODULE__, :cleanup_before_terminal, release_ref}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:codex_pooler, :repo, :query],
+          &__MODULE__.handle_blocking_stale_priming_update_event/4,
+          {handler_id, parent, release_ref}
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      cleanup =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            AccountReconciliation.cleanup_stale_state(DateTime.utc_now())
+          end)
+        end)
+
+      assert_receive {:stale_priming_update_before_commit, ^release_ref, query_pid}
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+            send(parent, {:terminal_reconciliation_connection_ready, release_ref, backend_pid})
+            AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+          end)
+        end)
+
+      assert_receive {:terminal_reconciliation_connection_ready, ^release_ref,
+                      reconciliation_backend}
+
+      assert_backend_waiting_on_db_lock!(reconciliation_backend)
+
+      send(query_pid, {:release_assignment_update, release_ref})
+
+      assert {:ok, %{stale_account_reconciliations_failed: 1}} = Task.await(cleanup)
+      assert {:ok, %{status: :succeeded}} = Task.await(reconciliation)
+
+      current_assignment =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(PoolUpstreamAssignment, assignment.id) end)
+
+      assert current_assignment.metadata["quota_priming"]["status"] == "known"
+    end
+
+    test "stale cleanup does not mutate a disabled assignment" do
+      {_pool, _identity, assignment} = committed_stale_priming_fixture()
+
+      disabled_assignment =
+        Sandbox.unboxed_run(Repo, fn ->
+          assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+          assert {:ok, disabled_assignment} = PoolAssignments.disable_pool_assignment(assignment)
+          disabled_assignment
+        end)
+
+      assert {:ok, %{stale_account_reconciliations_failed: 0}} =
+               Sandbox.unboxed_run(Repo, fn ->
+                 AccountReconciliation.cleanup_stale_state(DateTime.utc_now())
+               end)
+
+      current_assignment =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(PoolUpstreamAssignment, assignment.id) end)
+
+      assert current_assignment.status == "disabled"
+
+      assert current_assignment.metadata["quota_priming"] ==
+               disabled_assignment.metadata["quota_priming"]
+    end
+
+    test "stale cleanup does not mutate a deleted assignment with a live sibling" do
+      {pool, identity, assignment} = committed_stale_priming_fixture()
+
+      {sibling_pool, sibling_assignment} =
+        Sandbox.unboxed_run(Repo, fn ->
+          sibling_pool = pool_fixture()
+
+          assert {:ok, sibling_assignment} =
+                   PoolAssignments.create_pool_assignment(sibling_pool, identity, %{
+                     assignment_label: "Committed cleanup sibling"
+                   })
+
+          assert {:ok, sibling_assignment} =
+                   PoolAssignments.activate_pool_assignment(sibling_assignment, %{
+                     skip_quota_priming: true
+                   })
+
+          {sibling_pool, sibling_assignment}
+        end)
+
+      on_exit(fn -> cleanup_committed_pool(sibling_pool.id) end)
+
+      deleted_assignment =
+        Sandbox.unboxed_run(Repo, fn ->
+          assert {:ok, %{assignment: deleted_assignment}} =
+                   PoolAssignments.delete_pool_assignment(pool, assignment)
+
+          deleted_assignment
+        end)
+
+      assert {:ok, %{stale_account_reconciliations_failed: 0}} =
+               Sandbox.unboxed_run(Repo, fn ->
+                 AccountReconciliation.cleanup_stale_state(DateTime.utc_now())
+               end)
+
+      {current_assignment, current_sibling} =
+        Sandbox.unboxed_run(Repo, fn ->
+          {
+            Repo.get!(PoolUpstreamAssignment, assignment.id),
+            Repo.get!(PoolUpstreamAssignment, sibling_assignment.id)
+          }
+        end)
+
+      assert current_assignment.status == "deleted"
+
+      assert current_assignment.metadata["quota_priming"] ==
+               deleted_assignment.metadata["quota_priming"]
+
+      assert current_sibling.status == "active"
+    end
+
+    test "stale cleanup rejects priming from before pause and reactivation" do
+      {scope, _pool, identity, assignment} = committed_scoped_lifecycle_fixture()
+      assignment = mark_committed_assignment_stale!(assignment, 1)
+
+      reactivated_identity =
+        Sandbox.unboxed_run(Repo, fn ->
+          assert {:ok, %{status: :paused}} =
+                   Upstreams.pause_account_for_scope(scope, identity.id, %{
+                     reason: "operator_pause"
+                   })
+
+          assert {:ok, %{status: :active, identity: reactivated_identity}} =
+                   Upstreams.reactivate_account_for_scope(scope, identity.id, %{})
+
+          reactivated_identity
+        end)
+
+      assert CredentialFencing.credential_epoch(reactivated_identity) == 3
+
+      assert {:ok, %{stale_account_reconciliations_failed: 0}} =
+               Sandbox.unboxed_run(Repo, fn ->
+                 AccountReconciliation.cleanup_stale_state(DateTime.utc_now())
+               end)
+
+      current_assignment =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(PoolUpstreamAssignment, assignment.id) end)
+
+      assert current_assignment.status == "active"
+      assert current_assignment.metadata["quota_priming"]["status"] == "refreshing"
+      assert current_assignment.metadata["quota_priming"]["credential_epoch"] == 1
+    end
+
+    test "metadata quota read before an epoch change is superseded on another connection" do
+      {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+      release_ref = make_ref()
+      parent = self()
+
+      epoch_change =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+              locked_identity = CredentialFencing.lock_credential_replacement(identity.id)
+
+              epoch_two = CredentialFencing.advance_credential_epoch(locked_identity)
+
+              epoch_three =
+                CredentialFencing.advance_credential_epoch(%{
+                  locked_identity
+                  | metadata: epoch_two
+                })
+
+              locked_identity
+              |> UpstreamIdentity.changeset(%{metadata: epoch_three})
+              |> Repo.update!()
+
+              send(parent, {:epoch_change_before_commit, release_ref, backend_pid})
+
+              receive do
+                {:release_epoch_change, ^release_ref} -> :ok
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:epoch_change_before_commit, ^release_ref, epoch_backend}
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+            send(parent, {:metadata_reconciliation_ready, release_ref, backend_pid})
+            Upstreams.reconcile_pool_account(pool, assignment)
+          end)
+        end)
+
+      assert_receive {:metadata_reconciliation_ready, ^release_ref, reconciliation_backend}
+      assert reconciliation_backend != epoch_backend
+      assert_backend_waiting_on_db_lock!(reconciliation_backend)
+
+      send(epoch_change.pid, {:release_epoch_change, release_ref})
+      assert {:ok, :ok} = Task.await(epoch_change)
+
+      assert {:ok, result} = Task.await(reconciliation)
+      assert result.quota.code == "quota_refresh_superseded"
+
+      {current_identity, windows} =
+        Sandbox.unboxed_run(Repo, fn ->
+          {
+            Repo.get!(UpstreamIdentity, identity.id),
+            QuotaWindows.list_quota_windows(identity)
+          }
+        end)
+
+      assert CredentialFencing.credential_epoch(current_identity) == 3
+      assert windows == []
+    end
+
+    test "unfenced quota event is published after commit with persisted state visible" do
+      {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Upstreams.reconcile_pool_account(pool, assignment)
+          end)
+        end)
+
+      assert {:ok, %{quota: %{code: "quota_refreshed"}}} = Task.await(reconciliation)
+
+      assert_receive {Events,
+                      %{
+                        reason: "upstream_quota_windows_updated",
+                        payload: %{"assignment_id" => assignment_id}
+                      }}
+
+      assert assignment_id == assignment.id
+
+      assert [_window] =
+               Sandbox.unboxed_run(Repo, fn -> QuotaWindows.list_quota_windows(identity) end)
+
+      refute_receive {Events, %{reason: "upstream_quota_windows_updated"}}, 100
+    end
+
+    test "rolled back unfenced quota write publishes no local event" do
+      {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              assert {:ok, %{quota: %{code: "quota_refreshed"}}} =
+                       Upstreams.reconcile_pool_account(pool, assignment)
+
+              Repo.rollback(:forced_rollback)
+            end)
+          end)
+        end)
+
+      assert {:error, :forced_rollback} = Task.await(reconciliation)
+
+      refute_receive {Events, %{reason: "upstream_quota_windows_updated"}}, 100
+
+      assert [] = Sandbox.unboxed_run(Repo, fn -> QuotaWindows.list_quota_windows(identity) end)
+    end
+
+    test "unfenced quota event waits for an enclosing transaction commit" do
+      {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      parent = self()
+      release_ref = make_ref()
+
+      commit =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              result = Upstreams.reconcile_pool_account(pool, assignment)
+              send(parent, {:unfenced_outer_transaction_ready, release_ref, self(), result})
+
+              receive do
+                {:commit_unfenced_outer_transaction, ^release_ref} -> result
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:unfenced_outer_transaction_ready, ^release_ref, transaction_pid,
+                      {:ok, %{quota: %{code: "quota_refreshed"}}}}
+
+      refute_received {Events, %{reason: "upstream_quota_windows_updated"}}
+      send(transaction_pid, {:commit_unfenced_outer_transaction, release_ref})
+
+      assert {:ok, {:ok, %{quota: %{code: "quota_refreshed"}}}} = Task.await(commit)
+
+      assert_receive {Events,
+                      %{
+                        reason: "upstream_quota_windows_updated",
+                        payload: %{"upstream_identity_id" => identity_id}
+                      }}
+
+      assert identity_id == identity.id
+      refute_receive {Events, %{reason: "upstream_quota_windows_updated"}}, 100
+
+      assert [_window] =
+               Sandbox.unboxed_run(Repo, fn -> QuotaWindows.list_quota_windows(identity) end)
+    end
+
+    test "priming events wait for an enclosing account reconciliation commit" do
+      {pool, _identity, assignment} = committed_metadata_reconciliation_fixture()
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      parent = self()
+      release_ref = make_ref()
+
+      commit =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              result = AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+              send(parent, {:account_outer_transaction_ready, release_ref, self(), result})
+
+              receive do
+                {:commit_account_outer_transaction, ^release_ref} -> result
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:account_outer_transaction_ready, ^release_ref, transaction_pid,
+                      {:ok, %{quota: %{code: "quota_refreshed"}}}}
+
+      refute_received {Events, _event}
+      send(transaction_pid, {:commit_account_outer_transaction, release_ref})
+      assert {:ok, {:ok, %{quota: %{code: "quota_refreshed"}}}} = Task.await(commit)
+
+      assert_receive {Events,
+                      %{
+                        reason: "quota_priming_updated",
+                        payload: %{"quota_priming_status" => "refreshing"}
+                      }}
+
+      assert_receive {Events, %{reason: "upstream_quota_windows_updated"}}
+
+      assert_receive {Events,
+                      %{
+                        reason: "quota_priming_updated",
+                        payload: %{"quota_priming_status" => "known"}
+                      }}
+
+      refute_receive {Events, _event}, 100
+    end
+
+    test "priming events and state are discarded with an enclosing rollback" do
+      {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      rollback =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              assert {:ok, %{quota: %{code: "quota_refreshed"}}} =
+                       AccountReconciliation.run(pool.id, assignment.id, "scheduled")
+
+              Repo.rollback(:forced_outer_rollback)
+            end)
+          end)
+        end)
+
+      assert {:error, :forced_outer_rollback} = Task.await(rollback)
+      refute_receive {Events, _event}, 100
+
+      {current_assignment, windows} =
+        Sandbox.unboxed_run(Repo, fn ->
+          {
+            Repo.get!(PoolUpstreamAssignment, assignment.id),
+            QuotaWindows.list_quota_windows(identity)
+          }
+        end)
+
+      assert is_nil(current_assignment.metadata["quota_priming"])
+      assert is_nil(current_assignment.metadata["last_reconciliation"])
+      assert windows == []
+    end
+
+    test "fenced quota event waits for an enclosing transaction commit" do
+      {pool, identity, _assignment} = committed_metadata_reconciliation_fixture()
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      fence =
+        Sandbox.unboxed_run(Repo, fn ->
+          assert {:ok, _identity, fence} = CredentialFencing.allocate_usage_probe(identity)
+          fence
+        end)
+
+      parent = self()
+      release_ref = make_ref()
+
+      commit =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              assert {:ok, :applied, _identity, :persisted} =
+                       CredentialFencing.apply_usage_success(
+                         identity,
+                         fence,
+                         fn _locked_identity ->
+                           {:ok, :persisted}
+                         end
+                       )
+
+              send(parent, {:fenced_outer_transaction_ready, release_ref, self()})
+
+              receive do
+                {:commit_fenced_outer_transaction, ^release_ref} -> :ok
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:fenced_outer_transaction_ready, ^release_ref, transaction_pid}
+      refute_received {Events, %{reason: "upstream_quota_windows_updated"}}
+
+      send(transaction_pid, {:commit_fenced_outer_transaction, release_ref})
+      assert {:ok, :ok} = Task.await(commit)
+
+      assert_receive {Events,
+                      %{
+                        reason: "upstream_quota_windows_updated",
+                        payload: %{"upstream_identity_id" => identity_id}
+                      }}
+
+      assert identity_id == identity.id
+      refute_receive {Events, %{reason: "upstream_quota_windows_updated"}}, 100
+    end
+
+    test "fenced quota event is discarded with an enclosing transaction rollback" do
+      {pool, identity, _assignment} = committed_metadata_reconciliation_fixture()
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      fence =
+        Sandbox.unboxed_run(Repo, fn ->
+          assert {:ok, _identity, fence} = CredentialFencing.allocate_usage_probe(identity)
+          fence
+        end)
+
+      rollback =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              assert {:ok, :applied, _identity, :persisted} =
+                       CredentialFencing.apply_usage_success(
+                         identity,
+                         fence,
+                         fn _locked_identity -> {:ok, :persisted} end
+                       )
+
+              Repo.rollback(:forced_outer_rollback)
+            end)
+          end)
+        end)
+
+      assert {:error, :forced_outer_rollback} = Task.await(rollback)
+
+      refute_receive {Events, %{reason: "upstream_quota_windows_updated"}}, 100
+
+      current_identity =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(UpstreamIdentity, identity.id) end)
+
+      assert current_identity.metadata["usage_probe_applied_sequence"] == 0
+      assert current_identity.metadata["usage_probe_completed_sequence"] == 0
+    end
+
+    test "explicit quota terminal state is superseded after pause and reactivation" do
+      {scope, pool, identity, assignment} = committed_scoped_lifecycle_fixture()
+      release_ref = make_ref()
+      parent = self()
+      handler_id = {__MODULE__, :explicit_quota_terminal_epoch, release_ref}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:codex_pooler, :repo, :query],
+          &__MODULE__.handle_blocking_quota_notify_event/4,
+          {handler_id, parent, release_ref}
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Upstreams.reconcile_pool_account(pool, assignment,
+              quota_windows: assignment.metadata["quota_windows"]
+            )
+          end)
+        end)
+
+      assert_receive {:quota_notify_before_return, ^release_ref, query_pid}
+
+      reactivated_identity =
+        Sandbox.unboxed_run(Repo, fn ->
+          assert {:ok, %{status: :paused}} =
+                   Upstreams.pause_account_for_scope(scope, identity.id, %{
+                     reason: "operator_pause"
+                   })
+
+          assert {:ok, %{status: :active, identity: reactivated_identity}} =
+                   Upstreams.reactivate_account_for_scope(scope, identity.id, %{})
+
+          reactivated_identity
+        end)
+
+      assert CredentialFencing.credential_epoch(reactivated_identity) == 3
+      send(query_pid, {:release_quota_notify, release_ref})
+
+      assert {:ok, result} = Task.await(reconciliation)
+      assert result.quota.code == "quota_refresh_superseded"
+
+      current_assignment =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(PoolUpstreamAssignment, assignment.id) end)
+
+      assert is_nil(current_assignment.metadata["last_reconciliation"])
+      assert is_nil(current_assignment.last_successful_refresh_at)
+    end
+
+    test "pause and reactivation invalidate a probe allocated on another connection" do
+      {scope, _pool, identity, assignment} = committed_scoped_lifecycle_fixture()
+      release_ref = make_ref()
+      parent = self()
+
+      allocator =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+            assert {:ok, _identity, fence} = CredentialFencing.allocate_usage_probe(identity.id)
+            send(parent, {:pre_pause_probe_allocated, release_ref, backend_pid, fence})
+
+            receive do
+              {:release_probe_connection, ^release_ref} -> {backend_pid, fence}
+            end
+          end)
+        end)
+
+      assert_receive {:pre_pause_probe_allocated, ^release_ref, probe_backend, fence}
+
+      {lifecycle_backend, reactivated_identity} =
+        Sandbox.unboxed_run(Repo, fn ->
+          backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+
+          assert {:ok, %{status: :paused}} =
+                   Upstreams.pause_account_for_scope(scope, identity.id, %{
+                     reason: "operator_pause"
+                   })
+
+          assert {:ok, %{status: :active, identity: reactivated_identity}} =
+                   Upstreams.reactivate_account_for_scope(scope, identity.id, %{})
+
+          {backend_pid, reactivated_identity}
+        end)
+
+      assert lifecycle_backend != probe_backend
+      assert CredentialFencing.credential_epoch(reactivated_identity) > fence.credential_epoch
+
+      send(allocator.pid, {:release_probe_connection, release_ref})
+      assert {^probe_backend, ^fence} = Task.await(allocator)
+
+      stale_apply_result =
+        Sandbox.unboxed_run(Repo, fn ->
+          CredentialFencing.apply_usage_success(identity.id, fence, fn _locked_identity ->
+            current_assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+
+            current_assignment
+            |> PoolUpstreamAssignment.changeset(%{
+              metadata: Map.put(current_assignment.metadata || %{}, "stale_probe_applied", true)
+            })
+            |> Repo.update()
+          end)
+        end)
+
+      assert {:ok, :superseded, _identity, nil} = stale_apply_result
+
+      current_assignment =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(PoolUpstreamAssignment, assignment.id) end)
+
+      refute current_assignment.metadata["stale_probe_applied"]
+      assert current_assignment.status == "active"
+      assert current_assignment.eligibility_status == "eligible"
+    end
+
+    test "account terminal state is superseded after metadata quota and a later epoch change" do
+      catalog_release_ref = make_ref()
+
+      upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/backend-api/codex/models" =>
+               FakeUpstream.barrier_json_response(%{"models" => []},
+                 notify: self(),
+                 release_ref: catalog_release_ref
+               )
+           }}
+        )
+
+      {scope, pool, identity, assignment} = committed_scoped_lifecycle_fixture()
+
+      assignment =
+        Sandbox.unboxed_run(Repo, fn ->
+          assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+
+          assignment
+          |> PoolUpstreamAssignment.changeset(%{
+            metadata: Map.put(assignment.metadata, "base_url", FakeUpstream.url(upstream))
+          })
+          |> Repo.update!()
+        end)
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            AccountReconciliation.run(pool.id, assignment.id, "manual")
+          end)
+        end)
+
+      catalog_barrier = await_upstream_barrier(catalog_release_ref)
+
+      reactivated_identity =
+        Sandbox.unboxed_run(Repo, fn ->
+          assert {:ok, %{status: :paused}} =
+                   Upstreams.pause_account_for_scope(scope, identity.id, %{
+                     reason: "operator_pause"
+                   })
+
+          assert {:ok, %{status: :active, identity: reactivated_identity}} =
+                   Upstreams.reactivate_account_for_scope(scope, identity.id, %{})
+
+          reactivated_identity
+        end)
+
+      assert CredentialFencing.credential_epoch(reactivated_identity) == 3
+      release_upstream_barrier(catalog_barrier, catalog_release_ref)
+
+      assert {:ok, result} = Task.await(reconciliation)
+      assert result.quota.code == "quota_refresh_superseded"
+
+      current_assignment =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(PoolUpstreamAssignment, assignment.id) end)
+
+      assert current_assignment.metadata["quota_priming"]["status"] == "refreshing"
+      assert current_assignment.metadata["quota_priming"]["credential_epoch"] == 1
+      assert is_nil(current_assignment.metadata["last_reconciliation"])
+      assert is_nil(current_assignment.last_successful_refresh_at)
+    end
+
+    for lifecycle_action <- [:disable, :delete] do
+      test "metadata reconciliation cannot mutate an assignment when #{lifecycle_action} commits first on independent connections" do
+        lifecycle_action = unquote(lifecycle_action)
+        {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+        release_ref = make_ref()
+        parent = self()
+
+        identity_lock =
+          Task.async(fn ->
+            Sandbox.unboxed_run(Repo, fn ->
+              Repo.transaction(fn ->
+                Repo.one!(
+                  from(current_identity in UpstreamIdentity,
+                    where: current_identity.id == ^identity.id,
+                    lock: "FOR UPDATE"
+                  )
+                )
+
+                send(parent, {:identity_lock_acquired, release_ref})
+
+                receive do
+                  ^release_ref -> :ok
+                end
+              end)
+            end)
+          end)
+
+        assert_receive {:identity_lock_acquired, ^release_ref}
+
+        reconciliation =
+          Task.async(fn ->
+            Sandbox.unboxed_run(Repo, fn ->
+              backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+              send(parent, {:reconciliation_connection_ready, release_ref, backend_pid})
+              Upstreams.reconcile_pool_account(pool, assignment)
+            end)
+          end)
+
+        assert_receive {:reconciliation_connection_ready, ^release_ref, reconciliation_backend}
+        assert_backend_waiting_on_db_lock!(reconciliation_backend)
+
+        lifecycle_snapshot =
+          Sandbox.unboxed_run(Repo, fn ->
+            apply_assignment_lifecycle!(lifecycle_action, pool, assignment)
+          end)
+
+        send(identity_lock.pid, release_ref)
+        assert {:ok, :ok} = Task.await(identity_lock)
+
+        assert {:ok, stale_result} = Task.await(reconciliation)
+        assert stale_result.quota.code == "quota_refresh_superseded"
+
+        {current_assignment, windows} =
+          Sandbox.unboxed_run(Repo, fn ->
+            {
+              Repo.get!(PoolUpstreamAssignment, assignment.id),
+              QuotaWindows.list_quota_windows(identity)
+            }
+          end)
+
+        assert current_assignment == lifecycle_snapshot
+        assert windows == []
+      end
+    end
+
+    test "metadata reconciliation commits before a later disable on independent connections" do
+      {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+      release_ref = make_ref()
+      parent = self()
+      handler_id = {__MODULE__, :production_reconciliation_lock, release_ref}
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:codex_pooler, :repo, :query],
+          &__MODULE__.handle_blocking_assignment_update_event/4,
+          {handler_id, parent, release_ref}
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      reconciliation =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Upstreams.reconcile_pool_account(pool, assignment)
+          end)
+        end)
+
+      assert_receive {:assignment_update_before_commit, ^release_ref, reconciliation_pid}
+
+      lifecycle =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+            send(parent, {:lifecycle_connection_ready, release_ref, backend_pid})
+            PoolAssignments.disable_pool_assignment(assignment)
+          end)
+        end)
+
+      assert_receive {:lifecycle_connection_ready, ^release_ref, lifecycle_backend}
+      assert_backend_waiting_on_db_lock!(lifecycle_backend)
+
+      send(reconciliation_pid, {:release_assignment_update, release_ref})
+
+      assert {:ok, reconciliation_result} = Task.await(reconciliation)
+      assert reconciliation_result.quota.code == "quota_refreshed"
+      assert {:ok, disabled_assignment} = Task.await(lifecycle)
+
+      {current_assignment, windows} =
+        Sandbox.unboxed_run(Repo, fn ->
+          {
+            Repo.get!(PoolUpstreamAssignment, assignment.id),
+            QuotaWindows.list_quota_windows(identity)
+          }
+        end)
+
+      assert current_assignment.status == "disabled"
+      assert current_assignment.health_status == "disabled"
+      assert current_assignment.eligibility_status == "ineligible"
+      assert current_assignment.disabled_at == disabled_assignment.disabled_at
+      assert [_persisted_window] = windows
     end
 
     test "blocked rejection from an earlier credential epoch cannot demote a relinked identity" do
@@ -1793,6 +3310,39 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       refute_received {Events, %{reason: "upstream_account_reauth_required"}}
     end
 
+    test "definitive rejection event is discarded with an enclosing transaction rollback" do
+      {pool, identity, _assignment} = committed_metadata_reconciliation_fixture()
+      assert :ok = Events.subscribe_pool(pool.id, "upstreams")
+
+      fence =
+        Sandbox.unboxed_run(Repo, fn ->
+          assert {:ok, _identity, fence} = CredentialFencing.allocate_usage_probe(identity)
+          fence
+        end)
+
+      rollback =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              assert {:ok, :applied, rejected_identity} =
+                       CredentialFencing.mark_definitive_rejection(identity, fence)
+
+              assert rejected_identity.status == "reauth_required"
+              Repo.rollback(:forced_outer_rollback)
+            end)
+          end)
+        end)
+
+      assert {:error, :forced_outer_rollback} = Task.await(rollback)
+      refute_receive {Events, %{reason: "upstream_account_reauth_required"}}, 100
+
+      current_identity =
+        Sandbox.unboxed_run(Repo, fn -> Repo.get!(UpstreamIdentity, identity.id) end)
+
+      assert current_identity.status == "active"
+      assert current_identity.metadata["usage_probe_applied_sequence"] == 0
+    end
+
     test "newer success supersedes an older same-epoch rejection" do
       {_pool, assignment} = active_assignment_fixture(%{})
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
@@ -1821,6 +3371,111 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       assert Repo.get!(PoolUpstreamAssignment, assignment.id).health_status ==
                assignment.health_status
+    end
+
+    test "guarded unavailable completion does not suppress an older rejection" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, _identity, older_fence} = CredentialFencing.allocate_usage_probe(identity)
+      assert {:ok, _identity, newer_fence} = CredentialFencing.allocate_usage_probe(identity)
+
+      assert {:ok, :applied, current_identity, :completed} =
+               CredentialFencing.guard_active_usage_probe_completion(
+                 identity,
+                 newer_fence,
+                 :auth_failure,
+                 fn _locked_identity -> {:ok, :completed} end
+               )
+
+      assert current_identity.metadata["usage_probe_applied_sequence"] == 0
+      assert current_identity.metadata["usage_probe_completed_sequence"] == 2
+
+      assert {:ok, :applied, rejected_identity} =
+               CredentialFencing.mark_definitive_rejection(identity, older_fence)
+
+      assert rejected_identity.status == "reauth_required"
+      assert rejected_identity.metadata["usage_probe_applied_sequence"] == 1
+      assert rejected_identity.metadata["usage_probe_completed_sequence"] == 2
+
+      test_pid = self()
+
+      assert {:ok, :superseded, still_rejected_identity, nil} =
+               CredentialFencing.guard_current_usage_probe_completion(
+                 identity,
+                 newer_fence,
+                 :auth_failure,
+                 fn _locked_identity ->
+                   send(test_pid, :stale_terminal_callback_ran)
+                   {:ok, :stale_terminal_write}
+                 end
+               )
+
+      assert still_rejected_identity.status == "reauth_required"
+      refute_received :stale_terminal_callback_ran
+    end
+
+    test "newer unavailable pool completion cannot run after an older rejection applies" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, _identity, rejection_fence} =
+               CredentialFencing.allocate_usage_probe(identity)
+
+      assert {:ok, _identity, unavailable_fence} =
+               CredentialFencing.allocate_usage_probe(identity)
+
+      assert {:ok, :applied, rejected_identity} =
+               CredentialFencing.mark_definitive_rejection(identity, rejection_fence)
+
+      assert rejected_identity.status == "reauth_required"
+      test_pid = self()
+
+      assert {:ok, :superseded, still_rejected_identity, nil} =
+               CredentialFencing.guard_active_usage_probe_completion(
+                 identity,
+                 unavailable_fence,
+                 :auth_failure,
+                 fn _locked_identity ->
+                   send(test_pid, :stale_pool_callback_ran)
+                   {:ok, :stale_pool_write}
+                 end
+               )
+
+      assert still_rejected_identity.status == "reauth_required"
+      refute_received :stale_pool_callback_ran
+    end
+
+    test "older post-quota finalization is superseded after a newer rejection" do
+      {_pool, assignment} = active_assignment_fixture(%{})
+      identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
+
+      assert {:ok, _identity, older_fence} = CredentialFencing.allocate_usage_probe(identity)
+      assert {:ok, _identity, newer_fence} = CredentialFencing.allocate_usage_probe(identity)
+
+      assert {:ok, :applied, _identity, :persisted} =
+               CredentialFencing.apply_usage_success(identity, older_fence, fn _locked_identity ->
+                 {:ok, :persisted}
+               end)
+
+      assert {:ok, :applied, rejected_identity} =
+               CredentialFencing.mark_definitive_rejection(identity, newer_fence)
+
+      assert rejected_identity.status == "reauth_required"
+
+      assert {:ok, :superseded, still_rejected_identity, nil} =
+               CredentialFencing.guard_active_usage_probe_completion(
+                 identity,
+                 older_fence,
+                 fn _locked_identity ->
+                   send(self(), :unexpected_stale_finalization)
+                   {:ok, :finalized}
+                 end
+               )
+
+      refute_received :unexpected_stale_finalization
+      assert still_rejected_identity.status == "reauth_required"
+      assert still_rejected_identity.metadata["usage_probe_applied_sequence"] == 2
     end
 
     test "fresh fenced provider quota recovers every relinked assignment and retains history" do
@@ -1930,6 +3585,104 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       end
 
       refute_received :unexpected_duplicate_persist
+    end
+
+    test "fresh fenced provider quota preserves an assignment disabled after relink" do
+      success_upstream = start_upstream(FakeUpstream.json_response(usage_payload()))
+      recovery = rejected_and_relinked_identity_fixture()
+
+      assert {:ok, _disabled_assignment} =
+               PoolAssignments.disable_pool_assignment(recovery.sibling_assignment)
+
+      disabled_before = Repo.get!(PoolUpstreamAssignment, recovery.sibling_assignment.id)
+
+      source_assignment =
+        update_assignment_upstream!(recovery.linked_assignment, success_upstream)
+
+      assert {:ok, recovered_identity} =
+               PoolReconciliation.refresh_quota_from_usage(
+                 recovery.linked_identity,
+                 source_assignment
+               )
+
+      assert recovered_identity.status == "active"
+
+      assert Repo.get!(PoolUpstreamAssignment, recovery.sibling_assignment.id) ==
+               disabled_before
+
+      recovered_source = Repo.get!(PoolUpstreamAssignment, recovery.linked_assignment.id)
+      assert recovered_source.health_status == "active"
+      assert recovered_source.eligibility_status == "eligible"
+    end
+
+    test "fresh auth recovery preserves an independent disable committed while success waits" do
+      recovery = committed_relinked_recovery_fixture()
+      release_ref = make_ref()
+      parent = self()
+
+      identity_lock =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              Repo.one!(
+                from(identity in UpstreamIdentity,
+                  where: identity.id == ^recovery.identity.id,
+                  lock: "FOR UPDATE"
+                )
+              )
+
+              send(parent, {:recovery_identity_lock_acquired, release_ref})
+
+              receive do
+                ^release_ref -> :ok
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:recovery_identity_lock_acquired, ^release_ref}
+
+      recovery_success =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            backend_pid = Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+            send(parent, {:recovery_success_connection, release_ref, backend_pid})
+
+            CredentialFencing.apply_usage_success(
+              recovery.identity,
+              recovery.fence,
+              fn _locked_identity -> {:ok, :persisted} end
+            )
+          end)
+        end)
+
+      assert_receive {:recovery_success_connection, ^release_ref, recovery_backend}
+      assert_backend_waiting_on_db_lock!(recovery_backend)
+
+      disabled_before =
+        Sandbox.unboxed_run(Repo, fn ->
+          assert {:ok, disabled_assignment} =
+                   PoolAssignments.disable_pool_assignment(recovery.sibling_assignment)
+
+          Repo.reload!(disabled_assignment)
+        end)
+
+      send(identity_lock.pid, release_ref)
+      assert {:ok, :ok} = Task.await(identity_lock)
+
+      assert {:ok, :applied, _identity, :persisted} = Task.await(recovery_success)
+
+      {current_source, current_sibling} =
+        Sandbox.unboxed_run(Repo, fn ->
+          {
+            Repo.get!(PoolUpstreamAssignment, recovery.source_assignment.id),
+            Repo.get!(PoolUpstreamAssignment, recovery.sibling_assignment.id)
+          }
+        end)
+
+      assert current_sibling == disabled_before
+      assert current_source.health_status == "active"
+      assert current_source.eligibility_status == "eligible"
     end
 
     for completion_order <- [:rejection_first, :success_first] do
@@ -2093,6 +3846,176 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       end
     end
 
+    test "worker terminal writes cannot overwrite a newer rejection after catalog sync stalls" do
+      catalog_release_ref = make_ref()
+
+      success_upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/backend-api/wham/usage" => {200, usage_payload()},
+             "/backend-api/codex/models" =>
+               FakeUpstream.barrier_json_response(
+                 %{"models" => [%{"id" => "gpt-test"}]},
+                 notify: self(),
+                 release_ref: catalog_release_ref
+               )
+           }}
+        )
+
+      rejection_upstream =
+        start_upstream(unavailable_usage_paths(401, %{"error" => "rejected"}))
+
+      {success_pool, success_assignment} = active_usage_probe_assignment(success_upstream)
+      identity = Upstreams.get_upstream_identity(success_assignment.upstream_identity_id)
+      initial_success_at = ~U[2026-07-01 12:00:00.000000Z]
+
+      success_assignment =
+        success_assignment
+        |> PoolUpstreamAssignment.changeset(%{last_successful_refresh_at: initial_success_at})
+        |> Repo.update!()
+
+      success_task =
+        start_allowed_task(fn ->
+          AccountReconciliation.run(success_pool.id, success_assignment.id, "manual")
+        end)
+
+      catalog_barrier = await_upstream_barrier(catalog_release_ref)
+      rejection_pool = pool_fixture()
+
+      assert {:ok, rejection_assignment} =
+               PoolAssignments.create_pool_assignment(rejection_pool, identity, %{
+                 status: "active",
+                 health_status: "active",
+                 eligibility_status: "eligible",
+                 metadata: %{"base_url" => FakeUpstream.url(rejection_upstream)}
+               })
+
+      assert {:ok, rejection_result} =
+               Upstreams.reconcile_pool_account(rejection_pool, rejection_assignment)
+
+      assert rejection_result.quota.code == "quota_refresh_auth_unavailable"
+
+      rejected_before = Repo.get!(PoolUpstreamAssignment, success_assignment.id)
+      rejection_summary = rejected_before.metadata["last_reconciliation"]
+      rejection_success_at = rejected_before.last_successful_refresh_at
+      assert rejected_before.health_status == "disabled"
+      assert rejected_before.eligibility_status == "ineligible"
+
+      release_upstream_barrier(catalog_barrier, catalog_release_ref)
+
+      assert {:ok, stale_result} = Task.await(success_task)
+      assert stale_result.quota.code == "quota_refresh_superseded"
+
+      current_assignment = Repo.get!(PoolUpstreamAssignment, success_assignment.id)
+      assert current_assignment.metadata["last_reconciliation"] == rejection_summary
+      assert current_assignment.last_successful_refresh_at == rejection_success_at
+      assert current_assignment.health_status == "disabled"
+      assert current_assignment.eligibility_status == "ineligible"
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "reauth_required"
+    end
+
+    test "newer unavailable worker terminal cannot overwrite an older rejection after catalog stalls" do
+      rejection_release_ref = make_ref()
+      unavailable_release_ref = make_ref()
+      catalog_release_ref = make_ref()
+
+      rejection_upstream =
+        start_upstream(rejection_barrier_paths(self(), rejection_release_ref))
+
+      unavailable_response =
+        FakeUpstream.barrier_json_response(%{"error" => "busy"},
+          status: 429,
+          notify: self(),
+          release_ref: unavailable_release_ref
+        )
+
+      unavailable_upstream =
+        start_upstream(
+          {:path_json,
+           %{
+             "/backend-api/wham/usage" => unavailable_response,
+             "/backend-api/codex/usage" => unavailable_response,
+             "/backend-api/codex/models" =>
+               FakeUpstream.barrier_json_response(
+                 %{"models" => [%{"id" => "gpt-test"}]},
+                 notify: self(),
+                 release_ref: catalog_release_ref
+               )
+           }}
+        )
+
+      {rejection_pool, rejection_assignment} =
+        active_usage_probe_assignment(rejection_upstream)
+
+      identity = Upstreams.get_upstream_identity(rejection_assignment.upstream_identity_id)
+      unavailable_pool = pool_fixture()
+
+      assert {:ok, unavailable_assignment} =
+               PoolAssignments.create_pool_assignment(unavailable_pool, identity, %{
+                 status: "active",
+                 health_status: "active",
+                 eligibility_status: "eligible",
+                 metadata: %{"base_url" => FakeUpstream.url(unavailable_upstream)}
+               })
+
+      rejection_task =
+        start_allowed_task(fn ->
+          Upstreams.reconcile_pool_account(rejection_pool, rejection_assignment)
+        end)
+
+      first_rejection_barrier = await_upstream_barrier(rejection_release_ref)
+
+      unavailable_task =
+        start_allowed_task(fn ->
+          AccountReconciliation.run(
+            unavailable_pool.id,
+            unavailable_assignment.id,
+            "manual"
+          )
+        end)
+
+      first_unavailable_barrier = await_upstream_barrier(unavailable_release_ref)
+      release_upstream_barrier(first_unavailable_barrier, unavailable_release_ref)
+      second_unavailable_barrier = await_upstream_barrier(unavailable_release_ref)
+      release_upstream_barrier(second_unavailable_barrier, unavailable_release_ref)
+      catalog_barrier = await_upstream_barrier(catalog_release_ref)
+
+      release_upstream_barrier(first_rejection_barrier, rejection_release_ref)
+      second_rejection_barrier = await_upstream_barrier(rejection_release_ref)
+      release_upstream_barrier(second_rejection_barrier, rejection_release_ref)
+
+      assert {:ok, rejection_result} = Task.await(rejection_task)
+      assert rejection_result.quota.code == "quota_refresh_auth_unavailable"
+
+      rejected_before = Repo.get!(PoolUpstreamAssignment, unavailable_assignment.id)
+      assert rejected_before.health_status == "disabled"
+      assert rejected_before.eligibility_status == "ineligible"
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "reauth_required"
+
+      release_upstream_barrier(catalog_barrier, catalog_release_ref)
+
+      assert {:ok, stale_result} = Task.await(unavailable_task)
+      assert stale_result.quota.code == "quota_refresh_superseded"
+
+      current_assignment = Repo.get!(PoolUpstreamAssignment, unavailable_assignment.id)
+
+      protected_fields = [
+        :status,
+        :health_status,
+        :eligibility_status,
+        :disabled_at,
+        :last_healthcheck_at,
+        :last_successful_refresh_at,
+        :metadata
+      ]
+
+      assert Map.take(current_assignment, protected_fields) ==
+               Map.take(rejected_before, protected_fields)
+
+      assert Repo.get!(UpstreamIdentity, identity.id).status == "reauth_required"
+    end
+
     test "transient account reconciliation token refresh failure does not reuse persisted quota" do
       observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
       access_token = "token-access-reconciliation-recovery-do-not-leak"
@@ -2117,6 +4040,18 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
 
       identity = Upstreams.get_upstream_identity(assignment.upstream_identity_id)
 
+      preserved_healthcheck_at =
+        DateTime.utc_now() |> DateTime.add(-120, :second) |> DateTime.truncate(:microsecond)
+
+      assignment =
+        assignment
+        |> PoolUpstreamAssignment.changeset(%{
+          health_status: "disabled",
+          eligibility_status: "ineligible",
+          last_healthcheck_at: preserved_healthcheck_at
+        })
+        |> Repo.update!()
+
       persist_quota_windows!(identity, [persisted_account_primary_window_attrs(observed_at)])
 
       assert {:ok, _secret} =
@@ -2140,6 +4075,9 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assert token_refresh_metadata["reason"]["code"] == "codex_auth_transient"
 
       assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      assert assignment.health_status == "disabled"
+      assert assignment.eligibility_status == "ineligible"
+      assert assignment.last_healthcheck_at == preserved_healthcheck_at
       last_reconciliation = assignment.metadata["last_reconciliation"]
       assert last_reconciliation["status"] == "partial"
       assert assignment.metadata["quota_priming"]["status"] == "failed"
@@ -2390,6 +4328,22 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
       assert is_nil(assignment.metadata["quota_priming"])
       assert is_nil(assignment.metadata["last_reconciliation"])
+    end
+
+    test "skips already queued account reconciliation jobs when assignment is disabled" do
+      {pool, assignment} = active_assignment_fixture(%{})
+
+      assert {:ok, job} = Jobs.enqueue_account_reconciliation(pool, assignment)
+      assert {:ok, _disabled_assignment} = PoolAssignments.disable_pool_assignment(assignment)
+
+      disabled_before = Repo.get!(PoolUpstreamAssignment, assignment.id)
+
+      assert %{success: 1, discard: 0} = Oban.drain_queue(queue: :jobs)
+
+      completed_job = Repo.get!(Oban.Job, job.id)
+      assert completed_job.state == "completed"
+      assert completed_job.errors == []
+      assert Repo.get!(PoolUpstreamAssignment, assignment.id) == disabled_before
     end
 
     test "skips already queued account reconciliation jobs when upstream account requires reauth" do
@@ -2666,6 +4620,309 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
     task
   end
 
+  defp committed_metadata_reconciliation_fixture do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        pool = pool_fixture()
+
+        assert {:ok, identity} =
+                 IdentityLifecycle.create_upstream_identity(%{
+                   chatgpt_account_id: "acct_#{System.unique_integer([:positive])}",
+                   account_label: "Committed reconciliation account",
+                   onboarding_method: "import"
+                 })
+
+        assert {:ok, identity} = IdentityLifecycle.activate_upstream_identity(identity)
+
+        assert {:ok, assignment} =
+                 PoolAssignments.create_pool_assignment(pool, identity, %{
+                   assignment_label: "Committed reconciliation assignment",
+                   metadata: %{
+                     "quota_windows" => [
+                       %{
+                         "window_kind" => "primary",
+                         "window_minutes" => 300,
+                         "active_limit" => 100,
+                         "credits" => 75,
+                         "reset_at" =>
+                           DateTime.utc_now()
+                           |> DateTime.add(3_600, :second)
+                           |> DateTime.to_iso8601(),
+                         "source" => "local_reconciliation",
+                         "freshness_state" => "fresh"
+                       }
+                     ]
+                   }
+                 })
+
+        assert {:ok, assignment} =
+                 PoolAssignments.activate_pool_assignment(assignment, %{
+                   skip_quota_priming: true
+                 })
+
+        {pool, identity, assignment}
+      end)
+
+    {pool, identity, _assignment} = fixture
+
+    on_exit(fn ->
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.delete_all(
+          from(current_identity in UpstreamIdentity,
+            where: current_identity.id == ^identity.id
+          )
+        )
+
+        Repo.delete_all(
+          from(current_pool in CodexPooler.Pools.Pool, where: current_pool.id == ^pool.id)
+        )
+      end)
+    end)
+
+    fixture
+  end
+
+  defp committed_stale_priming_fixture do
+    {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+    assignment = mark_committed_assignment_stale!(assignment)
+    {pool, identity, assignment}
+  end
+
+  defp mark_committed_assignment_stale!(assignment, credential_epoch \\ nil) do
+    Sandbox.unboxed_run(Repo, fn ->
+      assignment = Repo.get!(PoolUpstreamAssignment, assignment.id)
+      stale_started_at = DateTime.add(DateTime.utc_now(), -1, :hour)
+
+      priming = %{
+        "status" => "refreshing",
+        "trigger_kind" => "scheduled",
+        "started_at" => DateTime.to_iso8601(stale_started_at)
+      }
+
+      priming =
+        if is_integer(credential_epoch),
+          do: Map.put(priming, "credential_epoch", credential_epoch),
+          else: priming
+
+      assignment
+      |> PoolUpstreamAssignment.changeset(%{
+        metadata: Map.put(assignment.metadata || %{}, "quota_priming", priming)
+      })
+      |> Repo.update!()
+    end)
+  end
+
+  defp committed_scoped_lifecycle_fixture do
+    configure_upstream_secret_key!()
+    {pool, identity, assignment} = committed_metadata_reconciliation_fixture()
+
+    {scope, created_owner_id} =
+      Sandbox.unboxed_run(Repo, fn ->
+        owner =
+          Repo.one(
+            from(user in User,
+              join: membership in Membership,
+              on: membership.user_id == user.id,
+              where:
+                membership.role == "instance_owner" and membership.status == "active" and
+                  user.status == "active" and is_nil(user.deleted_at),
+              limit: 1
+            )
+          )
+
+        {owner, created_owner_id} =
+          case owner do
+            %User{} = existing_owner -> {existing_owner, nil}
+            nil -> insert_committed_owner!()
+          end
+
+        assert {:ok, _secret} =
+                 Upstreams.store_encrypted_secret(identity, %{
+                   secret_kind: "access_token",
+                   plaintext: "committed-lifecycle-token"
+                 })
+
+        {%Scope{user: owner, roles: ["instance_owner"], assigned_pool_ids: []}, created_owner_id}
+      end)
+
+    if created_owner_id do
+      on_exit(fn -> cleanup_committed_owner(created_owner_id) end)
+    end
+
+    {scope, pool, identity, assignment}
+  end
+
+  defp insert_committed_owner! do
+    timestamp = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    owner =
+      Repo.insert!(%User{
+        email: "committed-owner-#{System.unique_integer([:positive])}@example.com",
+        display_name: "Committed owner",
+        password_hash: "not-used",
+        status: "active",
+        password_change_required: false,
+        created_at: timestamp,
+        updated_at: timestamp
+      })
+
+    %Membership{}
+    |> Membership.changeset(%{
+      user_id: owner.id,
+      role: "instance_owner",
+      status: "active",
+      created_at: timestamp
+    })
+    |> Repo.insert!()
+
+    {owner, owner.id}
+  end
+
+  defp cleanup_committed_owner(owner_id) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.delete_all(
+        from(event in CodexPooler.Audit.AuditEvent, where: event.actor_user_id == ^owner_id)
+      )
+
+      Repo.delete_all(from(membership in Membership, where: membership.user_id == ^owner_id))
+      Repo.delete_all(from(user in User, where: user.id == ^owner_id))
+    end)
+  end
+
+  defp committed_active_usage_probe_assignment(upstream) do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        active_usage_probe_assignment(upstream)
+      end)
+
+    {pool, assignment} = fixture
+    identity_id = assignment.upstream_identity_id
+
+    on_exit(fn -> cleanup_committed_reconciliation_fixture(identity_id, [pool.id]) end)
+
+    fixture
+  end
+
+  defp committed_relinked_recovery_fixture do
+    recovery =
+      Sandbox.unboxed_run(Repo, fn ->
+        {source_pool, source_assignment} = active_assignment_fixture(%{})
+        identity = Repo.get!(UpstreamIdentity, source_assignment.upstream_identity_id)
+
+        {sibling_pool, sibling_assignment} =
+          active_assignment_for_identity_fixture(identity,
+            assignment_label: "Committed recovery sibling"
+          )
+
+        assert {:ok, _identity, rejection_fence} =
+                 CredentialFencing.allocate_usage_probe(identity)
+
+        assert {:ok, :applied, rejected_identity} =
+                 CredentialFencing.mark_definitive_rejection(identity, rejection_fence)
+
+        relinked_identity =
+          rejected_identity
+          |> UpstreamIdentity.changeset(%{
+            status: "active",
+            disabled_at: nil,
+            metadata: CredentialFencing.advance_credential_epoch(rejected_identity)
+          })
+          |> Repo.update!()
+
+        source_assignment =
+          source_assignment
+          |> Repo.reload!()
+          |> PoolUpstreamAssignment.changeset(%{
+            status: "active",
+            health_status: "active",
+            eligibility_status: "ineligible",
+            disabled_at: nil
+          })
+          |> Repo.update!()
+
+        assert {:ok, current_identity, fence} =
+                 CredentialFencing.allocate_usage_probe(relinked_identity)
+
+        %{
+          identity: current_identity,
+          fence: fence,
+          source_assignment: source_assignment,
+          sibling_assignment: sibling_assignment,
+          pool_ids: [source_pool.id, sibling_pool.id]
+        }
+      end)
+
+    on_exit(fn ->
+      cleanup_committed_reconciliation_fixture(recovery.identity.id, recovery.pool_ids)
+    end)
+
+    recovery
+  end
+
+  defp cleanup_committed_reconciliation_fixture(identity_id, pool_ids) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.delete_all(from(identity in UpstreamIdentity, where: identity.id == ^identity_id))
+
+      Repo.delete_all(from(pool in CodexPooler.Pools.Pool, where: pool.id in ^pool_ids))
+    end)
+  end
+
+  defp cleanup_committed_pool(pool_id) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.delete_all(
+        from(assignment in PoolUpstreamAssignment, where: assignment.pool_id == ^pool_id)
+      )
+
+      Repo.delete_all(from(pool in CodexPooler.Pools.Pool, where: pool.id == ^pool_id))
+    end)
+  end
+
+  defp apply_assignment_lifecycle!(:disable, _pool, assignment) do
+    assert {:ok, disabled_assignment} = PoolAssignments.disable_pool_assignment(assignment)
+    Repo.reload!(disabled_assignment)
+  end
+
+  defp apply_assignment_lifecycle!(:delete, pool, assignment) do
+    assert {:ok, %{assignment: deleted_assignment}} =
+             PoolAssignments.delete_pool_assignment(pool, assignment)
+
+    Repo.reload!(deleted_assignment)
+  end
+
+  defp assert_backend_waiting_on_db_lock!(backend_pid) do
+    assert_backend_waiting_on_db_lock!(
+      backend_pid,
+      System.monotonic_time(:millisecond) + 5_000
+    )
+  end
+
+  defp assert_backend_waiting_on_db_lock!(backend_pid, deadline) do
+    waiting? =
+      Repo.query!(
+        """
+        SELECT 1
+        FROM pg_stat_activity
+        WHERE pid = $1
+          AND wait_event_type = 'Lock'
+        """,
+        [backend_pid]
+      ).num_rows == 1
+
+    cond do
+      waiting? ->
+        :ok
+
+      System.monotonic_time(:millisecond) < deadline ->
+        receive do
+        after
+          10 -> assert_backend_waiting_on_db_lock!(backend_pid, deadline)
+        end
+
+      true ->
+        flunk("backend did not enter a database lock wait")
+    end
+  end
+
   defp start_reconciliation_worker_task(assignment, credential_epoch) do
     start_allowed_task(fn ->
       AccountReconciliationWorker.perform(reconciliation_job(assignment, credential_epoch))
@@ -2929,9 +5186,39 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
     for assignment_id <- [recovery.linked_assignment.id, recovery.sibling_assignment.id] do
       assignment = Repo.get!(PoolUpstreamAssignment, assignment_id)
       assert assignment.status == "active"
-      assert assignment.health_status == "active"
-      assert assignment.eligibility_status == "eligible"
-      assert assignment.disabled_at == nil
+
+      assert assignment.health_status == "active",
+             inspect(
+               Map.take(assignment, [
+                 :status,
+                 :health_status,
+                 :eligibility_status,
+                 :disabled_at,
+                 :metadata
+               ])
+             )
+
+      assert assignment.eligibility_status == "eligible",
+             inspect(
+               Map.take(assignment, [
+                 :status,
+                 :health_status,
+                 :eligibility_status,
+                 :disabled_at,
+                 :metadata
+               ])
+             )
+
+      assert assignment.disabled_at == nil,
+             inspect(
+               Map.take(assignment, [
+                 :status,
+                 :health_status,
+                 :eligibility_status,
+                 :disabled_at,
+                 :metadata
+               ])
+             )
     end
   end
 
@@ -2940,6 +5227,115 @@ defmodule CodexPooler.Jobs.ReconciliationJobsTest do
       send(test_pid, {handler_id, %{params: metadata[:params]}})
     end
   end
+
+  def handle_blocking_assignment_update_event(
+        _event,
+        _measurements,
+        metadata,
+        {handler_id, test_pid, release_ref}
+      ) do
+    if metadata[:repo] == Repo and metadata[:source] == "pool_upstream_assignments" and
+         metadata[:query] |> to_string() |> String.trim_leading() |> String.starts_with?("UPDATE") do
+      :telemetry.detach(handler_id)
+      send(test_pid, {:assignment_update_before_commit, release_ref, self()})
+
+      receive do
+        {:release_assignment_update, ^release_ref} -> :ok
+      end
+    end
+  end
+
+  def handle_blocking_terminal_priming_update_event(
+        _event,
+        _measurements,
+        metadata,
+        {handler_id, test_pid, release_ref}
+      ) do
+    terminal_priming_update? =
+      metadata[:repo] == Repo and metadata[:source] == "pool_upstream_assignments" and
+        metadata[:query] |> to_string() |> String.trim_leading() |> String.starts_with?("UPDATE") and
+        query_params_contain?(metadata, "quota_priming") and
+        query_params_contain?(metadata, "known")
+
+    if terminal_priming_update? do
+      :telemetry.detach(handler_id)
+      send(test_pid, {:terminal_priming_update_before_commit, release_ref, self()})
+
+      receive do
+        {:release_assignment_update, ^release_ref} -> :ok
+      end
+    end
+  end
+
+  def handle_blocking_quota_notify_event(
+        _event,
+        _measurements,
+        metadata,
+        {handler_id, test_pid, release_ref}
+      ) do
+    quota_notify? =
+      metadata[:repo] == Repo and
+        metadata[:query] |> to_string() |> String.contains?("pg_notify") and
+        query_params_contain?(metadata, "upstream_quota_windows_updated")
+
+    if quota_notify? do
+      :telemetry.detach(handler_id)
+      send(test_pid, {:quota_notify_before_return, release_ref, self()})
+
+      receive do
+        {:release_quota_notify, ^release_ref} -> :ok
+      end
+    end
+  end
+
+  def handle_blocking_stale_priming_update_event(
+        _event,
+        _measurements,
+        metadata,
+        {handler_id, test_pid, release_ref}
+      ) do
+    stale_priming_update? =
+      metadata[:repo] == Repo and metadata[:source] == "pool_upstream_assignments" and
+        metadata[:query] |> to_string() |> String.trim_leading() |> String.starts_with?("UPDATE") and
+        query_params_contain?(metadata, "quota_priming") and
+        query_params_contain?(metadata, "runtime_timeout")
+
+    if stale_priming_update? do
+      :telemetry.detach(handler_id)
+      send(test_pid, {:stale_priming_update_before_commit, release_ref, self()})
+
+      receive do
+        {:release_assignment_update, ^release_ref} -> :ok
+      end
+    end
+  end
+
+  defp query_params_contain?(metadata, expected) do
+    metadata
+    |> Map.get(:params, [])
+    |> Enum.any?(&query_param_contains?(&1, expected))
+  end
+
+  defp query_param_contains?(value, expected) when is_binary(value) do
+    value == expected or decoded_query_param_contains?(Jason.decode(value), expected)
+  end
+
+  defp query_param_contains?(%{} = value, expected) when not is_struct(value) do
+    Enum.any?(value, fn {key, nested_value} ->
+      query_param_contains?(key, expected) or query_param_contains?(nested_value, expected)
+    end)
+  end
+
+  defp query_param_contains?(value, expected) when is_list(value) do
+    Enum.any?(value, &query_param_contains?(&1, expected))
+  end
+
+  defp query_param_contains?(_value, _expected), do: false
+
+  defp decoded_query_param_contains?({:ok, value}, expected),
+    do: query_param_contains?(value, expected)
+
+  defp decoded_query_param_contains?({:error, _reason}, _expected), do: false
 
   defp capture_assignment_updates(fun) when is_function(fun, 0) do
     test_pid = self()

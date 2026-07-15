@@ -301,11 +301,93 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
          %Evidence{} = evidence,
          timestamp
        ) do
-    if uncorroborated_zero_reenable_attempt?(evidence, existing, timestamp) do
-      sliding_restart_attrs(existing, attrs, evidence, timestamp)
-    else
-      merge_attrs_by_decision(existing, attrs, evidence, timestamp)
+    cond do
+      uncorroborated_zero_reenable_attempt?(evidence, existing, timestamp) ->
+        sliding_restart_attrs(existing, attrs, evidence, timestamp)
+
+      floating_model_weekly_attempt?(evidence, existing, timestamp) ->
+        floating_model_weekly_attrs(existing, attrs, evidence, timestamp)
+
+      true ->
+        merge_attrs_by_decision(existing, attrs, evidence, timestamp)
     end
+  end
+
+  # A zero-use model weekly window can be unanchored: the provider reports a
+  # full relative reset on every live observation until first use starts the
+  # actual cycle. Preserve the routing-required reset-bearing shape, but only
+  # label it floating after two observations prove that reset_at advances with
+  # observed_at. Replayed bodies keep a fixed reset and cannot pass this proof.
+  defp floating_model_weekly_attempt?(
+         %Evidence{
+           source: "codex_usage_api",
+           quota_scope: scope,
+           window_kind: "secondary",
+           window_minutes: 10_080,
+           used_percent: %Decimal{}
+         } = evidence,
+         %Quota.AccountQuotaWindow{reset_at: %DateTime{}, used_percent: %Decimal{}} = existing,
+         timestamp
+       )
+       when scope in ["model", "upstream_model"] do
+    zero_percent?(evidence.used_percent) and
+      relative_reset_metadata?(evidence.metadata) and
+      same_evidence_identity?(evidence, existing) and
+      newer_observation?(evidence.observed_at, existing.observed_at) and
+      Evidence.current_freshness_state(evidence, timestamp) == "fresh"
+  end
+
+  defp floating_model_weekly_attempt?(_evidence, _existing, _timestamp), do: false
+
+  defp floating_model_weekly_attrs(existing, attrs, evidence, timestamp) do
+    metadata = existing.metadata || %{}
+
+    case floating_model_weekly_decision(metadata, existing, evidence, timestamp) do
+      :accept ->
+        existing
+        |> accepted_snapshot_attrs(attrs, timestamp)
+        |> mark_floating_reset()
+
+      :keep ->
+        candidate_snapshot_attrs(existing, metadata, timestamp)
+
+      :restart ->
+        candidate_snapshot_attrs(
+          existing,
+          put_candidate(clear_candidate(metadata), evidence),
+          timestamp
+        )
+    end
+  end
+
+  defp floating_model_weekly_decision(metadata, existing, evidence, timestamp) do
+    if floating_reset?(metadata) and sliding_live_reset?(existing, evidence) do
+      :accept
+    else
+      floating_model_candidate_decision(metadata, evidence, timestamp)
+    end
+  end
+
+  defp floating_model_candidate_decision(metadata, evidence, timestamp) do
+    case parse_candidate(metadata) do
+      {:ok, candidate} ->
+        cond do
+          not newer_observation?(evidence.observed_at, candidate.observed_at) -> :keep
+          not consistent_sliding_candidate?(candidate, evidence, timestamp) -> :restart
+          confirmation_span_reached?(candidate, evidence) -> :accept
+          true -> :keep
+        end
+
+      :none ->
+        :restart
+    end
+  end
+
+  defp floating_reset?(metadata) when is_map(metadata),
+    do: Map.get(metadata, "reset_state") == "floating"
+
+  defp mark_floating_reset(attrs) do
+    Map.update!(attrs, :metadata, &Map.put(&1, "reset_state", "floating"))
   end
 
   # While the provider's anchored 5h windows are suspended (announced as
@@ -923,6 +1005,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
       |> Kernel.||(%{})
       |> Map.merge(Map.get(attrs, :metadata, %{}))
       |> clear_inherited_relative_reset_metadata(attrs)
+      |> clear_inherited_reset_state(attrs)
       |> clear_candidate()
 
     attrs
@@ -931,6 +1014,16 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     |> Map.put(:metadata, metadata)
     |> Map.put_new(:created_at, existing.created_at || timestamp)
     |> Map.put(:updated_at, timestamp)
+  end
+
+  defp clear_inherited_reset_state(metadata, attrs) do
+    incoming_metadata = Map.get(attrs, :metadata, %{})
+
+    if Map.has_key?(incoming_metadata, "reset_state") do
+      metadata
+    else
+      Map.delete(metadata, "reset_state")
+    end
   end
 
   defp clear_inherited_relative_reset_metadata(metadata, attrs) do

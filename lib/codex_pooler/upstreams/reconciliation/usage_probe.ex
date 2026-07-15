@@ -58,40 +58,51 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
           | {:continue_error, term()}
           | {:halt_error, term()}
   @type usage_probe_accumulator ::
-          usage_fetch_result() | {:auth_rejections, MapSet.t(String.t())}
+          usage_fetch_result()
+          | {:probe_failures, MapSet.t(String.t()), term() | nil}
 
   @spec reconciliation_source(UpstreamIdentity.t(), PoolUpstreamAssignment.t(), keyword()) ::
           {:usage, UpstreamIdentity.t(), Result.t()}
           | {:usage_rejected, UpstreamIdentity.t(), CredentialFencing.fence()}
-          | {:usage_unavailable, term()}
+          | {:usage_unavailable, term(), CredentialFencing.fence()}
+          | {:auth_unavailable, CredentialFencing.fence()}
           | :auth_unavailable
   def reconciliation_source(%UpstreamIdentity{} = identity, assignment, opts) do
     with chatgpt_account_id when is_binary(chatgpt_account_id) and chatgpt_account_id != "" <-
            identity.chatgpt_account_id,
-         {:ok, fenced_identity, fence} <- CredentialFencing.allocate_usage_probe(identity),
-         {:ok, access_token} <- Secrets.decrypt_active_secret(fenced_identity, "access_token"),
-         observed_at <- now() do
-      case fetch(fenced_identity, assignment, access_token, observed_at, opts) do
-        {:ok, %Result{} = result} ->
-          {:usage, fenced_identity, %{result | credential_fence: fence}}
-
-        {:error, :definitive_provider_auth_rejected} ->
-          {:usage_rejected, fenced_identity, fence}
-
-        {:error, {:upstream_status, status}} when status in [401, 403] ->
-          maybe_retry_after_token_refresh(
-            identity,
+         {:ok, fenced_identity, fence} <- CredentialFencing.allocate_usage_probe(identity) do
+      case Secrets.decrypt_active_secret(fenced_identity, "access_token") do
+        {:ok, access_token} ->
+          probe_reconciliation_source(
+            fenced_identity,
             assignment,
-            observed_at,
+            access_token,
+            now(),
             opts,
-            fence.credential_epoch
+            fence
           )
 
-        {:error, reason} ->
-          {:usage_unavailable, reason}
+        _unavailable ->
+          {:auth_unavailable, fence}
       end
     else
       _unavailable -> :auth_unavailable
+    end
+  end
+
+  defp probe_reconciliation_source(identity, assignment, access_token, observed_at, opts, fence) do
+    case fetch(identity, assignment, access_token, observed_at, opts) do
+      {:ok, %Result{} = result} ->
+        {:usage, identity, %{result | credential_fence: fence}}
+
+      {:error, :definitive_provider_auth_rejected} ->
+        {:usage_rejected, identity, fence}
+
+      {:error, {:upstream_status, status}} when status in [401, 403] ->
+        maybe_retry_after_token_refresh(identity, assignment, observed_at, opts, fence)
+
+      {:error, reason} ->
+        {:usage_unavailable, reason, fence}
     end
   end
 
@@ -185,32 +196,32 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
 
   defp metadata_usage_path(_metadata), do: nil
 
-  defp maybe_retry_after_token_refresh(identity, assignment, observed_at, opts, credential_epoch) do
+  defp maybe_retry_after_token_refresh(identity, assignment, observed_at, opts, fence) do
     if access_token_refresh_due_after_usage_auth_failure?(identity, observed_at) do
-      retry_after_token_refresh(identity, assignment, opts, credential_epoch)
+      retry_after_token_refresh(identity, assignment, opts, fence)
     else
-      {:usage_unavailable, {:upstream_status, :auth_rejected}}
+      {:usage_unavailable, {:upstream_status, :auth_rejected}, fence}
     end
   end
 
   # The expected epoch is the one the failed probe ran under: if credentials
   # rotated meanwhile, the refresh skips the provider call and hands back the
   # current active identity, and the usage fetch retries with its token.
-  defp retry_after_token_refresh(identity, assignment, opts, credential_epoch) do
+  defp retry_after_token_refresh(identity, assignment, opts, fence) do
     case TokenRefresh.refresh_access_token(identity,
            trigger_kind: "account_reconciliation",
            receive_timeout: Keyword.get(opts, :receive_timeout, 30_000),
-           expected_credential_epoch: credential_epoch
+           expected_credential_epoch: fence.credential_epoch
          ) do
       {:ok, %{status: :active, identity: refreshed_identity}} ->
         fetch_after_successful_token_refresh(refreshed_identity, assignment, opts)
 
       {:ok, %{status: :refresh_failed, retryable?: true, identity: failed_identity}} ->
         maybe_enqueue_account_reconciliation_token_refresh_recovery(failed_identity)
-        :auth_unavailable
+        {:auth_unavailable, fence}
 
       _unavailable ->
-        :auth_unavailable
+        {:auth_unavailable, fence}
     end
   end
 
@@ -225,20 +236,21 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
   end
 
   defp fetch_refreshed_probe(fenced_identity, assignment, fence, opts) do
-    with {:ok, access_token} <- Secrets.decrypt_active_secret(fenced_identity, "access_token"),
-         observed_at <- now() do
-      case fetch(fenced_identity, assignment, access_token, observed_at, opts) do
-        {:ok, %Result{} = result} ->
-          {:usage, fenced_identity, %{result | credential_fence: fence}}
+    case Secrets.decrypt_active_secret(fenced_identity, "access_token") do
+      {:ok, access_token} ->
+        case fetch(fenced_identity, assignment, access_token, now(), opts) do
+          {:ok, %Result{} = result} ->
+            {:usage, fenced_identity, %{result | credential_fence: fence}}
 
-        {:error, :definitive_provider_auth_rejected} ->
-          {:usage_rejected, fenced_identity, fence}
+          {:error, :definitive_provider_auth_rejected} ->
+            {:usage_rejected, fenced_identity, fence}
 
-        _unavailable ->
-          :auth_unavailable
-      end
-    else
-      _unavailable -> :auth_unavailable
+          {:error, reason} ->
+            {:usage_unavailable, reason, fence}
+        end
+
+      _unavailable ->
+        {:auth_unavailable, fence}
     end
   end
 
@@ -377,7 +389,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
          _retried_after_cookie?
        ) do
     CloudflareCookies.store_from_response(url, response)
-    {:halt_error, {:upstream_status, 429}}
+    {:continue_error, {:upstream_status, 429}}
   end
 
   defp handle_usage_response(
@@ -439,13 +451,21 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
 
   @spec finalize_usage_probe_result(usage_probe_accumulator(), [String.t()]) ::
           usage_fetch_result()
-  defp finalize_usage_probe_result({:auth_rejections, rejected_paths}, paths) do
+  defp finalize_usage_probe_result({:probe_failures, rejected_paths, reason}, paths) do
     expected_paths = MapSet.new(paths)
 
-    if MapSet.equal?(rejected_paths, expected_paths) do
-      {:error, :definitive_provider_auth_rejected}
-    else
-      {:error, {:upstream_status, 401}}
+    cond do
+      MapSet.equal?(rejected_paths, expected_paths) and is_nil(reason) ->
+        {:error, :definitive_provider_auth_rejected}
+
+      MapSet.size(rejected_paths) > 0 and not is_nil(reason) ->
+        {:error, {:mixed_auth_rejection, reason}}
+
+      MapSet.size(rejected_paths) > 0 ->
+        {:error, {:upstream_status, 401}}
+
+      true ->
+        {:error, reason}
     end
   end
 
@@ -520,25 +540,70 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
           {:cont, usage_probe_accumulator()} | {:halt, usage_probe_accumulator()}
   defp reduce_usage_probe_result(:not_found, last_result), do: {:cont, last_result}
 
-  defp reduce_usage_probe_result({:auth_rejected, _path}, {:ok, %Result{}} = last_result),
-    do: {:halt, last_result}
+  defp reduce_usage_probe_result({:auth_rejected, _path}, {:ok, %Result{}}),
+    do: {:halt, {:error, :definitive_provider_auth_rejected}}
 
-  defp reduce_usage_probe_result({:auth_rejected, path}, {:auth_rejections, paths}),
-    do: {:cont, {:auth_rejections, MapSet.put(paths, path)}}
+  defp reduce_usage_probe_result(
+         {:auth_rejected, path},
+         {:probe_failures, paths, reason}
+       ),
+       do: {:cont, {:probe_failures, MapSet.put(paths, path), reason}}
 
   defp reduce_usage_probe_result({:auth_rejected, path}, _last_result),
-    do: {:cont, {:auth_rejections, MapSet.new([path])}}
+    do: {:cont, {:probe_failures, MapSet.new([path]), nil}}
+
+  defp reduce_usage_probe_result(
+         {:halt_error, {:upstream_status, status} = reason},
+         {:ok, %Result{}}
+       )
+       when status in [401, 403],
+       do: {:halt, {:error, reason}}
 
   defp reduce_usage_probe_result({:halt_error, _reason}, {:ok, %Result{}} = last_result),
     do: {:halt, last_result}
 
+  defp reduce_usage_probe_result(
+         {:halt_error, reason},
+         {:probe_failures, paths, _previous_reason}
+       ) do
+    if MapSet.size(paths) > 0,
+      do: {:halt, {:error, {:mixed_auth_rejection, reason}}},
+      else: {:halt, {:error, reason}}
+  end
+
   defp reduce_usage_probe_result({:halt_error, reason}, _last_result),
     do: {:halt, {:error, reason}}
 
-  defp reduce_usage_probe_result({:continue_error, reason}, last_result),
-    do: {:cont, accumulate_successful_usage_result(last_result, {:error, reason})}
+  defp reduce_usage_probe_result(
+         {:continue_error, reason},
+         {:probe_failures, paths, _previous_reason}
+       ),
+       do: {:cont, {:probe_failures, paths, reason}}
 
-  defp reduce_usage_probe_result({:ok, %Result{windows: windows}} = result, last_result) do
+  defp reduce_usage_probe_result({:continue_error, _reason}, {:ok, %Result{}} = last_result),
+    do: {:cont, last_result}
+
+  defp reduce_usage_probe_result({:continue_error, reason}, _last_result),
+    do: {:cont, {:probe_failures, MapSet.new(), reason}}
+
+  defp reduce_usage_probe_result(
+         {:ok, %Result{}} = result,
+         {:probe_failures, rejected_paths, _reason} = last_result
+       ) do
+    if MapSet.size(rejected_paths) > 0 do
+      {:halt, {:error, :definitive_provider_auth_rejected}}
+    else
+      reduce_successful_usage_result(result, last_result)
+    end
+  end
+
+  defp reduce_usage_probe_result({:ok, %Result{}} = result, last_result),
+    do: reduce_successful_usage_result(result, last_result)
+
+  defp reduce_successful_usage_result(
+         {:ok, %Result{windows: windows}} = result,
+         last_result
+       ) do
     if account_primary_usage_window?(windows) do
       {:halt, prefer_current_usage_result(last_result, result)}
     else
@@ -561,9 +626,6 @@ defmodule CodexPooler.Upstreams.Reconciliation.UsageProbe do
        ) do
     {:ok, merge_results(previous, current, :previous)}
   end
-
-  defp accumulate_successful_usage_result({:ok, %Result{}} = result, _new_result),
-    do: result
 
   defp accumulate_successful_usage_result(_last_result, new_result), do: new_result
 

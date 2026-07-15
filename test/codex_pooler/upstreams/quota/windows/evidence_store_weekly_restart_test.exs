@@ -73,6 +73,71 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
     )
   end
 
+  defp model_weekly(observed_at, used_percent, opts \\ []) do
+    reset_at = Keyword.get(opts, :reset_at, DateTime.add(observed_at, @window_seconds, :second))
+
+    %{
+      quota_key: "codex_spark",
+      window_kind: "secondary",
+      window_minutes: 10_080,
+      used_percent: Decimal.new(used_percent),
+      reset_at: reset_at,
+      observed_at: observed_at,
+      last_sync_at: observed_at,
+      source: "codex_usage_api",
+      source_precision: "observed",
+      quota_scope: "model",
+      quota_family: "codex_model",
+      model: "gpt-5.3-codex-spark",
+      freshness_state: "fresh",
+      metadata: %{"reset_after_seconds" => @window_seconds}
+    }
+  end
+
+  defp model_weekly_row(identity) do
+    Repo.one(
+      from w in AccountQuotaWindow,
+        where:
+          w.upstream_identity_id == ^identity.id and w.quota_key == "codex_spark" and
+            w.window_kind == "secondary" and w.source == "codex_usage_api"
+    )
+  end
+
+  defp spark_weekly_payload(used_percent, reset_at) do
+    %{
+      "additional_rate_limits" => [
+        %{
+          "limit_name" => "GPT-5.3-Codex-Spark",
+          "metered_feature" => "codex_bengalfox",
+          "model" => "gpt-5.3-codex-spark",
+          "rate_limit" => %{
+            "primary_window" => %{
+              "used_percent" => used_percent,
+              "limit_window_seconds" => @window_seconds,
+              "reset_after_seconds" => @window_seconds,
+              "reset_at" => DateTime.to_iso8601(reset_at)
+            }
+          }
+        }
+      ]
+    }
+  end
+
+  defp record_spark_payload!(identity, payload, observed_at) do
+    assert {:ok, windows} = Windows.codex_usage_quota_windows_from_payload(payload, observed_at)
+
+    assert [spark_weekly] =
+             Enum.filter(
+               windows,
+               &(&1.quota_key == "codex_spark" and &1.window_kind == "secondary")
+             )
+
+    assert spark_weekly.quota_scope == "model"
+    assert spark_weekly.metadata["reset_after_seconds"] == @window_seconds
+    assert {:ok, row} = Windows.record_evidence(identity, spark_weekly, observed_at)
+    row
+  end
+
   test "sliding live restart observations converge an exhausted weekly account" do
     t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
     identity = identity!()
@@ -225,5 +290,150 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
     # the row still exists with a valid percent.
     row = account_row(identity)
     assert row
+  end
+
+  test "sliding model weekly zeros become explicitly floating after confirmation" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    stale_reset = DateTime.add(t0, 3, :day)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(
+               identity,
+               model_weekly(t0, "0", reset_at: stale_reset),
+               t0
+             )
+
+    t1 = DateTime.add(t0, 300, :second)
+    assert {:ok, _row} = Windows.record_evidence(identity, model_weekly(t1, "0"), t1)
+
+    row = model_weekly_row(identity)
+    assert DateTime.compare(row.reset_at, stale_reset) == :eq
+    refute row.metadata["reset_state"] == "floating"
+
+    t2 = DateTime.add(t1, 240, :second)
+    assert {:ok, _row} = Windows.record_evidence(identity, model_weekly(t2, "0"), t2)
+
+    row = model_weekly_row(identity)
+    assert row.metadata["reset_state"] == "floating"
+    assert Decimal.equal?(row.used_percent, Decimal.new("0"))
+    assert DateTime.compare(row.reset_at, DateTime.add(t2, @window_seconds, :second)) == :eq
+    assert DateTime.compare(row.observed_at, t2) == :eq
+  end
+
+  test "confirmed floating model weekly zero clears prior-cycle usage" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    stale_reset = DateTime.add(t0, 3, :day)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(
+               identity,
+               model_weekly(t0, "64", reset_at: stale_reset),
+               t0
+             )
+
+    t1 = DateTime.add(t0, 300, :second)
+    assert {:ok, _row} = Windows.record_evidence(identity, model_weekly(t1, "0"), t1)
+    t2 = DateTime.add(t1, 240, :second)
+    assert {:ok, _row} = Windows.record_evidence(identity, model_weekly(t2, "0"), t2)
+
+    row = model_weekly_row(identity)
+    assert row.metadata["reset_state"] == "floating"
+    assert Decimal.equal?(row.used_percent, Decimal.new("0"))
+  end
+
+  test "cached model weekly zero never becomes floating or clears prior usage" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_reset = DateTime.add(t0, 3, :day)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(
+               identity,
+               model_weekly(t0, "64", reset_at: fixed_reset),
+               t0
+             )
+
+    for offset <- [300, 540] do
+      observed_at = DateTime.add(t0, offset, :second)
+
+      assert {:ok, _row} =
+               Windows.record_evidence(
+                 identity,
+                 model_weekly(observed_at, "0", reset_at: fixed_reset),
+                 observed_at
+               )
+    end
+
+    row = model_weekly_row(identity)
+    refute row.metadata["reset_state"] == "floating"
+    assert Decimal.equal?(row.used_percent, Decimal.new("64"))
+    assert DateTime.compare(row.reset_at, fixed_reset) == :eq
+  end
+
+  test "positive model usage anchors a previously floating weekly window" do
+    t0 = DateTime.utc_now() |> DateTime.add(-10, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+
+    assert {:ok, _row} = Windows.record_evidence(identity, model_weekly(t0, "0"), t0)
+
+    t1 = DateTime.add(t0, 60, :second)
+    assert {:ok, _row} = Windows.record_evidence(identity, model_weekly(t1, "0"), t1)
+    t2 = DateTime.add(t1, 240, :second)
+    assert {:ok, _row} = Windows.record_evidence(identity, model_weekly(t2, "0"), t2)
+    assert model_weekly_row(identity).metadata["reset_state"] == "floating"
+
+    anchored_reset = DateTime.add(t2, @window_seconds, :second)
+    t3 = DateTime.add(t2, 60, :second)
+
+    assert {:ok, _row} =
+             Windows.record_evidence(
+               identity,
+               model_weekly(t3, "2", reset_at: anchored_reset),
+               t3
+             )
+
+    row = model_weekly_row(identity)
+    refute Map.has_key?(row.metadata, "reset_state")
+    assert Decimal.equal?(row.used_percent, Decimal.new("2"))
+    assert DateTime.compare(row.reset_at, anchored_reset) == :eq
+  end
+
+  test "parsed Spark payload requires a moving absolute reset before marking it floating" do
+    t0 = DateTime.utc_now() |> DateTime.add(-20, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    fixed_reset = DateTime.add(t0, 3, :day)
+
+    record_spark_payload!(identity, spark_weekly_payload(64, fixed_reset), t0)
+
+    cached_zero = spark_weekly_payload(0, fixed_reset)
+
+    for offset <- [300, 540] do
+      observed_at = DateTime.add(t0, offset, :second)
+      record_spark_payload!(identity, cached_zero, observed_at)
+    end
+
+    cached_row = model_weekly_row(identity)
+    refute cached_row.metadata["reset_state"] == "floating"
+    assert Decimal.equal?(cached_row.used_percent, Decimal.new("64"))
+    assert DateTime.compare(cached_row.reset_at, fixed_reset) == :eq
+
+    t3 = DateTime.add(t0, 600, :second)
+
+    record_spark_payload!(
+      identity,
+      spark_weekly_payload(0, DateTime.add(t3, @window_seconds)),
+      t3
+    )
+
+    t4 = DateTime.add(t3, 240, :second)
+    moving_reset = DateTime.add(t4, @window_seconds)
+    record_spark_payload!(identity, spark_weekly_payload(0, moving_reset), t4)
+
+    live_row = model_weekly_row(identity)
+    assert live_row.metadata["reset_state"] == "floating"
+    assert Decimal.equal?(live_row.used_percent, Decimal.new("0"))
+    assert DateTime.compare(live_row.reset_at, moving_reset) == :eq
   end
 end

@@ -9,7 +9,7 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
   alias CodexPooler.Quotas.{Evidence, WindowClassifier}
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
-  alias CodexPooler.Upstreams.Quota
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
@@ -17,8 +17,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
   @stale_after_seconds 25 * 60
   @successful_partial_codes ~w(catalog_sync_failed catalog_sync_in_progress)
   @catalog_sync_skipped_triggers ~w(scheduled gateway)
+  @active UpstreamIdentity.active_status()
   @paused UpstreamIdentity.paused_status()
+  @refresh_failed UpstreamIdentity.refresh_failed_status()
   @reauth_required UpstreamIdentity.reauth_required_status()
+  @assignment_active PoolUpstreamAssignment.active_status()
   @assignment_paused PoolUpstreamAssignment.paused_status()
   @assignment_reauth_required PoolUpstreamAssignment.reauth_required_status()
 
@@ -43,39 +46,27 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
   end
 
   defp run_reconciliation(pool_id, assignment_id, trigger_kind) do
-    mark_refreshing(pool_id, assignment_id, trigger_kind)
+    priming_fence = priming_fence(pool_id, assignment_id)
+    mark_refreshing(pool_id, assignment_id, trigger_kind, priming_fence)
 
     case PoolReconciliation.reconcile_pool_account(pool_id, assignment_id, record_summary?: false) do
       {:ok, result} ->
         catalog_step = reconcile_catalog(pool_id, trigger_kind)
         status = summarize_status([result.health, result.quota, catalog_step])
 
-        assignment =
-          record_quota_priming_result!(
-            result.assignment,
-            result.identity,
-            status,
-            trigger_kind,
-            result.quota
-          )
+        case finalize_terminal_result(result, catalog_step, status, trigger_kind) do
+          {:ok, finalized_result} ->
+            broadcast_job_result(pool_id, "account_reconciliation", {:ok, finalized_result})
+            {:ok, finalized_result}
 
-        result =
-          %{
-            status: status,
-            trigger_kind: trigger_kind,
-            assignment: assignment,
-            identity: result.identity,
-            health: result.health,
-            quota: result.quota,
-            catalog: catalog_step
-          }
-
-        result = maybe_record_result!(result)
-        broadcast_job_result(pool_id, "account_reconciliation", {:ok, result})
-        {:ok, result}
+          {:error, reason} ->
+            mark_failed(pool_id, assignment_id, trigger_kind, reason, priming_fence)
+            broadcast_job_result(pool_id, "account_reconciliation", {:error, reason})
+            {:error, reason}
+        end
 
       {:error, reason} ->
-        mark_failed(pool_id, assignment_id, trigger_kind, reason)
+        mark_failed(pool_id, assignment_id, trigger_kind, reason, priming_fence)
         broadcast_job_result(pool_id, "account_reconciliation", {:error, reason})
         {:error, reason}
     end
@@ -108,10 +99,52 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
       |> Repo.all()
       |> Enum.filter(&stale_quota_priming?(&1, cutoff))
       |> Enum.reduce(0, fn assignment, count ->
-        priming = assignment.metadata["quota_priming"] || %{}
+        if fail_stale_priming(assignment, now, cutoff), do: count + 1, else: count
+      end)
 
-        {:ok, _assignment} =
-          Quota.PrimingState.record(assignment.pool_id, assignment, %{
+    {:ok, %{stale_account_reconciliations_failed: failed_count}}
+  end
+
+  defp fail_stale_priming(assignment, now, cutoff) do
+    result =
+      CredentialFencing.guard_active_reconciliation(
+        assignment.upstream_identity_id,
+        :auth_failure,
+        fn locked_identity ->
+          case Repo.get(PoolUpstreamAssignment, assignment.id) do
+            %PoolUpstreamAssignment{} = current_assignment ->
+              persist_stale_priming_failure(
+                current_assignment,
+                locked_identity,
+                now,
+                cutoff
+              )
+
+            nil ->
+              {:ok, :unchanged}
+          end
+        end
+      )
+
+    case result do
+      {:ok, :applied, _identity, %PoolUpstreamAssignment{} = failed_assignment} ->
+        broadcast_priming_state(failed_assignment)
+        true
+
+      _result ->
+        false
+    end
+  end
+
+  defp persist_stale_priming_failure(assignment, identity, now, cutoff) do
+    if assignment.status == @assignment_active and stale_quota_priming?(assignment, cutoff) and
+         stale_priming_epoch_current?(assignment, identity) do
+      priming = assignment.metadata["quota_priming"] || %{}
+
+      assignment
+      |> PoolUpstreamAssignment.changeset(%{
+        metadata:
+          Map.put(assignment.metadata, "quota_priming", %{
             "status" => "failed",
             "trigger_kind" => Map.get(priming, "trigger_kind", "unknown"),
             "started_at" => Map.get(priming, "started_at"),
@@ -121,11 +154,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
               "message" => "account reconciliation timed out before completion"
             }
           })
-
-        count + 1
-      end)
-
-    {:ok, %{stale_account_reconciliations_failed: failed_count}}
+      })
+      |> Repo.update()
+    else
+      {:ok, :unchanged}
+    end
   end
 
   @spec discard_stale_jobs(DateTime.t(), String.t()) :: {non_neg_integer(), nil | [term()]}
@@ -170,20 +203,300 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
     %{result | assignment: assignment}
   end
 
-  defp mark_refreshing(pool_id, assignment_id, trigger_kind) do
-    Quota.PrimingState.record(pool_id, assignment_id, %{
-      "status" => "refreshing",
-      "trigger_kind" => trigger_kind,
-      "started_at" => timestamp_iso()
-    })
+  defp finalize_terminal_result(result, catalog_step, status, trigger_kind) do
+    apply = fn locked_identity ->
+      finalize_locked_terminal_result(result, locked_identity, catalog_step, status, trigger_kind)
+    end
+
+    result.identity
+    |> guard_terminal_result(result.quota, apply)
+    |> normalize_terminal_result(result, catalog_step, trigger_kind)
   end
 
-  defp mark_failed(pool_id, assignment_id, trigger_kind, reason) do
-    Quota.PrimingState.record(pool_id, assignment_id, %{
-      "status" => "failed",
-      "trigger_kind" => trigger_kind,
-      "finished_at" => timestamp_iso(),
-      "reason" => sanitized_reason(reason)
+  defp guard_terminal_result(
+         identity,
+         %{code: "quota_refresh_auth_unavailable", credential_fence: fence},
+         apply
+       ) do
+    CredentialFencing.guard_current_usage_probe_completion(identity, fence, :auth_failure, apply)
+  end
+
+  defp guard_terminal_result(identity, %{credential_fence: fence}, apply) do
+    CredentialFencing.guard_current_usage_probe_completion(identity, fence, :active_only, apply)
+  end
+
+  defp guard_terminal_result(
+         identity,
+         %{expected_credential_epoch: expected_credential_epoch},
+         apply
+       ) do
+    CredentialFencing.guard_active_reconciliation_epoch(
+      identity,
+      expected_credential_epoch,
+      apply
+    )
+  end
+
+  defp guard_terminal_result(identity, _quota_step, apply) do
+    CredentialFencing.guard_active_reconciliation(identity, apply)
+  end
+
+  defp finalize_locked_terminal_result(result, identity, catalog_step, status, trigger_kind) do
+    case Repo.get(PoolUpstreamAssignment, result.assignment.id) do
+      %PoolUpstreamAssignment{status: @assignment_active} = assignment ->
+        result = %{
+          status: status,
+          trigger_kind: trigger_kind,
+          assignment: assignment,
+          identity: identity,
+          health: result.health,
+          quota: Map.put(result.quota, :identity, identity),
+          catalog: catalog_step
+        }
+
+        assignment =
+          record_quota_priming_result!(
+            assignment,
+            identity,
+            status,
+            trigger_kind,
+            result.quota
+          )
+
+        {:ok, {:finalized, result |> Map.put(:assignment, assignment) |> maybe_record_result!()}}
+
+      %PoolUpstreamAssignment{} = assignment ->
+        {:ok, {:assignment_superseded, assignment}}
+
+      nil ->
+        {:ok, {:assignment_superseded, nil}}
+    end
+  end
+
+  defp normalize_terminal_result(
+         {:ok, :applied, _identity, {:finalized, result}},
+         _initial_result,
+         _catalog_step,
+         _trigger_kind
+       ) do
+    broadcast_priming_state(result.assignment)
+    {:ok, result}
+  end
+
+  defp normalize_terminal_result(
+         {:ok, :applied, identity, {:assignment_superseded, assignment}},
+         result,
+         catalog_step,
+         trigger_kind
+       ) do
+    {:ok,
+     superseded_terminal_result(
+       result,
+       assignment || result.assignment,
+       identity,
+       catalog_step,
+       trigger_kind
+     )}
+  end
+
+  defp normalize_terminal_result(
+         {:ok, :superseded, identity, nil},
+         result,
+         catalog_step,
+         trigger_kind
+       ) do
+    assignment = Repo.get(PoolUpstreamAssignment, result.assignment.id) || result.assignment
+    {:ok, superseded_terminal_result(result, assignment, identity, catalog_step, trigger_kind)}
+  end
+
+  defp normalize_terminal_result(
+         {:error, reason},
+         _result,
+         _catalog_step,
+         _trigger_kind
+       ),
+       do: {:error, reason}
+
+  defp superseded_terminal_result(result, assignment, identity, catalog_step, trigger_kind) do
+    quota_step = superseded_terminal_quota_step(result.quota, identity)
+    status = summarize_status([result.health, quota_step, catalog_step])
+
+    %{
+      status: status,
+      trigger_kind: trigger_kind,
+      assignment: assignment,
+      identity: identity,
+      health: result.health,
+      quota: quota_step,
+      catalog: catalog_step
+    }
+  end
+
+  defp superseded_terminal_quota_step(
+         %{
+           code: "quota_refresh_auth_unavailable",
+           credential_fence: %{credential_epoch: credential_epoch}
+         } = quota_step,
+         %UpstreamIdentity{status: status} = identity
+       )
+       when status in [@reauth_required, @refresh_failed] do
+    if CredentialFencing.current_credential_epoch?(identity, credential_epoch) do
+      Map.put(quota_step, :identity, identity)
+    else
+      superseded_quota_step(identity)
+    end
+  end
+
+  defp superseded_terminal_quota_step(_quota_step, identity) do
+    superseded_quota_step(identity)
+  end
+
+  defp superseded_quota_step(identity) do
+    step(:skipped, "quota_refresh_superseded", "quota refresh was superseded")
+    |> Map.put(:identity, identity)
+  end
+
+  defp mark_refreshing(pool_id, assignment_id, trigger_kind, priming_fence) do
+    record_active_priming_state(
+      pool_id,
+      assignment_id,
+      priming_fence,
+      :active_only,
+      %{
+        "status" => "refreshing",
+        "trigger_kind" => trigger_kind,
+        "started_at" => timestamp_iso()
+      }
+    )
+  end
+
+  defp mark_failed(pool_id, assignment_id, trigger_kind, reason, priming_fence) do
+    record_active_priming_state(
+      pool_id,
+      assignment_id,
+      priming_fence,
+      :auth_failure,
+      %{
+        "status" => "failed",
+        "trigger_kind" => trigger_kind,
+        "finished_at" => timestamp_iso(),
+        "reason" => sanitized_reason(reason)
+      }
+    )
+  end
+
+  defp priming_fence(pool_id, assignment_id) do
+    Repo.one(
+      from assignment in PoolUpstreamAssignment,
+        join: identity in UpstreamIdentity,
+        on: identity.id == assignment.upstream_identity_id,
+        where:
+          assignment.id == ^assignment_id and assignment.pool_id == ^pool_id and
+            assignment.status == ^@assignment_active and
+            identity.status == ^UpstreamIdentity.active_status(),
+        limit: 1,
+        select: identity
+    )
+    |> case do
+      %UpstreamIdentity{} = identity ->
+        %{
+          identity_id: identity.id,
+          credential_epoch: CredentialFencing.credential_epoch(identity)
+        }
+
+      nil ->
+        nil
+    end
+  end
+
+  defp record_active_priming_state(
+         pool_id,
+         assignment_id,
+         %{identity_id: identity_id, credential_epoch: credential_epoch},
+         mode,
+         attrs
+       ) do
+    attrs = Map.put(attrs, "credential_epoch", credential_epoch)
+
+    result =
+      CredentialFencing.guard_active_reconciliation(identity_id, mode, fn locked_identity ->
+        persist_active_priming_state(
+          pool_id,
+          assignment_id,
+          locked_identity,
+          credential_epoch,
+          attrs
+        )
+      end)
+
+    broadcast_active_priming_state(result, pool_id)
+  end
+
+  defp record_active_priming_state(
+         _pool_id,
+         _assignment_id,
+         _priming_fence,
+         _mode,
+         _attrs
+       ),
+       do: {:ok, :superseded}
+
+  defp persist_active_priming_state(
+         pool_id,
+         assignment_id,
+         locked_identity,
+         credential_epoch,
+         attrs
+       ) do
+    assignment =
+      Repo.one(
+        from assignment in PoolUpstreamAssignment,
+          where:
+            assignment.id == ^assignment_id and assignment.pool_id == ^pool_id and
+              assignment.upstream_identity_id == ^locked_identity.id and
+              assignment.status == ^@assignment_active,
+          limit: 1
+      )
+
+    persist_current_priming_state(assignment, locked_identity, credential_epoch, attrs)
+  end
+
+  defp persist_current_priming_state(
+         %PoolUpstreamAssignment{} = assignment,
+         locked_identity,
+         credential_epoch,
+         attrs
+       ) do
+    if CredentialFencing.current_credential_epoch?(locked_identity, credential_epoch) do
+      assignment
+      |> PoolUpstreamAssignment.changeset(%{
+        metadata: Map.put(assignment.metadata || %{}, "quota_priming", attrs)
+      })
+      |> Repo.update()
+    else
+      {:ok, :superseded}
+    end
+  end
+
+  defp persist_current_priming_state(_assignment, _identity, _credential_epoch, _attrs),
+    do: {:ok, :superseded}
+
+  defp broadcast_active_priming_state(
+         {:ok, :applied, _identity, %PoolUpstreamAssignment{} = assignment} = result,
+         _pool_id
+       ) do
+    broadcast_priming_state(assignment)
+    result
+  end
+
+  defp broadcast_active_priming_state(result, _pool_id), do: result
+
+  defp broadcast_priming_state(%PoolUpstreamAssignment{} = assignment) do
+    Events.broadcast_upstreams_after_commit(assignment.pool_id, "quota_priming_updated", %{
+      assignment_id: assignment.id,
+      upstream_identity_id: assignment.upstream_identity_id,
+      assignment_status: assignment.status,
+      quota_priming_status: get_in(assignment.metadata || %{}, ["quota_priming", "status"])
     })
   end
 
@@ -221,12 +534,23 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
           "upstream accounts requiring reauthentication are skipped by account reconciliation"
         )
 
-      _other ->
-        nil
+      statuses ->
+        inactive_reconciliation_reason(statuses)
     end
   end
 
   defp skipped_reconciliation_target(_pool_id, _assignment_id), do: nil
+
+  defp inactive_reconciliation_reason({@assignment_active, @active}), do: nil
+
+  defp inactive_reconciliation_reason({_assignment_status, _identity_status}) do
+    skipped_reconciliation_reason(
+      :upstream_account_inactive,
+      "inactive upstream accounts are skipped by account reconciliation"
+    )
+  end
+
+  defp inactive_reconciliation_reason(_statuses), do: nil
 
   defp skipped_reconciliation_reason(code, message), do: %{code: code, message: message}
 
@@ -294,7 +618,12 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
       |> quota_priming_details(trigger_kind, summary)
       |> maybe_put_failure_reason(quota_step)
 
-    {:ok, assignment} = Quota.PrimingState.record(assignment.pool_id, assignment, details)
+    {:ok, assignment} =
+      assignment
+      |> PoolUpstreamAssignment.changeset(%{
+        metadata: Map.put(assignment.metadata || %{}, "quota_priming", details)
+      })
+      |> Repo.update()
 
     assignment
   end
@@ -392,7 +721,11 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
   defp maybe_put_failure_reason(details, _quota_step), do: details
 
   defp stale_quota_priming?(
-         %{metadata: %{"quota_priming" => %{"started_at" => started_at}}},
+         %{
+           metadata: %{
+             "quota_priming" => %{"status" => "refreshing", "started_at" => started_at}
+           }
+         },
          cutoff
        )
        when is_binary(started_at) do
@@ -403,6 +736,13 @@ defmodule CodexPooler.Upstreams.Reconciliation.AccountReconciliation do
   end
 
   defp stale_quota_priming?(_assignment, _cutoff), do: false
+
+  defp stale_priming_epoch_current?(assignment, identity) do
+    priming_epoch = get_in(assignment.metadata || %{}, ["quota_priming", "credential_epoch"])
+    current_epoch = CredentialFencing.credential_epoch(identity)
+
+    priming_epoch == current_epoch or (is_nil(priming_epoch) and current_epoch == 1)
+  end
 
   defp sanitized_reason(%{code: code, message: message}) when is_binary(message),
     do: %{"code" => to_string(code), "message" => sanitized_message(message)}

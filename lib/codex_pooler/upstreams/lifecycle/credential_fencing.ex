@@ -11,6 +11,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
   @credential_epoch_key "credential_epoch"
   @probe_sequence_key "usage_probe_sequence"
   @applied_sequence_key "usage_probe_applied_sequence"
+  @completed_sequence_key "usage_probe_completed_sequence"
   @provider_auth_recovery_key "provider_auth_recovery"
   @assignment_deleted PoolUpstreamAssignment.deleted_status()
   @assignment_health_active PoolUpstreamAssignment.active_health_status()
@@ -18,6 +19,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
   @assignment_eligible PoolUpstreamAssignment.eligible_status()
   @assignment_ineligible PoolUpstreamAssignment.ineligible_status()
   @active UpstreamIdentity.active_status()
+  @refresh_failed UpstreamIdentity.refresh_failed_status()
   @reauth_required UpstreamIdentity.reauth_required_status()
 
   @type fence :: %{
@@ -25,6 +27,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
           required(:usage_probe_sequence) => pos_integer()
         }
   @type guarded_result :: :applied | :superseded
+  @type probe_completion_mode :: :active_only | :auth_failure
 
   @spec initialize_metadata(map() | nil) :: map()
   def initialize_metadata(metadata) do
@@ -33,6 +36,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
     |> Map.put_new(@credential_epoch_key, 1)
     |> Map.put_new(@probe_sequence_key, 0)
     |> Map.put_new(@applied_sequence_key, 0)
+    |> Map.put_new(@completed_sequence_key, 0)
   end
 
   @spec advance_credential_epoch(UpstreamIdentity.t()) :: map()
@@ -148,12 +152,14 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
 
         true ->
           timestamp = now()
+          assignments = provider_auth_rejection_assignments(identity.id)
 
           metadata =
             identity.metadata
             |> applied_metadata(fence)
             |> provider_rejection_metadata(timestamp)
             |> put_provider_auth_recovery("terminal", timestamp)
+            |> put_provider_auth_recovery_assignment_ids(assignments)
 
           identity =
             identity
@@ -165,19 +171,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
             })
             |> Repo.update!()
 
-          Repo.update_all(
-            from(assignment in PoolUpstreamAssignment,
-              where:
-                assignment.upstream_identity_id == ^identity.id and
-                  assignment.status != ^@assignment_deleted
-            ),
-            set: [
-              health_status: @assignment_disabled,
-              eligibility_status: @assignment_ineligible,
-              disabled_at: timestamp,
-              updated_at: timestamp
-            ]
-          )
+          demote_assignments_for_provider_auth_rejection!(assignments, timestamp)
 
           {:applied, identity}
       end
@@ -230,11 +224,239 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
     end
   end
 
+  @spec guard_active_usage_probe_completion(
+          UpstreamIdentity.t() | Ecto.UUID.t(),
+          fence(),
+          (UpstreamIdentity.t() -> {:ok, term()} | {:error, term()})
+        ) :: {:ok, guarded_result(), UpstreamIdentity.t(), term() | nil} | {:error, term()}
+  def guard_active_usage_probe_completion(identity_or_id, fence, apply)
+      when is_function(apply, 1) do
+    guard_active_usage_probe_completion(identity_or_id, fence, :active_only, apply)
+  end
+
+  @spec guard_active_usage_probe_completion(
+          UpstreamIdentity.t() | Ecto.UUID.t(),
+          fence(),
+          probe_completion_mode(),
+          (UpstreamIdentity.t() -> {:ok, term()} | {:error, term()})
+        ) :: {:ok, guarded_result(), UpstreamIdentity.t(), term() | nil} | {:error, term()}
+  def guard_active_usage_probe_completion(identity_or_id, fence, mode, apply)
+      when mode in [:active_only, :auth_failure] and is_function(apply, 1) do
+    Repo.transaction(fn ->
+      identity_or_id
+      |> lock_credential_replacement()
+      |> guard_active_probe_completion(fence, mode, apply)
+    end)
+    |> normalize_guarded_probe_completion()
+  end
+
+  @spec guard_current_usage_probe_completion(
+          UpstreamIdentity.t() | Ecto.UUID.t(),
+          fence(),
+          (UpstreamIdentity.t() -> {:ok, term()} | {:error, term()})
+        ) :: {:ok, guarded_result(), UpstreamIdentity.t(), term() | nil} | {:error, term()}
+  def guard_current_usage_probe_completion(identity_or_id, fence, apply)
+      when is_function(apply, 1) do
+    guard_current_usage_probe_completion(identity_or_id, fence, :active_only, apply)
+  end
+
+  @spec guard_current_usage_probe_completion(
+          UpstreamIdentity.t() | Ecto.UUID.t(),
+          fence(),
+          probe_completion_mode(),
+          (UpstreamIdentity.t() -> {:ok, term()} | {:error, term()})
+        ) :: {:ok, guarded_result(), UpstreamIdentity.t(), term() | nil} | {:error, term()}
+  def guard_current_usage_probe_completion(identity_or_id, fence, mode, apply)
+      when mode in [:active_only, :auth_failure] and is_function(apply, 1) do
+    Repo.transaction(fn ->
+      identity_or_id
+      |> lock_credential_replacement()
+      |> guard_current_probe_completion(fence, mode, apply)
+    end)
+    |> normalize_guarded_probe_completion()
+  end
+
+  @spec guard_active_reconciliation(
+          UpstreamIdentity.t() | Ecto.UUID.t(),
+          (UpstreamIdentity.t() -> {:ok, term()} | {:error, term()})
+        ) :: {:ok, guarded_result(), UpstreamIdentity.t(), term() | nil} | {:error, term()}
+  def guard_active_reconciliation(identity_or_id, apply) when is_function(apply, 1) do
+    guard_active_reconciliation(identity_or_id, :active_only, apply)
+  end
+
+  @spec guard_active_reconciliation(
+          UpstreamIdentity.t() | Ecto.UUID.t(),
+          probe_completion_mode(),
+          (UpstreamIdentity.t() -> {:ok, term()} | {:error, term()})
+        ) :: {:ok, guarded_result(), UpstreamIdentity.t(), term() | nil} | {:error, term()}
+  def guard_active_reconciliation(identity_or_id, mode, apply)
+      when mode in [:active_only, :auth_failure] and is_function(apply, 1) do
+    Repo.transaction(fn ->
+      case lock_credential_replacement(identity_or_id) do
+        nil ->
+          Repo.rollback(:upstream_identity_not_found)
+
+        %UpstreamIdentity{status: @active} = identity ->
+          apply_guarded_completion(identity, apply)
+
+        %UpstreamIdentity{status: @refresh_failed} = identity when mode == :auth_failure ->
+          apply_guarded_completion(identity, apply)
+
+        identity ->
+          {:superseded, identity, nil}
+      end
+    end)
+    |> normalize_guarded_probe_completion()
+  end
+
+  @spec guard_active_reconciliation_epoch(
+          UpstreamIdentity.t() | Ecto.UUID.t(),
+          non_neg_integer(),
+          (UpstreamIdentity.t() -> {:ok, term()} | {:error, term()})
+        ) :: {:ok, guarded_result(), UpstreamIdentity.t(), term() | nil} | {:error, term()}
+  def guard_active_reconciliation_epoch(identity_or_id, expected_credential_epoch, apply)
+      when is_integer(expected_credential_epoch) and is_function(apply, 1) do
+    Repo.transaction(fn ->
+      case lock_credential_replacement(identity_or_id) do
+        nil ->
+          Repo.rollback(:upstream_identity_not_found)
+
+        %UpstreamIdentity{status: @active} = identity ->
+          apply_guarded_epoch_completion(identity, expected_credential_epoch, apply)
+
+        identity ->
+          {:superseded, identity, nil}
+      end
+    end)
+    |> normalize_guarded_probe_completion()
+  end
+
+  defp apply_guarded_epoch_completion(identity, expected_credential_epoch, apply) do
+    if current_credential_epoch?(identity, expected_credential_epoch) do
+      apply_guarded_completion(identity, apply)
+    else
+      {:superseded, identity, nil}
+    end
+  end
+
+  defp guard_active_probe_completion(nil, _fence, _mode, _apply),
+    do: Repo.rollback(:upstream_identity_not_found)
+
+  defp guard_active_probe_completion(identity, fence, mode, apply) do
+    case completion_fence_position(identity, fence) do
+      position when position in [:advance, :continue] ->
+        if probe_completion_status_allowed?(identity, fence, mode) do
+          apply_guarded_probe_completion(identity, fence, position, apply)
+        else
+          {:superseded, identity, nil}
+        end
+
+      _position ->
+        {:superseded, identity, nil}
+    end
+  end
+
+  defp guard_current_probe_completion(nil, _fence, _mode, _apply),
+    do: Repo.rollback(:upstream_identity_not_found)
+
+  defp guard_current_probe_completion(identity, fence, mode, apply) do
+    if current_completion_fence?(identity, fence) and
+         probe_completion_status_allowed?(identity, fence, mode) do
+      apply_guarded_completion(identity, apply)
+    else
+      {:superseded, identity, nil}
+    end
+  end
+
+  defp probe_completion_status_allowed?(%UpstreamIdentity{status: @active}, _fence, _mode),
+    do: true
+
+  defp probe_completion_status_allowed?(
+         %UpstreamIdentity{status: @refresh_failed},
+         _fence,
+         :auth_failure
+       ),
+       do: true
+
+  defp probe_completion_status_allowed?(
+         %UpstreamIdentity{status: @reauth_required} = identity,
+         fence,
+         :auth_failure
+       ) do
+    metadata = initialize_metadata(identity.metadata)
+
+    metadata[@credential_epoch_key] == fence.credential_epoch and
+      (provider_auth_recovery_status(metadata) != "terminal" or
+         metadata[@applied_sequence_key] == fence.usage_probe_sequence)
+  end
+
+  defp probe_completion_status_allowed?(_identity, _fence, _mode), do: false
+
+  defp apply_guarded_probe_completion(identity, fence, _position, apply) do
+    case apply.(identity) do
+      {:ok, value} ->
+        identity = identity |> Repo.reload!() |> persist_probe_completion!(fence)
+        {:applied, identity, value}
+
+      {:error, reason} ->
+        Repo.rollback(reason)
+    end
+  end
+
+  defp apply_guarded_completion(identity, apply) do
+    case apply.(identity) do
+      {:ok, value} -> {:applied, Repo.reload!(identity), value}
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp completion_fence_position(identity, fence) do
+    metadata = initialize_metadata(identity.metadata)
+    sequence = fence.usage_probe_sequence
+
+    cond do
+      metadata[@credential_epoch_key] != fence.credential_epoch -> :superseded
+      sequence <= metadata[@completed_sequence_key] -> :superseded
+      sequence < metadata[@applied_sequence_key] -> :superseded
+      sequence == metadata[@applied_sequence_key] -> :continue
+      true -> :advance
+    end
+  end
+
+  defp persist_probe_completion!(identity, fence) do
+    metadata = initialize_metadata(identity.metadata)
+
+    identity
+    |> UpstreamIdentity.changeset(%{
+      metadata: Map.put(metadata, @completed_sequence_key, fence.usage_probe_sequence),
+      updated_at: now()
+    })
+    |> Repo.update!()
+  end
+
+  defp current_completion_fence?(identity, fence) do
+    metadata = initialize_metadata(identity.metadata)
+    sequence = fence.usage_probe_sequence
+
+    metadata[@credential_epoch_key] == fence.credential_epoch and
+      metadata[@completed_sequence_key] == sequence and
+      metadata[@applied_sequence_key] <= sequence
+  end
+
+  defp normalize_guarded_probe_completion({:ok, {:applied, identity, value}}),
+    do: {:ok, :applied, Repo.reload!(identity), value}
+
+  defp normalize_guarded_probe_completion({:ok, {:superseded, identity, nil}}),
+    do: {:ok, :superseded, Repo.reload!(identity), nil}
+
+  defp normalize_guarded_probe_completion({:error, reason}), do: {:error, reason}
+
   defp persist_usage_success(identity, fence, persist) do
     case persist.(identity) do
       {:ok, value} ->
+        recovery_assignment_ids = pending_provider_auth_recovery_assignment_ids(identity.metadata)
         identity = identity |> Repo.reload!() |> persist_usage_success_state!(fence)
-        recover_assignments_after_provider_auth_relink!(identity)
+        recover_assignments_after_provider_auth_relink!(identity, recovery_assignment_ids)
         {:applied, identity, value}
 
       {:error, reason} ->
@@ -258,28 +480,75 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
     |> Repo.update!()
   end
 
-  defp recover_assignments_after_provider_auth_relink!(identity) do
-    if provider_auth_recovery_status(identity.metadata) == "recovered" do
+  defp provider_auth_rejection_assignments(identity_id) do
+    Repo.all(
+      from(assignment in PoolUpstreamAssignment,
+        where:
+          assignment.upstream_identity_id == ^identity_id and
+            assignment.status != ^@assignment_deleted,
+        order_by: [asc: assignment.id]
+      )
+    )
+  end
+
+  defp demote_assignments_for_provider_auth_rejection!(assignments, timestamp) do
+    Enum.each(assignments, fn assignment ->
+      assignment
+      |> PoolUpstreamAssignment.changeset(%{
+        health_status: @assignment_disabled,
+        eligibility_status: @assignment_ineligible,
+        disabled_at: timestamp,
+        updated_at: timestamp
+      })
+      |> Repo.update!()
+    end)
+  end
+
+  defp recover_assignments_after_provider_auth_relink!(identity, recovery_assignment_ids) do
+    if provider_auth_recovery_status(identity.metadata) == "recovered" and
+         recovery_assignment_ids != [] do
       timestamp = now()
 
-      Repo.update_all(
+      Repo.all(
         from(assignment in PoolUpstreamAssignment,
           where:
             assignment.upstream_identity_id == ^identity.id and
-              assignment.status != ^@assignment_deleted
-        ),
-        set: [
+              assignment.status == ^PoolUpstreamAssignment.active_status() and
+              assignment.id in ^recovery_assignment_ids,
+          order_by: [asc: assignment.id]
+        )
+      )
+      |> Enum.each(fn assignment ->
+        assignment
+        |> PoolUpstreamAssignment.changeset(%{
           health_status: @assignment_health_active,
           eligibility_status: @assignment_eligible,
           cooldown_until: nil,
           disabled_at: nil,
           updated_at: timestamp
-        ]
-      )
+        })
+        |> Repo.update!()
+      end)
     end
 
     :ok
   end
+
+  defp pending_provider_auth_recovery_assignment_ids(%{} = metadata) do
+    case Map.get(metadata, @provider_auth_recovery_key) do
+      %{
+        "status" => status,
+        "demoted_assignment_ids" => assignment_ids
+      }
+      when status in ["terminal", "awaiting_fresh_quota"] and is_list(assignment_ids) ->
+        Enum.filter(assignment_ids, &is_binary/1)
+
+      _recovery ->
+        []
+    end
+  end
+
+  defp pending_provider_auth_recovery_assignment_ids(_metadata), do: []
 
   defp current_fence?(identity, fence) do
     metadata = initialize_metadata(identity.metadata)
@@ -334,6 +603,14 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
     Map.put(metadata, @provider_auth_recovery_key, recovery)
   end
 
+  defp put_provider_auth_recovery_assignment_ids(metadata, assignments) do
+    assignment_ids = Enum.map(assignments, & &1.id)
+
+    Map.update!(metadata, @provider_auth_recovery_key, fn recovery ->
+      Map.put(recovery, "demoted_assignment_ids", assignment_ids)
+    end)
+  end
+
   defp maybe_put_terminal_provider_auth_rejection(recovery, metadata) do
     case Map.get(metadata, "token_refresh") do
       %{"status" => "reauth_required"} = terminal -> Map.put(recovery, "last_terminal", terminal)
@@ -377,7 +654,7 @@ defmodule CodexPooler.Upstreams.Lifecycle.CredentialFencing do
     identity.id
     |> assignments_for_identity()
     |> Enum.each(fn assignment ->
-      Events.broadcast_upstreams(assignment.pool_id, reason, %{
+      Events.broadcast_upstreams_after_commit(assignment.pool_id, reason, %{
         assignment_id: assignment.id,
         upstream_identity_id: assignment.upstream_identity_id,
         upstream_status: identity.status,

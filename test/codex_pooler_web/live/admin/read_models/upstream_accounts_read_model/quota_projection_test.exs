@@ -522,6 +522,25 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjectionTest do
   end
 
   @tag :quota_spark_projection
+  test "floating Spark weekly evidence keeps the existing reset countdown presentation" do
+    observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    rows =
+      [
+        spark_window("secondary", 10_080, observed_at,
+          metadata: %{"reset_state" => "floating", "reset_after_seconds" => 604_800}
+        )
+      ]
+      |> QuotaProjection.quota_limit_rows(DateTimeDisplay.preferences_for_user(nil))
+
+    assert weekly = Enum.find(rows, &(&1.key == "model-codex_spark-secondary-10080"))
+    assert String.starts_with?(weekly.reset_label, "in ")
+    assert String.starts_with?(weekly.reset_title, "resets ")
+    refute weekly.reset_label =~ "floating"
+    refute weekly.reset_title =~ "floating"
+  end
+
+  @tag :quota_spark_projection
   test "resetless inferred zero-use model evidence stays hidden" do
     observed_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
