@@ -29,7 +29,7 @@ defmodule CodexPoolerWeb.Admin.AuditLogsComponents do
     ~H"""
     <div
       id="admin-audit-logs"
-      class="min-w-0 rounded-box border border-base-300 bg-base-100 shadow-sm"
+      class="min-w-0 rounded-box border border-base-300 bg-base-100"
     >
       <div class="hidden overflow-x-auto md:block">
         <table class="table min-w-[58rem] font-sans">

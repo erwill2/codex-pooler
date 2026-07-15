@@ -253,9 +253,9 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
       <section
         :for={group <- @groups}
         id={"api-key-pool-group-#{group.dom_id}"}
-        class="grid min-w-0 overflow-visible border border-base-300 bg-base-100 xl:grid-cols-[13rem_minmax(0,1fr)]"
+        class="grid min-w-0 overflow-visible rounded-box border border-base-300 bg-base-100 xl:grid-cols-[13rem_minmax(0,1fr)]"
       >
-        <header class="flex min-w-0 flex-wrap content-start items-center gap-3 border-b border-base-300 bg-primary/5 p-4 xl:justify-between xl:border-r xl:border-b-0">
+        <header class="flex min-w-0 flex-wrap content-start items-center gap-3 rounded-t-[calc(var(--radius-box)-1px)] border-b border-base-300 bg-primary/5 p-4 xl:justify-between xl:rounded-l-[calc(var(--radius-box)-1px)] xl:rounded-tr-none xl:border-r xl:border-b-0">
           <span class="grid size-9 shrink-0 place-items-center rounded-field border border-primary/30 bg-primary/15 text-primary">
             <.icon name="hero-server-stack" class="size-4" />
           </span>
@@ -278,7 +278,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
           <article
             :for={api_key <- group.api_keys}
             id={"api-key-row-#{api_key.id}"}
-            class="relative grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3 p-4 transition-colors hover:bg-base-200/60 focus-within:z-30 xl:grid-cols-[minmax(12rem,0.9fr)_minmax(12rem,0.85fr)_minmax(14rem,1fr)_auto] xl:gap-4"
+            class="relative grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3 p-4 transition-colors last:rounded-b-[calc(var(--radius-box)-1px)] hover:bg-base-200/60 focus-within:z-30 xl:grid-cols-[minmax(12rem,0.9fr)_minmax(12rem,0.85fr)_minmax(14rem,1fr)_auto] xl:gap-4 xl:last:rounded-bl-none"
           >
             <div class="grid min-w-0 gap-2 xl:contents">
               <div id={"api-key-row-#{api_key.id}-key"} class="grid min-w-0 gap-1.5 xl:content-start">

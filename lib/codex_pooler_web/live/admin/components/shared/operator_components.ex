@@ -162,7 +162,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents do
     <section id="operator-inventory-surface" class="grid min-w-0 gap-4 overflow-visible">
       <.operator_filter_form form={@filter_form} />
 
-      <div class="min-w-0 rounded-box border border-base-300 bg-base-100 shadow-sm">
+      <div class="min-w-0 rounded-box border border-base-300 bg-base-100">
         <div id="operators-table-scroll-region" class="overflow-x-auto md:overflow-visible">
           <table class="table min-w-[56rem]">
             <thead>

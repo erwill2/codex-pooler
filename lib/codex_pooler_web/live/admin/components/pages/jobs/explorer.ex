@@ -47,7 +47,7 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.Explorer do
         :if={@explorer.items != []}
         id="admin-jobs-explorer-desktop"
         data-role="explorer-desktop"
-        class="hidden overflow-x-auto rounded-box border border-base-300 bg-base-100 shadow-sm lg:block"
+        class="hidden overflow-x-auto rounded-box border border-base-300 bg-base-100 lg:block"
       >
         <table
           id="admin-jobs-explorer-table"
@@ -180,7 +180,7 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.Explorer do
       data-job-id={@job.id}
       phx-click="open_job"
       phx-value-job-id={@job.id}
-      class="grid cursor-pointer gap-3 rounded-box border border-base-300 bg-base-100 p-4 text-sm shadow-sm transition-colors hover:bg-base-200/60"
+      class="grid cursor-pointer gap-3 rounded-box border border-base-300 bg-base-100 p-4 text-sm transition-colors hover:bg-base-200/60"
     >
       <.job_identity job={@job} />
       <.job_target_summary job={@job} />

@@ -93,7 +93,7 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
     <div
       :if={@invites.items != []}
       id="invite-table-surface"
-      class="min-w-0 overflow-visible rounded-box border border-base-300 bg-base-100 shadow-sm"
+      class="min-w-0 overflow-visible rounded-box border border-base-300 bg-base-100"
     >
       <div
         id="invite-table-scroll-region"

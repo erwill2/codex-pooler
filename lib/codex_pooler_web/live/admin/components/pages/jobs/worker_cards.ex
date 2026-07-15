@@ -19,7 +19,7 @@ defmodule CodexPoolerWeb.Admin.JobsPageComponents.WorkerCards do
     ~H"""
     <article
       id={"job-worker-card-#{@card.id}"}
-      class="grid min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100 shadow-sm"
+      class="grid min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100"
     >
       <.job_worker_card_header card={@card} />
 
