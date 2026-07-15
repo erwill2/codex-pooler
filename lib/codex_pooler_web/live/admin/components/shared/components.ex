@@ -216,7 +216,7 @@ defmodule CodexPoolerWeb.Admin.Components do
             aria-hidden="true"
             class="inline-flex size-3.5 items-center justify-center"
           >
-            <.icon name="hero-arrow-top-right-on-square" class="size-3.5" />
+            <.icon name="hero-book-open" class="size-3.5" />
           </span>
           <span class="leading-none">Docs</span>
         </a>
