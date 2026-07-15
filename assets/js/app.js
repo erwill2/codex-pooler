@@ -452,9 +452,8 @@ const ApexTimeSeriesChart = {
     const compact = this.el.dataset.chartCompact === "true"
     const stacked = this.el.dataset.chartStacked === "true"
     const safeTooltip = this.el.dataset.chartSafeTooltip === "true"
-    const showLegend = this.el.dataset.chartLegend
-      ? this.el.dataset.chartLegend !== "false"
-      : !compact
+    const legendMode = this.el.dataset.chartLegend
+    const showLegend = legendMode ? legendMode !== "false" : !compact
     const showLabels = this.el.dataset.chartLabels === "true"
     const height = Number.parseInt(this.el.dataset.chartHeight || "260", 10)
     const configuredBarRadius = Number.parseInt(
@@ -508,7 +507,20 @@ const ApexTimeSeriesChart = {
           columnWidth: compact ? "72%" : "58%",
         },
       },
-      legend: {show: showLegend},
+      legend: {
+        show: showLegend,
+        showForSingleSeries: legendMode === "always",
+        position: "bottom",
+        horizontalAlign: "center",
+        fontSize: "12px",
+        fontFamily: "inherit",
+        fontWeight: 500,
+        labels: {colors: axisColor, useSeriesColors: false},
+        markers: {size: 5, shape: "square", strokeWidth: 0, offsetX: -2},
+        itemMargin: {horizontal: 10, vertical: 2},
+        onItemHover: {highlightDataSeries: true},
+        clusterGroupedSeries: false,
+      },
       markers: {
         size: 0,
         hover: {size: compact ? 3 : 4},

@@ -56,10 +56,9 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
             data-chart-units={@traffic_chart.units}
             data-chart-value-kinds={@traffic_chart.value_kinds}
             data-chart-yaxis={@traffic_chart.yaxis}
-            data-chart-height="260"
+            data-chart-height="292"
             data-chart-colors={@traffic_chart.colors}
-            data-chart-labels="true"
-            data-chart-legend="false"
+            data-chart-legend="true"
           >
           </div>
         </div>
@@ -110,10 +109,9 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
             data-chart-value-kinds={@token_cost_chart.value_kinds}
             data-chart-yaxis={@token_cost_chart.yaxis}
             data-chart-bar-radius="0"
-            data-chart-height="260"
+            data-chart-height="292"
             data-chart-colors={@token_cost_chart.colors}
-            data-chart-labels="true"
-            data-chart-legend="false"
+            data-chart-legend="true"
             data-chart-stacked="true"
           >
           </div>
@@ -171,10 +169,9 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
               data-chart-value-kinds={@model_usage_chart.value_kinds}
               data-chart-yaxis={@model_usage_chart.yaxis}
               data-chart-bar-radius="0"
-              data-chart-height="260"
+              data-chart-height="292"
               data-chart-colors={@model_usage_chart.colors}
-              data-chart-labels="true"
-              data-chart-legend="false"
+              data-chart-legend="always"
               data-chart-safe-tooltip="true"
               data-chart-stacked="true"
             >
