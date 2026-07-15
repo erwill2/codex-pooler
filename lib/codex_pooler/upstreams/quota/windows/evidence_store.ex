@@ -32,6 +32,16 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
           required(:reset_at) => DateTime.t(),
           required(:observed_at) => DateTime.t()
         }
+  @type pending_confirmation :: %{
+          required(:used_percent) => Decimal.t(),
+          required(:reset_at) => DateTime.t(),
+          required(:observed_at) => DateTime.t(),
+          required(:due_at) => DateTime.t()
+        }
+
+  @spec weekly_restart_confirmation_span_seconds() :: pos_integer()
+  def weekly_restart_confirmation_span_seconds,
+    do: @weekly_restart_confirmation_span_seconds
 
   @spec evidence_changeset(identity_ref(), map(), DateTime.t()) ::
           {:ok, Ecto.Changeset.t()} | {:error, Evidence.errors() | map()}
@@ -200,6 +210,34 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   end
 
   def candidate_valid?(_candidate, _timestamp), do: false
+
+  @spec pending_weekly_zero_confirmation(Quota.AccountQuotaWindow.t(), DateTime.t()) ::
+          {:ok, pending_confirmation()} | :none
+  def pending_weekly_zero_confirmation(
+        %Quota.AccountQuotaWindow{} = window,
+        %DateTime{} = timestamp
+      ) do
+    with true <- account_weekly_evidence?(window),
+         {:ok, %{used_percent: used_percent} = candidate} <-
+           parse_candidate(window.metadata || %{}),
+         true <- zero_percent?(used_percent),
+         true <- candidate_valid?(candidate, timestamp) do
+      {:ok,
+       Map.put(
+         candidate,
+         :due_at,
+         DateTime.add(
+           candidate.observed_at,
+           @weekly_restart_confirmation_span_seconds,
+           :second
+         )
+       )}
+    else
+      _not_pending -> :none
+    end
+  end
+
+  def pending_weekly_zero_confirmation(_window, _timestamp), do: :none
 
   @spec clear_candidate(map()) :: map()
   def clear_candidate(metadata) when is_map(metadata) do
@@ -497,9 +535,12 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
   # floating reset advances with observation time, while a cached body keeps a
   # fixed reset. Accept the zero only when a stored candidate and the incoming
   # observation prove that sliding-live shape across the confirmation span;
-  # otherwise keep the canonical row and let the candidate age or restart.
-  # Anchored resets (the 5h shape, should it return) never slide, so they keep
-  # taking the pre-existing anchored + corroboration path untouched.
+  # otherwise keep the canonical row and let the candidate age or restart. This
+  # applies after the zero is accepted too: periodically reconfirming live
+  # zeroes advances their observation time before the freshness TTL, while
+  # cached fixed-reset bodies fail the sliding proof and age out. Anchored
+  # resets (the 5h shape, should it return) never slide, so they keep taking
+  # the pre-existing anchored + corroboration path untouched.
   defp sliding_restart_attrs(existing, attrs, evidence, timestamp) do
     metadata = existing.metadata || %{}
     decision = restart_candidate_decision(metadata, existing, evidence, timestamp)
@@ -594,7 +635,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
           nil
       end
 
-    Logger.info(
+    Logger.debug(
       "quota_restart_decision decision=#{decision} " <>
         "upstream_identity_id=#{existing.upstream_identity_id} " <>
         "quota_key=#{evidence.quota_key} window_kind=#{evidence.window_kind} " <>

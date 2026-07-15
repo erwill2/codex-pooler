@@ -192,6 +192,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
           phx-value-id={@cockpit.identity.id}
         />
         <.rail_action
+          id={"cockpit-reconcile-upstream-account-#{@cockpit.identity.id}"}
+          icon="hero-arrow-path"
+          label="Refresh quota"
+          action={@cockpit.actions.reconcile_quota}
+          phx-click="reconcile_account"
+          phx-value-id={@cockpit.identity.id}
+        />
+        <.rail_action
           id={"cockpit-oauth-relink-upstream-account-#{@cockpit.identity.id}"}
           icon="hero-link"
           label="OAuth relink"
