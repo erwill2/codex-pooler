@@ -32,6 +32,48 @@ defmodule CodexPoolerWeb.Admin.Format do
     |> money()
   end
 
+  @doc """
+  Money with elastic precision: amounts routinely land below one cent, where
+  the ledger-style two-decimal rounding collapses everything to $0.01/$0.00.
+  Small amounts keep up to four decimals (trimmed, minimum two); from ten
+  cents up the regular money format applies.
+  """
+  @spec money_precise(Decimal.t() | integer() | float()) :: String.t()
+  def money_precise(%Decimal{} = usd) do
+    abs = Decimal.abs(usd)
+
+    cond do
+      Decimal.compare(abs, Decimal.new("0.1")) != :lt ->
+        money(usd)
+
+      Decimal.compare(abs, Decimal.new(0)) == :eq ->
+        money(usd)
+
+      Decimal.compare(Decimal.round(abs, 4), Decimal.new(0)) == :eq ->
+        "<$0.0001"
+
+      true ->
+        usd
+        |> Decimal.round(4)
+        |> Decimal.to_string(:normal)
+        |> trim_trailing_money_zeros()
+        |> then(&"$#{&1}")
+    end
+  end
+
+  def money_precise(value) when is_integer(value), do: value |> Decimal.new() |> money_precise()
+
+  def money_precise(value) when is_float(value),
+    do: value |> Decimal.from_float() |> money_precise()
+
+  @spec money_precise_from_micros(integer()) :: String.t()
+  def money_precise_from_micros(micros) when is_integer(micros) do
+    micros
+    |> Decimal.new()
+    |> Decimal.div(@micros_per_usd)
+    |> money_precise()
+  end
+
   @spec token_count(integer() | float() | Decimal.t() | nil) :: String.t()
   def token_count(nil), do: "0"
 
@@ -71,6 +113,21 @@ defmodule CodexPoolerWeb.Admin.Format do
     |> :erlang.float_to_binary(decimals: 1)
     |> String.trim_trailing("0")
     |> String.trim_trailing(".")
+  end
+
+  defp trim_trailing_money_zeros(value) do
+    case String.split(value, ".", parts: 2) do
+      [int_part, frac_part] ->
+        trimmed = String.trim_trailing(frac_part, "0")
+
+        frac_part =
+          if String.length(trimmed) < 2, do: String.slice(frac_part, 0, 2), else: trimmed
+
+        "#{int_part}.#{frac_part}"
+
+      [int_part] ->
+        "#{int_part}.00"
+    end
   end
 
   defp fixed_decimal_places(value, places) do

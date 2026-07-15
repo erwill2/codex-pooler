@@ -431,7 +431,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   defp quota_state_presentation(state),
     do: Map.get(@quota_state_presentations, state, @default_quota_state_presentation)
 
-  defp format_cost(%{usd: %Decimal{} = usd}), do: Format.money(usd)
+  defp format_cost(%{usd: %Decimal{} = usd}), do: Format.money_precise(usd)
   defp format_cost(%{status: "unpriced"}), do: "unpriced"
   defp format_cost(%{status: "unavailable"}), do: "unavailable"
   defp format_cost(%{status: status}), do: status || "unavailable"
@@ -442,7 +442,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   defp cost_status_label(status), do: humanize(status)
 
   defp format_micros(nil), do: "unavailable"
-  defp format_micros(micros) when is_integer(micros), do: Format.money_from_micros(micros)
+  defp format_micros(micros) when is_integer(micros), do: Format.money_precise_from_micros(micros)
 
   defp format_percent(nil), do: "not available"
   defp format_percent(value), do: "#{format_float(value)}%"

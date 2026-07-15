@@ -101,10 +101,10 @@ defmodule CodexPoolerWeb.Admin.PoolsReadModel do
   end
 
   @spec format_settled_cost_micros(non_neg_integer() | nil) :: String.t()
-  def format_settled_cost_micros(nil), do: Format.money_from_micros(0)
+  def format_settled_cost_micros(nil), do: Format.money_precise_from_micros(0)
 
   def format_settled_cost_micros(micros) when is_integer(micros) do
-    Format.money_from_micros(micros)
+    Format.money_precise_from_micros(micros)
   end
 
   defp pool_rows(scope, traffic_window) do

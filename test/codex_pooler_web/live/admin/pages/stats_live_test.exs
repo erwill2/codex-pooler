@@ -239,6 +239,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
                "#stats-api-key-surface > header p",
                "Top API keys by token usage"
              )
+
       refute has_element?(view, "#stats-upstream-surface > header p")
       refute has_element?(view, "#stats-upstream-surface > header > span")
       refute has_element?(view, "#stats-upstream-table .font-mono")

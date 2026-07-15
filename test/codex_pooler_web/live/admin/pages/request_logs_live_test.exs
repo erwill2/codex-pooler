@@ -306,33 +306,14 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     refute has_element?(view, "#request-log-page-header", "Review recent requests")
     assert has_element?(view, "#admin-request-logs")
     assert has_element?(view, "#request-logs-table")
-    assert has_element?(view, "#mobile-request-logs-table")
-    assert has_element?(view, "#mobile-request-logs-table-body")
+    refute has_element?(view, "#mobile-request-logs-table")
     assert has_element?(view, "#admin-request-logs", "Usage")
     assert has_element?(view, "#admin-request-logs", "$0.12")
     assert has_element?(view, "#request-log-row-#{request.id}", "Admin key")
-    assert has_element?(view, "#mobile-request-log-row-#{request.id}", "Admin key")
-    assert has_element?(view, "#mobile-request-log-row-#{request.id}", "gpt-live-mini")
     assert has_element?(view, "#request-log-row-#{request.id} [data-role='pool-name']", pool.name)
     assert has_element?(view, "#request-log-row-#{request.id} [data-role='pool-icon']")
     assert has_element?(view, "#request-log-row-#{request.id} [data-role='api-key-icon']")
 
-    assert has_element?(
-             view,
-             "#mobile-request-log-row-#{request.id} [data-role='pool-name']",
-             pool.name
-           )
-
-    assert has_element?(view, "#mobile-request-log-row-#{request.id} [data-role='pool-icon']")
-    assert has_element?(view, "#mobile-request-log-row-#{request.id} [data-role='api-key-icon']")
-
-    assert has_element?(
-             view,
-             "#mobile-request-log-row-#{request.id}",
-             "/backend-api/codex/responses"
-           )
-
-    assert has_element?(view, "#mobile-request-log-#{request.id}-protocol", "WebSocket")
     assert has_element?(view, "#request-log-row-#{request.id}", "gpt-live-mini")
     assert has_element?(view, "#request-log-row-#{request.id}", "/backend-api/codex/responses")
     assert has_element?(view, "#request-log-#{request.id}-protocol", "WebSocket")
@@ -349,19 +330,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
              "87ms"
            )
 
-    assert has_element?(
-             view,
-             "#mobile-request-log-row-#{request.id} [data-role='route'] + [data-role='latency']",
-             "87ms"
-           )
-
     assert has_element?(view, "#request-log-row-#{request.id}", "(2k cached)")
 
-    assert has_element?(
-             view,
-             "#request-log-row-#{request.id} [data-role='cached-cost']",
-             "($0.00 cached)"
-           )
+    refute has_element?(view, "#request-log-row-#{request.id} [data-role='cached-cost']")
 
     assert has_element?(view, "#request-log-row-#{request.id}", "$0.12")
     refute has_element?(view, "#request-log-row-#{request.id}", "$0.123456")
@@ -532,7 +503,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#request-log-row-#{failed_request.id} [data-role='status-icon'][aria-label='Status: Failed']"
+             "#request-log-row-#{failed_request.id} [data-role='status-label']",
+             "Status: Failed"
            )
 
     refute has_element?(view, "#request-log-row-#{failed_request.id}", "deny:")
@@ -1398,7 +1370,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/request-logs?pool_id=#{pool.id}")
 
-    for prefix <- ["request-log", "mobile-request-log"] do
+    for prefix <- ["request-log"] do
       render_click(element(view, "##{prefix}-#{request.id}-open-details"))
       assert_patch(view)
 
@@ -1576,27 +1548,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
              "#request-log-#{token_request.id}-compression-savings[title*='not total request tokens']"
            )
 
-    assert has_element?(
-             view,
-             "#mobile-request-log-#{token_request.id}-compression-savings[data-compression-unit='tokens']",
-             "600 (60%)"
-           )
-
-    assert has_element?(
-             view,
-             "#mobile-request-log-#{token_request.id}-compression-savings .hero-arrows-pointing-in"
-           )
-
-    assert has_element?(
-             view,
-             "#mobile-request-log-#{token_request.id}-compression-savings[title*='tokenizer input skipped: 1']"
-           )
-
     refute has_element?(view, "#request-log-#{byte_request.id}-compression-savings")
-    refute has_element?(view, "#mobile-request-log-#{byte_request.id}-compression-savings")
 
     refute has_element?(view, "#request-log-#{zero_request.id}-compression-savings")
-    refute has_element?(view, "#mobile-request-log-#{zero_request.id}-compression-savings")
 
     html = render(view)
     refute html =~ sentinel
@@ -1688,23 +1642,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
              "#request-log-#{desktop_request.id}-user-agent .hero-computer-desktop"
            )
 
-    assert has_element?(
-             view,
-             "#mobile-request-log-#{desktop_request.id}-route",
-             "/backend-api/codex/responses"
-           )
-
-    assert has_element?(
-             view,
-             "#mobile-request-log-#{desktop_request.id}-user-agent",
-             "Codex Desktop 0.128.0-alpha.1"
-           )
-
-    assert has_element?(
-             view,
-             "#mobile-request-log-#{desktop_request.id}-user-agent[data-client-kind='codex_desktop']"
-           )
-
     refute has_element?(view, "#request-log-#{desktop_request.id}-user-agent", "unknown")
     refute has_element?(view, "#request-log-#{desktop_request.id}-user-agent", "Mac OS")
     refute has_element?(view, "#request-log-#{desktop_request.id}-user-agent", "26.429.61741")
@@ -1748,21 +1685,31 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#request-log-row-#{translated_request.id} [data-role='route-metadata']",
-             "translated from /v1/chat/completions"
+             "#request-log-row-#{translated_request.id} [data-role='route-origin']",
+             "/v1/chat/completions"
            )
 
     assert has_element?(
              view,
-             "#mobile-request-log-row-#{translated_request.id} [data-role='route-metadata']",
-             "translated from /v1/chat/completions"
+             "#request-log-row-#{translated_request.id} [data-role='route-origin'][title='translated from /v1/chat/completions']"
+           )
+
+    assert has_element?(
+             view,
+             "#request-log-row-#{translated_request.id} [data-role='route-origin'] .hero-arrows-right-left"
+           )
+
+    refute has_element?(
+             view,
+             "#request-log-row-#{translated_request.id} [data-role='route-metadata']",
+             "translated from"
            )
 
     html = render(view)
     refute html =~ sensitive_marker
   end
 
-  test "normalized table headers put transport, route, and usage in separate columns",
+  test "normalized table headers fold plan and transport into their row cells",
        %{conn: conn, scope: scope} do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "header-order", name: "Header Order"})
 
@@ -1787,24 +1734,24 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
       |> Enum.map(fn [text] -> String.trim(text) end)
 
     expected_headers = [
-      "Timestamp",
-      "Upstream account",
-      "Plan",
-      "Model / API Key",
-      "Transport",
+      "Request",
+      "Upstream",
+      "Model / API key",
       "Route",
       "Usage",
-      "Errors"
+      "Outcome"
     ]
 
     assert header_texts == expected_headers
 
-    assert has_element?(view, "#admin-request-logs thead th", "Timestamp")
-    assert has_element?(view, "#admin-request-logs thead th", "Plan")
-    assert has_element?(view, "#admin-request-logs thead th", "Transport")
+    assert has_element?(view, "#admin-request-logs thead th", "Request")
+    assert has_element?(view, "#admin-request-logs thead th", "Upstream")
+    assert has_element?(view, "#admin-request-logs thead th", "Outcome")
+    refute has_element?(view, "#admin-request-logs thead th", "Plan")
+    refute has_element?(view, "#admin-request-logs thead th", "Transport")
   end
 
-  test "normalized row renders all 9 column values with stable selectors",
+  test "normalized row renders all column values with stable selectors",
        %{conn: conn, scope: scope} do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "normalized-row", name: "Normalized Row"})
 
@@ -1974,7 +1921,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     # 8. Status icon
     assert has_element?(
              view,
-             "#{row_selector} [data-role='status-icon'][aria-label='Status: Succeeded']"
+             "#{row_selector} [data-role='status-label']",
+             "Status: Succeeded"
            )
 
     refute has_element?(view, "#{row_selector} [data-role='status']", "succeeded")
@@ -2033,20 +1981,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     refute has_element?(view, "#{row_selector} [data-role='cost']", "$0.234567")
     refute has_element?(view, "#{row_selector} [data-role='cost']", "cost:")
 
-    assert has_element?(
-             view,
-             "#{row_selector} [data-role='usage-cost-line']",
-             "$0.23 ($0.00 cached)"
-           )
-
-    assert has_element?(
-             view,
-             "#{row_selector} [data-role='usage-cost-line'] [data-role='cached-cost']",
-             "($0.00 cached)"
-           )
-
+    refute has_element?(view, "#{row_selector} [data-role='usage-cost-line']", "($0.00 cached)")
+    refute has_element?(view, "#{row_selector} [data-role='cached-cost']")
     refute has_element?(view, "#{row_selector} [data-role='usage-cost-line']", "·")
-    refute has_element?(view, "#{row_selector} [data-role='cached-cost'].sr-only")
 
     # 10. Errors
     assert has_element?(view, "#{row_selector} [data-role='errors']", "sanitized_denial")
@@ -2256,24 +2193,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#mobile-request-log-row-#{proxied_request.id} [data-role='route-metadata']",
-             "proxy_control"
-           )
-
-    assert has_element?(
-             view,
-             "#mobile-request-log-row-#{proxied_request.id} [data-role='route-metadata']",
-             "application/json"
-           )
-
-    assert has_element?(
-             view,
-             "#mobile-request-log-row-#{proxied_request.id} [data-role='route-metadata']",
-             "187 bytes"
-           )
-
-    assert has_element?(
-             view,
              "#request-log-row-#{disabled_request.id} [data-role='route']",
              "/api/codex/usage"
            )
@@ -2293,18 +2212,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
     assert has_element?(
              view,
              "#request-log-row-#{disabled_request.id} [data-role='route-metadata']",
-             "99 bytes"
-           )
-
-    assert has_element?(
-             view,
-             "#mobile-request-log-row-#{disabled_request.id} [data-role='route-metadata']",
-             "proxy_control"
-           )
-
-    assert has_element?(
-             view,
-             "#mobile-request-log-row-#{disabled_request.id} [data-role='route-metadata']",
              "99 bytes"
            )
 
@@ -2355,7 +2262,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#{row_selector} [data-role='status-icon'][aria-label='Status: Failed']"
+             "#{row_selector} [data-role='status-label']",
+             "Status: Failed"
            )
 
     assert has_element?(view, "#{row_selector} [data-role='errors']", "no_eligible_backend")
@@ -2407,7 +2315,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#{row_selector} [data-role='status-icon'][aria-label='Status: Succeeded']"
+             "#{row_selector} [data-role='status-label']",
+             "Status: Succeeded"
            )
 
     assert has_element?(view, "#{row_selector} [data-role='errors']", "—")
@@ -2512,11 +2421,12 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#{row_selector} [data-role='status-icon'][aria-label='Status: Succeeded']"
+             "#{row_selector} [data-role='status-label']",
+             "Status: Succeeded"
            )
 
-    assert has_element?(view, "#{row_selector} [data-role='status-icon'] .text-success")
-    refute has_element?(view, "#{row_selector} [data-role='status-icon'] .text-error")
+    assert has_element?(view, "#{row_selector} td.border-l-success")
+    refute has_element?(view, "#{row_selector} td.border-l-error")
     assert has_element?(view, errors_selector, "upstream_network_error")
 
     errors_html = view |> element(errors_selector) |> render()
@@ -2585,7 +2495,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#{in_progress_row} [data-role='status-icon'][aria-label='Status: In progress']"
+             "#{in_progress_row} [data-role='status-label']",
+             "Status: In progress"
            )
 
     assert has_element?(view, "#{in_progress_row} [data-role='errors']", "owner_drained")
@@ -2593,14 +2504,16 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     refute has_element?(
              view,
-             "#{in_progress_row} [data-role='status-icon'][aria-label='Status: Failed']"
+             "#{in_progress_row} [data-role='status-label']",
+             "Status: Failed"
            )
 
     refute has_element?(view, in_progress_row, "Status: Failed")
 
     assert has_element?(
              view,
-             "#{failed_row} [data-role='status-icon'][aria-label='Status: Failed']"
+             "#{failed_row} [data-role='status-label']",
+             "Status: Failed"
            )
 
     assert has_element?(view, "#{failed_row} [data-role='errors']", "owner_drained")
@@ -2608,7 +2521,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     refute has_element?(
              view,
-             "#{failed_row} [data-role='status-icon'][aria-label='Status: In progress']"
+             "#{failed_row} [data-role='status-label']",
+             "Status: In progress"
            )
 
     refute has_element?(view, failed_row, "Status: In progress")
@@ -2660,7 +2574,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
 
     assert has_element?(
              view,
-             "#{row_selector} [data-role='status-icon'][aria-label='Status: Rejected']"
+             "#{row_selector} [data-role='status-label']",
+             "Status: Rejected"
            )
 
     assert has_element?(view, "#request-log-#{request.id}-errors", "quota exhausted")

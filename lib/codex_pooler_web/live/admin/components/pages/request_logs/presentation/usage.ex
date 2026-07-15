@@ -5,15 +5,12 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation.Usage do
 
   import CodexPoolerWeb.Admin.RequestLogsDisplay,
     only: [
-      cached_cost_title: 1,
       compression_savings_line: 1,
       compression_savings_reason: 1,
       compression_savings_status: 1,
       compression_savings_title: 1,
       compression_savings_unit: 1,
-      format_cached_input_cost_summary: 1,
       format_cached_token_breakdown: 1,
-      format_errors: 2,
       format_token_totals: 1,
       format_total_cost: 1,
       format_usage_cost: 1,
@@ -28,36 +25,36 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation.Usage do
   attr :request_log, :map, required: true
   attr :prefix, :string, required: true
   attr :datetime_preferences, :map, required: true
-  attr :show_errors, :boolean, default: false
 
   def request_log_usage_lines(assigns) do
     ~H"""
-    <div data-role="token-lines" class="grid gap-0.5 leading-tight">
+    <div data-role="token-lines" class="grid min-w-0 gap-0.5">
       <%= if usage_line_applicable?(@request_log) do %>
         <span
           data-role="usage-token-line"
-          class="block whitespace-nowrap"
+          class="flex h-5 min-w-0 items-center gap-1"
           title={usage_cached_line_title(@request_log)}
         >
           <span
             data-role="token-totals"
-            class="whitespace-nowrap"
+            class="min-w-0 truncate whitespace-nowrap text-base-content"
             title={token_totals_title(@request_log)}
           >
             {format_token_totals(@request_log)}
           </span>
           <span
+            :if={cached = format_cached_token_breakdown(@request_log)}
             id={"#{@prefix}-#{@request_log.id}-cached-tokens"}
             data-role="cached-tokens"
-            class="whitespace-nowrap pl-1 text-base-content/50"
+            class="shrink-0 whitespace-nowrap text-base-content/45"
             title={usage_cached_line_title(@request_log)}
           >
-            {format_cached_token_breakdown(@request_log) || "—"}
+            {cached}
           </span>
         </span>
         <span
           data-role="usage-cost-line"
-          class="block whitespace-nowrap text-base-content/70"
+          class="flex h-5 min-w-0 items-center gap-1.5 text-base-content/70"
           title={usage_cost_line_title(@request_log)}
         >
           <span
@@ -68,45 +65,29 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation.Usage do
             {format_usage_cost(@request_log.cost)}
           </span>
           <span
-            id={"#{@prefix}-#{@request_log.id}-cached-cost"}
-            data-role="cached-cost"
-            class="whitespace-nowrap pl-1 text-base-content/50"
-            title={cached_cost_title(@request_log)}
+            :if={compression_line = compression_savings_line(@request_log)}
+            id={"#{@prefix}-#{@request_log.id}-compression-savings"}
+            data-role="compression-savings"
+            data-compression-unit={compression_savings_unit(@request_log)}
+            data-compression-status={compression_savings_status(@request_log)}
+            data-compression-reason={compression_savings_reason(@request_log)}
+            class="flex min-w-0 items-center gap-1 whitespace-nowrap text-base-content/45"
+            title={compression_savings_title(@request_log)}
           >
-            {format_cached_input_cost_summary(@request_log) || "(cached n/a)"}
+            <.icon name="hero-arrows-pointing-in" class="size-3 shrink-0" />
+            <span class="sr-only">compression</span>
+            <span class="truncate">{compression_line}</span>
           </span>
         </span>
       <% else %>
         <span
           data-role="usage-placeholder"
-          class="block whitespace-nowrap text-base-content/55"
+          class="flex h-5 items-center whitespace-nowrap text-base-content/45"
           title={format_total_cost(@request_log.cost)}
         >
           —
         </span>
       <% end %>
-      <span
-        :if={compression_line = compression_savings_line(@request_log)}
-        id={"#{@prefix}-#{@request_log.id}-compression-savings"}
-        data-role="compression-savings"
-        data-compression-unit={compression_savings_unit(@request_log)}
-        data-compression-status={compression_savings_status(@request_log)}
-        data-compression-reason={compression_savings_reason(@request_log)}
-        class="flex items-center gap-1 whitespace-nowrap text-base-content/60"
-        title={compression_savings_title(@request_log)}
-      >
-        <.icon name="hero-arrows-pointing-in" class="size-3.5 shrink-0" />
-        <span class="sr-only">compression</span>
-        {compression_line}
-      </span>
-      <span
-        :for={error <- format_errors(@request_log, @datetime_preferences)}
-        :if={@show_errors}
-        data-role="error-line"
-        class="block text-base-content/65"
-      >
-        {error}
-      </span>
     </div>
     """
   end

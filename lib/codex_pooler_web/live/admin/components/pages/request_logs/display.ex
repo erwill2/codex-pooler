@@ -1,7 +1,6 @@
 defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
   @moduledoc false
 
-  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Format
   alias CodexPoolerWeb.Admin.RequestLogsDisplay.{Errors, Status, UserAgents}
   alias CodexPoolerWeb.DateTimeDisplay
@@ -84,20 +83,22 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
     end
   end
 
+  @protocol_chip_base "inline-flex h-4.5 shrink-0 items-center whitespace-nowrap rounded-full border px-2 text-[10px] font-semibold uppercase leading-none tracking-[0.04em]"
+
   def protocol_badge_class("websocket"),
-    do: "#{AdminBadges.metadata_chip_class(:info)} justify-center whitespace-nowrap"
+    do: "#{@protocol_chip_base} border-info/20 bg-info/10 text-info"
 
   def protocol_badge_class("http_sse"),
-    do: "#{AdminBadges.metadata_chip_class(:success)} justify-center whitespace-nowrap"
+    do: "#{@protocol_chip_base} border-success/20 bg-success/10 text-success"
 
   def protocol_badge_class("http_multipart"),
-    do: "#{AdminBadges.metadata_chip_class(:warning)} justify-center whitespace-nowrap"
+    do: "#{@protocol_chip_base} border-warning/20 bg-warning/10 text-warning"
 
   def protocol_badge_class("http_json"),
-    do: "#{AdminBadges.metadata_chip_class(:primary)} justify-center whitespace-nowrap"
+    do: "#{@protocol_chip_base} border-primary/20 bg-primary/10 text-primary"
 
   def protocol_badge_class(_transport),
-    do: "#{AdminBadges.metadata_chip_class(:neutral)} justify-center whitespace-nowrap"
+    do: "#{@protocol_chip_base} border-base-300 bg-base-200 text-base-content/60"
 
   def format_total(1), do: "1"
   def format_total(total), do: Integer.to_string(total || 0)
@@ -115,6 +116,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   defdelegate request_status_icon(status), to: Status
   defdelegate request_status_icon_class(status), to: Status
+  defdelegate request_status_border_class(status), to: Status
   defdelegate request_status_filter_icon_color(status), to: Status
 
   def format_token_counts(nil), do: "-"
@@ -148,6 +150,9 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
       parts -> Enum.join(parts, "; ")
     end
   end
+
+  def format_usage_cost(%{status: "priced", usd: %Decimal{} = usd}),
+    do: Format.money_precise(usd)
 
   def format_usage_cost(cost) do
     case format_cost(cost) do
@@ -351,7 +356,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   def format_route_metadata(log) do
     [
-      openai_compatibility_origin(log),
       route_class(log),
       request_content_type(log),
       request_body_size(log)
@@ -362,6 +366,19 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
       parts -> Enum.join(parts, " · ")
     end
   end
+
+  @doc """
+  Source endpoint for requests translated from an OpenAI-compatible surface,
+  e.g. "/v1/chat/completions".
+  """
+  def translated_origin(%{metadata: metadata}) when is_map(metadata) do
+    case nested_metadata_value(metadata, "openai_compatibility", "source_endpoint") do
+      endpoint when is_binary(endpoint) -> endpoint
+      _endpoint -> nil
+    end
+  end
+
+  def translated_origin(_log), do: nil
 
   defdelegate format_errors(log, datetime_preferences), to: Errors
 
@@ -446,15 +463,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
     do: nested_metadata_value(metadata, "routing", "route_class")
 
   defp route_class(_log), do: nil
-
-  defp openai_compatibility_origin(%{metadata: metadata}) when is_map(metadata) do
-    case nested_metadata_value(metadata, "openai_compatibility", "source_endpoint") do
-      endpoint when is_binary(endpoint) -> "translated from #{endpoint}"
-      _endpoint -> nil
-    end
-  end
-
-  defp openai_compatibility_origin(_log), do: nil
 
   defp request_content_type(%{metadata: metadata}) when is_map(metadata),
     do: nested_metadata_value(metadata, "request", "content_type")

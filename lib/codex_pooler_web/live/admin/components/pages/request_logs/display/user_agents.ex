@@ -30,7 +30,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.UserAgents do
     {:custom, :node_runtime, "node", "Node.js", "hero-cube", :warning},
     {:prefix, "curl/", "curl", "curl", "hero-command-line", :neutral},
     {:custom, :elixir_http, "elixir_http", "Elixir HTTP", "hero-beaker", :neutral},
-    {:prefix, "codex-pooler-", "codex_pooler", "Codex Pooler", "hero-server-stack", :neutral}
+    {:prefix, "codex-pooler-", "codex_pooler", "Codex Pooler", "hero-cube-transparent", :neutral}
   ]
 
   @spec display(map()) :: map() | nil
