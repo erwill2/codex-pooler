@@ -369,7 +369,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
             </dd>
           </div>
           <div class="group relative isolate min-w-0 pl-3" data-role="upstream-pool-count-cell">
-            <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35 transition-colors group-hover:text-primary/70">
+            <dt class={footer_panel_label_class(@panel_view == :pools)}>
               <button
                 id={"upstream-account-#{@account.identity.id}-pools-panel-trigger"}
                 type="button"
@@ -386,12 +386,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
                 Pools
               </span>
             </dt>
-            <dd class="pointer-events-none relative z-30 truncate text-base-content/60 transition-colors group-hover:text-base-content/75">
+            <dd class={footer_panel_value_class(@panel_view == :pools)}>
               {assignment_count_label(@account.assignments)}
             </dd>
           </div>
           <div class="group relative isolate min-w-0 pl-3" data-role="upstream-token-status-cell">
-            <dt class="text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35 transition-colors group-hover:text-primary/70">
+            <dt class={footer_panel_label_class(@panel_view == :tokens)}>
               <button
                 id={"upstream-account-#{@account.identity.id}-tokens-panel-trigger"}
                 type="button"
@@ -408,7 +408,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
                 tokens/<span class="normal-case">5m</span>
               </span>
             </dt>
-            <dd class="pointer-events-none relative z-30 truncate text-base-content/60 transition-colors group-hover:text-base-content/75">
+            <dd class={footer_panel_value_class(@panel_view == :tokens)}>
               {recent_token_count_label(@account)}
             </dd>
           </div>
@@ -726,6 +726,28 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
 
   defp pools_panel_trigger_label(_panel_view, assignments),
     do: "Show Pool assignments: #{assignment_count_label(assignments)}"
+
+  # The open panel keeps its trigger cell in the hover tint, so the footer
+  # shows which panel the card body is currently disclosing.
+  defp footer_panel_label_class(active?) do
+    [
+      "text-[0.62rem] font-semibold uppercase tracking-[0.08em] transition-colors",
+      if(active?,
+        do: "text-primary/70",
+        else: "text-base-content/35 group-hover:text-primary/70"
+      )
+    ]
+  end
+
+  defp footer_panel_value_class(active?) do
+    [
+      "pointer-events-none relative z-30 truncate transition-colors",
+      if(active?,
+        do: "text-base-content/75",
+        else: "text-base-content/60 group-hover:text-base-content/75"
+      )
+    ]
+  end
 
   defp footer_panel_trigger_class(active?, position) do
     [
