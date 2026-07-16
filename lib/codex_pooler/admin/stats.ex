@@ -138,6 +138,7 @@ defmodule CodexPooler.Admin.Stats do
       Quota.ReadModel.account_summaries_for_pool_ids(pool_ids, normalized.ended_at)
 
     quota_summary = Quota.ReadModel.summary(quota_accounts)
+    tokens = Kpis.token_kpi(settlements)
 
     dashboard = %{
       filters: Filters.public(normalized, pools),
@@ -145,13 +146,13 @@ defmodule CodexPooler.Admin.Stats do
       kpis: %{
         requests: Kpis.request_kpi(requests),
         success_rate: Kpis.success_rate_kpi(requests),
-        tokens: Kpis.token_kpi(settlements),
+        tokens: tokens,
+        cache_rate: Kpis.cache_rate_kpi(tokens),
         tokens_per_second: Kpis.tokens_per_second_kpi(settlements, attempts),
         settled_cost: Kpis.settled_cost_kpi(settlements),
         average_latency_ms: Kpis.average_latency_kpi(attempts),
         active_sessions: %{value: active_session_count},
-        turns: Kpis.turn_kpi(turns),
-        quota_health: quota_summary
+        turns: Kpis.turn_kpi(turns)
       },
       tables: %{
         top_api_keys: Tables.top_api_keys(settlements, pools),
@@ -198,6 +199,7 @@ defmodule CodexPooler.Admin.Stats do
   @spec empty_dashboard(Filters.normalized(), [Pools.Pool.t()]) :: dashboard()
   defp empty_dashboard(normalized, pools) do
     quota_summary = Quota.ReadModel.summary([])
+    tokens = Kpis.token_kpi([])
 
     %{
       filters: Filters.public(normalized, pools),
@@ -205,13 +207,13 @@ defmodule CodexPooler.Admin.Stats do
       kpis: %{
         requests: Kpis.request_kpi([]),
         success_rate: Kpis.success_rate_kpi([]),
-        tokens: Kpis.token_kpi([]),
+        tokens: tokens,
+        cache_rate: Kpis.cache_rate_kpi(tokens),
         tokens_per_second: Kpis.tokens_per_second_kpi([], []),
         settled_cost: Kpis.settled_cost_kpi([]),
         average_latency_ms: Kpis.average_latency_kpi([]),
         active_sessions: %{value: 0},
-        turns: Kpis.turn_kpi([]),
-        quota_health: quota_summary
+        turns: Kpis.turn_kpi([])
       },
       tables: %{
         top_api_keys: [],

@@ -97,7 +97,7 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
           <AdminComponents.page_header
             id="stats-page-header"
             title="Usage"
-            description="Usage, cost, latency, sessions, and quota for the current scope."
+            description="Usage, cost, latency, sessions, and cache activity for the current scope."
           />
 
           <AdminComponents.filter_form
@@ -185,7 +185,11 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
               sort={@leaderboard_sort}
               window_label={selected_window_filter_label(@filter_form)}
             />
-            <StatsPresentation.upstreams_table rows={@dashboard.tables.upstreams} />
+            <StatsPresentation.upstream_traffic_distribution
+              rows={@dashboard.tables.upstreams}
+              scope_label={stats_scope_label(@dashboard)}
+              window_label={selected_window_filter_label(@filter_form)}
+            />
           </section>
         <% else %>
           <AdminComponents.empty_state
@@ -407,6 +411,11 @@ defmodule CodexPoolerWeb.Admin.StatsLive do
   end
 
   defp stats_pool_filter_selected(_options), do: nil
+
+  defp stats_scope_label(%{selected_pool: %{name: name}}) when is_binary(name) and name != "",
+    do: name
+
+  defp stats_scope_label(_dashboard), do: "all visible pools"
 
   defp window_options, do: @window_options
 

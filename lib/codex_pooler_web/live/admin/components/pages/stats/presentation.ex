@@ -5,20 +5,8 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
 
   use CodexPoolerWeb, :html
 
-  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.Format
-
-  @default_quota_state_presentation %{tone: :neutral, label: nil}
-  @quota_state_presentations %{
-    available: %{tone: :success, label: "Available"},
-    partial: %{tone: :warning, label: "Partial"},
-    weekly_only_evidence: %{tone: :warning, label: "Weekly evidence only"},
-    missing_evidence: %{tone: :error, label: "Missing evidence"},
-    exhausted: %{tone: :error, label: "Exhausted"},
-    unknown: %{tone: :neutral, label: "Unknown"},
-    empty: %{tone: :neutral, label: "No upstream accounts"}
-  }
 
   attr :id, :string, required: true
   attr :dashboard, :map, required: true
@@ -27,7 +15,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
     ~H"""
     <section
       id={@id}
-      class="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 min-[1900px]:grid-cols-8"
+      class="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 min-[1900px]:grid-cols-8 max-sm:[&_[data-role=metric-card-value]]:text-xs max-sm:[&_[data-role=metric-card-value]]:whitespace-nowrap"
       aria-label="Page metrics"
     >
       <AdminComponents.metric_card
@@ -48,15 +36,54 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
         tone={success_rate_tone(@dashboard.kpis.success_rate.value)}
         compact_mobile
       />
-      <AdminComponents.metric_card
+      <article
         id="stats-kpi-tokens"
-        icon="hero-cpu-chip"
-        label="Tokens"
-        value={Format.token_count(@dashboard.kpis.tokens.total_tokens)}
-        description={token_summary(@dashboard.kpis.tokens)}
-        tone={:primary}
-        compact_mobile
-      />
+        data-density="compact"
+        class="grid min-w-0 content-start gap-0.5 rounded-box border border-base-300 bg-base-100 px-3 py-2.5 lg:gap-1 lg:px-4 lg:py-3"
+      >
+        <div class="flex min-w-0 items-center justify-between gap-2">
+          <p class="min-w-0 truncate text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
+            Tokens
+          </p>
+          <.icon name="hero-cpu-chip" class="hidden size-3.5 shrink-0 text-primary lg:block" />
+        </div>
+        <p
+          class="min-w-0 max-w-full overflow-hidden break-words font-mono text-lg font-semibold tabular-nums leading-tight text-base-content lg:text-xl"
+          data-role="metric-card-value"
+        >
+          {Format.token_count(@dashboard.kpis.tokens.total_tokens)}
+        </p>
+        <div
+          data-role="token-summary"
+          class="grid min-w-0 grid-cols-1 gap-0 text-[0.68rem] text-base-content/55 lg:grid-cols-3 lg:gap-1"
+        >
+          <span
+            :for={
+              {label, title, value, icon} <- [
+                {"input", "Input", @dashboard.kpis.tokens.input_tokens, "hero-arrow-down-left"},
+                {"cached input", "Cached input", @dashboard.kpis.tokens.cached_input_tokens,
+                 "hero-circle-stack"},
+                {"output", "Output", @dashboard.kpis.tokens.output_tokens, "hero-arrow-up-right"}
+              ]
+            }
+            data-role="token-summary-item"
+            role="group"
+            aria-label={label}
+            title={title}
+            class="inline-flex min-w-0 items-center gap-1 lg:justify-center"
+          >
+            <span data-role="token-summary-icon" aria-hidden="true" class="shrink-0">
+              <.icon name={icon} class="size-3" />
+            </span>
+            <span
+              data-role="token-summary-value"
+              class="whitespace-nowrap font-mono tabular-nums"
+            >
+              {Format.token_count(value)}
+            </span>
+          </span>
+        </div>
+      </article>
       <AdminComponents.metric_card
         id="stats-kpi-tokens-per-sec"
         icon="hero-bolt"
@@ -90,12 +117,11 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
         compact_mobile
       />
       <AdminComponents.metric_card
-        id="stats-kpi-quota-health"
-        icon="hero-shield-check"
-        label="Quota"
-        value={quota_state_label(@dashboard.kpis.quota_health.state)}
-        description={quota_summary(@dashboard.kpis.quota_health)}
-        tone={quota_tone(@dashboard.kpis.quota_health.state)}
+        id="stats-kpi-cache-rate"
+        icon="hero-circle-stack"
+        label="Cache rate"
+        value={format_percent(@dashboard.kpis.cache_rate.value)}
+        description={cache_rate_summary(@dashboard.kpis.cache_rate)}
         compact_mobile
       />
     </section>
@@ -305,88 +331,104 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
     ]
 
   attr :rows, :list, required: true
+  attr :scope_label, :string, required: true
+  attr :window_label, :string, required: true
 
-  def upstreams_table(assigns) do
+  def upstream_traffic_distribution(assigns) do
     ~H"""
     <AdminComponents.admin_surface
       id="stats-upstream-surface"
-      title="Upstream usage"
+      title="Traffic distribution"
+      description={traffic_distribution_description(@scope_label, @window_label)}
     >
-      <div class="divide-y divide-base-300 md:hidden">
-        <p
-          :if={@rows == []}
-          id="stats-upstream-empty-card"
-          class="px-3 py-4 text-center text-sm text-base-content/60"
+      <ol
+        :if={@rows != []}
+        id="stats-upstream-lanes"
+        class="list-none divide-y divide-base-300/70"
+      >
+        <li
+          :for={{row, rank} <- Enum.with_index(@rows, 1)}
+          id={"stats-upstream-lane-#{rank}"}
+          data-role="upstream-traffic-lane"
+          data-leader={(rank == 1 and row.requests > 0) && "true"}
+          class={[
+            "grid min-w-0 gap-3 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center",
+            (rank == 1 and row.requests > 0) && "bg-primary/5"
+          ]}
         >
-          No upstream assignments in this scope.
-        </p>
-        <article
-          :for={{row, index} <- Enum.with_index(@rows)}
-          id={"stats-upstream-card-#{index}"}
-          class="grid gap-2 px-3 py-3"
-        >
-          <div class="flex min-w-0 items-start justify-between gap-3">
-            <h3 class="min-w-0 truncate text-sm font-semibold text-base-content">
-              {row.assignment_label || row.upstream_label || "upstream account"}
-            </h3>
-            <span class={AdminBadges.status_chip_class(row.status)}>
-              {row.status || "unknown"}
-            </span>
+          <div class="grid min-w-0 gap-2">
+            <div class="flex min-w-0 items-baseline justify-between gap-3">
+              <h3
+                class="min-w-0 truncate text-sm font-semibold text-base-content"
+                title={upstream_label(row)}
+              >
+                {upstream_label(row)}
+              </h3>
+              <span
+                data-role="upstream-traffic-share"
+                class={[
+                  "shrink-0 font-mono text-sm font-semibold tabular-nums text-base-content/70",
+                  (rank == 1 and row.requests > 0) && "text-primary"
+                ]}
+              >
+                {format_traffic_share(row.traffic_share_percent)}
+              </span>
+            </div>
+            <progress
+              id={"stats-upstream-rail-#{rank}"}
+              data-role="upstream-traffic-rail"
+              class={[
+                "progress h-1.5 w-full",
+                (rank == 1 and row.requests > 0) && "progress-primary"
+              ]}
+              max="100"
+              value={format_traffic_share_value(row.traffic_share_percent)}
+              aria-label={"#{upstream_label(row)} traffic share"}
+              aria-valuetext={"#{format_traffic_share(row.traffic_share_percent)} of accounted requests"}
+            >
+              {format_traffic_share(row.traffic_share_percent)}
+            </progress>
           </div>
-          <dl class="grid grid-cols-2 gap-2 text-xs">
-            <div>
+
+          <dl class="grid grid-cols-3 gap-3 text-xs sm:min-w-64">
+            <div class="min-w-0">
               <dt class="text-base-content/50">Requests</dt>
-              <dd class="font-semibold tabular-nums">
+              <dd
+                data-role="upstream-requests"
+                class="truncate font-mono font-semibold tabular-nums text-base-content"
+              >
                 {format_integer(row.requests)}
               </dd>
             </div>
-            <div>
+            <div class="min-w-0">
               <dt class="text-base-content/50">Tokens</dt>
-              <dd class="font-semibold tabular-nums">
+              <dd
+                data-role="upstream-tokens"
+                class="truncate font-mono font-semibold tabular-nums text-base-content"
+              >
                 {Format.token_count(row.total_tokens)}
+              </dd>
+            </div>
+            <div class="min-w-0">
+              <dt class="truncate text-base-content/50">Settled cost</dt>
+              <dd
+                data-role="upstream-settled-cost"
+                class="truncate font-mono font-semibold tabular-nums text-base-content"
+              >
+                {format_micros(row.settled_cost_micros)}
               </dd>
             </div>
           </dl>
-        </article>
-      </div>
-      <div class="hidden overflow-x-auto md:block">
-        <table id="stats-upstream-table" class="table table-zebra table-sm">
-          <thead>
-            <tr>
-              <th>Upstream</th>
-              <th class="text-center">Status</th>
-              <th class="text-right">Requests</th>
-              <th class="text-right">Tokens</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr :if={@rows == []} id="stats-upstream-empty-row">
-              <td colspan="4" class="text-center text-sm text-base-content/60">
-                No upstream assignments in this scope.
-              </td>
-            </tr>
-            <tr :for={{row, index} <- Enum.with_index(@rows)} id={"stats-upstream-row-#{index}"}>
-              <td class="min-w-56">
-                <div class="grid gap-1">
-                  <span class="font-semibold">
-                    {row.assignment_label || row.upstream_label || "upstream account"}
-                  </span>
-                </div>
-              </td>
-              <td class="text-center">
-                <span class={AdminBadges.status_chip_class(row.status)}>
-                  {row.status || "unknown"}
-                </span>
-              </td>
-              <td class="text-right tabular-nums">
-                {format_integer(row.requests)}
-              </td>
-              <td class="text-right tabular-nums">
-                {Format.token_count(row.total_tokens)}
-              </td>
-            </tr>
-          </tbody>
-        </table>
+        </li>
+      </ol>
+
+      <div :if={@rows == []} class="p-4">
+        <AdminComponents.empty_state
+          id="stats-upstream-empty-state"
+          title="No upstream identities"
+          description="No upstream identities are visible in this scope."
+          icon="hero-server-stack"
+        />
       </div>
     </AdminComponents.admin_surface>
     """
@@ -395,21 +437,15 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   defp request_summary(%{succeeded: succeeded, failed: failed}),
     do: "#{format_integer(succeeded)} succeeded · #{format_integer(failed)} failed"
 
-  defp token_summary(tokens),
-    do:
-      "#{Format.token_count(tokens.input_tokens)} input · #{Format.token_count(tokens.cached_input_tokens)} cached · #{Format.token_count(tokens.output_tokens)} output"
+  defp cache_rate_summary(%{input_tokens: 0}), do: "No input tokens"
+  defp cache_rate_summary(%{cached_input_tokens: 0}), do: "No cached input"
+
+  defp cache_rate_summary(cache_rate) do
+    "#{Format.token_count(cache_rate.cached_input_tokens)} of #{Format.token_count(cache_rate.input_tokens)} input cached"
+  end
 
   defp turn_summary(turns),
     do: "#{format_integer(turns.value)} turns · #{format_integer(turns.in_progress)} in progress"
-
-  defp quota_summary(%{total: 0}), do: "No upstream accounts"
-
-  defp quota_summary(%{state: :weekly_only_evidence, weekly_only_evidence: count}),
-    do: "#{format_integer(count)} account with weekly evidence only"
-
-  defp quota_summary(quota),
-    do:
-      "#{format_integer(quota.available)} usable · #{format_integer(quota.missing_evidence)} missing quota"
 
   defp request_tone(%{failed: failed}) when failed > 0, do: :warning
   defp request_tone(_requests), do: :neutral
@@ -419,17 +455,17 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   defp success_rate_tone(value) when value >= 50.0, do: :warning
   defp success_rate_tone(_value), do: :error
 
-  defp quota_tone(state), do: quota_state_presentation(state).tone
-
-  defp quota_state_label(state) do
-    case quota_state_presentation(state).label do
-      nil -> humanize(state)
-      label -> label
-    end
+  defp traffic_distribution_description(scope_label, window_label) do
+    "Share of accounted requests across #{scope_label} in the #{String.downcase(window_label)}."
   end
 
-  defp quota_state_presentation(state),
-    do: Map.get(@quota_state_presentations, state, @default_quota_state_presentation)
+  defp upstream_label(row),
+    do: row.assignment_label || row.upstream_label || "upstream account"
+
+  defp format_traffic_share(value), do: "#{format_traffic_share_value(value)}%"
+
+  defp format_traffic_share_value(value) when is_number(value),
+    do: :erlang.float_to_binary(value / 1, decimals: 1)
 
   defp format_cost(%{usd: %Decimal{} = usd}), do: Format.money_precise(usd)
   defp format_cost(%{status: "unpriced"}), do: "unpriced"

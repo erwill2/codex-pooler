@@ -45,31 +45,36 @@ defmodule CodexPooler.Admin.Stats.Tables do
   def upstream_table(settlements, quota_accounts) do
     entries_by_identity = Enum.group_by(settlements, & &1.upstream_identity_id)
 
-    quota_accounts
-    |> Enum.group_by(& &1.upstream_identity_id)
-    |> Enum.map(fn {upstream_identity_id, accounts} ->
-      entries = Map.get(entries_by_identity, upstream_identity_id, [])
-      canonical_account = canonical_upstream_account(accounts)
+    rows =
+      quota_accounts
+      |> Enum.group_by(& &1.upstream_identity_id)
+      |> Enum.map(fn {upstream_identity_id, accounts} ->
+        entries = Map.get(entries_by_identity, upstream_identity_id, [])
+        canonical_account = canonical_upstream_account(accounts)
 
-      %{
-        pool_upstream_assignment_id: single_assignment_id(accounts),
-        upstream_identity_id: upstream_identity_id,
-        assignment_label: shared_account_value(accounts, :assignment_label),
-        upstream_label:
-          shared_account_value(accounts, :upstream_label) || canonical_account.upstream_label,
-        status: aggregate_account_value(accounts, :assignment_status),
-        health_status: aggregate_account_value(accounts, :health_status),
-        quota_state: aggregate_account_value(accounts, :state, :mixed),
-        assignment_count: length(accounts),
-        requests: Aggregates.sum_integer(entries, :request_count),
-        total_tokens: Aggregates.sum_integer(entries, :total_tokens),
-        settled_cost_micros: Aggregates.sum_decimal_integer(entries, :settled_cost_micros)
-      }
+        %{
+          pool_upstream_assignment_id: single_assignment_id(accounts),
+          upstream_identity_id: upstream_identity_id,
+          assignment_label: shared_account_value(accounts, :assignment_label),
+          upstream_label:
+            shared_account_value(accounts, :upstream_label) || canonical_account.upstream_label,
+          status: aggregate_account_value(accounts, :assignment_status),
+          health_status: aggregate_account_value(accounts, :health_status),
+          quota_state: aggregate_account_value(accounts, :state, :mixed),
+          assignment_count: length(accounts),
+          requests: Aggregates.sum_integer(entries, :request_count),
+          total_tokens: Aggregates.sum_integer(entries, :total_tokens),
+          settled_cost_micros: Aggregates.sum_decimal_integer(entries, :settled_cost_micros)
+        }
+      end)
+
+    total_requests = Aggregates.sum_integer(rows, :requests)
+
+    rows
+    |> Enum.map(fn row ->
+      Map.put(row, :traffic_share_percent, traffic_share_percent(row.requests, total_requests))
     end)
-    |> Enum.sort_by(fn row ->
-      {-row.total_tokens, -row.requests, upstream_table_label(row),
-       row.upstream_identity_id || ""}
-    end)
+    |> Enum.sort_by(&upstream_table_sort_key/1)
   end
 
   @spec recent_failures([map()]) :: [map()]
@@ -169,6 +174,23 @@ defmodule CodexPooler.Admin.Stats.Tables do
   @spec upstream_table_label(map()) :: String.t()
   defp upstream_table_label(row) do
     safe_string(row.assignment_label || row.upstream_label)
+  end
+
+  @spec upstream_table_sort_key(map()) :: {integer(), integer(), String.t(), String.t()}
+  defp upstream_table_sort_key(row) do
+    {
+      -row.requests,
+      -row.total_tokens,
+      upstream_table_label(row) |> String.trim() |> String.downcase(),
+      safe_string(row.upstream_identity_id)
+    }
+  end
+
+  @spec traffic_share_percent(integer(), integer()) :: float()
+  defp traffic_share_percent(_requests, 0), do: 0.0
+
+  defp traffic_share_percent(requests, total_requests) do
+    Aggregates.percentage(requests, total_requests)
   end
 
   @spec blank_value?(term()) :: boolean()

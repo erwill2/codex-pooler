@@ -5,6 +5,15 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
 
   alias CodexPoolerWeb.Admin.Format
 
+  @model_colors [
+    "var(--color-primary)",
+    "var(--color-secondary)",
+    "var(--color-info)",
+    "var(--color-success)",
+    "var(--color-warning)",
+    "var(--color-accent)"
+  ]
+
   attr :requests, :list, required: true
   attr :tokens, :list, required: true
   attr :costs, :list, required: true
@@ -15,29 +24,34 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
 
     assigns =
       assigns
-      |> assign(:traffic_chart, traffic_chart_model(assigns.requests, assigns.tokens))
+      |> assign(
+        :traffic_chart,
+        traffic_chart_model(assigns.requests, assigns.tokens, model_usage)
+      )
       |> assign(:token_cost_chart, token_cost_chart_model(assigns.tokens, assigns.costs))
-      |> assign(:model_usage_chart, model_usage_chart_model(model_usage))
 
     ~H"""
-    <section class="grid min-w-0 gap-3 lg:gap-4 xl:grid-cols-2 2xl:grid-cols-3">
+    <section id="stats-traffic-charts" class="grid min-w-0 gap-3 lg:gap-4 xl:grid-cols-2">
       <section
         id="stats-traffic-chart"
-        class="min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100 xl:col-span-2 2xl:col-span-1"
+        class="min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100"
       >
         <header class="flex flex-wrap items-center justify-between gap-2 border-b border-base-300 bg-base-200/35 px-4 py-3">
-          <h2
-            id="stats-traffic-chart-heading"
-            class="text-base font-semibold leading-5 text-base-content"
-          >
-            Traffic over time
-          </h2>
-          <span
-            id="stats-traffic-chart-total"
-            class="text-right text-xs font-semibold tabular-nums text-base-content/70"
-          >
-            {@traffic_chart.total_label}
-          </span>
+          <div data-role="chart-heading-group" class="min-w-0">
+            <h2
+              id="stats-traffic-chart-heading"
+              class="text-base font-semibold leading-5 text-base-content"
+            >
+              Traffic over time
+            </h2>
+            <span
+              id="stats-traffic-chart-total"
+              class="mt-0.5 block text-xs font-medium tabular-nums text-base-content/70"
+            >
+              {@traffic_chart.total_label}
+            </span>
+          </div>
+          <.chart_mode_control chart_id="stats-traffic-chart" label="Traffic chart mode" />
         </header>
         <div
           id="stats-traffic-chart-scroll"
@@ -50,7 +64,8 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
             phx-hook="ApexTimeSeriesChart"
             phx-update="ignore"
             role="img"
-            aria-labelledby="stats-traffic-chart-title stats-traffic-chart-desc"
+            aria-labelledby="stats-traffic-chart-title"
+            aria-describedby="stats-traffic-chart-desc stats-traffic-chart-mode-description"
             data-chart-categories={@traffic_chart.categories}
             data-chart-series={@traffic_chart.series}
             data-chart-unit="tokens"
@@ -59,7 +74,14 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
             data-chart-yaxis={@traffic_chart.yaxis}
             data-chart-height="292"
             data-chart-colors={@traffic_chart.colors}
-            data-chart-legend="true"
+            data-chart-legend="always"
+            data-chart-safe-tooltip="true"
+            data-chart-stacked="true"
+            data-chart-bar-radius="0"
+            data-chart-zoom="false"
+            data-chart-wheel-scroll="page"
+            data-chart-mode-control="stats-traffic-chart-mode-control"
+            data-chart-mode-description="stats-traffic-chart-mode-description"
           >
           </div>
         </div>
@@ -67,7 +89,15 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
         <p id="stats-traffic-chart-desc" class="sr-only">
           {traffic_chart_description(@traffic_chart.points)}
         </p>
-        <ul class="sr-only">
+        <p id="stats-traffic-chart-mode-description" class="sr-only" aria-live="polite">
+          Showing interval values for each time bucket.
+        </p>
+        <ul
+          id="stats-traffic-chart-interval-values"
+          class="sr-only"
+          data-chart-source="interval"
+          aria-label="Underlying interval values for Traffic over time"
+        >
           <li :for={point <- @traffic_chart.points}>
             {point.label}: {point.tokens} tokens, {point.requests} requests
           </li>
@@ -79,18 +109,21 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
         class="min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100"
       >
         <header class="flex flex-wrap items-center justify-between gap-2 border-b border-base-300 bg-base-200/35 px-4 py-3">
-          <h2
-            id="stats-token-cost-chart-heading"
-            class="text-base font-semibold leading-5 text-base-content"
-          >
-            Tokens vs cost
-          </h2>
-          <span
-            id="stats-token-cost-chart-total"
-            class="text-right text-xs font-semibold tabular-nums text-base-content/70"
-          >
-            {@token_cost_chart.total_label}
-          </span>
+          <div data-role="chart-heading-group" class="min-w-0">
+            <h2
+              id="stats-token-cost-chart-heading"
+              class="text-base font-semibold leading-5 text-base-content"
+            >
+              Tokens vs cost
+            </h2>
+            <span
+              id="stats-token-cost-chart-total"
+              class="mt-0.5 block text-xs font-medium tabular-nums text-base-content/70"
+            >
+              {@token_cost_chart.total_label}
+            </span>
+          </div>
+          <.chart_mode_control chart_id="stats-token-cost-chart" label="Tokens vs cost chart mode" />
         </header>
         <div
           id="stats-token-cost-chart-scroll"
@@ -103,7 +136,8 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
             phx-hook="ApexTimeSeriesChart"
             phx-update="ignore"
             role="img"
-            aria-labelledby="stats-token-cost-chart-title stats-token-cost-chart-desc"
+            aria-labelledby="stats-token-cost-chart-title"
+            aria-describedby="stats-token-cost-chart-desc stats-token-cost-chart-mode-description"
             data-chart-categories={@token_cost_chart.categories}
             data-chart-series={@token_cost_chart.series}
             data-chart-unit="tokens"
@@ -115,6 +149,10 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
             data-chart-colors={@token_cost_chart.colors}
             data-chart-legend="true"
             data-chart-stacked="true"
+            data-chart-zoom="false"
+            data-chart-wheel-scroll="page"
+            data-chart-mode-control="stats-token-cost-chart-mode-control"
+            data-chart-mode-description="stats-token-cost-chart-mode-description"
           >
           </div>
         </div>
@@ -122,7 +160,15 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
         <p id="stats-token-cost-chart-desc" class="sr-only">
           {token_cost_chart_description(@token_cost_chart.points)}
         </p>
-        <ul class="sr-only">
+        <p id="stats-token-cost-chart-mode-description" class="sr-only" aria-live="polite">
+          Showing interval values for each time bucket.
+        </p>
+        <ul
+          id="stats-token-cost-chart-interval-values"
+          class="sr-only"
+          data-chart-source="interval"
+          aria-label="Underlying interval values for Tokens vs cost"
+        >
           <li :for={point <- @token_cost_chart.points}>
             {point.label}: {point.total_tokens} tokens, {point.cached_input_tokens} cached input tokens, {Format.money_from_micros(
               point.cost_micros
@@ -130,78 +176,36 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
           </li>
         </ul>
       </section>
-
-      <section
-        id="stats-model-usage-chart"
-        class="min-w-0 overflow-hidden rounded-box border border-base-300 bg-base-100"
-      >
-        <header class="flex flex-wrap items-center justify-between gap-2 border-b border-base-300 bg-base-200/35 px-4 py-3">
-          <h2
-            id="stats-model-usage-chart-heading"
-            class="text-base font-semibold leading-5 text-base-content"
-          >
-            Model usage
-          </h2>
-          <span
-            id="stats-model-usage-chart-total"
-            class="text-right text-xs font-semibold tabular-nums text-base-content/70"
-          >
-            {@model_usage_chart.total_label}
-          </span>
-        </header>
-        <div
-          id="stats-model-usage-chart-scroll"
-          class="min-w-0 overflow-x-auto overscroll-x-contain p-3 pb-2 sm:p-4 sm:pb-2"
-          data-role="chart-scroll-region"
-        >
-          <div class={["relative", @model_usage_chart.points == [] && "min-h-[260px]"]}>
-            <div
-              id="stats-model-usage-chart-plot"
-              class={[
-                "admin-apex-bar-chart admin-chart-mobile-wide w-full",
-                @model_usage_chart.points == [] && "absolute inset-0 pointer-events-none opacity-0"
-              ]}
-              phx-hook="ApexTimeSeriesChart"
-              phx-update="ignore"
-              role="img"
-              aria-labelledby="stats-model-usage-chart-title stats-model-usage-chart-desc"
-              data-chart-categories={@model_usage_chart.categories}
-              data-chart-series={@model_usage_chart.series}
-              data-chart-unit="tokens"
-              data-chart-units={@model_usage_chart.units}
-              data-chart-value-kinds={@model_usage_chart.value_kinds}
-              data-chart-yaxis={@model_usage_chart.yaxis}
-              data-chart-bar-radius="0"
-              data-chart-height="292"
-              data-chart-colors={@model_usage_chart.colors}
-              data-chart-legend="always"
-              data-chart-safe-tooltip="true"
-              data-chart-stacked="true"
-            >
-            </div>
-            <div
-              :if={@model_usage_chart.points == []}
-              id="stats-model-usage-chart-empty"
-              class="absolute inset-0 grid place-items-center rounded-box border border-dashed border-base-300 bg-base-200/40 px-4 text-center"
-            >
-              <div class="grid justify-items-center gap-2 text-sm text-base-content/60">
-                <.icon name="hero-chart-bar" class="size-6 text-base-content/35" />
-                <p class="font-medium text-base-content/70">No model usage in this range</p>
-              </div>
-            </div>
-          </div>
-        </div>
-        <p id="stats-model-usage-chart-title" class="sr-only">Model usage</p>
-        <p id="stats-model-usage-chart-desc" class="sr-only">
-          {model_usage_chart_description(@model_usage_chart.points)}
-        </p>
-        <ul class="sr-only">
-          <li :for={point <- @model_usage_chart.points}>
-            {point.label}: {point.total_tokens} tokens for {point.model_code}
-          </li>
-        </ul>
-      </section>
     </section>
+    """
+  end
+
+  attr :chart_id, :string, required: true
+  attr :label, :string, required: true
+
+  defp chart_mode_control(assigns) do
+    assigns = assign(assigns, :modes, [{"Interval", "interval"}, {"Cumulative", "cumulative"}])
+
+    ~H"""
+    <div
+      id={"#{@chart_id}-mode-control"}
+      class="flex shrink-0 items-center gap-0.5 rounded-full border border-base-300 bg-base-200/60 p-0.5"
+      role="group"
+      aria-label={@label}
+    >
+      <button
+        :for={{label, mode} <- @modes}
+        id={"#{@chart_id}-mode-#{mode}"}
+        type="button"
+        class="cursor-pointer rounded-full border border-transparent px-2.5 py-0.5 text-[11px] font-medium leading-4 text-base-content/70 transition-colors hover:text-base-content aria-pressed:border-base-300 aria-pressed:bg-base-100 aria-pressed:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+        data-chart-mode={mode}
+        aria-controls={"#{@chart_id}-plot"}
+        aria-pressed={to_string(mode == "interval")}
+        phx-click={JS.dispatch("chart:set-mode", to: "##{@chart_id}-plot", detail: %{mode: mode})}
+      >
+        {label}
+      </button>
+    </div>
     """
   end
 
@@ -219,14 +223,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
     "#{length(points)} time buckets with #{token_total} total tokens and #{Format.money_from_micros(cost_total)} total cost."
   end
 
-  defp model_usage_chart_description(points) do
-    token_total = Enum.reduce(points, 0, &(&1.total_tokens + &2))
-    model_count = points |> Enum.map(& &1.model_code) |> Enum.uniq() |> length()
-
-    "#{model_count} models with #{token_total} total tokens."
-  end
-
-  defp traffic_chart_model(request_rows, token_rows) do
+  defp traffic_chart_model(request_rows, token_rows, model_usage_rows) do
     requests_by_label =
       Map.new(request_rows, fn row -> {format_bucket(row.bucket), max(row.requests || 0, 0)} end)
 
@@ -235,42 +232,79 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
 
     labels =
       (Enum.map(request_rows, &format_bucket(&1.bucket)) ++
-         Enum.map(token_rows, &format_bucket(&1.bucket)))
+         Enum.map(token_rows, &format_bucket(&1.bucket)) ++
+         Enum.map(model_usage_rows, &format_bucket(&1.bucket)))
       |> Enum.uniq()
 
+    request_values = Enum.map(labels, &Map.get(requests_by_label, &1, 0))
+    model_series = model_traffic_series(model_usage_rows, labels)
+
+    {column_series, token_values, token_axis_series, colors} =
+      case model_series do
+        [] ->
+          token_values = Enum.map(labels, &Map.get(tokens_by_label, &1, 0))
+
+          {[%{name: "Tokens", type: "column", data: token_values}], token_values, "Tokens",
+           ["var(--color-primary)", "var(--color-info)"]}
+
+        model_series ->
+          token_values = model_series |> Enum.map(& &1.data) |> Enum.zip_with(&Enum.sum/1)
+          model_names = Enum.map(model_series, & &1.name)
+
+          {model_series, token_values, model_names,
+           Enum.take(@model_colors, length(model_series)) ++ ["var(--color-base-content)"]}
+      end
+
     points =
-      Enum.map(labels, fn label ->
+      labels
+      |> Enum.zip(Enum.zip(token_values, request_values))
+      |> Enum.map(fn {label, {tokens, requests}} ->
         %{
           label: label,
-          tokens: Map.get(tokens_by_label, label, 0),
-          requests: Map.get(requests_by_label, label, 0)
+          tokens: tokens,
+          requests: requests
         }
       end)
 
-    token_values = Enum.map(points, & &1.tokens)
-    request_values = Enum.map(points, & &1.requests)
     token_total = Enum.sum(token_values)
     request_total = Enum.sum(request_values)
+    series = column_series ++ [%{name: "Requests", type: "line", data: request_values}]
 
     %{
       categories: Jason.encode!(labels),
-      series:
-        Jason.encode!([
-          %{name: "Tokens", type: "column", data: token_values},
-          %{name: "Requests", type: "line", data: request_values}
-        ]),
-      units: Jason.encode!(["tokens", "requests"]),
-      value_kinds: Jason.encode!(["tokens", "integer"]),
+      series: Jason.encode!(series),
+      units: Jason.encode!(List.duplicate("tokens", length(column_series)) ++ ["requests"]),
+      value_kinds: Jason.encode!(List.duplicate("tokens", length(column_series)) ++ ["integer"]),
       yaxis:
         Jason.encode!([
-          %{seriesName: "Tokens", title: "tokens", valueKind: "tokens"},
+          %{seriesName: token_axis_series, title: "tokens", valueKind: "tokens"},
           %{seriesName: "Requests", title: "requests", opposite: true, valueKind: "integer"}
         ]),
-      colors: Jason.encode!(["var(--color-primary)", "var(--color-info)"]),
+      colors: Jason.encode!(colors),
       points: points,
       total_label:
         "#{Format.token_count(token_total)} tokens / #{Format.integer(request_total)} requests"
     }
+  end
+
+  defp model_traffic_series(model_usage_rows, labels) do
+    model_codes = model_usage_rows |> Enum.map(& &1.model_code) |> Enum.uniq()
+
+    rows_by_model_and_label =
+      Map.new(model_usage_rows, fn row -> {{row.model_code, format_bucket(row.bucket)}, row} end)
+
+    model_codes
+    |> Enum.map(fn model_code ->
+      data =
+        Enum.map(labels, fn label ->
+          rows_by_model_and_label
+          |> Map.get({model_code, label}, %{})
+          |> chart_value(:total_tokens)
+        end)
+
+      %{name: chart_series_name(model_code), type: "column", data: data}
+    end)
+    |> Enum.filter(fn series -> Enum.any?(series.data, &(&1 > 0)) end)
   end
 
   defp token_cost_chart_model(token_rows, cost_rows) do
@@ -343,70 +377,6 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation.Charts do
       points: points,
       total_label:
         "#{Format.token_count(token_total)} tokens / #{Format.money_from_micros(cost_total)}"
-    }
-  end
-
-  defp model_usage_chart_model(model_usage_rows) do
-    labels = model_usage_rows |> Enum.map(&format_bucket(&1.bucket)) |> Enum.uniq()
-    model_codes = model_usage_rows |> Enum.map(& &1.model_code) |> Enum.uniq()
-
-    rows_by_model_and_label =
-      Map.new(model_usage_rows, fn row -> {{row.model_code, format_bucket(row.bucket)}, row} end)
-
-    chart_labels =
-      Map.new(model_codes, fn model_code -> {model_code, chart_series_name(model_code)} end)
-
-    series =
-      Enum.map(model_codes, fn model_code ->
-        values =
-          Enum.map(labels, fn label ->
-            rows_by_model_and_label
-            |> Map.get({model_code, label}, %{})
-            |> chart_value(:total_tokens)
-          end)
-
-        %{name: Map.fetch!(chart_labels, model_code), type: "column", data: values}
-      end)
-
-    points =
-      Enum.flat_map(model_codes, fn model_code ->
-        Enum.map(labels, fn label ->
-          row = Map.get(rows_by_model_and_label, {model_code, label}, %{})
-
-          %{
-            label: label,
-            model_code: model_code,
-            total_tokens: chart_value(row, :total_tokens)
-          }
-        end)
-      end)
-
-    token_total = points |> Enum.map(& &1.total_tokens) |> Enum.sum()
-
-    %{
-      categories: Jason.encode!(labels),
-      series: Jason.encode!(series),
-      units: Jason.encode!(Enum.map(model_codes, fn _model_code -> "tokens" end)),
-      value_kinds: Jason.encode!(Enum.map(model_codes, fn _model_code -> "tokens" end)),
-      yaxis:
-        Jason.encode!([
-          %{
-            seriesName: Enum.map(model_codes, &Map.fetch!(chart_labels, &1)),
-            title: "tokens",
-            valueKind: "tokens"
-          }
-        ]),
-      colors:
-        Jason.encode!([
-          "var(--color-primary)",
-          "var(--color-secondary)",
-          "var(--color-info)",
-          "var(--color-success)",
-          "var(--color-warning)",
-          "var(--color-accent)"
-        ]),
-      points: points,
-      total_label: "#{Format.token_count(token_total)} tokens"
     }
   end
 

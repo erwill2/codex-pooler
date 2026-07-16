@@ -6,6 +6,7 @@ defmodule CodexPooler.Admin.StatsAuthorizationTest do
 
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Admin.Stats
+  alias CodexPooler.Upstreams.Assignments.PoolAssignments
 
   test "invalid and unauthorized scopes fail without returning data" do
     pool = pool_fixture(%{slug: "stats-invalid", name: "Stats Invalid"})
@@ -98,6 +99,70 @@ defmodule CodexPooler.Admin.StatsAuthorizationTest do
     assert owner_dashboard.kpis.tokens.total_tokens == 60
   end
 
+  test "assigned admins recalculate traffic shares for visible and selected pools" do
+    fixtures = authorization_traffic_fixture()
+    admin_scope = fixtures.admin_scope
+    shared_identity_id = fixtures.shared_identity.id
+    visible_identity_id = fixtures.visible_identity.id
+    hidden_identity_id = fixtures.hidden_identity.id
+
+    assert {:ok, all_pools_dashboard} =
+             Stats.build_dashboard(admin_scope, %{window: "24h"})
+
+    assert all_pools_dashboard.selected_pool == nil
+
+    assert MapSet.new(Enum.map(all_pools_dashboard.filters.pool_options, & &1.id)) ==
+             MapSet.new([fixtures.pools.visible_a.id, fixtures.pools.visible_b.id])
+
+    assert [
+             %{
+               upstream_identity_id: ^shared_identity_id,
+               assignment_count: 2,
+               requests: 3,
+               traffic_share_percent: 75.0
+             },
+             %{
+               upstream_identity_id: ^visible_identity_id,
+               requests: 1,
+               traffic_share_percent: 25.0
+             }
+           ] = all_pools_dashboard.tables.upstreams
+
+    assert Enum.sum(Enum.map(all_pools_dashboard.tables.upstreams, & &1.requests)) == 4
+
+    refute Enum.any?(all_pools_dashboard.tables.upstreams, fn row ->
+             row.upstream_identity_id == hidden_identity_id or
+               row.upstream_label == "Hidden pool identity"
+           end)
+
+    refute Enum.any?(all_pools_dashboard.filters.pool_options, &(&1.name == "Stats Hidden"))
+
+    assert {:ok, selected_pool_dashboard} =
+             Stats.build_dashboard(admin_scope, %{
+               pool_id: fixtures.pools.visible_a.id,
+               window: "24h"
+             })
+
+    assert [
+             %{
+               upstream_identity_id: ^shared_identity_id,
+               assignment_count: 1,
+               requests: 2,
+               traffic_share_percent: 100.0
+             }
+           ] = selected_pool_dashboard.tables.upstreams
+
+    assert {:ok, owner_dashboard} = Stats.build_dashboard(fixtures.owner_scope, %{window: "24h"})
+    assert Enum.sum(Enum.map(owner_dashboard.tables.upstreams, & &1.requests)) == 104
+
+    assert owner_dashboard.tables.upstreams
+           |> Map.new(&{&1.upstream_identity_id, &1.traffic_share_percent}) == %{
+             hidden_identity_id => 96.2,
+             shared_identity_id => 2.9,
+             visible_identity_id => 1.0
+           }
+  end
+
   test "unassigned admins get explicit empty scoped stats" do
     %{user: owner} = bootstrap_owner_fixture()
     %{user: admin} = operator_fixture(owner, %{"email" => "stats-empty-admin@example.com"})
@@ -133,8 +198,103 @@ defmodule CodexPooler.Admin.StatsAuthorizationTest do
   end
 
   defp stats_usage_fixture(pool, total_tokens, api_key_display_name) do
+    %{assignment: assignment} = upstream_assignment_fixture(pool)
+
+    stats_usage_for_assignment_fixture(pool, assignment, %{
+      total_tokens: total_tokens,
+      request_count: 1,
+      api_key_display_name: api_key_display_name
+    })
+  end
+
+  defp authorization_traffic_fixture do
+    %{user: owner} = bootstrap_owner_fixture()
+    owner_scope = Scope.for_user(owner, ["instance_owner"])
+
+    %{user: admin} =
+      operator_fixture(owner, %{
+        "email" => "stats-auth-admin-#{System.unique_integer([:positive])}@example.com"
+      })
+
+    visible_a = pool_fixture(%{slug: "stats-auth-visible-a", name: "Stats Visible A"})
+    visible_b = pool_fixture(%{slug: "stats-auth-visible-b", name: "Stats Visible B"})
+    hidden = pool_fixture(%{slug: "stats-auth-hidden", name: "Stats Hidden"})
+
+    operator_pool_assignment_fixture(admin, visible_a, created_by_user_id: owner.id)
+    operator_pool_assignment_fixture(admin, visible_b, created_by_user_id: owner.id)
+
+    %{identity: shared_identity, assignment: shared_assignment_a} =
+      active_upstream_assignment_fixture(visible_a, %{
+        account_label: "Shared identity",
+        assignment_label: "Shared assignment"
+      })
+
+    shared_assignment_b =
+      assignment_for_identity_fixture(visible_b, shared_identity, "Shared assignment")
+
+    stats_usage_for_assignment_fixture(visible_a, shared_assignment_a, %{
+      total_tokens: 20,
+      request_count: 2,
+      api_key_display_name: "Stats shared A"
+    })
+
+    stats_usage_for_assignment_fixture(visible_b, shared_assignment_b, %{
+      total_tokens: 10,
+      request_count: 1,
+      api_key_display_name: "Stats shared B"
+    })
+
+    %{identity: visible_identity, assignment: visible_assignment} =
+      upstream_assignment_fixture(visible_b, %{
+        account_label: "Visible only identity",
+        assignment_label: "Visible only assignment"
+      })
+
+    stats_usage_for_assignment_fixture(visible_b, visible_assignment, %{
+      total_tokens: 10,
+      request_count: 1,
+      api_key_display_name: "Stats visible only"
+    })
+
+    %{identity: hidden_identity, assignment: hidden_assignment} =
+      upstream_assignment_fixture(hidden, %{
+        account_label: "Hidden pool identity",
+        assignment_label: "Hidden pool assignment"
+      })
+
+    stats_usage_for_assignment_fixture(hidden, hidden_assignment, %{
+      total_tokens: 100,
+      request_count: 100,
+      api_key_display_name: "Stats hidden"
+    })
+
+    %{
+      owner_scope: owner_scope,
+      admin_scope: Scope.for_user(admin),
+      pools: %{visible_a: visible_a, visible_b: visible_b, hidden: hidden},
+      shared_identity: shared_identity,
+      visible_identity: visible_identity,
+      hidden_identity: hidden_identity
+    }
+  end
+
+  defp assignment_for_identity_fixture(pool, identity, assignment_label) do
+    assert {:ok, assignment} =
+             PoolAssignments.create_pool_assignment(pool, identity, %{
+               assignment_label: assignment_label
+             })
+
+    assert {:ok, assignment} = PoolAssignments.activate_pool_assignment(assignment)
+    assignment
+  end
+
+  defp stats_usage_for_assignment_fixture(pool, assignment, attrs) do
+    attrs = Map.new(attrs)
+    total_tokens = Map.fetch!(attrs, :total_tokens)
+    request_count = Map.fetch!(attrs, :request_count)
+    api_key_display_name = Map.fetch!(attrs, :api_key_display_name)
+
     %{api_key: api_key} = active_api_key_fixture(pool, %{display_name: api_key_display_name})
-    %{identity: identity, assignment: assignment} = upstream_assignment_fixture(pool)
 
     request =
       request_fixture(%{pool: pool, api_key: api_key}, %{
@@ -147,10 +307,11 @@ defmodule CodexPooler.Admin.StatsAuthorizationTest do
     ledger_entry_fixture(request, %{
       attempt_id: attempt.id,
       pool_upstream_assignment_id: assignment.id,
-      upstream_identity_id: identity.id,
+      upstream_identity_id: assignment.upstream_identity_id,
       total_tokens: total_tokens,
       input_tokens: total_tokens,
       output_tokens: 0,
+      request_count: request_count,
       estimated_cost_micros: 0
     })
   end

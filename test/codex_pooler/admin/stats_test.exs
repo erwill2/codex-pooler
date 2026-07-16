@@ -9,12 +9,149 @@ defmodule CodexPooler.Admin.StatsTest do
   alias CodexPooler.Accounting.DailyRollup
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.Admin.Stats
+  alias CodexPooler.Admin.Stats.Kpis
+  alias CodexPooler.Admin.Stats.Tables
   alias CodexPooler.Audit
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
   alias CodexPooler.Jobs
   alias CodexPooler.Jobs.RuntimeStateCleanupWorker
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
+
+  test "baseline: upstream inventory keeps a zero-usage quota account visible" do
+    quota_account = %{
+      pool_upstream_assignment_id: "assignment-a",
+      upstream_identity_id: "identity-a",
+      assignment_label: "Primary upstream",
+      assignment_status: "active",
+      health_status: "active",
+      upstream_label: "Account A",
+      state: :unknown
+    }
+
+    assert [
+             %{
+               upstream_identity_id: "identity-a",
+               requests: 0,
+               total_tokens: 0,
+               settled_cost_micros: 0,
+               quota_state: :unknown
+             }
+           ] = Tables.upstream_table([], [quota_account])
+  end
+
+  test "upstream_table/2 calculates shares and sorts by requests before tokens" do
+    quota_accounts = [
+      quota_account("identity-a", "Alpha upstream", "assignment-a"),
+      quota_account("identity-b", "Beta upstream", "assignment-b")
+    ]
+
+    settlements = [
+      settlement("identity-a", 2, 10),
+      settlement("identity-b", 1, 100)
+    ]
+
+    assert [
+             %{
+               upstream_identity_id: "identity-a",
+               requests: 2,
+               total_tokens: 10,
+               traffic_share_percent: 66.7
+             },
+             %{
+               upstream_identity_id: "identity-b",
+               requests: 1,
+               total_tokens: 100,
+               traffic_share_percent: 33.3
+             }
+           ] = Tables.upstream_table(settlements, quota_accounts)
+  end
+
+  test "upstream_table/2 uses normalized label and identity for stable ties" do
+    quota_accounts = [
+      quota_account("identity-b", "Same upstream", "assignment-b"),
+      quota_account("identity-a", "Same upstream", "assignment-a")
+    ]
+
+    settlements = [
+      settlement("identity-b", 1, 10),
+      settlement("identity-a", 1, 10)
+    ]
+
+    assert [
+             %{upstream_identity_id: "identity-a", traffic_share_percent: 50.0},
+             %{upstream_identity_id: "identity-b", traffic_share_percent: 50.0}
+           ] = Tables.upstream_table(settlements, quota_accounts)
+  end
+
+  test "upstream_table/2 returns zero shares for every zero-traffic identity" do
+    quota_accounts = [
+      quota_account("identity-b", "Beta upstream", "assignment-b"),
+      quota_account("identity-a", "Alpha upstream", "assignment-a")
+    ]
+
+    assert [
+             %{
+               upstream_identity_id: "identity-a",
+               requests: 0,
+               traffic_share_percent: first_share
+             },
+             %{
+               upstream_identity_id: "identity-b",
+               requests: 0,
+               traffic_share_percent: second_share
+             }
+           ] = Tables.upstream_table([], quota_accounts)
+
+    assert first_share == 0.0
+    assert second_share == 0.0
+  end
+
+  test "upstream_table/2 emits no Repo queries and retains zero-traffic inventory" do
+    quota_accounts = [
+      quota_account("identity-a", "Alpha upstream", "assignment-a"),
+      quota_account("identity-b", "Beta upstream", "assignment-b")
+    ]
+
+    settlements = [settlement("identity-a", 2, 10)]
+
+    {_result, outside_events} =
+      collect_repo_query_events(fn -> Repo.query!("SELECT 1") end)
+
+    assert [%{command: "SELECT", row_count: 1}] = outside_events
+
+    {rows, table_events} =
+      collect_repo_query_events(fn -> Tables.upstream_table(settlements, quota_accounts) end)
+
+    assert table_events == []
+
+    assert [
+             %{upstream_identity_id: "identity-a", requests: 2, traffic_share_percent: 100.0},
+             %{upstream_identity_id: "identity-b", requests: 0, traffic_share_percent: zero_share}
+           ] = rows
+
+    assert zero_share == 0.0
+  end
+
+  test "cache_rate_kpi/1 rounds cached input over positive input and handles zero states" do
+    assert Kpis.cache_rate_kpi(%{input_tokens: 60, cached_input_tokens: 10}) == %{
+             value: 16.7,
+             cached_input_tokens: 10,
+             input_tokens: 60
+           }
+
+    assert Kpis.cache_rate_kpi(%{input_tokens: 60, cached_input_tokens: 0}) == %{
+             value: 0.0,
+             cached_input_tokens: 0,
+             input_tokens: 60
+           }
+
+    assert Kpis.cache_rate_kpi(%{input_tokens: 0, cached_input_tokens: 0}) == %{
+             value: nil,
+             cached_input_tokens: 0,
+             input_tokens: 0
+           }
+  end
 
   test "build_dashboard/2 returns pool-scoped KPI, table, chart, session, and quota aggregates" do
     scope = owner_scope()
@@ -116,7 +253,15 @@ defmodule CodexPooler.Admin.StatsTest do
     assert dashboard.kpis.average_latency_ms.value == 1000
     assert dashboard.kpis.active_sessions.value == 1
     assert dashboard.kpis.turns.value == 1
-    assert dashboard.kpis.quota_health.state == :available
+
+    assert dashboard.kpis.cache_rate == %{
+             value: 16.7,
+             cached_input_tokens: 10,
+             input_tokens: 60
+           }
+
+    refute Map.has_key?(dashboard.kpis, :quota_health)
+    assert dashboard.quota.summary.state == :available
 
     assert [
              %{
@@ -128,7 +273,14 @@ defmodule CodexPooler.Admin.StatsTest do
            ] =
              dashboard.tables.top_api_keys
 
-    assert [%{quota_state: :available, requests: 1, total_tokens: 100}] =
+    assert [
+             %{
+               quota_state: :available,
+               requests: 1,
+               total_tokens: 100,
+               traffic_share_percent: 100.0
+             }
+           ] =
              dashboard.tables.upstreams
 
     assert [%{error_code: "upstream_rate_limited", status: "failed"}] =
@@ -257,7 +409,8 @@ defmodule CodexPooler.Admin.StatsTest do
                status: "active",
                assignment_count: 2,
                requests: 2,
-               total_tokens: 100
+               total_tokens: 100,
+               traffic_share_percent: 66.7
              },
              %{
                upstream_identity_id: same_label_identity_id,
@@ -265,7 +418,8 @@ defmodule CodexPooler.Admin.StatsTest do
                upstream_label: "Shared account",
                assignment_count: 1,
                requests: 1,
-               total_tokens: 25
+               total_tokens: 25,
+               traffic_share_percent: 33.3
              }
            ] = dashboard.tables.upstreams
 
@@ -663,7 +817,7 @@ defmodule CodexPooler.Admin.StatsTest do
     assert dashboard.kpis.settled_cost == %{status: "unavailable", micros: 0, usd: nil}
     assert dashboard.kpis.average_latency_ms == %{value: nil, unit: "ms"}
     assert dashboard.kpis.turns == %{value: 0, succeeded: 0, failed: 0, in_progress: 0}
-    assert dashboard.kpis.quota_health.state == :unknown
+    assert dashboard.quota.summary.state == :unknown
     assert Enum.map(dashboard.empty_states, & &1.code) == [:no_requests, :no_usage]
     assert [%{requests: 0, succeeded: 0, failed: 0}] = dashboard.charts.requests
     assert [%{total_tokens: 0}] = dashboard.charts.tokens
@@ -1052,9 +1206,9 @@ defmodule CodexPooler.Admin.StatsTest do
              ])
 
     assert {:ok, dashboard} = Stats.build_dashboard(scope, %{pool_id: pool.id, window: "5h"})
-    assert dashboard.kpis.quota_health.state == :weekly_only_evidence
-    assert dashboard.kpis.quota_health.weekly_only_evidence == 1
-    assert dashboard.kpis.quota_health.exhausted == 0
+    assert dashboard.quota.summary.state == :weekly_only_evidence
+    assert dashboard.quota.summary.weekly_only_evidence == 1
+    assert dashboard.quota.summary.exhausted == 0
 
     assert [account] = dashboard.quota.accounts
     assert account.state == :weekly_only_evidence
@@ -1085,11 +1239,11 @@ defmodule CodexPooler.Admin.StatsTest do
              ])
 
     assert {:ok, dashboard} = Stats.build_dashboard(scope, %{pool_id: pool.id, window: "5h"})
-    assert dashboard.kpis.quota_health.state == :available
-    assert dashboard.kpis.quota_health.available == 1
-    assert dashboard.kpis.quota_health.missing_evidence == 0
-    assert dashboard.kpis.quota_health.exhausted == 0
-    assert dashboard.kpis.quota_health.weekly_only_evidence == 0
+    assert dashboard.quota.summary.state == :available
+    assert dashboard.quota.summary.available == 1
+    assert dashboard.quota.summary.missing_evidence == 0
+    assert dashboard.quota.summary.exhausted == 0
+    assert dashboard.quota.summary.weekly_only_evidence == 0
 
     assert [account] = dashboard.quota.accounts
     assert account.state == :available
@@ -1143,6 +1297,27 @@ defmodule CodexPooler.Admin.StatsTest do
     refute rendered =~ raw_idempotency_key
     refute rendered =~ raw_key
     refute Map.has_key?(hd(dashboard.tables.recent_failures ++ [%{}]), :metadata)
+  end
+
+  defp quota_account(identity_id, assignment_label, assignment_id) do
+    %{
+      pool_upstream_assignment_id: assignment_id,
+      upstream_identity_id: identity_id,
+      assignment_label: assignment_label,
+      assignment_status: "active",
+      health_status: "active",
+      upstream_label: assignment_label,
+      state: :unknown
+    }
+  end
+
+  defp settlement(identity_id, requests, total_tokens) do
+    %{
+      upstream_identity_id: identity_id,
+      request_count: requests,
+      total_tokens: total_tokens,
+      settled_cost_micros: total_tokens
+    }
   end
 
   defp owner_scope do

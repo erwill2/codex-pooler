@@ -14,6 +14,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
   alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPoolerWeb.Admin.StatsPresentation.Charts, as: StatsCharts
 
   @reload_telemetry_event [:codex_pooler, :admin, :stats_live, :reload]
   @dashboard_build_telemetry_event [:codex_pooler, :admin, :stats, :dashboard, :build]
@@ -22,6 +23,191 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
 
   test "redirects unauthenticated operators to login" do
     assert {:error, {:redirect, %{to: "/login"}}} = live(build_conn(), ~p"/admin/stats")
+  end
+
+  test "traffic chart presentation merges model columns with the requests line" do
+    # Given
+    buckets = [
+      "2026-01-10T12:00:00Z",
+      "2026-01-10T13:00:00Z",
+      "2026-01-10T14:00:00Z"
+    ]
+
+    assigns = %{
+      requests: Enum.map(buckets, &%{bucket: &1, requests: 1}),
+      tokens:
+        Enum.map(buckets, fn bucket ->
+          %{
+            bucket: bucket,
+            uncached_input_tokens: 7,
+            cached_input_tokens: 1,
+            output_tokens: 3,
+            reasoning_tokens: 2,
+            total_tokens: 13
+          }
+        end),
+      costs: Enum.map(buckets, &%{bucket: &1, settled_cost_micros: 0}),
+      model_usage: [
+        %{bucket: Enum.at(buckets, 0), model_code: "model-a", total_tokens: 5},
+        %{bucket: Enum.at(buckets, 1), model_code: "model-a", total_tokens: 7},
+        %{bucket: Enum.at(buckets, 2), model_code: "model-a", total_tokens: 9},
+        %{bucket: Enum.at(buckets, 0), model_code: "model-b", total_tokens: 0},
+        %{bucket: Enum.at(buckets, 1), model_code: "model-b", total_tokens: 15},
+        %{bucket: Enum.at(buckets, 2), model_code: "model-b", total_tokens: 0},
+        %{bucket: Enum.at(buckets, 0), model_code: "Other", total_tokens: 0},
+        %{bucket: Enum.at(buckets, 1), model_code: "Other", total_tokens: 0},
+        %{bucket: Enum.at(buckets, 2), model_code: "Other", total_tokens: 24}
+      ]
+    }
+
+    # When
+    html = render_component(&StatsCharts.traffic_charts/1, assigns)
+
+    # Then
+    traffic_series =
+      html
+      |> LazyHTML.from_fragment()
+      |> LazyHTML.query("#stats-traffic-chart-plot")
+      |> LazyHTML.attribute("data-chart-series")
+      |> List.first()
+      |> Jason.decode!()
+
+    assert Enum.map(traffic_series, & &1["name"]) == [
+             "model-a",
+             "model-b",
+             "Other",
+             "Requests"
+           ]
+
+    assert Enum.map(traffic_series, & &1["data"]) == [
+             [5, 7, 9],
+             [0, 15, 0],
+             [0, 0, 24],
+             [1, 1, 1]
+           ]
+
+    assert Enum.map(traffic_series, & &1["type"]) == ["column", "column", "column", "line"]
+    assert html =~ "60 tokens / 3 requests"
+    refute html =~ "39 tokens / 3 requests"
+
+    assert component_chart_json_attribute(html, "data-chart-units") == [
+             "tokens",
+             "tokens",
+             "tokens",
+             "requests"
+           ]
+
+    assert component_chart_json_attribute(html, "data-chart-yaxis") == [
+             %{
+               "seriesName" => ["model-a", "model-b", "Other"],
+               "title" => "tokens",
+               "valueKind" => "tokens"
+             },
+             %{
+               "seriesName" => "Requests",
+               "title" => "requests",
+               "opposite" => true,
+               "valueKind" => "integer"
+             }
+           ]
+
+    fragment = LazyHTML.from_fragment(html)
+
+    assert fragment
+           |> LazyHTML.query("#stats-traffic-charts > section")
+           |> Enum.count() == 2
+
+    assert fragment
+           |> LazyHTML.query(
+             "#stats-traffic-chart-plot[data-chart-stacked='true'][data-chart-bar-radius='0'][data-chart-zoom='false'][data-chart-legend='always'][data-chart-safe-tooltip='true']"
+           )
+           |> Enum.count() == 1
+
+    assert fragment
+           |> LazyHTML.query(
+             "#stats-token-cost-chart-plot[data-chart-bar-radius='0'][data-chart-zoom='false']"
+           )
+           |> Enum.count() == 1
+
+    for selector <- [
+          "#stats-traffic-chart [data-role='chart-heading-group'] > #stats-traffic-chart-heading + #stats-traffic-chart-total",
+          "#stats-token-cost-chart [data-role='chart-heading-group'] > #stats-token-cost-chart-heading + #stats-token-cost-chart-total",
+          "#stats-traffic-chart header > [data-role='chart-heading-group'] + #stats-traffic-chart-mode-control:last-child",
+          "#stats-token-cost-chart header > [data-role='chart-heading-group'] + #stats-token-cost-chart-mode-control:last-child",
+          "#stats-traffic-chart-mode-control[role='group'][aria-label='Traffic chart mode']",
+          "#stats-token-cost-chart-mode-control[role='group'][aria-label='Tokens vs cost chart mode']",
+          "#stats-traffic-chart-mode-interval[aria-controls='stats-traffic-chart-plot'][aria-pressed='true']",
+          "#stats-traffic-chart-mode-cumulative[aria-controls='stats-traffic-chart-plot'][aria-pressed='false']",
+          "#stats-token-cost-chart-mode-interval[aria-controls='stats-token-cost-chart-plot'][aria-pressed='true']",
+          "#stats-token-cost-chart-mode-cumulative[aria-controls='stats-token-cost-chart-plot'][aria-pressed='false']",
+          "#stats-traffic-chart-plot[aria-describedby~='stats-traffic-chart-mode-description']",
+          "#stats-token-cost-chart-plot[aria-describedby~='stats-token-cost-chart-mode-description']",
+          "#stats-traffic-chart-interval-values[data-chart-source='interval']",
+          "#stats-token-cost-chart-interval-values[data-chart-source='interval']"
+        ] do
+      assert fragment |> LazyHTML.query(selector) |> Enum.count() == 1
+    end
+
+    assert fragment
+           |> LazyHTML.query("[id^='stats-model-usage-chart']")
+           |> Enum.empty?()
+
+    assert [click_command] =
+             fragment
+             |> LazyHTML.query("#stats-traffic-chart-mode-cumulative")
+             |> LazyHTML.attribute("phx-click")
+
+    assert click_command =~ "dispatch"
+    refute click_command =~ "push"
+  end
+
+  test "traffic chart presentation falls back to settlement tokens for all-zero model data" do
+    # Given
+    bucket = "2026-01-10T12:00:00Z"
+
+    assigns = %{
+      requests: [%{bucket: bucket, requests: 2}],
+      tokens: [
+        %{
+          bucket: bucket,
+          uncached_input_tokens: 7,
+          cached_input_tokens: 1,
+          output_tokens: 3,
+          reasoning_tokens: 2,
+          total_tokens: 13
+        }
+      ],
+      costs: [%{bucket: bucket, settled_cost_micros: 0}],
+      model_usage: [%{bucket: bucket, model_code: "gpt-zero", total_tokens: 0}]
+    }
+
+    # When
+    html = render_component(&StatsCharts.traffic_charts/1, assigns)
+
+    # Then
+    traffic_series = component_chart_json_attribute(html, "data-chart-series")
+
+    assert Enum.map(traffic_series, & &1["name"]) == ["Tokens", "Requests"]
+    assert Enum.map(traffic_series, & &1["data"]) == [[13], [2]]
+    refute html =~ "gpt-zero"
+  end
+
+  test "traffic chart presentation keeps an empty fallback payload composed" do
+    # Given
+    assigns = %{requests: [], tokens: [], costs: [], model_usage: []}
+
+    # When
+    html = render_component(&StatsCharts.traffic_charts/1, assigns)
+
+    # Then
+    traffic_series = component_chart_json_attribute(html, "data-chart-series")
+
+    assert traffic_series == [
+             %{"name" => "Tokens", "type" => "column", "data" => []},
+             %{"name" => "Requests", "type" => "line", "data" => []}
+           ]
+
+    refute html =~ "stats-model-usage-chart"
   end
 
   describe "authenticated stats dashboard" do
@@ -81,7 +267,13 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
 
       assert has_element?(view, "#admin-nav-stats[aria-current='page']")
       assert has_element?(view, "#stats-page-header", "Usage")
-      assert has_element?(view, "#stats-page-header", "Usage, cost, latency, sessions, and quota")
+
+      assert has_element?(
+               view,
+               "#stats-page-header",
+               "Usage, cost, latency, sessions, and cache activity"
+             )
+
       assert has_element?(view, "#stats-pool-filter[type='hidden'][value='#{pool.id}']")
       assert has_element?(view, "#stats-pool-filter-control")
 
@@ -164,8 +356,48 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-kpi-success-rate", "50.0%")
       assert has_element?(view, "#stats-kpi-success-rate", "Completed")
       assert has_element?(view, "#stats-kpi-tokens", "100")
-      assert has_element?(view, "#stats-kpi-tokens", "60 input")
-      assert has_element?(view, "#stats-kpi-tokens", "10 cached")
+
+      token_summary_html =
+        view
+        |> element("#stats-kpi-tokens [data-role='token-summary']")
+        |> render()
+
+      token_summary = LazyHTML.from_fragment(token_summary_html)
+
+      assert token_summary
+             |> LazyHTML.query("[data-role='token-summary-item']")
+             |> Enum.count() == 3
+
+      assert token_summary
+             |> LazyHTML.query("[data-role='token-summary'].grid")
+             |> Enum.count() == 1
+
+      refute token_summary_html =~ "overflow-hidden"
+
+      for {position, label, title, value, icon} <- [
+            {1, "input", "Input", "60", "hero-arrow-down-left"},
+            {2, "cached input", "Cached input", "10", "hero-circle-stack"},
+            {3, "output", "Output", "30", "hero-arrow-up-right"}
+          ] do
+        selector =
+          "[data-role='token-summary-item']:nth-child(#{position})[role='group'][aria-label='#{label}'][title='#{title}']"
+
+        assert token_summary |> LazyHTML.query(selector) |> Enum.count() == 1
+
+        assert token_summary
+               |> LazyHTML.query(
+                 "#{selector} [data-role='token-summary-icon'][aria-hidden='true'] .#{icon}"
+               )
+               |> Enum.count() == 1
+
+        assert token_summary
+               |> LazyHTML.query(
+                 "#{selector} [data-role='token-summary-value'].whitespace-nowrap:not(.truncate)"
+               )
+               |> LazyHTML.text()
+               |> String.trim() == value
+      end
+
       assert has_element?(view, "#stats-kpi-tokens-per-sec", "50.0")
       assert has_element?(view, "#stats-kpi-tokens-per-sec", "Throughput")
       assert has_element?(view, "#stats-kpi-cost", "$0.75")
@@ -173,7 +405,10 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-kpi-avg-latency", "Mean response time")
       assert has_element?(view, "#stats-kpi-active-sessions", "1")
       assert has_element?(view, "#stats-kpi-active-sessions", "1 turns")
-      assert has_element?(view, "#stats-kpi-quota-health", "Available")
+      assert has_element?(view, "#stats-kpi-cache-rate", "Cache rate")
+      assert has_element?(view, "#stats-kpi-cache-rate", "16.7%")
+      assert has_element?(view, "#stats-kpi-cache-rate", "10 of 60 input cached")
+      refute has_element?(view, "#stats-kpi-quota-health")
       assert has_element?(view, "#stats-traffic-chart-scroll[data-role='chart-scroll-region']")
       assert has_element?(view, "#stats-traffic-chart-scroll.overflow-x-auto")
       assert has_element?(view, "#stats-traffic-chart-plot.admin-chart-mobile-wide")
@@ -182,9 +417,21 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-traffic-chart-plot[data-chart-unit='tokens']")
       assert has_element?(view, "#stats-traffic-chart-plot[data-chart-units]")
       assert has_element?(view, "#stats-traffic-chart-plot[data-chart-yaxis]")
-      assert has_element?(view, "#stats-traffic-chart-plot[data-chart-legend='true']")
+
+      assert has_element?(
+               view,
+               "#stats-traffic-chart-plot[data-chart-legend='always'][data-chart-safe-tooltip='true'][data-chart-stacked='true'][data-chart-bar-radius='0'][data-chart-zoom='false']"
+             )
+
       assert has_element?(view, "#stats-traffic-chart", "Traffic over time")
       assert has_element?(view, "#stats-traffic-chart", "100 tokens / 2 requests")
+      assert has_element?(view, "#stats-traffic-chart-mode-control[role='group']")
+
+      assert has_element?(
+               view,
+               "#stats-traffic-chart-interval-values[data-chart-source='interval']"
+             )
+
       refute has_element?(view, "#stats-traffic-chart-summary")
       refute has_element?(view, "#stats-traffic-chart-total.font-mono")
       refute has_element?(view, "#stats-traffic-chart-plot svg")
@@ -200,7 +447,16 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-token-cost-chart-plot[data-chart-bar-radius='0']")
       assert has_element?(view, "#stats-token-cost-chart-plot[data-chart-value-kinds]")
       assert has_element?(view, "#stats-token-cost-chart-plot[data-chart-yaxis]")
+      assert has_element?(view, "#stats-token-cost-chart-plot[data-chart-zoom='false']")
+      assert has_element?(view, "#stats-token-cost-chart-mode-control[role='group']")
+
+      assert has_element?(
+               view,
+               "#stats-token-cost-chart-interval-values[data-chart-source='interval']"
+             )
+
       refute has_element?(view, "#stats-token-chart")
+      refute has_element?(view, "[id^='stats-model-usage-chart']")
 
       assert has_element?(
                view,
@@ -240,21 +496,59 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
                "Top API keys by token usage"
              )
 
-      refute has_element?(view, "#stats-upstream-surface > header p")
+      assert has_element?(view, "#stats-upstream-surface", "Traffic distribution")
+
+      assert has_element?(
+               view,
+               "#stats-upstream-surface > header p",
+               "Share of accounted requests across Stats Live in the last 24 hours."
+             )
+
       refute has_element?(view, "#stats-upstream-surface > header > span")
-      refute has_element?(view, "#stats-upstream-table .font-mono")
-      refute has_element?(view, "#stats-upstream-card-0 .font-mono")
-      assert has_element?(view, "#stats-upstream-table", "Stats assignment")
-      assert has_element?(view, "#stats-upstream-table thead th", "Upstream")
-      assert has_element?(view, "#stats-upstream-table thead th", "Status")
-      assert has_element?(view, "#stats-upstream-table thead th.text-center", "Status")
-      refute has_element?(view, "#stats-upstream-table thead th", "Quota")
-      assert has_element?(view, "#stats-upstream-table thead th", "Requests")
-      assert has_element?(view, "#stats-upstream-table thead th", "Tokens")
-      assert has_element?(view, "#stats-upstream-row-0 td:nth-child(2).text-center")
-      assert has_element?(view, "#stats-upstream-row-0 td:nth-child(3)", "1")
-      assert has_element?(view, "#stats-upstream-row-0 td:nth-child(4)", "100")
-      refute has_element?(view, "#stats-upstream-row-0 td:nth-child(5)")
+
+      upstream_surface_html = view |> element("#stats-upstream-surface") |> render()
+      upstream_surface = LazyHTML.from_fragment(upstream_surface_html)
+
+      assert upstream_surface |> LazyHTML.query("ol#stats-upstream-lanes") |> Enum.count() == 1
+
+      assert upstream_surface
+             |> LazyHTML.query("[data-role='upstream-traffic-lane']")
+             |> Enum.count() == 1
+
+      assert has_element?(
+               view,
+               "#stats-upstream-lane-1[data-role='upstream-traffic-lane'][data-leader='true']",
+               "Stats assignment"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-upstream-lane-1 [data-role='upstream-traffic-share']",
+               "100.0%"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-upstream-rail-1[data-role='upstream-traffic-rail'][max='100'][value='100.0'][aria-label='Stats assignment traffic share']"
+             )
+
+      assert has_element?(view, "#stats-upstream-lane-1 [data-role='upstream-requests']", "1")
+      assert has_element?(view, "#stats-upstream-lane-1 [data-role='upstream-tokens']", "100")
+
+      assert has_element?(
+               view,
+               "#stats-upstream-lane-1 [data-role='upstream-settled-cost']",
+               "$0.75"
+             )
+
+      refute has_element?(view, "#stats-upstream-surface table")
+      refute has_element?(view, "#stats-upstream-surface article")
+      refute has_element?(view, "#stats-upstream-surface .badge")
+      refute has_element?(view, "#stats-upstream-surface .overflow-x-auto")
+      refute has_element?(view, "[id^='stats-upstream-card-']")
+      refute has_element?(view, "[id^='stats-upstream-row-']")
+      refute has_element?(view, "#stats-upstream-surface", "active")
+      refute has_element?(view, "#stats-upstream-surface", "Quota")
       refute has_element?(view, "#stats-recent-activity")
       refute has_element?(view, "#stats-quota-table")
 
@@ -262,10 +556,26 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       refute has_element?(view, "#stats-traffic-chart", "33 tokens")
 
       traffic_chart_html = view |> element("#stats-traffic-chart-plot") |> render()
+      traffic_series = chart_json_attribute(traffic_chart_html, "data-chart-series")
 
       assert traffic_chart_html =~ "ApexTimeSeriesChart"
-      assert traffic_chart_html =~ "Tokens"
-      assert traffic_chart_html =~ "Requests"
+      assert Enum.map(traffic_series, & &1["name"]) == ["Tokens", "Requests"]
+      assert Enum.map(traffic_series, & &1["type"]) == ["column", "line"]
+
+      assert chart_json_attribute(traffic_chart_html, "data-chart-units") == [
+               "tokens",
+               "requests"
+             ]
+
+      assert chart_json_attribute(traffic_chart_html, "data-chart-yaxis") == [
+               %{"seriesName" => "Tokens", "title" => "tokens", "valueKind" => "tokens"},
+               %{
+                 "seriesName" => "Requests",
+                 "title" => "requests",
+                 "opposite" => true,
+                 "valueKind" => "integer"
+               }
+             ]
 
       token_cost_chart_html = view |> element("#stats-token-cost-chart-plot") |> render()
 
@@ -281,7 +591,129 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       refute html =~ "raw prompt #{sensitive_marker}"
     end
 
-    test "renders model usage chart selectors and sanitized hook payload", %{
+    test "merges model usage into traffic with independent accessible chart controls", %{
+      conn: conn,
+      scope: scope
+    } do
+      # Given
+      {:ok, pool} =
+        Pools.create_pool(scope, %{slug: "stats-chart-baseline", name: "Stats Chart Baseline"})
+
+      model =
+        model_fixture(pool, %{
+          exposed_model_id: "gpt-chart-baseline",
+          display_name: "Chart Baseline Model"
+        })
+
+      as_of = ~U[2026-01-10 12:00:00.000000Z]
+
+      stats_model_usage_fixture(pool, model, %{
+        sensitive_marker: "chart-baseline-secret-do-not-render",
+        as_of: as_of,
+        total_tokens: 13,
+        input_tokens: 8,
+        cached_input_tokens: 1,
+        output_tokens: 3,
+        reasoning_tokens: 2
+      })
+
+      # When
+      {:ok, view, _html} =
+        live(
+          conn,
+          ~p"/admin/stats?pool_id=#{pool.id}&window=1h&as_of=#{DateTime.to_iso8601(as_of)}"
+        )
+
+      # Then
+      traffic_series =
+        view
+        |> element("#stats-traffic-chart-plot")
+        |> render()
+        |> chart_json_attribute("data-chart-series")
+
+      assert Enum.map(traffic_series, & &1["name"]) == ["gpt-chart-baseline", "Requests"]
+      assert Enum.map(traffic_series, & &1["type"]) == ["column", "line"]
+      assert traffic_series |> hd() |> Map.fetch!("data") |> Enum.sum() == 13
+      assert traffic_series |> List.last() |> Map.fetch!("data") |> Enum.sum() == 1
+
+      assert has_element?(
+               view,
+               "#stats-traffic-chart-plot[data-chart-stacked='true'][data-chart-legend='always'][data-chart-safe-tooltip='true'][data-chart-zoom='false'][data-chart-bar-radius='0']"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-token-cost-chart-plot[data-chart-zoom='false'][data-chart-bar-radius='0']"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-traffic-chart [data-role='chart-heading-group'] > #stats-traffic-chart-heading + #stats-traffic-chart-total",
+               "13 tokens / 1 requests"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-token-cost-chart [data-role='chart-heading-group'] > #stats-token-cost-chart-heading + #stats-token-cost-chart-total"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-traffic-chart-mode-control[role='group'][aria-label='Traffic chart mode']"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-traffic-chart-mode-interval[type='button'][phx-click][data-chart-mode='interval'][aria-controls='stats-traffic-chart-plot'][aria-pressed='true']:not([phx-keydown])"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-traffic-chart-mode-cumulative[type='button'][phx-click][data-chart-mode='cumulative'][aria-controls='stats-traffic-chart-plot'][aria-pressed='false']:not([phx-keydown])"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-token-cost-chart-mode-control[role='group'][aria-label='Tokens vs cost chart mode']"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-token-cost-chart-mode-interval[type='button'][phx-click][data-chart-mode='interval'][aria-controls='stats-token-cost-chart-plot'][aria-pressed='true']:not([phx-keydown])"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-token-cost-chart-mode-cumulative[type='button'][phx-click][data-chart-mode='cumulative'][aria-controls='stats-token-cost-chart-plot'][aria-pressed='false']:not([phx-keydown])"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-traffic-chart header > [data-role='chart-heading-group'] + #stats-traffic-chart-mode-control:last-child"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-token-cost-chart header > [data-role='chart-heading-group'] + #stats-token-cost-chart-mode-control:last-child"
+             )
+
+      assert has_element?(view, "#stats-traffic-chart-mode-description", "interval")
+      assert has_element?(view, "#stats-token-cost-chart-mode-description", "interval")
+
+      assert has_element?(
+               view,
+               "#stats-traffic-chart-interval-values[data-chart-source='interval']"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-token-cost-chart-interval-values[data-chart-source='interval']"
+             )
+
+      refute has_element?(view, "[id^='stats-model-usage-chart']")
+    end
+
+    test "renders ranked model traffic in the merged sanitized hook payload", %{
       conn: conn,
       scope: scope
     } do
@@ -323,54 +755,93 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
         sensitive_marker: sensitive_marker,
         as_of: as_of,
         correlation_id: "stats-model-usage-live-unsafe",
-        total_tokens: 7,
-        input_tokens: 4,
-        cached_input_tokens: 1,
-        output_tokens: 2,
-        reasoning_tokens: 1
+        total_tokens: 110,
+        input_tokens: 70,
+        cached_input_tokens: 10,
+        output_tokens: 20,
+        reasoning_tokens: 20
       })
+
+      for {model_code, total_tokens} <- [
+            {"gpt-ranked-3", 100},
+            {"gpt-ranked-4", 90},
+            {"gpt-ranked-5", 80},
+            {"gpt-ranked-6", 70},
+            {"gpt-ranked-7", 60}
+          ] do
+        model =
+          model_fixture(pool, %{
+            exposed_model_id: model_code,
+            display_name: "Ranked Model Display Name #{sensitive_marker}"
+          })
+
+        insert_hourly_model_usage_rollup!(pool, model, truncate_to_hour(as_of), %{
+          total_tokens: total_tokens,
+          input_tokens: total_tokens,
+          cached_input_tokens: 0,
+          output_tokens: 0,
+          reasoning_tokens: 0
+        })
+      end
 
       {:ok, view, _html} =
         live(conn, ~p"/admin/stats?pool_id=#{pool.id}&window=1h&as_of=#{as_of_iso}")
 
-      assert has_element?(view, "#stats-model-usage-chart")
-      assert has_element?(view, "#stats-model-usage-chart", "Model usage")
-      assert has_element?(view, "#stats-model-usage-chart", "130 tokens")
-
       assert has_element?(
                view,
-               "#stats-model-usage-chart-scroll[data-role='chart-scroll-region']"
+               "#stats-traffic-chart-plot[data-chart-legend='always'][data-chart-safe-tooltip='true'][data-chart-stacked='true'][data-chart-bar-radius='0']"
              )
 
-      assert has_element?(view, "#stats-model-usage-chart-scroll.overflow-x-auto")
-      assert has_element?(view, "#stats-model-usage-chart-plot.admin-chart-mobile-wide")
-      assert has_element?(view, "#stats-model-usage-chart-plot[phx-hook='ApexTimeSeriesChart']")
-      assert has_element?(view, "#stats-model-usage-chart-plot[phx-update='ignore']")
-      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-legend='always']")
-      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-safe-tooltip='true']")
-      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-colors]")
-      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-stacked='true']")
-      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-categories]")
-      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-series]")
-      assert has_element?(view, "#stats-model-usage-chart-plot[data-chart-yaxis]")
+      assert has_element?(view, "#stats-traffic-chart", "633 tokens / 2 requests")
+      refute has_element?(view, "[id^='stats-model-usage-chart']")
 
-      chart_html = view |> element("#stats-model-usage-chart-plot") |> render()
+      chart_html = view |> element("#stats-traffic-chart-plot") |> render()
       series = chart_json_attribute(chart_html, "data-chart-series")
+      units = chart_json_attribute(chart_html, "data-chart-units")
+      value_kinds = chart_json_attribute(chart_html, "data-chart-value-kinds")
       yaxis = chart_json_attribute(chart_html, "data-chart-yaxis")
       series_names = Enum.map(series, & &1["name"])
+      model_series_names = Enum.drop(series_names, -1)
 
-      assert "gpt-5.5" in series_names
-      assert escaped_unsafe_model_code in series_names
+      assert series_names == [
+               "gpt-5.5",
+               escaped_unsafe_model_code,
+               "gpt-ranked-3",
+               "gpt-ranked-4",
+               "gpt-ranked-5",
+               "Other",
+               "Requests"
+             ]
+
+      assert Enum.map(series, & &1["type"]) ==
+               List.duplicate("column", 6) ++ ["line"]
+
+      assert units == List.duplicate("tokens", 6) ++ ["requests"]
+      assert value_kinds == List.duplicate("tokens", 6) ++ ["integer"]
+      assert series |> Enum.at(5) |> Map.fetch!("data") |> Enum.sum() == 130
+      assert series |> List.last() |> Map.fetch!("data") |> Enum.sum() == 2
+
+      assert [
+               %{
+                 "seriesName" => ^model_series_names,
+                 "title" => "tokens",
+                 "valueKind" => "tokens"
+               },
+               %{
+                 "seriesName" => "Requests",
+                 "title" => "requests",
+                 "opposite" => true,
+                 "valueKind" => "integer"
+               }
+             ] = yaxis
+
       refute unsafe_model_code in series_names
-      assert [%{"seriesName" => yaxis_series_names}] = yaxis
-      assert "gpt-5.5" in yaxis_series_names
-      assert escaped_unsafe_model_code in yaxis_series_names
-      refute unsafe_model_code in yaxis_series_names
       assert chart_html =~ "gpt-5.5"
       assert chart_html =~ "&amp;lt;img src=x onerror=alert(1)&amp;gt;"
       refute chart_html =~ "<img src=x onerror=alert(1)>"
       refute chart_html =~ "Model Usage Display Name"
       refute chart_html =~ "Unsafe Model Usage Display Name"
+      refute chart_html =~ "Ranked Model Display Name"
       refute chart_html =~ sensitive_marker
 
       html = render(view)
@@ -495,10 +966,49 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
 
       assert has_element?(view, "#stats-kpi-requests", "2")
       assert has_element?(view, "#stats-kpi-tokens", "30")
+      assert has_element?(view, "#stats-kpi-cache-rate", "0.0%")
+      assert has_element?(view, "#stats-kpi-cache-rate", "No cached input")
       assert has_element?(view, "#stats-traffic-chart", "30 tokens")
       assert has_element?(view, "#stats-api-key-surface", "Scoped A key")
       assert has_element?(view, "#stats-api-key-surface", "Scoped B key")
       refute has_element?(view, "#stats-api-key-surface", "Hidden C key")
+
+      assert has_element?(
+               view,
+               "#stats-upstream-surface > header p",
+               "Share of accounted requests across all visible pools in the last 24 hours."
+             )
+
+      all_pool_surface =
+        view
+        |> element("#stats-upstream-surface")
+        |> render()
+        |> LazyHTML.from_fragment()
+
+      assert all_pool_surface
+             |> LazyHTML.query("#stats-upstream-lanes")
+             |> Enum.count() == 1
+
+      assert all_pool_surface
+             |> LazyHTML.query("[data-role='upstream-traffic-lane']")
+             |> Enum.count() == 2
+
+      assert has_element?(
+               view,
+               "#stats-upstream-lane-1[data-leader='true'] [data-role='upstream-traffic-share']",
+               "50.0%"
+             )
+
+      assert has_element?(view, "#stats-upstream-lane-1 [data-role='upstream-tokens']", "20")
+
+      assert has_element?(
+               view,
+               "#stats-upstream-lane-2 [data-role='upstream-traffic-share']",
+               "50.0%"
+             )
+
+      assert has_element?(view, "#stats-upstream-lane-2 [data-role='upstream-tokens']", "10")
+      refute has_element?(view, "#stats-upstream-lane-2[data-leader='true']")
 
       view
       |> element("#stats-pool-filter-control button[data-pool-id='#{pool_b.id}']")
@@ -507,9 +1017,35 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert_patch(view, ~p"/admin/stats?pool_id=#{pool_b.id}&window=24h")
       assert has_element?(view, "#stats-pool-filter[value='#{pool_b.id}']")
       assert has_element?(view, "#stats-kpi-tokens", "20")
+      assert has_element?(view, "#stats-kpi-cache-rate", "0.0%")
+      assert has_element?(view, "#stats-kpi-cache-rate", "No cached input")
       assert has_element?(view, "#stats-api-key-surface", "Scoped B key")
       refute has_element?(view, "#stats-api-key-surface", "Scoped A key")
       refute has_element?(view, "#stats-api-key-surface", "Hidden C key")
+
+      assert has_element?(
+               view,
+               "#stats-upstream-surface > header p",
+               "Share of accounted requests across Stats Scope B in the last 24 hours."
+             )
+
+      selected_pool_surface =
+        view
+        |> element("#stats-upstream-surface")
+        |> render()
+        |> LazyHTML.from_fragment()
+
+      assert selected_pool_surface
+             |> LazyHTML.query("[data-role='upstream-traffic-lane']")
+             |> Enum.count() == 1
+
+      assert has_element?(
+               view,
+               "#stats-upstream-lane-1[data-leader='true'] [data-role='upstream-traffic-share']",
+               "100.0%"
+             )
+
+      assert has_element?(view, "#stats-upstream-lane-1 [data-role='upstream-tokens']", "20")
       refute render(view) =~ assigned_a.raw_key
       refute render(view) =~ assigned_b.raw_key
       refute render(view) =~ hidden_c.raw_key
@@ -524,7 +1060,7 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       refute render(blocked_view) =~ hidden_c.raw_key
     end
 
-    test "renders monthly-only primary quota evidence as available", %{
+    test "monthly quota evidence stays out of the neutral cache-rate KPI", %{
       conn: conn,
       scope: scope
     } do
@@ -551,10 +1087,11 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
 
       {:ok, view, _html} = live(conn, ~p"/admin/stats?pool_id=#{pool.id}&window=5h")
 
-      assert has_element?(view, "#stats-kpi-quota-health", "Available")
-      assert has_element?(view, "#stats-kpi-quota-health", "1 usable")
-      assert has_element?(view, "#stats-kpi-quota-health", "0 missing quota")
-      refute has_element?(view, "#stats-kpi-quota-health", "Missing evidence")
+      assert has_element?(view, "#stats-kpi-cache-rate", "not available")
+      assert has_element?(view, "#stats-kpi-cache-rate", "No input tokens")
+      refute has_element?(view, "#stats-kpi-quota-health")
+      refute has_element?(view, "#stats-kpis", "Missing evidence")
+      refute has_element?(view, "#stats-kpis", "1 usable")
     end
 
     test "unassigned admin sees empty scoped stats with no pool subscriptions", %{
@@ -593,9 +1130,14 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
 
       assert has_element?(view, "#stats-kpi-requests", "0")
       assert has_element?(view, "#stats-kpi-tokens", "0")
+      assert has_element?(view, "#stats-kpi-cache-rate", "not available")
+      assert has_element?(view, "#stats-kpi-cache-rate", "No input tokens")
       assert has_element?(view, "#stats-traffic-chart", "0 tokens / 0 requests")
       assert has_element?(view, "#stats-token-cost-chart", "0 tokens / $0.00")
       refute has_element?(view, "#stats-api-key-surface", "Unassigned hidden key")
+      assert has_element?(view, "#stats-upstream-empty-state", "No upstream identities")
+      refute has_element?(view, "#stats-upstream-lanes")
+      refute has_element?(view, "[data-role='upstream-traffic-lane']")
 
       state = :sys.get_state(view.pid)
       assert state.socket.assigns.subscribed_pool_ids == MapSet.new()
@@ -866,23 +1408,73 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       assert has_element?(view, "#stats-kpi-requests", "0")
       assert has_element?(view, "#stats-kpi-success-rate", "not available")
       assert has_element?(view, "#stats-kpi-cost", "unavailable")
+
+      [stats_kpi_classes] =
+        view
+        |> element("#stats-kpis")
+        |> render()
+        |> LazyHTML.from_fragment()
+        |> LazyHTML.query("#stats-kpis")
+        |> LazyHTML.attribute("class")
+
+      stats_kpi_classes = String.split(stats_kpi_classes)
+
+      assert "max-sm:[&_[data-role=metric-card-value]]:text-xs" in stats_kpi_classes
+
+      assert "max-sm:[&_[data-role=metric-card-value]]:whitespace-nowrap" in stats_kpi_classes
+
+      assert has_element?(view, "#stats-kpi-cache-rate", "not available")
+      assert has_element?(view, "#stats-kpi-cache-rate", "No input tokens")
       assert has_element?(view, "#stats-traffic-chart", "0 requests")
       assert has_element?(view, "#stats-traffic-chart", "0 tokens")
       assert has_element?(view, "#stats-token-cost-chart", "$0.00")
-      assert has_element?(view, "#stats-model-usage-chart", "0 tokens")
+      refute has_element?(view, "[id^='stats-model-usage-chart']")
 
-      model_usage_chart_html = view |> element("#stats-model-usage-chart-plot") |> render()
+      assert has_element?(
+               view,
+               "#stats-upstream-surface > header p",
+               "Share of accounted requests across Stats Empty Live in the last 1 hour."
+             )
 
-      assert chart_json_attribute(model_usage_chart_html, "data-chart-categories") == []
-      assert chart_json_attribute(model_usage_chart_html, "data-chart-series") == []
-      assert chart_json_attribute(model_usage_chart_html, "data-chart-units") == []
-      assert chart_json_attribute(model_usage_chart_html, "data-chart-value-kinds") == []
+      assert has_element?(view, "#stats-upstream-lanes")
 
-      assert [%{"seriesName" => [], "title" => "tokens", "valueKind" => "tokens"}] =
-               chart_json_attribute(model_usage_chart_html, "data-chart-yaxis")
+      all_zero_surface_html = view |> element("#stats-upstream-surface") |> render()
+      refute all_zero_surface_html =~ "bg-primary/5"
+      refute all_zero_surface_html =~ "text-primary"
+      refute all_zero_surface_html =~ "progress-primary"
+
+      assert has_element?(
+               view,
+               "#stats-upstream-lane-1:not([data-leader='true']) [data-role='upstream-traffic-share']",
+               "0.0%"
+             )
+
+      assert has_element?(
+               view,
+               "#stats-upstream-rail-1[max='100'][value='0.0']"
+             )
+
+      refute has_element?(view, "#stats-upstream-lanes [data-leader='true']")
+      refute has_element?(view, "#stats-upstream-empty-state")
+
+      traffic_chart_html = view |> element("#stats-traffic-chart-plot") |> render()
+      traffic_series = chart_json_attribute(traffic_chart_html, "data-chart-series")
+
+      assert Enum.map(traffic_series, & &1["name"]) == ["Tokens", "Requests"]
+      assert Enum.all?(traffic_series, fn series -> Enum.all?(series["data"], &(&1 == 0)) end)
+
+      assert chart_json_attribute(traffic_chart_html, "data-chart-units") == [
+               "tokens",
+               "requests"
+             ]
+
+      assert chart_json_attribute(traffic_chart_html, "data-chart-value-kinds") == [
+               "tokens",
+               "integer"
+             ]
     end
 
-    test "free plan weekly-only quota is not rendered as consumed or exhausted", %{
+    test "weekly-only quota evidence does not leak into traffic or cache usage", %{
       conn: conn,
       scope: scope
     } do
@@ -908,11 +1500,14 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
 
       {:ok, view, _html} = live(conn, ~p"/admin/stats?pool_id=#{pool.id}&window=5h")
 
-      assert has_element?(view, "#stats-kpi-quota-health", "Weekly evidence only")
-      assert has_element?(view, "#stats-kpi-quota-health", "1 account with weekly evidence only")
+      assert has_element?(view, "#stats-kpi-cache-rate", "not available")
+      assert has_element?(view, "#stats-kpi-cache-rate", "No input tokens")
+      refute has_element?(view, "#stats-kpi-quota-health")
+      refute has_element?(view, "#stats-kpis", "Weekly evidence only")
+      refute has_element?(view, "#stats-upstream-surface", "weekly")
+      refute has_element?(view, "#stats-upstream-surface", "active")
       refute has_element?(view, "#stats-quota-table")
       refute has_element?(view, "#stats-quota-table", "Exhausted")
-      refute has_element?(view, "#stats-kpi-quota-health", "0")
     end
   end
 
@@ -985,10 +1580,9 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
       #stats-kpi-cost
       #stats-kpi-avg-latency
       #stats-kpi-active-sessions
-      #stats-kpi-quota-health
+      #stats-kpi-cache-rate
       #stats-traffic-chart
       #stats-token-cost-chart
-      #stats-model-usage-chart
     )
   end
 
@@ -999,6 +1593,17 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
     |> case do
       [value] -> Jason.decode!(value)
       [] -> flunk("missing #{attribute} in chart HTML")
+    end
+  end
+
+  defp component_chart_json_attribute(html, attribute) do
+    html
+    |> LazyHTML.from_fragment()
+    |> LazyHTML.query("#stats-traffic-chart-plot")
+    |> LazyHTML.attribute(attribute)
+    |> case do
+      [value] -> Jason.decode!(value)
+      [] -> flunk("missing #{attribute} in Traffic chart HTML")
     end
   end
 

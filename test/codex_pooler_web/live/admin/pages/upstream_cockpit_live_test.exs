@@ -972,6 +972,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     end
 
     assert has_element?(view, "#upstream-status-summary", "Quota evidence is missing")
+
+    assert has_element?(
+             view,
+             "#upstream-status-summary-quota [data-role='metric-card-value'].break-words:not(.whitespace-nowrap)",
+             "Quota evidence is missing"
+           )
+
     assert has_element?(view, "#upstream-assignments", "1 assignment")
 
     assert has_element?(

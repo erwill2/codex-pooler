@@ -6,6 +6,20 @@ defmodule CodexPooler.Admin.Stats.Kpis do
   @succeeded "succeeded"
   @failed_statuses ~w(failed rejected interrupted cancelled)
 
+  @type cache_rate_kpi :: %{
+          value: float() | nil,
+          cached_input_tokens: integer(),
+          input_tokens: integer()
+        }
+
+  @type token_kpi_input :: %{
+          cached_input_tokens: integer(),
+          input_tokens: integer(),
+          output_tokens: integer(),
+          reasoning_tokens: integer(),
+          total_tokens: integer()
+        }
+
   @spec request_kpi([map()]) :: map()
   def request_kpi(requests) do
     %{
@@ -32,6 +46,18 @@ defmodule CodexPooler.Admin.Stats.Kpis do
       output_tokens: Aggregates.sum_integer(settlements, :output_tokens),
       reasoning_tokens: Aggregates.sum_integer(settlements, :reasoning_tokens),
       total_tokens: Aggregates.sum_integer(settlements, :total_tokens)
+    }
+  end
+
+  @spec cache_rate_kpi(token_kpi_input()) :: cache_rate_kpi()
+  def cache_rate_kpi(%{
+        cached_input_tokens: cached_input_tokens,
+        input_tokens: input_tokens
+      }) do
+    %{
+      value: Aggregates.percentage(cached_input_tokens, input_tokens),
+      cached_input_tokens: cached_input_tokens,
+      input_tokens: input_tokens
     }
   end
 
