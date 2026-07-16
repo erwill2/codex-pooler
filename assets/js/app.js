@@ -154,15 +154,44 @@ const buildChartTooltip = ({categories, series, unit, units, valueKinds, safeToo
 }
 const ClipboardCopy = {
   mounted() {
+    this.originalAriaLabel = this.el.getAttribute("aria-label")
     this.el.addEventListener("click", async () => {
       const icon = this.el.querySelector(".copy-icon")
       const label = this.el.querySelector("[data-copy-label]")
       window.clearTimeout(this.timeout)
       await navigator.clipboard.writeText(this.el.dataset.copyText)
 
+      const copiedText = this.el.dataset.copiedLabel || "Copied"
+
+      // Capture announced subject before mutating label.textContent
+      let announcedSubject = this.originalAriaLabel || label?.textContent || this.el.innerText?.trim() || "Text"
+      announcedSubject = announcedSubject.replace(/\.+$/, "").trim()
+
       if (label) {
-        label.textContent = this.el.dataset.copiedLabel || "Copied"
+        label.textContent = copiedText
       }
+
+      if (this.originalAriaLabel) {
+        this.el.setAttribute("aria-label", `${copiedText}: ${this.originalAriaLabel}`)
+      }
+
+      // Announce the action politely to assistive technologies (screen readers)
+      let liveRegion = document.getElementById("clipboard-copy-live-region")
+      if (!liveRegion) {
+        liveRegion = document.createElement("div")
+        liveRegion.id = "clipboard-copy-live-region"
+        liveRegion.setAttribute("aria-live", "polite")
+        liveRegion.className = "sr-only"
+        document.body.appendChild(liveRegion)
+      }
+      liveRegion.textContent = ""
+
+      // Delay slightly to ensure screen readers register the text content update
+      setTimeout(() => {
+        if (liveRegion) {
+          liveRegion.textContent = `${announcedSubject} successfully copied to clipboard`
+        }
+      }, 50)
 
       icon?.classList.remove("hero-clipboard-document")
       icon?.classList.add("hero-check")
@@ -175,6 +204,10 @@ const ClipboardCopy = {
 
         if (label) {
           label.textContent = this.el.dataset.copyLabel || "Copy"
+        }
+
+        if (this.originalAriaLabel) {
+          this.el.setAttribute("aria-label", this.originalAriaLabel)
         }
       }, 1400)
     })
