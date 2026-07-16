@@ -415,11 +415,11 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
   defp candidates_by_model_id(models, candidates) do
     Map.new(models, fn %Model{} = model ->
-      source_ids = MapSet.new(source_assignment_ids(model))
+      source_ids = source_assignment_ids(model)
 
       model_candidates =
         Enum.filter(candidates, fn {assignment, _identity} ->
-          MapSet.member?(source_ids, assignment.id)
+          assignment.id in source_ids
         end)
 
       {model.id, model_candidates}
@@ -449,7 +449,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
   defp routable_candidates_by_source_ids(%{} = hydration, %Model{} = model) do
     active_health_status = PoolUpstreamAssignment.active_health_status()
-    source_ids = MapSet.new(source_assignment_ids(model))
+    source_ids = source_assignment_ids(model)
 
     hydration
     |> Map.get(:visible_candidates_by_model_id, %{})
@@ -458,7 +458,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     |> Enum.uniq_by(fn {assignment, _identity} -> assignment.id end)
     |> Enum.filter(fn {assignment, _identity} ->
       assignment.health_status == active_health_status and
-        MapSet.member?(source_ids, assignment.id)
+        assignment.id in source_ids
     end)
   end
 
@@ -487,12 +487,13 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
   defp model_source_plan_rank(%UpstreamIdentity{} = identity) do
     plan = identity.plan_family || identity.plan_label || ""
+    plan_lower = String.downcase(plan)
 
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      String.contains?(plan_lower, "enterprise") or String.contains?(plan_lower, "team") -> 4
+      String.contains?(plan_lower, "pro") -> 3
+      String.contains?(plan_lower, "plus") -> 2
+      String.contains?(plan_lower, "free") -> 1
       true -> 0
     end
   end
