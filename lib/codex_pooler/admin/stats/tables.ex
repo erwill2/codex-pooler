@@ -5,13 +5,11 @@ defmodule CodexPooler.Admin.Stats.Tables do
   alias CodexPooler.Admin.Stats.Aggregates
 
   @failed_statuses ~w(failed rejected interrupted cancelled)
+  @leaderboard_limit 10
 
   @spec top_api_keys([map()], [map()]) :: [map()]
   def top_api_keys([], _pools), do: []
 
-  # Returns the union of the top keys by token usage and by settled cost, so
-  # the leaderboard can re-rank by either dimension without missing a key
-  # that is expensive but light on tokens (or vice versa).
   def top_api_keys(settlements, pools) do
     key_ids = settlements |> Enum.map(& &1.api_key_id) |> Enum.reject(&is_nil/1) |> Enum.uniq()
     keys_by_id = AccessReporting.api_keys_by_id(key_ids)
@@ -33,10 +31,15 @@ defmodule CodexPooler.Admin.Stats.Tables do
         }
       end)
 
-    top_by_tokens = rows |> Enum.sort_by(&{&1.total_tokens, &1.requests}, :desc) |> Enum.take(5)
+    top_by_tokens =
+      rows
+      |> Enum.sort_by(&{&1.total_tokens, &1.requests}, :desc)
+      |> Enum.take(@leaderboard_limit)
 
     top_by_cost =
-      rows |> Enum.sort_by(&{&1.settled_cost_micros, &1.total_tokens}, :desc) |> Enum.take(5)
+      rows
+      |> Enum.sort_by(&{&1.settled_cost_micros, &1.total_tokens}, :desc)
+      |> Enum.take(@leaderboard_limit)
 
     Enum.uniq_by(top_by_tokens ++ top_by_cost, & &1.api_key_id)
   end

@@ -8,6 +8,8 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.Format
 
+  @leaderboard_limit 10
+
   attr :id, :string, required: true
   attr :dashboard, :map, required: true
 
@@ -264,13 +266,13 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   defp leaderboard_ranking(rows, :cost) do
     rows
     |> Enum.sort_by(&{&1.settled_cost_micros, &1.total_tokens}, :desc)
-    |> Enum.take(5)
+    |> Enum.take(@leaderboard_limit)
   end
 
   defp leaderboard_ranking(rows, _sort) do
     rows
     |> Enum.sort_by(&{&1.total_tokens, &1.requests}, :desc)
-    |> Enum.take(5)
+    |> Enum.take(@leaderboard_limit)
   end
 
   defp leaderboard_description(sort, window_label) do

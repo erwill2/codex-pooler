@@ -14,12 +14,50 @@ defmodule CodexPoolerWeb.Admin.StatsLiveTest do
   alias CodexPooler.Pools
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPoolerWeb.Admin.StatsPresentation
   alias CodexPoolerWeb.Admin.StatsPresentation.Charts, as: StatsCharts
 
   @reload_telemetry_event [:codex_pooler, :admin, :stats_live, :reload]
   @dashboard_build_telemetry_event [:codex_pooler, :admin, :stats, :dashboard, :build]
   @telemetry_windows ~w(1h 5h 24h 7d unknown)
   @telemetry_scopes ~w(selected_pool all_visible_pools unknown)
+
+  test "leaderboard renders at most ten ranked API keys" do
+    # Given
+    rows =
+      for index <- 1..11 do
+        %{
+          api_key_id: "api-key-#{index}",
+          display_name: "Leaderboard key #{index}",
+          pool_name: "Leaderboard pool",
+          requests: index,
+          total_tokens: index * 100,
+          settled_cost_micros: index * 1_000
+        }
+      end
+
+    # When
+    html =
+      render_component(&StatsPresentation.top_api_keys_table/1, %{
+        rows: rows,
+        sort: :tokens,
+        window_label: "Last 24 hours"
+      })
+
+    fragment = LazyHTML.from_fragment(html)
+
+    # Then
+    assert fragment
+           |> LazyHTML.query("[data-role='leaderboard-podium-place']")
+           |> Enum.count() == 3
+
+    assert fragment
+           |> LazyHTML.query("[data-role='leaderboard-runner-row']")
+           |> Enum.count() == 7
+
+    assert html =~ "Leaderboard key 2"
+    refute html =~ "Leaderboard key 1<"
+  end
 
   test "redirects unauthenticated operators to login" do
     assert {:error, {:redirect, %{to: "/login"}}} = live(build_conn(), ~p"/admin/stats")

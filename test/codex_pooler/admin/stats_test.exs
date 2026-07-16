@@ -18,6 +18,40 @@ defmodule CodexPooler.Admin.StatsTest do
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
 
+  test "top_api_keys/2 retains the ten highest-ranked API keys" do
+    # Given
+    pool = pool_fixture(%{name: "Leaderboard pool"})
+
+    api_keys =
+      for index <- 1..11 do
+        %{api_key: api_key} =
+          active_api_key_fixture(pool, %{display_name: "Leaderboard key #{index}"})
+
+        api_key
+      end
+
+    settlements =
+      api_keys
+      |> Enum.with_index(1)
+      |> Enum.map(fn {api_key, index} ->
+        %{
+          api_key_id: api_key.id,
+          pool_id: pool.id,
+          request_count: index,
+          total_tokens: index * 100,
+          settled_cost_micros: index * 1_000
+        }
+      end)
+
+    # When
+    rows = Tables.top_api_keys(settlements, [pool])
+
+    # Then
+    expected_api_keys = Enum.drop(api_keys, 1)
+
+    assert MapSet.new(rows, & &1.api_key_id) == MapSet.new(expected_api_keys, & &1.id)
+  end
+
   test "baseline: upstream inventory keeps a zero-usage quota account visible" do
     quota_account = %{
       pool_upstream_assignment_id: "assignment-a",
