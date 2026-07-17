@@ -1023,3 +1023,21 @@ body {
   background-color: var(--color-primary);
   color: #fff;
 }
+
+/* Auto redeem tunables dim while the policy toggle is off. Keyed on the
+   shared form id so the cockpit accordion (submit-only, no server
+   re-render while editing) and the saved-reset dialog behave identically
+   and instantly. */
+#saved-reset-policy-form:has(#saved-reset-policy-auto-redeem-enabled:not(:checked))
+  [data-role="saved-reset-policy-tunables"] {
+  opacity: 0.55;
+}
+
+/* Trigger-mode radio cards: selected tint as a top-level :has rule.
+   Tailwind's has-[] utilities compile to nested &:has rules, whose dynamic
+   re-invalidation is unreliable in Chromium; the cockpit form is
+   submit-only, so the tint must move purely client-side. */
+[data-role="saved-reset-policy-trigger-card"]:has(input[type="radio"]:checked) {
+  border-color: var(--color-primary);
+  background-color: color-mix(in oklab, var(--color-primary) 10%, transparent);
+}

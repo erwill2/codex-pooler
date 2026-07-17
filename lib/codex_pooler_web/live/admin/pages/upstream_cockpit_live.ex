@@ -43,6 +43,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
         deleting_account: nil,
         delete_account_form: AccountLifecycleWorkflow.delete_form(nil),
         saved_reset_policy_form: SavedResetWorkflow.policy_form(%{}),
+        saved_reset_policy_dirty?: false,
         confirming_saved_reset_redemption: nil,
         selected_request_log: nil,
         subscribed_pool_ids: MapSet.new()
@@ -240,8 +241,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
      end)}
   end
 
+  def handle_event("validate_saved_reset_policy", %{"saved_reset_policy" => params}, socket) do
+    {:noreply,
+     assign(socket,
+       saved_reset_policy_form: Phoenix.Component.to_form(params, as: :saved_reset_policy),
+       saved_reset_policy_dirty?: true
+     )}
+  end
+
   def handle_event("save_saved_reset_policy", %{"saved_reset_policy" => params}, socket) do
-    {:noreply, SavedResetWorkflow.save_policy(socket, params, &load_cockpit/1)}
+    {:noreply,
+     socket
+     |> assign(:saved_reset_policy_dirty?, false)
+     |> SavedResetWorkflow.save_policy(params, &load_cockpit/1)}
   end
 
   def handle_event(
@@ -334,13 +346,24 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLive do
     end
   end
 
+  # Event-driven cockpit reloads must not clobber policy edits in progress:
+  # the form assign is rebuilt from the persisted policy only while the
+  # operator hasn't touched it (dirty resets on save).
+  defp preserve_policy_edits(socket, cockpit) do
+    if socket.assigns[:saved_reset_policy_dirty?] do
+      socket.assigns.saved_reset_policy_form
+    else
+      SavedResetWorkflow.policy_form(cockpit.saved_reset_policy)
+    end
+  end
+
   defp assign_cockpit(socket, cockpit) do
     socket
     |> maybe_subscribe_pool_events(cockpit)
     |> assign(
       cockpit: cockpit,
       dialog_pool_options: dialog_pool_options(socket.assigns.current_scope),
-      saved_reset_policy_form: SavedResetWorkflow.policy_form(cockpit.saved_reset_policy)
+      saved_reset_policy_form: preserve_policy_edits(socket, cockpit)
     )
   end
 

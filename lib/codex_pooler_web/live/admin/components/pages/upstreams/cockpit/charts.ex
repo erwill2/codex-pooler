@@ -106,84 +106,34 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Charts do
         <.form
           id="saved-reset-policy-form"
           for={@saved_reset_policy_form}
+          phx-change="validate_saved_reset_policy"
           phx-submit="save_saved_reset_policy"
           autocomplete="off"
           class="grid gap-4 border-t border-base-300/50 p-4"
         >
-          <fieldset class="grid gap-4">
-            <legend class="sr-only">Auto redeem policy</legend>
-            <div
-              id="saved-reset-policy-auto-redeem-control"
-              class="grid gap-3 rounded-box border border-base-300 bg-base-200/30 p-4 lg:grid-cols-[minmax(0,1fr)_18rem] lg:items-start"
-            >
-              <div class="grid max-w-3xl gap-1">
-                <p class="text-sm font-semibold text-base-content">Auto redeem policy</p>
-                <p class="text-xs leading-5 text-base-content/60">
-                  Automatic redemption can wait until weekly quota is blocked, start earlier near the quota limit when every eligible account is under pressure, or rescue a soon-expiring reset when this account already has weekly usage. The reset buffer prevents spending when the weekly reset is close.
-                </p>
-              </div>
-              <label
-                id="saved-reset-policy-auto-redeem-card"
-                for="saved-reset-policy-auto-redeem-enabled"
-                class="flex min-h-12 w-full cursor-pointer items-center justify-between gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-2 transition-colors hover:border-primary/50 hover:bg-primary/5"
-              >
-                <span class="text-sm font-medium text-base-content">Auto redeem saved resets</span>
-                <input type="hidden" name="saved_reset_policy[auto_redeem_enabled]" value="false" />
-                <input
-                  id="saved-reset-policy-auto-redeem-enabled"
-                  type="checkbox"
-                  name="saved_reset_policy[auto_redeem_enabled]"
-                  value="true"
-                  checked={form_checkbox_checked?(@saved_reset_policy_form[:auto_redeem_enabled])}
-                  class="toggle toggle-primary toggle-sm shrink-0"
-                />
-              </label>
-            </div>
+          <label
+            id="saved-reset-policy-auto-redeem-control"
+            for="saved-reset-policy-auto-redeem-enabled"
+            class="flex cursor-pointer items-center justify-between gap-3"
+          >
+            <span class="grid gap-0.5">
+              <span class="text-sm font-semibold text-base-content">Auto redeem saved resets</span>
+              <span class="text-xs leading-5 text-base-content/60">
+                Spend banked resets without operator action; the cards below decide when.
+              </span>
+            </span>
+            <input type="hidden" name="saved_reset_policy[auto_redeem_enabled]" value="false" />
+            <input
+              id="saved-reset-policy-auto-redeem-enabled"
+              type="checkbox"
+              name="saved_reset_policy[auto_redeem_enabled]"
+              value="true"
+              checked={form_checkbox_checked?(@saved_reset_policy_form[:auto_redeem_enabled])}
+              class="toggle toggle-primary toggle-sm shrink-0"
+            />
+          </label>
 
-            <div id="saved-reset-policy-controls" class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-              <.input
-                field={@saved_reset_policy_form[:trigger_mode]}
-                type="select"
-                id="saved-reset-policy-trigger-mode"
-                name="saved_reset_policy[trigger_mode]"
-                label="Auto trigger"
-                class="select select-bordered w-full"
-                options={[
-                  {"Blocked or expiring", "blocked"},
-                  {"Near limit", "threshold"}
-                ]}
-              />
-              <.input
-                field={@saved_reset_policy_form[:quota_threshold_percent]}
-                type="number"
-                id="saved-reset-policy-quota-threshold-percent"
-                name="saved_reset_policy[quota_threshold_percent]"
-                label="Near limit %"
-                class="input input-bordered w-full"
-                min="1"
-                max="100"
-                step="1"
-              />
-              <.input
-                field={@saved_reset_policy_form[:min_blocked_minutes]}
-                type="number"
-                id="saved-reset-policy-min-blocked-minutes"
-                name="saved_reset_policy[min_blocked_minutes]"
-                label="Reset buffer min"
-                class="input input-bordered w-full"
-                min="0"
-              />
-              <.input
-                field={@saved_reset_policy_form[:keep_credits]}
-                type="number"
-                id="saved-reset-policy-keep-credits"
-                name="saved_reset_policy[keep_credits]"
-                label="Resets to keep"
-                class="input input-bordered w-full"
-                min="0"
-              />
-            </div>
-          </fieldset>
+          <SavedResetComponents.saved_reset_policy_fields form={@saved_reset_policy_form} />
 
           <div class="flex justify-end border-t border-base-300/70 pt-3">
             <AdminComponents.action_button

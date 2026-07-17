@@ -831,73 +831,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents do
             </summary>
             <div
               id="saved-reset-policy-advanced-fields"
-              class={[
-                "grid gap-4 border-t border-base-300/50 px-5 py-4 transition-opacity",
-                !form_checkbox_checked?(@form[:auto_redeem_enabled]) && "opacity-55"
-              ]}
+              class="grid gap-4 border-t border-base-300/50 px-5 py-4"
             >
-              <div class="grid items-start gap-4 md:grid-cols-[minmax(0,1.1fr)_minmax(9rem,0.9fr)]">
-                <div class="grid gap-1">
-                  <.input
-                    field={@form[:trigger_mode]}
-                    type="select"
-                    id="saved-reset-policy-trigger-mode"
-                    name="saved_reset_policy[trigger_mode]"
-                    label="When automatic redemption can start"
-                    options={[
-                      {"After block or near expiry", "blocked"},
-                      {"Before work stops near the quota limit", "threshold"}
-                    ]}
-                  />
-                  <p class="text-xs leading-5 text-base-content/65">
-                    Blocked mode waits for weekly quota exhaustion, except a known reset expiring within 24 hours may be rescued early after this account has weekly usage. Near-limit mode waits until every eligible account in the Pool is also near the configured weekly quota limit.
-                  </p>
-                </div>
-                <div class="grid gap-1 self-start">
-                  <.input
-                    field={@form[:quota_threshold_percent]}
-                    type="number"
-                    id="saved-reset-policy-quota-threshold-percent"
-                    name="saved_reset_policy[quota_threshold_percent]"
-                    label="Near-limit threshold"
-                    min="1"
-                    max="100"
-                    step="1"
-                  />
-                  <p class="text-xs leading-5 text-base-content/65">
-                    Used only by near-limit mode. 95 means redeem when every eligible account has fresh weekly quota evidence at or above 95% used.
-                  </p>
-                </div>
-              </div>
-
-              <div class="grid gap-4 md:grid-cols-2">
-                <div class="grid gap-1">
-                  <.input
-                    field={@form[:min_blocked_minutes]}
-                    type="number"
-                    id="saved-reset-policy-min-blocked-minutes"
-                    name="saved_reset_policy[min_blocked_minutes]"
-                    label="Natural reset buffer"
-                    min="0"
-                  />
-                  <p class="text-xs leading-5 text-base-content/65">
-                    Do not spend a saved reset when the weekly quota will reset naturally within this many minutes.
-                  </p>
-                </div>
-                <div class="grid gap-1">
-                  <.input
-                    field={@form[:keep_credits]}
-                    type="number"
-                    id="saved-reset-policy-keep-credits"
-                    name="saved_reset_policy[keep_credits]"
-                    label="Resets to keep in bank"
-                    min="0"
-                  />
-                  <p class="text-xs leading-5 text-base-content/65">
-                    Automatic redemption stops when the available reset count is at or below this reserve.
-                  </p>
-                </div>
-              </div>
+              <SavedResetComponents.saved_reset_policy_fields form={@form} />
             </div>
           </details>
         </.form>

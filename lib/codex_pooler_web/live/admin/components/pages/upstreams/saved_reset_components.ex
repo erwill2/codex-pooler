@@ -103,6 +103,146 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.SavedResetComponents do
     """
   end
 
+  attr :form, :any, required: true
+
+  def saved_reset_policy_fields(assigns) do
+    threshold_field = assigns.form[:quota_threshold_percent]
+
+    threshold_errors =
+      if Phoenix.Component.used_input?(threshold_field) do
+        Enum.map(threshold_field.errors, &translate_error/1)
+      else
+        []
+      end
+
+    assigns =
+      assigns
+      |> assign(:trigger_mode, to_string(assigns.form[:trigger_mode].value || "blocked"))
+      |> assign(:policy_enabled?, assigns.form[:auto_redeem_enabled].value in [true, "true"])
+      |> assign(:threshold_errors, threshold_errors)
+
+    ~H"""
+    <div
+      data-role="saved-reset-policy-tunables"
+      class={["grid gap-4 transition-opacity", !@policy_enabled? && "opacity-55"]}
+    >
+      <fieldset id="saved-reset-policy-trigger-mode" class="grid items-stretch gap-2.5 md:grid-cols-2">
+        <legend class="sr-only">When automatic redemption can start</legend>
+        <label
+          id="saved-reset-policy-trigger-blocked"
+          data-role="saved-reset-policy-trigger-card"
+          class={trigger_card_class(@trigger_mode == "blocked")}
+        >
+          <input
+            id="saved-reset-policy-trigger-mode-blocked"
+            type="radio"
+            name="saved_reset_policy[trigger_mode]"
+            value="blocked"
+            checked={@trigger_mode == "blocked"}
+            class="radio radio-primary radio-sm mt-0.5"
+          />
+          <span class="grid gap-1">
+            <span class="text-sm font-semibold leading-5 text-base-content">
+              Blocked or expiring
+            </span>
+            <span class="text-xs leading-5 text-base-content/60">
+              Waits for weekly quota exhaustion. A reset expiring within 24 hours may be rescued early once this account has weekly usage.
+            </span>
+          </span>
+        </label>
+        <label
+          id="saved-reset-policy-trigger-threshold"
+          data-role="saved-reset-policy-trigger-card"
+          class={trigger_card_class(@trigger_mode == "threshold")}
+        >
+          <input
+            id="saved-reset-policy-trigger-mode-threshold"
+            type="radio"
+            name="saved_reset_policy[trigger_mode]"
+            value="threshold"
+            checked={@trigger_mode == "threshold"}
+            class="radio radio-primary radio-sm mt-0.5"
+          />
+          <span class="grid gap-1">
+            <span class="text-sm font-semibold leading-5 text-base-content">Near limit</span>
+            <span class="text-xs leading-5 text-base-content/60">
+              Starts earlier: once every eligible account in the Pool reaches
+              <input
+                id="saved-reset-policy-quota-threshold-percent"
+                type="number"
+                name="saved_reset_policy[quota_threshold_percent]"
+                value={
+                  Phoenix.HTML.Form.normalize_value(
+                    "number",
+                    @form[:quota_threshold_percent].value
+                  )
+                }
+                min="1"
+                max="100"
+                step="1"
+                class={[
+                  "input input-xs mx-0.5 inline-block w-14 border-base-300 bg-base-100 px-1.5 text-center text-xs font-semibold tabular-nums",
+                  @threshold_errors != [] && "input-error"
+                ]}
+              />% of the weekly quota window.
+            </span>
+            <span
+              :for={message <- @threshold_errors}
+              class="flex items-center gap-1.5 text-xs text-error"
+            >
+              <.icon name="hero-exclamation-circle" class="size-4 shrink-0" />
+              {message}
+            </span>
+          </span>
+        </label>
+      </fieldset>
+
+      <div class="grid items-start gap-4 border-t border-base-300/50 pt-4 md:grid-cols-2">
+        <div class="grid gap-1">
+          <.input
+            field={@form[:min_blocked_minutes]}
+            type="number"
+            id="saved-reset-policy-min-blocked-minutes"
+            name="saved_reset_policy[min_blocked_minutes]"
+            label="Natural reset buffer"
+            min="0"
+          />
+          <p class="text-xs leading-5 text-base-content/65">
+            Do not spend a saved reset when the weekly quota will reset naturally within this many minutes.
+          </p>
+        </div>
+        <div class="grid gap-1">
+          <.input
+            field={@form[:keep_credits]}
+            type="number"
+            id="saved-reset-policy-keep-credits"
+            name="saved_reset_policy[keep_credits]"
+            label="Resets to keep"
+            min="0"
+          />
+          <p class="text-xs leading-5 text-base-content/65">
+            Automatic redemption stops when the available reset count is at or below this reserve.
+          </p>
+        </div>
+      </div>
+    </div>
+    """
+  end
+
+  # Same selection anatomy as the API-key policy mode cards, sized down for
+  # the dense policy panels. Selection is server-rendered from the form value
+  # (both forms phx-change validate); the app.css :has(:checked) rule doubles
+  # it client-side so the tint moves before the round trip lands.
+  defp trigger_card_class(selected?) do
+    [
+      "flex cursor-pointer items-start gap-3 rounded-box border p-3 transition-colors hover:bg-base-200",
+      if(selected?,
+        do: "border-primary bg-primary/10",
+        else: "border-base-300 bg-base-100"
+      )
+    ]
+  end
+
   defp expiration_rows(saved_resets, datetime_preferences, now) do
     available_expiration_rows =
       saved_resets
