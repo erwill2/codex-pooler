@@ -96,8 +96,28 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
             >
               {assignment.pool_label}
             </.link>
-            <p class="truncate text-[11px] leading-4 text-base-content/50">
-              {assignment_meta(assignment, @datetime_preferences)}
+            <p class="flex min-w-0 items-baseline text-[11px] leading-4 text-base-content/50">
+              <span
+                :if={assignment_label(assignment)}
+                title={assignment_label(assignment)}
+                class="min-w-0 truncate"
+              >
+                {assignment_label(assignment)}
+              </span>
+              <span
+                :if={
+                  assignment_label(assignment) && reconciled_label(assignment, @datetime_preferences)
+                }
+                class="shrink-0 px-1"
+              >
+                ·
+              </span>
+              <span
+                :if={reconciled_label(assignment, @datetime_preferences)}
+                class="shrink-0 whitespace-nowrap"
+              >
+                {reconciled_label(assignment, @datetime_preferences)}
+              </span>
             </p>
           </div>
           <div
@@ -516,19 +536,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
 
   defp format_rate(rate), do: "#{rate}%"
 
-  defp assignment_meta(assignment, datetime_preferences) do
-    [
-      assignment.assignment_label,
-      refreshed_label(assignment.last_successful_refresh_at, datetime_preferences)
-    ]
-    |> Enum.reject(&is_nil/1)
-    |> Enum.join(" · ")
-  end
+  defp assignment_label(%{assignment_label: label}) when is_binary(label) and label != "",
+    do: label
 
-  defp refreshed_label(%DateTime{} = refreshed_at, datetime_preferences),
-    do: "refreshed #{DateTimeDisplay.format_datetime(refreshed_at, datetime_preferences)}"
+  defp assignment_label(_assignment), do: nil
 
-  defp refreshed_label(_refreshed_at, _datetime_preferences), do: nil
+  # last_successful_refresh_at is stamped by account reconciliation, so name
+  # the event rather than a vague "refreshed".
+  defp reconciled_label(
+         %{last_successful_refresh_at: %DateTime{} = reconciled_at},
+         datetime_preferences
+       ),
+       do: "reconciled #{DateTimeDisplay.format_datetime(reconciled_at, datetime_preferences)}"
+
+  defp reconciled_label(_assignment, _datetime_preferences), do: nil
 
   defp lane_share_label(cockpit, assignment) do
     case contribution_item(cockpit, assignment) do
