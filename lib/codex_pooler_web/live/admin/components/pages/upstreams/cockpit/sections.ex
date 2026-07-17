@@ -32,7 +32,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
             Each Pool assignment must pass assignment → health → quota to receive traffic
           </p>
         </div>
-        <span class={AdminBadges.count_chip_class()}>
+        <span class={AdminBadges.metadata_chip_class()}>
           {Formatting.pluralize_count(@cockpit.assignments.count, "lane", "lanes")}
         </span>
       </header>
