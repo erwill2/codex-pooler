@@ -1036,6 +1036,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     first_seen_label = DateTimeDisplay.format_datetime(first_seen_at, datetime_preferences)
     second_seen_label = DateTimeDisplay.format_datetime(second_seen_at, datetime_preferences)
 
+    first_seen_date =
+      DateTimeDisplay.format_datetime_parts(first_seen_at, datetime_preferences).date
+
+    second_seen_date =
+      DateTimeDisplay.format_datetime_parts(second_seen_at, datetime_preferences).date
+
     legacy_expiration_label =
       DateTimeDisplay.format_datetime(legacy_expires_at, datetime_preferences)
 
@@ -1465,12 +1471,47 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(view, "#saved-reset-policy-dialog")
     assert has_element?(view, "#saved-reset-policy-dialog", "Auto redeem")
-    assert has_element?(view, "#saved-reset-expiration-summary", "Banked reset expirations")
-    assert has_element?(view, "#saved-reset-expiration-table", "Expiration Date")
+    assert has_element?(view, "#saved-reset-bank-count", "×2")
+    assert has_element?(view, "#saved-reset-bank-meter[role='meter'][aria-valuenow='2']")
+    assert has_element?(view, "#saved-reset-next-expiry", "next expires in")
+
+    assert has_element?(
+             view,
+             "#saved-reset-expirations-disclosure summary",
+             "All expirations"
+           )
+
+    assert has_element?(
+             view,
+             "#saved-reset-policy-advanced-disclosure summary",
+             "Advanced policy settings"
+           )
+    assert has_element?(
+             view,
+             "#saved-reset-expiration[data-role='saved-reset-expiration-list']"
+           )
+
     assert has_element?(view, "#saved-reset-expiration-date-0", first_expiration_label)
     assert has_element?(view, "#saved-reset-expiration-date-1", second_expiration_label)
-    assert has_element?(view, "#saved-reset-expiration-first-seen-0", first_seen_label)
-    assert has_element?(view, "#saved-reset-expiration-first-seen-1", second_seen_label)
+
+    assert has_element?(
+             view,
+             "#saved-reset-expiration-first-seen-0[title='#{first_seen_label}']",
+             "banked #{first_seen_date}"
+           )
+
+    assert has_element?(
+             view,
+             "#saved-reset-expiration-first-seen-1[title='#{second_seen_label}']",
+             "banked #{second_seen_date}"
+           )
+
+    assert has_element?(
+             view,
+             "#saved-reset-expiration-life-0[data-role='saved-reset-expiration-life'] .saved-reset-life-fill"
+           )
+
+    assert has_element?(view, "#saved-reset-expiration-held-0", "held 2d")
     assert has_element?(view, "#saved-reset-expiration-time-left-0 .hero-clock")
 
     send(view.pid, :reload_upstreams_from_events)
@@ -1553,12 +1594,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(view, "#saved-reset-policy-quota-threshold-percent")
     assert has_element?(view, "#saved-reset-policy-min-blocked-minutes")
     assert has_element?(view, "#saved-reset-policy-keep-credits")
-    assert has_element?(view, "#saved-reset-policy-auto-redeem-card")
+    assert has_element?(view, "#saved-reset-policy-auto-redeem-control")
 
     assert has_element?(
              view,
              "#saved-reset-redemption-action[data-role='saved-reset-redemption-action']",
-             "Queue manual redemption"
+             "Redeem"
            )
 
     html = render(view)
@@ -1571,7 +1612,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#saved-reset-policy-dialog-panel > div:first-child",
-             "A saved reset is account-level quota recovery capacity for this account"
+             "Account-level quota recovery capacity"
            )
 
     refute render(view) =~ "Saved resets are earned reset credits reported by Codex"
@@ -1696,7 +1737,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#saved-reset-redemption-action[data-role='saved-reset-redemption-action']",
-             "Queue manual redemption"
+             "Redeem"
            )
 
     action_html = view |> element("#saved-reset-redemption-action") |> render()
