@@ -695,6 +695,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       id_suffix: "v1",
       icon: "hero-code-bracket",
       label: "/v1 compatibility",
+      docs_url: "https://docs.codex-pooler.com/operators/pools/#compatibility",
       description: "OpenAI-style /v1 compatibility routes."
     },
     %{
@@ -702,6 +703,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       id_suffix: "compression",
       icon: "hero-arrows-pointing-in",
       label: "Request compression",
+      docs_url: "https://docs.codex-pooler.com/operators/pools/#compatibility",
       description: "Shrinks eligible Responses tool outputs before upstream dispatch."
     },
     %{
@@ -768,6 +770,18 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
           >
             <.icon name="hero-beaker" class="size-3.5" />
           </span>
+          <a
+            :if={@flag[:docs_url]}
+            id={"pool-row-#{@pool_row.pool.id}-compat-#{@flag.id_suffix}-docs-link"}
+            href={@flag.docs_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={"#{@flag.label} documentation"}
+            aria-label={"#{@flag.label} documentation"}
+            class="flex shrink-0 items-center text-base-content/45 transition-colors hover:text-primary"
+          >
+            <.icon name="hero-book-open" class="size-3.5" />
+          </a>
           <a
             :if={@flag[:issue_number]}
             id={"pool-row-#{@pool_row.pool.id}-compat-#{@flag.id_suffix}-issue-link"}
