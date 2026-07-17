@@ -175,6 +175,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
 
   defp normalize_input_item(%{"type" => "custom_tool_call_output"} = item), do: {:ok, item}
 
+  defp normalize_input_item(%{"type" => "function_call_output", "output" => output} = item)
+       when is_list(output) do
+    with {:ok, output} <- normalize_function_call_output_parts(output) do
+      {:ok, Map.put(item, "output", output)}
+    end
+  end
+
   defp normalize_input_item(%{"type" => "function_call_output"} = item), do: {:ok, item}
 
   defp normalize_input_item(%{"role" => "assistant", "content" => content} = item)
@@ -344,6 +351,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
     case clean_string(Map.get(item, "tool_call_id")) || clean_string(Map.get(item, "call_id")) do
       nil -> {:error, Error.invalid_request("input item shape is not translatable", "input")}
       call_id -> {:ok, call_id}
+    end
+  end
+
+  defp normalize_function_call_output_parts(output) do
+    output
+    |> Enum.reduce_while({:ok, []}, fn
+      %{"type" => "input_image"} = part, {:ok, acc} ->
+        case normalize_tool_output_part(part) do
+          {:ok, part} -> {:cont, {:ok, [part | acc]}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+
+      part, {:ok, acc} ->
+        {:cont, {:ok, [part | acc]}}
+    end)
+    |> case do
+      {:ok, output} -> {:ok, Enum.reverse(output)}
+      {:error, reason} -> {:error, reason}
     end
   end
 

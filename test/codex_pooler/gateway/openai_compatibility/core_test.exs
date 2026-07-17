@@ -1904,6 +1904,41 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
       assert [%{"output" => ^structured_output}] = structured_payload["input"]
     end
 
+    test "function_call_output normalizes input image detail from Responses SDK tool output" do
+      assert {:ok, %{payload: payload}} =
+               Responses.coerce(%{
+                 "model" => "gpt-fixture-text",
+                 "input" => [
+                   %{
+                     "type" => "function_call_output",
+                     "call_id" => "call_fixture_image_detail",
+                     "output" => [
+                       %{"type" => "input_text", "text" => "synthetic screenshot taken"},
+                       %{
+                         "type" => "input_image",
+                         "detail" => "auto",
+                         "image_url" => "https://example.com/synthetic-image.png"
+                       }
+                     ]
+                   }
+                 ]
+               })
+
+      assert [
+               %{
+                 "type" => "function_call_output",
+                 "call_id" => "call_fixture_image_detail",
+                 "output" => [
+                   %{"type" => "input_text", "text" => "synthetic screenshot taken"},
+                   %{
+                     "type" => "input_image",
+                     "image_url" => "https://example.com/synthetic-image.png"
+                   }
+                 ]
+               }
+             ] = payload["input"]
+    end
+
     test "structured function_call_output preserves explicit null output" do
       assert {:ok, %{payload: payload}} =
                Responses.coerce(%{
