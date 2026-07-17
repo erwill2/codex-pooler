@@ -67,19 +67,16 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
 
   @spec list_operators(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
   def list_operators(arguments, context) do
-    with {:ok, scope} <- scope_from_context(context) do
+    with {:ok, scope} <- scope_from_context(context),
+         :ok <- require_owner(scope) do
       limit = bounded_limit(arguments)
       status = blank_to_nil(Map.get(arguments, "status"))
       query = blank_to_nil(Map.get(arguments, "query"))
 
       operators =
-        if Pools.owner?(scope) do
-          Accounts.list_operators()
-          |> filter_operator_status(status)
-          |> filter_operator_query(query)
-        else
-          []
-        end
+        Accounts.list_operators()
+        |> filter_operator_status(status)
+        |> filter_operator_query(query)
 
       items =
         operators
@@ -100,13 +97,10 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
   @spec get_operator(map(), map()) :: {:ok, map(), String.t()} | {:error, map()}
   def get_operator(%{"selector" => selector}, context) when is_binary(selector) do
     with {:ok, scope} <- scope_from_context(context),
-         true <- Pools.owner?(scope) do
+         :ok <- require_owner(scope) do
       selector
       |> String.trim()
       |> operator_match_result()
-    else
-      false -> operator_not_found()
-      error -> error
     end
   end
 
@@ -402,6 +396,18 @@ defmodule CodexPooler.MCP.Tools.OperatorMetadata do
 
   defp scope_from_context(_context) do
     {:error, %{code: :tool_execution_failed, message: "MCP authenticated actor is unavailable"}}
+  end
+
+  defp require_owner(scope) do
+    if Pools.owner?(scope) do
+      :ok
+    else
+      {:error,
+       %{
+         code: :capability_denied,
+         message: "operator metadata tools require the instance owner role"
+       }}
+    end
   end
 
   defp required_argument(name) do

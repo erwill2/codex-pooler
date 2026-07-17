@@ -681,7 +681,7 @@ defmodule CodexPoolerWeb.McpControllerTest do
       assert :ok = Redaction.assert_mcp_output_safe!(sentinel_result)
     end
 
-    test "tools call hides operator inventory from scoped admin tokens", %{conn: conn, user: user} do
+    test "tools call denies operator inventory to scoped admin tokens", %{conn: conn, user: user} do
       target = operator_fixture(user, %{"display_name" => "Wire Hidden Operator"}).user
 
       %{user: admin} = operator_fixture(user, %{"email" => unique_user_email()})
@@ -696,12 +696,11 @@ defmodule CodexPoolerWeb.McpControllerTest do
           "limit" => 10
         })
 
-      {list_result, text, structured} =
-        assert_successful_tool_response(response, "wire-scoped-list-operators")
+      denied_text = "capability_denied: operator metadata tools require the instance owner role"
 
-      assert text == "No operator metadata records matched the visible scope"
-      assert structured["operators"] == []
-      assert structured["total"] == 0
+      list_result =
+        assert_denied_tool_response(response, "wire-scoped-list-operators", denied_text)
+
       refute inspect(response) =~ target.id
       refute inspect(response) =~ "Wire Hidden Operator"
       assert_no_wire_leaks(response, raw_token, [target.email])
@@ -714,16 +713,8 @@ defmodule CodexPoolerWeb.McpControllerTest do
           "selector" => target.id
         })
 
-      {get_result, _get_text, get_structured} =
-        assert_successful_tool_response(get_response, "wire-scoped-get-operator")
-
-      assert get_structured == %{
-               "status" => "not_found",
-               "kind" => "operator",
-               "item" => nil,
-               "candidates" => [],
-               "message" => "Operator selector did not match"
-             }
+      get_result =
+        assert_denied_tool_response(get_response, "wire-scoped-get-operator", denied_text)
 
       refute inspect(get_response) =~ target.id
       assert_no_wire_leaks(get_response, raw_token, [target.email])
@@ -1147,6 +1138,16 @@ defmodule CodexPoolerWeb.McpControllerTest do
     assert is_binary(text)
     assert is_map(result["structuredContent"])
     {result, text, result["structuredContent"]}
+  end
+
+  defp assert_denied_tool_response(response, id, denied_text) do
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == id
+    result = response["result"]
+    assert result["isError"] == true
+    assert [%{"type" => "text", "text" => ^denied_text}] = result["content"]
+    refute Map.has_key?(result, "structuredContent")
+    result
   end
 
   defp assert_no_wire_leaks(response, raw_token, extra_values) do

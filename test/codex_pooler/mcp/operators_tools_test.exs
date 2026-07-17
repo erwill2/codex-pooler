@@ -218,6 +218,8 @@ defmodule CodexPooler.MCP.OperatorsToolsTest do
 
     assert {:ok, admin_auth} = MCP.authenticate_token(raw_token)
 
+    denied_text = "capability_denied: operator metadata tools require the instance owner role"
+
     assert {:ok, list_result} =
              ToolDispatch.call(
                "codex_pooler_list_operators",
@@ -225,11 +227,9 @@ defmodule CodexPooler.MCP.OperatorsToolsTest do
                %{auth: admin_auth}
              )
 
-    assert list_result["isError"] == false
-    assert [%{"type" => "text", "text" => list_text}] = list_result["content"]
-    assert list_text == "No operator metadata records matched the visible scope"
-    assert list_result["structuredContent"]["operators"] == []
-    assert list_result["structuredContent"]["total"] == 0
+    assert list_result["isError"] == true
+    assert [%{"type" => "text", "text" => ^denied_text}] = list_result["content"]
+    refute Map.has_key?(list_result, "structuredContent")
     refute inspect(list_result) =~ target.id
     refute inspect(list_result) =~ "Hidden Operator"
 
@@ -238,15 +238,9 @@ defmodule CodexPooler.MCP.OperatorsToolsTest do
                auth: admin_auth
              })
 
-    assert get_result["isError"] == false
-
-    assert get_result["structuredContent"] == %{
-             "status" => "not_found",
-             "kind" => "operator",
-             "item" => nil,
-             "candidates" => [],
-             "message" => "Operator selector did not match"
-           }
+    assert get_result["isError"] == true
+    assert [%{"type" => "text", "text" => ^denied_text}] = get_result["content"]
+    refute Map.has_key?(get_result, "structuredContent")
 
     assert {:ok, ambiguous_result} =
              ToolDispatch.call(
@@ -255,8 +249,8 @@ defmodule CodexPooler.MCP.OperatorsToolsTest do
                %{auth: admin_auth}
              )
 
-    assert ambiguous_result["structuredContent"]["status"] == "not_found"
-    assert ambiguous_result["structuredContent"]["candidates"] == []
+    assert ambiguous_result["isError"] == true
+    assert [%{"type" => "text", "text" => ^denied_text}] = ambiguous_result["content"]
     refute inspect(ambiguous_result) =~ "Hidden Operator"
     assert :ok = Redaction.assert_mcp_output_safe!(list_result)
     assert :ok = Redaction.assert_mcp_output_safe!(get_result)
