@@ -568,6 +568,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert has_element?(view, "#upstream-event-summary", "OAuth relink cancelled")
   end
 
+  test "renders the page header without page actions", %{conn: conn, scope: scope} do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "cockpit-page-header", name: "Cockpit Page Header"})
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{account_label: "Cockpit Page Header Account"})
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    assert has_element?(view, "#upstream-cockpit-page-header h1", "Upstream cockpit")
+    assert has_element?(view, "#upstream-cockpit-page-header", "recovery actions")
+    refute has_element?(view, "#upstream-cockpit-page-header button")
+  end
+
   test "vitals values carry title tooltips for clipped text", %{conn: conn, scope: scope} do
     {:ok, pool} =
       Pools.create_pool(scope, %{slug: "cockpit-vitals-titles", name: "Cockpit Vitals Titles"})

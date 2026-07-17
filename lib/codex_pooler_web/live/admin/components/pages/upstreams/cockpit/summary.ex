@@ -241,9 +241,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
         <div class="flex items-center gap-3">
           <.cockpit_avatar identity={@cockpit.identity} status={@cockpit.header.status} />
           <div class="min-w-0 flex-1">
-            <h1 class="truncate text-xl font-bold leading-tight text-base-content">
+            <h2 class="truncate text-xl font-bold leading-tight text-base-content">
               {@cockpit.header.title}
-            </h1>
+            </h2>
             <p
               id="upstream-cockpit-status"
               class={["mt-0.5 text-xs font-semibold", status_text_class(@cockpit.header.status)]}

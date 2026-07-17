@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
 
   use CodexPoolerWeb, :html
 
+  alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.RequestLogDetailDrawer
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.{Charts, Dialogs, Sections, Summary}
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog
@@ -42,6 +43,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents do
 
       <div class="drawer-content min-w-0">
         <section id="upstream-cockpit" class="grid gap-4">
+          <AdminComponents.page_header
+            id="upstream-cockpit-page-header"
+            title="Upstream cockpit"
+            description="Credential health, routing readiness, quota and banked resets, and recovery actions for one upstream account."
+          />
+
           <AuthJsonDialog.auth_json_import_dialog
             auth_json_form={@auth_json_form}
             importing_auth_json={@importing_auth_json}
