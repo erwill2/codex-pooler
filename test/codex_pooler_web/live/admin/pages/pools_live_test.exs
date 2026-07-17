@@ -164,8 +164,18 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     view |> element("#pool-row-#{pool.id}-compat-v1") |> render_click()
     assert has_element?(view, "#pool-row-#{pool.id}-compat-panel", "/v1 compatibility")
+    refute has_element?(view, ~s([data-role="pool-compat-experimental"]))
 
-    view |> element("#pool-row-#{pool.id}-compat-v1") |> render_click()
+    view |> element("#pool-row-#{pool.id}-compat-ws-bridge") |> render_click()
+    assert has_element?(view, "#pool-row-#{pool.id}-compat-panel", "Upstream websocket bridge")
+    assert has_element?(view, ~s([data-role="pool-compat-experimental"]))
+
+    assert has_element?(
+             view,
+             ~s(#pool-row-#{pool.id}-compat-ws-bridge-issue-link[href="https://github.com/icoretech/codex-pooler/issues/171"])
+           )
+
+    view |> element("#pool-row-#{pool.id}-compat-ws-bridge") |> render_click()
     refute has_element?(view, "#pool-row-#{pool.id}-compat-panel")
   end
 

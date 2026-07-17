@@ -709,6 +709,8 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       id_suffix: "ws-bridge",
       icon: "hero-link",
       label: "Upstream websocket bridge",
+      experimental: true,
+      issue_number: 171,
       description:
         "Carries public streaming turns upstream over the session's Codex websocket to reuse the provider prompt cache."
     }
@@ -754,9 +756,31 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
       class="pool-compat-panel"
     >
       <div class="flex items-center justify-between gap-3">
-        <p class="min-w-0 truncate text-sm font-semibold leading-5 text-base-content">
-          {@flag.label}
-        </p>
+        <span class="flex min-w-0 items-center gap-2">
+          <p class="min-w-0 truncate text-sm font-semibold leading-5 text-base-content">
+            {@flag.label}
+          </p>
+          <span
+            :if={@flag[:experimental]}
+            data-role="pool-compat-experimental"
+            title="Experimental feature — behavior may change"
+            class="flex shrink-0 items-center text-warning"
+          >
+            <.icon name="hero-beaker" class="size-3.5" />
+          </span>
+          <a
+            :if={@flag[:issue_number]}
+            id={"pool-row-#{@pool_row.pool.id}-compat-#{@flag.id_suffix}-issue-link"}
+            href={compat_issue_url(@flag.issue_number)}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={"Issue ##{@flag.issue_number} on GitHub"}
+            aria-label={"Issue ##{@flag.issue_number} on GitHub"}
+            class="flex shrink-0 items-center text-base-content/45 transition-colors hover:text-primary"
+          >
+            <.github_icon class="size-3.5 fill-current" />
+          </a>
+        </span>
         <input
           :if={@can_manage_pools?}
           id={"pool-row-#{@pool_row.pool.id}-compat-#{@flag.id_suffix}-toggle"}
@@ -781,6 +805,9 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
     </div>
     """
   end
+
+  defp compat_issue_url(issue_number),
+    do: "https://github.com/icoretech/codex-pooler/issues/#{issue_number}"
 
   defp compat_panel_flag(panel_views, %{pool: %{id: pool_id}}) when is_map(panel_views) do
     case Map.get(panel_views, pool_id) do
