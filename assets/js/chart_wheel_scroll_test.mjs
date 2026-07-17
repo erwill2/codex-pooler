@@ -268,6 +268,9 @@ test("keeps the hook lifecycle scoped and listener-stable", async () => {
 		(statsSource.match(/data-chart-wheel-scroll="page"/g) || []).length,
 		2,
 	);
+	assert.equal(
+		(upstreamsSource.match(/data-chart-wheel-scroll="page"/g) || []).length,
+		1,
+	);
 	assert.doesNotMatch(poolsSource, /data-chart-wheel-scroll/);
-	assert.doesNotMatch(upstreamsSource, /data-chart-wheel-scroll/);
 });
