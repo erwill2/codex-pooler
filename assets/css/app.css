@@ -939,7 +939,9 @@ body {
 .ws-step-dot {
   position: absolute;
   left: 0;
-  top: 5px;
+  /* First-line optical center: 0.25rem top padding plus half the
+     12px × 1.35 line box, minus half the 8px dot. */
+  top: 8px;
   width: 8px;
   height: 8px;
   border-radius: 999px;
