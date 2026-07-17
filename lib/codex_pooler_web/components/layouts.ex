@@ -25,7 +25,7 @@ defmodule CodexPoolerWeb.Layouts do
   attr :current_scope, :map, default: nil
 
   attr :auth_surface, :boolean, default: false
-  attr :chrome, :atom, default: :default, values: [:default, :admin, :invite]
+  attr :chrome, :atom, default: :default, values: [:default, :admin, :invite, :observatory]
 
   slot :inner_block, required: true
 
@@ -42,6 +42,18 @@ defmodule CodexPoolerWeb.Layouts do
             {render_slot(@inner_block)}
           </div>
           <.public_footer id="invite-footer" />
+        </main>
+      <% @chrome == :observatory -> %>
+        <main id="observatory-shell" class="min-h-svh bg-base-200/40 text-base-content">
+          <div class="mx-auto w-full max-w-6xl">
+            <header class="flex items-center justify-between border-b border-base-300 px-4 py-4 sm:px-6 lg:px-8">
+              <Layouts.public_logo id="observatory-logo" />
+              <span class="font-mono text-xs font-semibold uppercase tracking-[0.2em] text-base-content/60">
+                Observatory
+              </span>
+            </header>
+            {render_slot(@inner_block)}
+          </div>
         </main>
       <% true -> %>
         <main class={[@auth_surface && "flex flex-col bg-base-200/40", "min-h-svh"]}>
@@ -141,7 +153,10 @@ defmodule CodexPoolerWeb.Layouts do
         id="client-error"
         kind={:error}
         title={gettext("We can't find the internet")}
-        phx-disconnected={show(".phx-client-error #client-error") |> JS.remove_attribute("hidden")}
+        phx-disconnected={
+          show(".phx-client-error #client-error")
+          |> JS.remove_attribute("hidden", to: ".phx-client-error #client-error")
+        }
         phx-connected={hide("#client-error") |> JS.set_attribute({"hidden", ""})}
         hidden
       >
@@ -153,7 +168,10 @@ defmodule CodexPoolerWeb.Layouts do
         id="server-error"
         kind={:error}
         title={gettext("Something went wrong!")}
-        phx-disconnected={show(".phx-server-error #server-error") |> JS.remove_attribute("hidden")}
+        phx-disconnected={
+          show(".phx-server-error #server-error")
+          |> JS.remove_attribute("hidden", to: ".phx-server-error #server-error")
+        }
         phx-connected={hide("#server-error") |> JS.set_attribute({"hidden", ""})}
         hidden
       >
