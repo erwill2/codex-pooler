@@ -1686,6 +1686,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
              view,
              "#upstream-quota-saved-reset-meter-bar[aria-label*='Reset consumed — confirming']"
            )
+
+    assert has_element?(
+             view,
+             "#upstream-quota-saved-reset-meter-redemption-status",
+             "confirming reset"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-quota-saved-reset-meter-policy",
+             "Auto redeem inactive · confirming reset"
+           )
   end
 
   @tag :saved_reset_cockpit

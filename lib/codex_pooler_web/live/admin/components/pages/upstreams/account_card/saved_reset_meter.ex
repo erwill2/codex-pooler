@@ -117,6 +117,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
             active
           </span>
           <span :if={!@meter_policy_active}>inactive</span>
+          <span
+            :if={@redemption_status}
+            id={"#{@id}-redemption-status"}
+            data-role="upstream-saved-reset-meter-redemption-status"
+            class={[
+              "font-medium",
+              if(@redemption_status.kind == :attention,
+                do: "text-warning",
+                else: "text-(--color-reset-bank)"
+              )
+            ]}
+          >
+            · {@redemption_status.short_label}
+          </span>
         </span>
         <span
           :if={@meter_reset_label}
@@ -196,15 +210,30 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
   defp saved_reset_redemption_status(saved_resets) do
     case Map.get(saved_resets, :reset_lifecycle) do
       %{phase: phase} = lifecycle when phase in ["consuming", "consumed_pending_probe"] ->
-        %{kind: :active, phase: phase, title: saved_reset_redemption_title(lifecycle)}
+        %{
+          kind: :active,
+          phase: phase,
+          title: saved_reset_redemption_title(lifecycle),
+          short_label: saved_reset_redemption_short_label(phase)
+        }
 
       %{phase: phase} = lifecycle when phase in ["reblocked", "expired"] ->
-        %{kind: :attention, phase: phase, title: saved_reset_redemption_title(lifecycle)}
+        %{
+          kind: :attention,
+          phase: phase,
+          title: saved_reset_redemption_title(lifecycle),
+          short_label: saved_reset_redemption_short_label(phase)
+        }
 
       _lifecycle ->
         nil
     end
   end
+
+  defp saved_reset_redemption_short_label("consuming"), do: "redeeming"
+  defp saved_reset_redemption_short_label("consumed_pending_probe"), do: "confirming reset"
+  defp saved_reset_redemption_short_label("reblocked"), do: "still blocked"
+  defp saved_reset_redemption_short_label("expired"), do: "confirmation expired"
 
   defp saved_reset_redemption_title(%{label: label, deadline_at: deadline_at})
        when is_binary(deadline_at),
