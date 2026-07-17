@@ -1917,7 +1917,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                        %{
                          "type" => "input_image",
                          "detail" => "auto",
-                         "image_url" => "https://example.com/synthetic-image.png"
+                         "image_url" => "https://example.com/synthetic-image.png",
+                         "prompt_cache_breakpoint" => %{"mode" => "explicit"}
                        }
                      ]
                    }
@@ -1932,7 +1933,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                    %{"type" => "input_text", "text" => "synthetic screenshot taken"},
                    %{
                      "type" => "input_image",
-                     "image_url" => "https://example.com/synthetic-image.png"
+                     "image_url" => "https://example.com/synthetic-image.png",
+                     "prompt_cache_breakpoint" => %{"mode" => "explicit"}
                    }
                  ]
                }

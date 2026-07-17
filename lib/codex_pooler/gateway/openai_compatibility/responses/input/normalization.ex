@@ -409,9 +409,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
      |> maybe_put_prompt_cache_breakpoint(part)}
   end
 
-  defp normalize_tool_output_part(%{"type" => "input_image", "image_url" => image_url})
+  defp normalize_tool_output_part(%{"type" => "input_image", "image_url" => image_url} = part)
        when is_binary(image_url) do
-    {:ok, %{"type" => "input_image", "image_url" => image_url}}
+    {:ok,
+     %{"type" => "input_image", "image_url" => image_url}
+     |> maybe_put_prompt_cache_breakpoint(part)}
   end
 
   defp normalize_tool_output_part(%{"type" => "image_url"} = part) do
