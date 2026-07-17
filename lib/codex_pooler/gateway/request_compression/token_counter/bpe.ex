@@ -67,11 +67,10 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter.BPE do
     rank = pair_rank(previous, next, ranks)
 
     {best_rank, best_index} =
-      cond do
-        is_nil(rank) -> {best_rank, best_index}
-        is_nil(best_rank) -> {rank, pair_index}
-        rank < best_rank -> {rank, pair_index}
-        true -> {best_rank, best_index}
+      if rank && (is_nil(best_rank) || rank < best_rank) do
+        {rank, pair_index}
+      else
+        {best_rank, best_index}
       end
 
     lowest_ranked_pair(rest, next, ranks, pair_index, best_rank, best_index)
@@ -79,8 +78,18 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter.BPE do
 
   defp pair_rank(first, second, ranks), do: Map.get(ranks, first <> second)
 
+  # Performance optimized merge_at/2 to avoid Enum.split/2 and list concatenation (++/2).
+  # Tail-recursively traverses the list exactly once up to the index, then uses the
+  # native fast Enum.reverse/2 to reverse the accumulator onto the remainder.
   defp merge_at(pieces, index) do
-    {before_pair, [first, second | after_pair]} = Enum.split(pieces, index)
-    before_pair ++ [first <> second | after_pair]
+    merge_at(pieces, index, [])
+  end
+
+  defp merge_at([first, second | rest], 0, acc) do
+    Enum.reverse(acc, [first <> second | rest])
+  end
+
+  defp merge_at([first | rest], index, acc) do
+    merge_at(rest, index - 1, [first | acc])
   end
 end
