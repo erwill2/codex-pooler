@@ -980,3 +980,24 @@ body {
   font-size: 0.6875rem;
   color: color-mix(in oklab, var(--color-base-content) 45%, transparent);
 }
+
+/* Unified toggle look (daisyUI .toggle draws track and handle from
+   currentColor, which reads near-black): grey track, white handle,
+   primary track when checked — same in both themes. */
+.toggle {
+  border-color: transparent;
+  background-color: var(--color-base-300);
+  color: #fff;
+  box-shadow: none;
+}
+
+.toggle:before {
+  box-shadow: 0 1px 2px oklch(0% 0 0 / 0.25);
+}
+
+.toggle:checked,
+.toggle[aria-checked="true"] {
+  border-color: transparent;
+  background-color: var(--color-primary);
+  color: #fff;
+}
