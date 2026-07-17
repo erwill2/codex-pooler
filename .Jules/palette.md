@@ -1,0 +1,3 @@
+## 2025-02-18 - Client-Side Copy Accessibility
+**Learning:** When client-side clipboard copy interactions dynamically change visual and textual states (like text labels changing from "Copy" to "Copied"), screen reader users are often left unaware of the success event. This can be resolved elegantly by using a visually hidden element with `aria-live="polite"` to dynamically announce updates, along with dynamic `aria-label` attribute updates on the button. Caching the original `aria-label` on mount prevents state corruption from rapid successive clicks.
+**Action:** Always include a visually hidden `aria-live` sibling/child and cache the initial `aria-label` on mount whenever dynamic copy hooks or toggles are implemented.

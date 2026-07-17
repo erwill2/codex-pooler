@@ -154,15 +154,26 @@ const buildChartTooltip = ({categories, series, unit, units, valueKinds, safeToo
 }
 const ClipboardCopy = {
   mounted() {
+    this.originalAriaLabel = this.el.getAttribute("aria-label") || ""
+    this.srFeedback = document.createElement("span")
+    this.srFeedback.className = "sr-only"
+    this.srFeedback.setAttribute("aria-live", "polite")
+    this.el.appendChild(this.srFeedback)
+
     this.el.addEventListener("click", async () => {
       const icon = this.el.querySelector(".copy-icon")
       const label = this.el.querySelector("[data-copy-label]")
+      const copiedText = this.el.dataset.copiedLabel || "Copied"
+
       window.clearTimeout(this.timeout)
       await navigator.clipboard.writeText(this.el.dataset.copyText)
 
       if (label) {
-        label.textContent = this.el.dataset.copiedLabel || "Copied"
+        label.textContent = copiedText
       }
+
+      this.el.setAttribute("aria-label", copiedText)
+      this.srFeedback.textContent = copiedText
 
       icon?.classList.remove("hero-clipboard-document")
       icon?.classList.add("hero-check")
@@ -176,6 +187,13 @@ const ClipboardCopy = {
         if (label) {
           label.textContent = this.el.dataset.copyLabel || "Copy"
         }
+
+        if (this.originalAriaLabel) {
+          this.el.setAttribute("aria-label", this.originalAriaLabel)
+        } else {
+          this.el.removeAttribute("aria-label")
+        }
+        this.srFeedback.textContent = ""
       }, 1400)
     })
   },
