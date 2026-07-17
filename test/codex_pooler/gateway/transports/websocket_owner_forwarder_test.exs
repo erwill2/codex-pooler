@@ -1325,10 +1325,27 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
   defp ensure_test_distribution_started!, do: start_test_distribution!(node())
 
   defp start_test_distribution!(:nonode@nohost) do
+    # This throwaway single-host mesh does not use global names; global's
+    # overlapping-partition guard only adds nondeterministic teardown
+    # disconnects that print WARNING REPORTs into the suite output on slow
+    # CI machines. Disable it on every node involved (peers get the same
+    # flag at boot) and restore the previous setting afterwards.
+    previous_partition_guard =
+      Application.fetch_env(:kernel, :prevent_overlapping_partitions)
+
+    Application.put_env(:kernel, :prevent_overlapping_partitions, false)
+
     node_name = String.to_atom("codex_pooler_test_#{System.unique_integer([:positive])}")
     assert {:ok, _pid} = :net_kernel.start([node_name, :shortnames])
 
-    on_exit(fn -> assert :ok = :net_kernel.stop() end)
+    on_exit(fn ->
+      assert :ok = :net_kernel.stop()
+
+      case previous_partition_guard do
+        {:ok, value} -> Application.put_env(:kernel, :prevent_overlapping_partitions, value)
+        :error -> Application.delete_env(:kernel, :prevent_overlapping_partitions)
+      end
+    end)
   end
 
   defp start_test_distribution!(_distributed_node), do: :ok
@@ -1342,7 +1359,13 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
     ensure_test_distribution_started!()
 
     peer_name = String.to_atom("#{prefix}_#{System.unique_integer([:positive])}")
-    assert {:ok, peer_pid, peer_node} = :peer.start_link(%{name: peer_name})
+
+    assert {:ok, peer_pid, peer_node} =
+             :peer.start_link(%{
+               name: peer_name,
+               args: [~c"-kernel", ~c"prevent_overlapping_partitions", ~c"false"]
+             })
+
     Process.unlink(peer_pid)
     on_exit(fn -> stop_peer(peer_pid) end)
 
