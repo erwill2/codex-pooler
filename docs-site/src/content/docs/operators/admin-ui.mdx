@@ -13,6 +13,75 @@ The first account created during bootstrap is an instance owner. Owners can mana
 
 Instance admins work inside assigned Pools. They can manage Pool-scoped upstreams, Pool API keys, request logs, and audit logs for those Pools. If an admin isn't assigned to a Pool, the Pool-scoped pages show empty states instead of global data.
 
+The table below summarizes what each role can do across the admin UI. "Assigned Pools" always means the Pools explicitly granted to that instance admin on the [Operators page](/operators/operators/).
+
+<table>
+  <thead>
+    <tr>
+      <th>Area</th>
+      <th>Instance owner</th>
+      <th>Instance admin</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><a href="/operators/pools/">Pools</a></td>
+      <td>Creates Pools and controls their full lifecycle: edit, pause, archive, and delete archived Pools.</td>
+      <td>Sees assigned Pools, can rename them and adjust their routing settings. Cannot create, pause, archive, or delete Pools.</td>
+    </tr>
+    <tr>
+      <td><a href="/operators/upstreams/">Upstreams</a></td>
+      <td>Imports accounts and manages account lifecycle for any Pool.</td>
+      <td>Imports accounts and manages account lifecycle within assigned Pools. When an account serves several Pools, lifecycle actions require assignment to all of them.</td>
+    </tr>
+    <tr>
+      <td><a href="/operators/api-keys/">Pool API keys</a></td>
+      <td>Creates, rotates, pauses, revokes, and deletes keys for any Pool.</td>
+      <td>Same key lifecycle, limited to assigned Pools. Moving a key between Pools requires access to both.</td>
+    </tr>
+    <tr>
+      <td><a href="/operators/invites/">Invites</a></td>
+      <td>Creates, reissues, and revokes invites for any Pool.</td>
+      <td>Same invite actions, limited to assigned Pools.</td>
+    </tr>
+    <tr>
+      <td><a href="/operators/operators/">Operators</a></td>
+      <td>Creates operator accounts, changes roles and Pool assignments, resets passwords, and deactivates or reactivates accounts.</td>
+      <td>No access. The page shows an owner-only notice.</td>
+    </tr>
+    <tr>
+      <td>Stats and <a href="/operators/request-logs/">request logs</a></td>
+      <td>Sees traffic and usage metadata for all Pools, including archived Pools.</td>
+      <td>Sees traffic and usage metadata for assigned Pools only.</td>
+    </tr>
+    <tr>
+      <td><a href="/operators/audit-logs/">Audit logs</a></td>
+      <td>Sees audit events for all Pools plus instance-wide events that aren't tied to a Pool.</td>
+      <td>Sees audit events for assigned Pools only.</td>
+    </tr>
+    <tr>
+      <td><a href="/operators/alerts/">Alerts</a></td>
+      <td>Manages alert rules for any Pool and every delivery channel on the instance.</td>
+      <td>Manages alert rules for assigned Pools and only the delivery channels they created.</td>
+    </tr>
+    <tr>
+      <td><a href="/operators/jobs/">System jobs</a></td>
+      <td>Full access to background job status and manual runs.</td>
+      <td>No access. The page shows an owner-only notice and is hidden from navigation.</td>
+    </tr>
+    <tr>
+      <td>System settings</td>
+      <td>Full access to instance-wide runtime, email, and security settings.</td>
+      <td>No access. The page shows an owner-only notice and is hidden from navigation.</td>
+    </tr>
+    <tr>
+      <td>Account settings</td>
+      <td>Manages their own profile, password, two-factor auth, and MCP tokens.</td>
+      <td>Same self-service access.</td>
+    </tr>
+  </tbody>
+</table>
+
 Historical request logs and audit logs for archived or deleted Pools are owner-only. This keeps old metadata available for accountability without exposing global history to admins who no longer own that Pool.
 
 ## Pools
