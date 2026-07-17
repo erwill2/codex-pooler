@@ -98,15 +98,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
             </.link>
             <p class="flex min-w-0 items-baseline text-[11px] leading-4 text-base-content/50">
               <span
-                :if={assignment_label(assignment)}
-                title={assignment_label(assignment)}
+                :if={lane_label(assignment, @cockpit)}
+                title={lane_label(assignment, @cockpit)}
                 class="min-w-0 truncate"
               >
-                {assignment_label(assignment)}
+                {lane_label(assignment, @cockpit)}
               </span>
               <span
                 :if={
-                  assignment_label(assignment) && reconciled_label(assignment, @datetime_preferences)
+                  lane_label(assignment, @cockpit) &&
+                    reconciled_label(assignment, @datetime_preferences)
                 }
                 class="shrink-0 px-1"
               >
@@ -535,6 +536,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
     do: :erlang.float_to_binary(rate, decimals: 1) <> "%"
 
   defp format_rate(rate), do: "#{rate}%"
+
+  # Every lane on this page belongs to the account in the header, so the
+  # label only earns its place when an operator gave the lane its own name.
+  defp lane_label(assignment, cockpit) do
+    case assignment_label(assignment) do
+      nil -> nil
+      label -> if label == cockpit.header.title, do: nil, else: label
+    end
+  end
 
   defp assignment_label(%{assignment_label: label}) when is_binary(label) and label != "",
     do: label

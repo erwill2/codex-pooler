@@ -363,7 +363,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     stale_selector = "#upstream-assignment-#{stale_assignment.id}"
     blocked_selector = "#upstream-assignment-#{blocked_assignment.id}"
 
-    assert has_element?(view, stale_selector, "Current Shared Codex")
+    # The stale stored label resolves to the account name, which the lane
+    # hides as redundant — so neither string may render in the row.
+    refute has_element?(view, stale_selector, "Current Shared Codex")
     assert has_element?(view, "#{stale_selector}-route-quota[title='Quota failed']")
     assert has_element?(view, "#{blocked_selector}-route-quota[title='Priming blocked']")
     assert has_element?(view, "#upstream-quota", "Fresh")
@@ -566,6 +568,31 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
     assert Repo.get!(OAuthFlow, flow.id).status == "cancelled"
     refute has_element?(view, "#upstream-cockpit-relink")
     assert has_element?(view, "#upstream-event-summary", "OAuth relink cancelled")
+  end
+
+  test "shows lane labels only when they differ from the account name", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "cockpit-lane-labels", name: "Cockpit Lane Labels"})
+
+    %{identity: identity, assignment: assignment} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Lane Label Account",
+        assignment_label: "Custom lane name"
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    assert has_element?(view, "#upstream-assignment-#{assignment.id}", "Custom lane name")
+
+    {:ok, _assignment} =
+      assignment
+      |> PoolUpstreamAssignment.changeset(%{assignment_label: "Lane Label Account"})
+      |> Repo.update()
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+    refute has_element?(view, "#upstream-assignment-#{assignment.id}", "Lane Label Account")
   end
 
   test "renders the page header without page actions", %{conn: conn, scope: scope} do
