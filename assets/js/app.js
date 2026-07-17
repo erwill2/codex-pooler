@@ -13,7 +13,7 @@ import { attachChartWheelScroll } from "./chart_wheel_scroll.mjs";
 import { classifyLiveSocketConnection } from "./live_socket_connection.mjs";
 import {
 	connectionActionLabel,
-	connectionFooterMeta,
+	connectionFooterParts,
 	connectionHint,
 	connectionTimelineSteps,
 	initialConnectionHistory,
@@ -1047,19 +1047,25 @@ const updateConnectionIndicator = () => {
 		if (hintEl.hidden === Boolean(hint)) hintEl.hidden = !hint;
 	}
 
+	const footer = connectionFooterParts(connection.visualState, {
+		endPoint: socket?.endPoint,
+		heartbeatIntervalMs: socket?.heartbeatIntervalMs,
+		online: navigator.onLine,
+	});
+	const actionLabel = connectionActionLabel(connection.visualState);
+
 	const metaEl = popover.querySelector("[data-ws-meta]");
-	if (metaEl) {
-		setTextIfChanged(
-			metaEl,
-			connectionFooterMeta(connection.visualState, {
-				endPoint: socket?.endPoint,
-				heartbeatIntervalMs: socket?.heartbeatIntervalMs,
-				online: navigator.onLine,
-			}),
-		);
+	if (metaEl) setTextIfChanged(metaEl, footer.meta);
+
+	// The right slot holds one thing: the action when there is one, the
+	// keepalive detail otherwise.
+	const detail = actionLabel ? null : footer.detail;
+	const detailEl = popover.querySelector("[data-ws-detail]");
+	if (detailEl) {
+		setTextIfChanged(detailEl, detail || "");
+		if (detailEl.hidden === Boolean(detail)) detailEl.hidden = !detail;
 	}
 
-	const actionLabel = connectionActionLabel(connection.visualState);
 	const actionEl = popover.querySelector("[data-ws-action]");
 	if (actionEl) {
 		setTextIfChanged(actionEl, actionLabel || "");

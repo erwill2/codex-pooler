@@ -181,12 +181,15 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                   </div>
                   <footer class="flex min-h-9 items-center justify-between gap-3 border-t border-base-300 bg-base-200/60 py-1.5 pl-4 pr-2 text-[11px] text-base-content/55">
                     <span data-ws-meta>connecting…</span>
-                    <button
-                      type="button"
-                      data-ws-action
-                      class="btn btn-ghost btn-xs text-base-content/55 hover:text-primary"
-                      hidden
-                    ></button>
+                    <span class="flex shrink-0 items-center">
+                      <span data-ws-detail class="pr-2" hidden></span>
+                      <button
+                        type="button"
+                        data-ws-action
+                        class="btn btn-ghost btn-xs text-base-content/55 hover:text-primary"
+                        hidden
+                      ></button>
+                    </span>
                   </footer>
                 </section>
               </details>

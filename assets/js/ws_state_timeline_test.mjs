@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 
 import {
   connectionActionLabel,
-  connectionFooterMeta,
+  connectionFooterParts,
   connectionHint,
   connectionTimelineSteps,
   displayEndpoint,
@@ -222,28 +222,28 @@ test("hints exist only for fallback and connecting", () => {
   assert.equal(connectionHint("disconnected"), null)
 })
 
-test("footer meta pairs endpoint and heartbeat when connected, network otherwise", () => {
-  const connected = connectionFooterMeta("websocketConnected", {
+test("footer splits endpoint and keepalive when connected, network-only otherwise", () => {
+  const connected = connectionFooterParts("websocketConnected", {
     endPoint: "/live/websocket",
     heartbeatIntervalMs: 30000,
     online: true,
   })
-  assert.equal(connected, "/live · heartbeat 30s")
+  assert.deepEqual(connected, {meta: "/live", detail: "keepalive 30s"})
 
-  const fallback = connectionFooterMeta("longPollFallback", {
+  const fallback = connectionFooterParts("longPollFallback", {
     endPoint: "/live/longpoll",
     heartbeatIntervalMs: null,
     online: true,
   })
-  assert.equal(fallback, "/live · heartbeat default")
+  assert.deepEqual(fallback, {meta: "/live", detail: "keepalive default"})
 
-  assert.equal(
-    connectionFooterMeta("disconnected", {endPoint: null, online: true}),
-    "network: online",
+  assert.deepEqual(
+    connectionFooterParts("disconnected", {endPoint: null, online: true}),
+    {meta: "network: online", detail: null},
   )
-  assert.equal(
-    connectionFooterMeta("connecting", {endPoint: null, online: false}),
-    "network: offline",
+  assert.deepEqual(
+    connectionFooterParts("connecting", {endPoint: null, online: false}),
+    {meta: "network: offline", detail: null},
   )
 })
 

@@ -183,15 +183,19 @@ export const connectionHint = (visual) => {
 export const displayEndpoint = (endPoint) =>
   (endPoint || "/live").replace(/\/(websocket|longpoll)$/, "")
 
-export const connectionFooterMeta = (visual, {endPoint, heartbeatIntervalMs, online}) => {
+export const connectionFooterParts = (visual, {endPoint, heartbeatIntervalMs, online}) => {
   if (connectedVisual(visual)) {
-    const heartbeat = heartbeatIntervalMs
-      ? `heartbeat ${Math.round(heartbeatIntervalMs / 1000)}s`
-      : "heartbeat default"
-    return `${displayEndpoint(endPoint)} · ${heartbeat}`
+    // "keepalive", not "heartbeat": this is Phoenix's idle keepalive
+    // interval, distinct from the measured heartbeat RTT in the timeline.
+    return {
+      meta: displayEndpoint(endPoint),
+      detail: heartbeatIntervalMs
+        ? `keepalive ${Math.round(heartbeatIntervalMs / 1000)}s`
+        : "keepalive default",
+    }
   }
 
-  return `network: ${online ? "online" : "offline"}`
+  return {meta: `network: ${online ? "online" : "offline"}`, detail: null}
 }
 
 export const connectionActionLabel = (visual) => {
