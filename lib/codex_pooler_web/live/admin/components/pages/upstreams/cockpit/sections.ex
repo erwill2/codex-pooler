@@ -208,31 +208,31 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
         <div
           :if={confirming_saved_reset_redemption?(@confirming_saved_reset_redemption, @cockpit)}
           id="cockpit-saved-reset-redemption-confirmation"
-          class="mx-3 mb-2 grid gap-3 rounded-box border border-warning/30 bg-warning/10 p-3"
+          class="grid gap-2.5 border-t border-warning/20 bg-warning/5 px-4 py-3"
         >
-          <div class="grid gap-1">
-            <h3 class="text-sm font-semibold text-base-content">Confirm saved reset redemption</h3>
-            <p class="text-xs leading-5 text-base-content/75">
-              This queues one manual redemption for this account. It is separate from the auto
-              redeem policy.
-            </p>
-          </div>
+          <p class="text-xs leading-5 text-base-content/70">
+            Queues one manual redemption for this account, separate from the auto redeem policy.
+          </p>
           <div class="flex flex-wrap items-center gap-2">
-            <AdminComponents.action_button
+            <button
               id="cockpit-saved-reset-redemption-confirm"
-              icon="hero-check"
-              label="Confirm redemption"
+              type="button"
               phx-click="redeem_saved_reset"
               phx-value-id={@cockpit.identity.id}
               phx-value-pool-id={default_pool_id(@cockpit)}
-              variant={:primary}
-            />
-            <AdminComponents.action_button
+              class="btn btn-primary btn-xs gap-1.5"
+            >
+              <.icon name="hero-check" class="size-3.5" />
+              <span>Confirm redemption</span>
+            </button>
+            <button
               id="cockpit-saved-reset-redemption-cancel"
-              icon="hero-x-mark"
-              label="Keep resets in bank"
+              type="button"
               phx-click="cancel_saved_reset_redemption"
-            />
+              class="btn btn-ghost btn-xs text-base-content/60 hover:text-base-content"
+            >
+              Keep resets in bank
+            </button>
           </div>
         </div>
         <.rail_action
