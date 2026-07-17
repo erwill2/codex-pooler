@@ -109,10 +109,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
         <span
           :if={@meter_reset_label}
           id={"#{@id}-reset"}
-          class="inline-flex shrink-0 items-center gap-1"
+          class="inline-flex shrink-0 items-baseline gap-1"
           title={@saved_resets.next_expires_title}
         >
-          <.icon name="hero-clock" class="size-3 shrink-0 -translate-y-px" />
+          <.icon name="hero-clock" class="size-3 shrink-0 translate-y-0.5" />
           <span class="truncate">{@meter_reset_label}</span>
         </span>
       </div>

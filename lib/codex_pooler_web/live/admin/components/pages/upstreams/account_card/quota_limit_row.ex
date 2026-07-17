@@ -36,12 +36,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.QuotaLimitRow 
         <span
           :if={@limit.reset_label}
           id={"#{@id}-reset"}
-          class="inline-flex items-center gap-1"
+          class="inline-flex items-baseline gap-1"
           title={@limit.reset_title}
         >
-          <%!-- Roboto Condensed's 11px line box sits ink-high; without the 1px
-          lift the box-centered icon reads low against the glyphs. --%>
-          <.icon name="hero-clock" class="size-3 -translate-y-px" />
+          <%!-- Anchor the icon to the text baseline, not the line box: the
+          box center shifts per engine, the baseline doesn't. Bottom-on-
+          baseline puts the 12px icon ~2px high of the glyph ink center. --%>
+          <.icon name="hero-clock" class="size-3 translate-y-0.5" />
           <span>{strip_in_prefix(@limit.reset_label)}</span>
         </span>
       </div>

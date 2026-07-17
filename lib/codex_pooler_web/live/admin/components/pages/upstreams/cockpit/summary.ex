@@ -118,9 +118,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
         <span
           id="upstream-cockpit-relink-expiry"
           title={Formatting.format_oauth_flow_time(@flow.expires_at, @datetime_preferences)}
-          class="inline-flex items-center gap-1.5 text-[11px] tabular-nums text-base-content/55"
+          class="inline-flex items-baseline gap-1.5 text-[11px] tabular-nums text-base-content/55"
         >
-          <.icon name="hero-clock" class="size-3 shrink-0 -translate-y-px" />
+          <.icon name="hero-clock" class="size-3 shrink-0 translate-y-0.5" />
           <span>expires {ResetFormatting.relative_time_label(@flow.expires_at)}</span>
         </span>
         <button
