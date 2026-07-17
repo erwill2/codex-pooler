@@ -329,35 +329,33 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
         aria-label="Codex Pooler project links"
       >
         <div class="grid gap-3">
-          <div>
-            <p class="font-mono text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-primary">
-              Codex Pooler
-            </p>
-          </div>
+          <p class="font-mono text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-primary">
+            Codex Pooler
+          </p>
 
-          <nav class="grid gap-2" aria-label="Codex Pooler project resources">
-            <.github_resource_card
+          <nav class="grid" aria-label="Codex Pooler project resources">
+            <.github_resource_row
               id="admin-github-release-notes"
               href={@release_notes_url}
-              icon="hero-tag"
+              icon="hero-sparkles"
               title="Release notes"
-              subtitle={"codex-pooler-v#{@app_version}"}
+              subtitle={"v#{@app_version}"}
             />
-            <.github_resource_card
+            <.github_resource_row
               id="admin-github-repository"
               href={@repository_url}
-              icon="hero-code-bracket-square"
-              title="Official repository"
+              github_mark
+              title="Repository"
               subtitle="icoretech/codex-pooler"
             />
-            <.github_resource_card
+            <.github_resource_row
               id="admin-github-docs"
               href={@docs_url}
               icon="hero-book-open"
               title="Documentation"
               subtitle="docs.codex-pooler.com"
             />
-            <.github_resource_card
+            <.github_resource_row
               id="admin-github-x-profile"
               href={@x_profile_url}
               icon="hero-at-symbol"
@@ -371,9 +369,13 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
             href={@repository_url}
             target="_blank"
             rel="noopener noreferrer"
-            class="flex items-start gap-2 rounded-box bg-base-200/70 px-3 py-2 text-xs leading-5 text-base-content/60 transition-colors hover:bg-base-200 hover:text-base-content"
+            class="group -mx-4 -mb-4 flex items-center gap-2 border-t border-base-300 bg-base-200/60 px-5 py-2.5 text-xs leading-5 text-base-content/60 transition-colors hover:bg-base-200 hover:text-base-content"
           >
-            <.icon name="hero-star" class="mt-0.5 size-4 shrink-0 text-primary" />
+            <.icon name="hero-star" class="size-3.5 shrink-0 text-primary group-hover:hidden" />
+            <.icon
+              name="hero-star-solid"
+              class="hidden size-3.5 shrink-0 text-primary group-hover:inline-block"
+            />
             <span>Star the repository to follow updates.</span>
           </a>
         </div>
@@ -384,31 +386,31 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
 
   attr :id, :string, required: true
   attr :href, :string, required: true
-  attr :icon, :string, required: true
+  attr :icon, :string, default: nil
+  attr :github_mark, :boolean, default: false
   attr :title, :string, required: true
   attr :subtitle, :string, required: true
 
-  defp github_resource_card(assigns) do
+  defp github_resource_row(assigns) do
     ~H"""
     <a
       id={@id}
       href={@href}
       target="_blank"
       rel="noopener noreferrer"
-      class="group flex items-center gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-2.5 text-left transition-colors hover:border-base-content/20 hover:bg-base-200"
+      class="group flex items-center gap-2.5 border-t border-base-300/55 px-1 py-2 text-base-content/55 transition-colors first:border-t-0 hover:text-base-content"
     >
-      <span class="grid size-8 shrink-0 place-items-center rounded-box bg-base-200 text-base-content/55 group-hover:text-base-content">
-        <.icon name={@icon} class="size-4" />
+      <.github_icon :if={@github_mark} class="size-4 shrink-0 fill-current" />
+      <.icon :if={!@github_mark} name={@icon} class="size-4 shrink-0" />
+      <span class="min-w-0 truncate text-xs font-semibold text-base-content">
+        {@title}
       </span>
-      <span class="min-w-0 flex-1">
-        <span class="block truncate text-xs font-semibold text-base-content">{@title}</span>
-        <span class="mt-0.5 block truncate font-mono text-[0.66rem] leading-none text-base-content/45">
-          {@subtitle}
-        </span>
+      <span class="ml-auto shrink-0 text-[11px] text-base-content/45">
+        {@subtitle}
       </span>
       <.icon
         name="hero-arrow-top-right-on-square"
-        class="size-3.5 shrink-0 text-base-content/35 group-hover:text-base-content/65"
+        class="size-3 shrink-0 translate-y-px opacity-0 transition-opacity group-hover:opacity-60"
       />
     </a>
     """

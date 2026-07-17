@@ -163,12 +163,11 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
                  "Release notes"
                )
 
-        assert has_element?(view, "#admin-github-release-notes", "codex-pooler-v#{app_version}")
+        assert has_element?(view, "#admin-github-release-notes", "v#{app_version}")
 
         assert has_element?(
                  view,
-                 "#admin-github-repository[href='https://github.com/icoretech/codex-pooler'][target='_blank']",
-                 "Official repository"
+                 "#admin-github-repository[href='https://github.com/icoretech/codex-pooler'][target='_blank']"
                )
 
         assert has_element?(view, "#admin-github-repository", "icoretech/codex-pooler")
