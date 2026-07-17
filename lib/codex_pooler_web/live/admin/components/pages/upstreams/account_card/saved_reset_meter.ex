@@ -51,15 +51,21 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
   attr :class, :any, default: nil
 
   def saved_reset_meter(assigns) do
+    redemption_status = saved_reset_redemption_status(assigns.saved_resets)
+
     assigns =
       assigns
       |> assign(:segments, saved_reset_meter_segments(assigns.saved_resets))
       |> assign(:meter_max, saved_reset_meter_max(assigns.saved_resets))
       |> assign(:meter_value, saved_reset_meter_value(assigns.saved_resets))
-      |> assign(:meter_label, saved_reset_meter_label(assigns.saved_resets))
+      |> assign(
+        :meter_label,
+        saved_reset_meter_label(assigns.saved_resets, redemption_status)
+      )
       |> assign(:meter_count_label, saved_reset_meter_count_label(assigns.saved_resets))
       |> assign(:meter_reset_label, saved_reset_meter_reset_label(assigns.saved_resets))
       |> assign(:meter_policy_active, saved_reset_policy_active?(assigns.saved_reset_policy))
+      |> assign(:redemption_status, redemption_status)
 
     ~H"""
     <div id={@id} data-role="upstream-saved-reset-meter" class={["grid gap-1.5", @class]}>
@@ -90,8 +96,14 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
           :for={segment <- @segments}
           id={"#{@id}-segment-#{segment.index}"}
           data-role="upstream-saved-reset-meter-segment"
+          data-redemption-phase={segment.index == 1 && @redemption_status && @redemption_status.phase}
           aria-hidden="true"
-          class={saved_reset_meter_segment_class(segment, @saved_reset_policy)}
+          title={segment.index == 1 && @redemption_status && @redemption_status.title}
+          class={[
+            saved_reset_meter_segment_class(segment, @saved_reset_policy),
+            segment.index == 1 && @redemption_status &&
+              saved_reset_redemption_segment_class(@redemption_status)
+          ]}
         ></span>
       </div>
       <div class="flex items-center justify-between gap-3 text-[11px] text-base-content/60">
@@ -166,11 +178,44 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
 
   defp saved_reset_meter_max(saved_resets), do: max(saved_reset_meter_value(saved_resets), 5)
 
+  defp saved_reset_meter_label(saved_resets, %{title: status_title}),
+    do: "#{saved_reset_meter_label(saved_resets)} · #{status_title}"
+
+  defp saved_reset_meter_label(saved_resets, nil),
+    do: saved_reset_meter_label(saved_resets)
+
   defp saved_reset_meter_label(%{label: label}) when is_binary(label) and label != "",
     do: label
 
   defp saved_reset_meter_label(saved_resets),
     do: "#{saved_reset_meter_value(saved_resets)} saved resets"
+
+  # The redemption lifecycle rides the first meter segment instead of a
+  # separate status box: an in-flight spend pulses, a failed or expired
+  # confirmation turns the segment warning. Details stay in the tooltip.
+  defp saved_reset_redemption_status(saved_resets) do
+    case Map.get(saved_resets, :reset_lifecycle) do
+      %{phase: phase} = lifecycle when phase in ["consuming", "consumed_pending_probe"] ->
+        %{kind: :active, phase: phase, title: saved_reset_redemption_title(lifecycle)}
+
+      %{phase: phase} = lifecycle when phase in ["reblocked", "expired"] ->
+        %{kind: :attention, phase: phase, title: saved_reset_redemption_title(lifecycle)}
+
+      _lifecycle ->
+        nil
+    end
+  end
+
+  defp saved_reset_redemption_title(%{label: label, deadline_at: deadline_at})
+       when is_binary(deadline_at),
+       do: "#{label} · confirmation window until #{deadline_at}"
+
+  defp saved_reset_redemption_title(%{label: label}), do: label
+
+  defp saved_reset_redemption_segment_class(%{kind: :active}),
+    do: "animate-pulse !bg-(--color-reset-bank)/80"
+
+  defp saved_reset_redemption_segment_class(%{kind: :attention}), do: "!bg-warning/70"
 
   defp saved_reset_meter_count_label(%{available_count: count})
        when is_integer(count) and count >= 0,

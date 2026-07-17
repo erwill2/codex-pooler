@@ -1638,6 +1638,57 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitLiveTest do
   end
 
   @tag :saved_reset_cockpit
+  test "rides the redemption lifecycle on the first meter segment", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "saved-reset-lifecycle", name: "Saved Reset Lifecycle"})
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    %{identity: identity} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Saved Reset Lifecycle Codex",
+        identity_metadata: %{
+          "saved_resets" => %{
+            "status" => "reported",
+            "available_count" => 2,
+            "source" => "codex_usage_api",
+            "path_style" => "codex",
+            "usage_path" => "/api/codex/usage",
+            "observed_at" => DateTime.to_iso8601(now)
+          },
+          "saved_reset_redemption" => %{
+            "phase" => "consumed_pending_probe",
+            "started_at" => DateTime.to_iso8601(DateTime.add(now, -3, :minute)),
+            "consumed_at" => DateTime.to_iso8601(DateTime.add(now, -2, :minute)),
+            "deadline_at" => DateTime.to_iso8601(DateTime.add(now, 58, :minute))
+          }
+        }
+      })
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams/#{identity.id}")
+
+    refute has_element?(view, "#cockpit-saved-reset-lifecycle")
+
+    assert has_element?(
+             view,
+             "#upstream-quota-saved-reset-meter-segment-1[data-redemption-phase='consumed_pending_probe'].animate-pulse[title*='Reset consumed — confirming'][title*='confirmation window until']"
+           )
+
+    refute has_element?(
+             view,
+             "#upstream-quota-saved-reset-meter-segment-2[data-redemption-phase]"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-quota-saved-reset-meter-bar[aria-label*='Reset consumed — confirming']"
+           )
+  end
+
+  @tag :saved_reset_cockpit
   test "stale saved reset cockpit confirmation reloads before enqueueing", %{
     conn: conn,
     scope: scope
