@@ -257,7 +257,7 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.Security do
               <span
                 :if={session.current?}
                 id="settings-current-session-badge"
-                class="badge badge-primary badge-sm mt-1"
+                class={[CodexPoolerWeb.Admin.BadgeComponents.metadata_chip_class(:primary), "mt-1"]}
               >
                 This session
               </span>

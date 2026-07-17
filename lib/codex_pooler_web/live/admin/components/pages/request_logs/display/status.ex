@@ -5,39 +5,33 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.Status do
   @default_request_status_presentation %{
     icon: "hero-question-mark-circle",
     icon_class: "mx-auto size-5 text-base-content/60",
-    filter_icon_color: "text-base-content/60",
-    border_class: "border-l-base-300"
+    filter_icon_color: "text-base-content/60"
   }
   @request_status_presentations %{
     "succeeded" => %{
       icon: "hero-check-circle",
       icon_class: "mx-auto size-5 text-success",
-      filter_icon_color: "text-success",
-      border_class: "border-l-success"
+      filter_icon_color: "text-success"
     },
     "failed" => %{
       icon: "hero-x-circle",
       icon_class: "mx-auto size-5 text-error",
-      filter_icon_color: "text-error",
-      border_class: "border-l-error"
+      filter_icon_color: "text-error"
     },
     "rejected" => %{
       icon: "hero-shield-exclamation",
       icon_class: "mx-auto size-5 text-error",
-      filter_icon_color: "text-error",
-      border_class: "border-l-error"
+      filter_icon_color: "text-error"
     },
     "cancelled" => %{
       icon: "hero-no-symbol",
       icon_class: "mx-auto size-5 text-warning",
-      filter_icon_color: "text-warning",
-      border_class: "border-l-warning"
+      filter_icon_color: "text-warning"
     },
     "in_progress" => %{
       icon: "hero-clock",
       icon_class: "mx-auto size-5 text-info",
-      filter_icon_color: "text-info",
-      border_class: "border-l-info"
+      filter_icon_color: "text-info"
     }
   }
 
@@ -83,9 +77,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay.Status do
 
   def request_status_filter_icon_color(status),
     do: request_status_presentation(status).filter_icon_color
-
-  def request_status_border_class(status),
-    do: request_status_presentation(status).border_class
 
   defp request_status_presentation(status),
     do:

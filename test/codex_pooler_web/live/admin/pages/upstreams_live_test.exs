@@ -1202,7 +1202,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-account-#{active_identity.id}-saved-reset-meter-policy .text-violet-700",
+             "#upstream-account-#{active_identity.id}-saved-reset-meter-policy [class*='--color-reset-bank']",
              "active"
            )
 
@@ -1268,16 +1268,16 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert active_badge_class =~ "bg-success/15"
     assert active_badge_class =~ "text-success"
     assert active_badge_class =~ "border-success/40"
-    refute active_badge_class =~ "bg-violet-500/10"
-    refute active_badge_class =~ "text-violet-700"
+    refute active_badge_class =~ "bg-(--color-reset-bank)/10"
+    refute active_badge_class =~ "text-(--color-reset-bank)"
     refute active_badge_class =~ "border-dashed"
     assert active_usage_panel_class =~ "max-h-[28rem]"
     assert active_usage_panel_class =~ "transition-opacity"
     refute active_usage_panel_class =~ "translate-y"
     refute active_usage_panel_class =~ "transition-[max-height"
     assert active_saved_meter_class =~ "md:col-span-2"
-    assert active_saved_meter_segment_1_class =~ "bg-violet-500/80"
-    assert active_saved_meter_segment_2_class =~ "bg-violet-500/80"
+    assert active_saved_meter_segment_1_class =~ "bg-(--color-reset-bank)/80"
+    assert active_saved_meter_segment_2_class =~ "bg-(--color-reset-bank)/80"
     assert active_saved_meter_segment_3_class =~ "bg-base-300/70"
     refute active_saved_meter_segment_1_class =~ "bg-success"
     refute active_saved_meter_segment_2_class =~ "bg-success"
@@ -1419,7 +1419,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     refute has_element?(
              view,
-             "#upstream-account-#{inactive_identity.id}-saved-reset-meter-policy .text-violet-700",
+             "#upstream-account-#{inactive_identity.id}-saved-reset-meter-policy [class*='--color-reset-bank']",
              "inactive"
            )
 
@@ -1427,7 +1427,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#{inactive_badge_selector} .hero-battery-100.size-3.text-violet-600"
+             "#{inactive_badge_selector} .hero-battery-100.size-3[class*='--color-reset-bank']"
            )
 
     refute has_element?(view, "#upstream-account-#{inactive_identity.id}-saved-reset-panel")
@@ -1447,11 +1447,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
         "upstream-account-#{inactive_identity.id}-saved-reset-meter-segment-1"
       )
 
-    assert inactive_badge_class =~ "bg-violet-500/10"
-    assert inactive_badge_class =~ "text-violet-700"
-    assert inactive_badge_class =~ "border-violet-500/50"
+    assert inactive_badge_class =~ "bg-(--color-reset-bank)/10"
+    assert inactive_badge_class =~ "text-(--color-reset-bank)"
+    assert inactive_badge_class =~ "border-(--color-reset-bank)/40"
     refute inactive_badge_class =~ "border-dashed"
-    assert inactive_saved_meter_segment_1_class =~ "bg-violet-500/80"
+    assert inactive_saved_meter_segment_1_class =~ "bg-(--color-reset-bank)/80"
 
     assert upstream_header_badge_order(inactive_card) == [
              inactive_badge_id,
@@ -2250,7 +2250,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
            )
 
     assert render(view) =~
-             ~r/id="upstream-account-#{identity.id}-workspace"[^>]*class="badge badge-ghost badge-sm shrink-0 max-w-48 truncate text-\[0\.65rem\] text-base-content\/50"/
+             ~r/id="upstream-account-#{identity.id}-workspace"[^>]*class="[^"]*rounded-full[^"]*shrink-0 max-w-48 truncate"/
 
     refute has_element?(view, "#upstream-account-#{identity.id}-cockpit-link")
 
@@ -3464,7 +3464,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       state: "weekly_only_probe",
       label: "Weekly quota probe",
       tone: :warning,
-      border_class: "border-l-warning",
       routing_ready_now?: true,
       priming_status: "weekly_only_probe",
       priming_label: "Weekly-only probe",
@@ -3476,7 +3475,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       state: "exhausted",
       label: "Quota exhausted",
       tone: :error,
-      border_class: "border-l-error",
       routing_ready_now?: false,
       priming_status: "known",
       priming_label: "Quota known",
@@ -3543,9 +3541,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 
-    assert has_element?(view, "#upstream-account-#{exhausted_identity.id}.border-l-error")
+    assert has_element?(
+             view,
+             "#upstream-account-#{exhausted_identity.id}[data-routing-tone='error']"
+           )
 
-    refute has_element?(view, "#upstream-account-#{exhausted_identity.id}.border-l-success")
+    refute has_element?(
+             view,
+             "#upstream-account-#{exhausted_identity.id}[data-routing-tone='success']"
+           )
 
     assert has_element?(
              view,
@@ -3565,7 +3569,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              "Quota known"
            )
 
-    assert has_element?(view, "#upstream-account-#{ready_identity.id}.border-l-success")
+    assert has_element?(
+             view,
+             "#upstream-account-#{ready_identity.id}[data-routing-tone='success']"
+           )
 
     assert has_element?(
              view,
@@ -3597,45 +3604,45 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       %{
         readiness_state: "ready",
         quota_state: "ready",
+        expected_tone: "success",
         expected_label: "Routing ready",
         expected_quota_label: "Quota ready",
-        border_class: "border-l-success",
         priming_status: "known",
         priming_label: "Quota known"
       },
       %{
         readiness_state: "weekly_only_probe",
         quota_state: "weekly_only_probe",
+        expected_tone: "success",
         expected_label: "Routing ready",
         expected_quota_label: "Weekly quota probe",
-        border_class: "border-l-success",
         priming_status: "weekly_only_probe",
         priming_label: "Weekly-only probe"
       },
       %{
         readiness_state: "exhausted",
         quota_state: "exhausted",
+        expected_tone: "error",
         expected_label: "Quota exhausted",
         expected_quota_label: "Quota exhausted",
-        border_class: "border-l-error",
         priming_status: "known",
         priming_label: "Quota known"
       },
       %{
         readiness_state: "stale",
         quota_state: "stale",
+        expected_tone: "warning",
         expected_label: "Quota refresh needed",
         expected_quota_label: "Quota refresh needed",
-        border_class: "border-l-warning",
         priming_status: "known",
         priming_label: "Quota known"
       },
       %{
         readiness_state: "missing",
         quota_state: "missing",
+        expected_tone: "warning",
         expected_label: "Quota missing",
         expected_quota_label: "Quota missing",
-        border_class: "border-l-warning",
         priming_status: "unknown",
         priming_label: "Priming pending"
       }
@@ -3663,7 +3670,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
       {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 
-      assert has_element?(view, "#upstream-account-#{identity.id}.#{routing_case.border_class}"),
+      assert has_element?(
+               view,
+               "#upstream-account-#{identity.id}[data-routing-tone='#{routing_case.expected_tone}']"
+             ),
              routing_case.readiness_state
 
       assert has_element?(
@@ -3720,7 +3730,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 
-    assert has_element?(view, "#upstream-account-#{identity.id}.border-l-warning")
+    assert has_element?(view, "#upstream-account-#{identity.id}[data-routing-tone='warning']")
 
     assert has_element?(
              view,
@@ -3757,7 +3767,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
         state: "blocked",
         label: "Quota blocked",
         tone: :warning,
-        border_class: "border-l-warning",
         routing_ready_now?: false,
         reason_codes: ["quota_window_unusable", "not_fresh"],
         primary_window: nil,
@@ -3775,9 +3784,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     card_class = html_element_class(blocked_html, "upstream-account-#{blocked_id}")
 
-    assert card_class =~ "border-l "
     assert card_class =~ "border-base-300"
-    assert card_class =~ "border-l-warning"
+    assert blocked_html =~ ~s(data-routing-tone="warning")
     refute card_class =~ "shadow-sm"
 
     assert [_match, routing_contract] =
@@ -3833,7 +3841,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 
-    assert has_element?(view, "#upstream-account-#{identity.id}.border-l-warning")
+    assert has_element?(view, "#upstream-account-#{identity.id}[data-routing-tone='warning']")
 
     assert has_element?(
              view,
@@ -3903,7 +3911,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 
-    assert has_element?(view, "#upstream-account-#{identity.id}.border-l-error")
+    assert has_element?(view, "#upstream-account-#{identity.id}[data-routing-tone='error']")
 
     assert has_element?(
              view,
@@ -4040,7 +4048,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       state: "ready",
       label: "Quota ready",
       tone: :success,
-      border_class: "border-l-success",
       routing_ready_now?: true,
       priming_status: "known",
       priming_label: "Quota known",
@@ -5756,7 +5763,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
         state: "missing_evidence",
         label: "Quota missing",
         tone: :warning,
-        border_class: "border-l-warning",
         routing_ready_now?: false,
         reason_codes: [],
         primary_window: nil,
@@ -5859,7 +5865,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert account.quota_readiness.state == Keyword.fetch!(opts, :state)
     assert account.quota_readiness.label == Keyword.fetch!(opts, :label)
     assert account.quota_readiness.tone == Keyword.fetch!(opts, :tone)
-    assert account.quota_readiness.border_class == Keyword.fetch!(opts, :border_class)
     assert account.quota_readiness.routing_ready_now? == Keyword.fetch!(opts, :routing_ready_now?)
 
     case Keyword.fetch!(opts, :primary_window?) do

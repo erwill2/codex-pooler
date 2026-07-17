@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
 
   use CodexPoolerWeb, :html
 
+  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReconciliationStatus
@@ -59,7 +60,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
                 {flow.flow_kind} · {flow.purpose}
               </p>
             </div>
-            <span class="badge badge-outline badge-sm">{flow.status}</span>
+            <span class={AdminBadges.status_chip_class(flow.status)}>{flow.status}</span>
           </div>
 
           <dl class="grid gap-1 text-xs text-base-content/70">
@@ -129,7 +130,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
         >
           <span
             id="upstream-cockpit-safe-account-id"
-            class="badge badge-outline max-w-full break-all font-mono"
+            class={[AdminBadges.count_chip_class(), "max-w-full break-all font-mono"]}
           >
             {@cockpit.header.safe_account_id_label}
           </span>
@@ -137,16 +138,18 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
             :if={@cockpit.header.subject_ref}
             id="upstream-cockpit-safe-subject-ref"
             data-role="upstream-subject-ref"
-            class="badge badge-outline max-w-full break-all font-mono"
+            class={[AdminBadges.count_chip_class(), "max-w-full break-all font-mono"]}
           >
             Subject {@cockpit.header.subject_ref}
           </span>
           <span class={Formatting.status_badge_class(@cockpit.header.status)}>
             {@cockpit.header.status_label}
           </span>
-          <span :if={@cockpit.header.plan_reported?} class="badge badge-outline">
-            {@cockpit.header.plan_label}
-          </span>
+          <AdminBadges.plan_badge
+            :if={@cockpit.header.plan_reported?}
+            id="upstream-cockpit-plan-badge"
+            label={@cockpit.header.plan_label}
+          />
         </div>
       </:actions>
     </AdminComponents.page_header>

@@ -121,7 +121,6 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
   attr :label, :string, default: nil
   attr :family, :string, default: nil
   attr :placeholder, :string, default: "Plan unknown"
-  attr :variant, :atom, default: :badge, values: [:badge, :metadata]
   attr :class, :any, default: nil
   attr :rest, :global
 
@@ -132,7 +131,7 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
         :badge_label,
         plan_badge_label(assigns.label, assigns.family, assigns.placeholder)
       )
-      |> assign(:badge_class, plan_badge_class(assigns.label || assigns.family, assigns.variant))
+      |> assign(:badge_class, plan_badge_class(assigns.label || assigns.family))
 
     ~H"""
     <span id={@id} class={[@badge_class, @class]} {@rest}>
@@ -143,10 +142,10 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
 
   def plan_badge_label(plan_label), do: plan_badge_text(plan_label, "Plan unknown")
 
-  def plan_badge_class(plan_label, variant \\ :badge) do
+  def plan_badge_class(plan_label) do
     plan_label
     |> plan_tone()
-    |> plan_badge_class_for_tone(variant)
+    |> plan_badge_class_for_tone()
   end
 
   defp chip_class(:primary),
@@ -223,33 +222,15 @@ defmodule CodexPoolerWeb.Admin.BadgeComponents do
 
   defp plan_tone(_plan_label), do: :unknown
 
-  defp plan_badge_class_for_tone(:free, :badge),
-    do: "badge badge-success badge-sm whitespace-nowrap font-semibold"
+  defp plan_badge_class_for_tone(:free), do: chip_class(:success)
+  defp plan_badge_class_for_tone(:pro), do: chip_class(:primary)
+  defp plan_badge_class_for_tone(:team), do: chip_class(:info)
+  defp plan_badge_class_for_tone(:enterprise), do: chip_class(:warning)
 
-  defp plan_badge_class_for_tone(:pro, :badge),
-    do: "badge badge-primary badge-sm whitespace-nowrap font-semibold"
-
-  defp plan_badge_class_for_tone(:team, :badge),
-    do: "badge badge-info badge-sm whitespace-nowrap font-semibold"
-
-  defp plan_badge_class_for_tone(:enterprise, :badge),
-    do: "badge badge-secondary badge-sm whitespace-nowrap font-semibold"
-
-  defp plan_badge_class_for_tone({:generated, _key}, :badge),
-    do: "badge badge-accent badge-sm whitespace-nowrap font-semibold"
-
-  defp plan_badge_class_for_tone(:free, :metadata), do: chip_class(:success)
-  defp plan_badge_class_for_tone(:pro, :metadata), do: chip_class(:primary)
-  defp plan_badge_class_for_tone(:team, :metadata), do: chip_class(:info)
-  defp plan_badge_class_for_tone(:enterprise, :metadata), do: chip_class(:warning)
-
-  defp plan_badge_class_for_tone({:generated, key}, :metadata),
+  defp plan_badge_class_for_tone({:generated, key}),
     do: key |> generated_chip_tone() |> chip_class()
 
-  defp plan_badge_class_for_tone(_tone, :metadata), do: chip_class(:neutral)
-
-  defp plan_badge_class_for_tone(_tone, :badge),
-    do: "badge badge-ghost badge-sm whitespace-nowrap font-semibold"
+  defp plan_badge_class_for_tone(_tone), do: chip_class(:neutral)
 
   defp generated_chip_tone(key) do
     tones = [:primary, :success, :warning, :error, :info]

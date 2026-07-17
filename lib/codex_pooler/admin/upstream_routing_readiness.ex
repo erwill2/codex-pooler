@@ -82,7 +82,6 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
           required(:state) => String.t(),
           required(:label) => String.t(),
           required(:tone) => tone(),
-          required(:border_class) => String.t(),
           required(:reason) => String.t(),
           required(:reason_code) => String.t(),
           required(:recovery_action) => String.t() | nil,
@@ -95,7 +94,6 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
           required(:state) => String.t(),
           required(:label) => String.t(),
           required(:tone) => tone(),
-          required(:border_class) => String.t(),
           required(:reason) => String.t(),
           required(:reason_code) => String.t(),
           required(:recovery_action) => String.t() | nil
@@ -229,13 +227,7 @@ defmodule CodexPooler.Admin.UpstreamRoutingReadiness do
   end
 
   @spec projection(map()) :: projection_base()
-  defp projection(attrs),
-    do: Map.put(attrs, :border_class, border_class(Map.fetch!(attrs, :tone)))
-
-  @spec border_class(tone()) :: String.t()
-  defp border_class(:success), do: "border-l-success"
-  defp border_class(:error), do: "border-l-error"
-  defp border_class(_tone), do: "border-l-warning"
+  defp projection(attrs) when is_map_key(attrs, :tone), do: attrs
 
   @spec identity_status(identity_input()) :: UpstreamIdentity.status() | nil
   defp identity_status(%UpstreamIdentity{status: status}), do: status

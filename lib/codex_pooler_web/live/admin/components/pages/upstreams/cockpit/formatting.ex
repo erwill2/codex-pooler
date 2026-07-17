@@ -32,10 +32,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting do
     |> String.replace("_", " ")
   end
 
-  def status_badge_class("active"), do: "badge badge-success"
-  def status_badge_class("disabled"), do: "badge badge-warning"
-  def status_badge_class("reauth_required"), do: "badge badge-error"
-  def status_badge_class(_status), do: "badge badge-neutral"
+  def status_badge_class(status),
+    do: CodexPoolerWeb.Admin.BadgeComponents.status_chip_class(status)
 
   def humanize_state(state) do
     state

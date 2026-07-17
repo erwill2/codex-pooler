@@ -2456,8 +2456,8 @@ defmodule CodexPoolerWeb.Admin.RequestLogsLiveTest do
              "Status: Succeeded"
            )
 
-    assert has_element?(view, "#{row_selector} td.border-l-success")
-    refute has_element?(view, "#{row_selector} td.border-l-error")
+    assert has_element?(view, "#{row_selector}[data-status='succeeded']")
+    refute has_element?(view, "#{row_selector}[data-status='failed']")
     assert has_element?(view, errors_selector, "upstream_network_error")
 
     errors_html = view |> element(errors_selector) |> render()

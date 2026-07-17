@@ -29,7 +29,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
       protocol_badge_class: 1,
       protocol_label: 1,
       protocol_title: 1,
-      request_status_border_class: 1,
       status_label: 1,
       user_agent_display: 1
     ]
@@ -82,10 +81,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
               data-status={request_log.status}
               class="transition-colors hover:bg-base-200/80"
             >
-              <td class={[
-                "whitespace-nowrap border-l pl-4 align-middle text-base-content/70",
-                request_status_border_class(request_log.status)
-              ]}>
+              <td class="whitespace-nowrap pl-4 align-middle text-base-content/70">
                 <.request_log_timestamp_cell
                   request_log={request_log}
                   datetime_preferences={@datetime_preferences}
@@ -148,7 +144,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsPresentation do
           label={@request_log.upstream_account_plan_label}
           family={@request_log.upstream_account_plan_family}
           placeholder="—"
-          variant={:metadata}
           class="max-w-[8rem] shrink-0 truncate !px-2 !py-0.5 !text-[10px]"
           title="upstream account plan"
         />

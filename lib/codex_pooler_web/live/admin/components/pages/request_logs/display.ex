@@ -116,7 +116,6 @@ defmodule CodexPoolerWeb.Admin.RequestLogsDisplay do
 
   defdelegate request_status_icon(status), to: Status
   defdelegate request_status_icon_class(status), to: Status
-  defdelegate request_status_border_class(status), to: Status
   defdelegate request_status_filter_icon_color(status), to: Status
 
   def format_token_counts(nil), do: "-"

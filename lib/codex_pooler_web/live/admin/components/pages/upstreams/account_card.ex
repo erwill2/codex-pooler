@@ -58,9 +58,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     <article
       id={"upstream-account-#{@account.identity.id}"}
       data-role="upstream-account-card"
+      data-routing-tone={@routing_readiness.tone}
       class={[
-        "min-w-0 rounded-box border border-l border-base-300 bg-base-100 transition-colors",
-        @routing_readiness.border_class,
+        "min-w-0 rounded-box border border-base-300 bg-base-100 transition-colors",
         token_burn_active?(@account) && "admin-token-burn-active"
       ]}
       style={quota_shine_style(@account, @account_index)}
@@ -84,7 +84,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
               :if={@workspace_context_label != ""}
               id={"upstream-account-#{@account.identity.id}-workspace"}
               data-role="upstream-workspace-context"
-              class="badge badge-ghost badge-sm shrink-0 max-w-48 truncate text-[0.65rem] text-base-content/50"
+              class={[
+                AdminBadges.metadata_chip_class(:neutral),
+                "!px-2 !py-0.5 !text-[10px] shrink-0 max-w-48 truncate"
+              ]}
               title={@workspace_context_title}
             >
               {@workspace_context_label}
@@ -633,7 +636,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
       :if={@account.plan_reported?}
       id={account_plan_label_id(@account, @account_index)}
       label={@account.plan_label}
-      variant={:metadata}
       class="self-center"
       aria-label={"Account plan: #{@account.plan_label}"}
     />
@@ -780,7 +782,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
       state: "unavailable",
       label: "Routing unavailable",
       tone: :warning,
-      border_class: "border-l-warning",
       routing_ready_now?: false,
       reason: "Routing readiness is unavailable for this upstream account.",
       reason_code: "routing_readiness_unavailable",

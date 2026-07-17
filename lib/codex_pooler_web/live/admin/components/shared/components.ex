@@ -54,6 +54,7 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :id, :string, required: true
   attr :compact_mobile, :boolean, default: false
   attr :desktop_columns, :atom, default: :five, values: [:four, :five]
+  attr :class, :any, default: nil
 
   slot :inner_block, required: true
 
@@ -62,11 +63,14 @@ defmodule CodexPoolerWeb.Admin.Components do
     <section
       id={@id}
       data-desktop-columns={@desktop_columns}
-      class={[
-        "grid min-w-0 gap-2 md:grid-cols-3",
-        @compact_mobile && compact_metric_strip_columns(@desktop_columns),
-        !@compact_mobile && "grid-cols-1"
-      ]}
+      class={
+        @class ||
+          [
+            "grid min-w-0 gap-2 md:grid-cols-3",
+            @compact_mobile && compact_metric_strip_columns(@desktop_columns),
+            !@compact_mobile && "grid-cols-1"
+          ]
+      }
       aria-label="Page metrics"
     >
       {render_slot(@inner_block)}
@@ -84,6 +88,8 @@ defmodule CodexPoolerWeb.Admin.Components do
   attr :description, :string, default: nil
   attr :tone, :atom, default: :neutral, values: [:neutral, :primary, :success, :warning, :error]
   attr :compact_mobile, :boolean, default: false
+
+  slot :breakdown
 
   def metric_card(assigns) do
     ~H"""
@@ -115,6 +121,7 @@ defmodule CodexPoolerWeb.Admin.Components do
       >
         {@value}
       </p>
+      {render_slot(@breakdown)}
       <p
         :if={@description}
         class={[

@@ -385,11 +385,10 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                 data-role="plan-badge"
                 label={PoolForm.option_plan_label(option)}
                 family={PoolForm.option_plan_family(option)}
-                variant={:metadata}
               />
               <span
                 :if={PoolForm.option_badge_kind(option) != :plan}
-                class="inline-flex items-center rounded-box bg-base-200 px-2 py-1 text-xs font-semibold text-base-content/70"
+                class={AdminBadges.count_chip_class()}
               >
                 {PoolForm.option_plan_label(option)}
               </span>

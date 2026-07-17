@@ -15,10 +15,9 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
 
   def kpi_strip(assigns) do
     ~H"""
-    <section
+    <AdminComponents.metric_strip
       id={@id}
       class="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4 min-[1900px]:grid-cols-8 max-sm:[&_[data-role=metric-card-value]]:text-xs max-sm:[&_[data-role=metric-card-value]]:whitespace-nowrap"
-      aria-label="Page metrics"
     >
       <AdminComponents.metric_card
         id="stats-kpi-requests"
@@ -38,54 +37,47 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
         tone={success_rate_tone(@dashboard.kpis.success_rate.value)}
         compact_mobile
       />
-      <article
+      <AdminComponents.metric_card
         id="stats-kpi-tokens"
-        data-density="compact"
-        class="grid min-w-0 content-start gap-0.5 rounded-box border border-base-300 bg-base-100 px-3 py-2.5 lg:gap-1 lg:px-4 lg:py-3"
+        icon="hero-cpu-chip"
+        label="Tokens"
+        value={Format.token_count(@dashboard.kpis.tokens.total_tokens)}
+        tone={:primary}
+        compact_mobile
       >
-        <div class="flex min-w-0 items-center justify-between gap-2">
-          <p class="min-w-0 truncate text-[0.62rem] font-semibold uppercase tracking-[0.08em] text-base-content/35">
-            Tokens
-          </p>
-          <.icon name="hero-cpu-chip" class="hidden size-3.5 shrink-0 text-primary lg:block" />
-        </div>
-        <p
-          class="min-w-0 max-w-full overflow-hidden break-words font-mono text-lg font-semibold tabular-nums leading-tight text-base-content lg:text-xl"
-          data-role="metric-card-value"
-        >
-          {Format.token_count(@dashboard.kpis.tokens.total_tokens)}
-        </p>
-        <div
-          data-role="token-summary"
-          class="grid min-w-0 grid-cols-1 gap-0 text-[0.68rem] text-base-content/55 lg:grid-cols-3 lg:gap-1"
-        >
-          <span
-            :for={
-              {label, title, value, icon} <- [
-                {"input", "Input", @dashboard.kpis.tokens.input_tokens, "hero-arrow-down-left"},
-                {"cached input", "Cached input", @dashboard.kpis.tokens.cached_input_tokens,
-                 "hero-circle-stack"},
-                {"output", "Output", @dashboard.kpis.tokens.output_tokens, "hero-arrow-up-right"}
-              ]
-            }
-            data-role="token-summary-item"
-            role="group"
-            aria-label={label}
-            title={title}
-            class="inline-flex min-w-0 items-center gap-1 lg:justify-center"
+        <:breakdown>
+          <div
+            data-role="token-summary"
+            class="grid min-w-0 grid-cols-1 gap-0 text-[0.68rem] text-base-content/55 lg:grid-cols-3 lg:gap-1"
           >
-            <span data-role="token-summary-icon" aria-hidden="true" class="shrink-0">
-              <.icon name={icon} class="size-3" />
-            </span>
             <span
-              data-role="token-summary-value"
-              class="whitespace-nowrap font-mono tabular-nums"
+              :for={
+                {label, title, value, icon} <- [
+                  {"input", "Input", @dashboard.kpis.tokens.input_tokens, "hero-arrow-down-left"},
+                  {"cached input", "Cached input", @dashboard.kpis.tokens.cached_input_tokens,
+                   "hero-circle-stack"},
+                  {"output", "Output", @dashboard.kpis.tokens.output_tokens, "hero-arrow-up-right"}
+                ]
+              }
+              data-role="token-summary-item"
+              role="group"
+              aria-label={label}
+              title={title}
+              class="inline-flex min-w-0 items-center gap-1 lg:justify-center"
             >
-              {Format.token_count(value)}
+              <span data-role="token-summary-icon" aria-hidden="true" class="shrink-0">
+                <.icon name={icon} class="size-3" />
+              </span>
+              <span
+                data-role="token-summary-value"
+                class="whitespace-nowrap font-mono tabular-nums"
+              >
+                {Format.token_count(value)}
+              </span>
             </span>
-          </span>
-        </div>
-      </article>
+          </div>
+        </:breakdown>
+      </AdminComponents.metric_card>
       <AdminComponents.metric_card
         id="stats-kpi-tokens-per-sec"
         icon="hero-bolt"
@@ -126,7 +118,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
         description={cache_rate_summary(@dashboard.kpis.cache_rate)}
         compact_mobile
       />
-    </section>
+    </AdminComponents.metric_strip>
     """
   end
 
@@ -306,7 +298,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
     do: [
       @podium_cell_base,
       "sm:order-2 sm:py-5",
-      "border-[oklch(0.78_0.13_85_/_0.45)] bg-[oklch(0.78_0.13_85_/_0.07)]"
+      "border-(--codex-rank-gold)/45 bg-(--codex-rank-gold)/7"
     ]
 
   defp podium_cell_class(2),
@@ -320,7 +312,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   defp podium_medallion_class(1),
     do: [
       @podium_medallion_base,
-      "border-[oklch(0.78_0.13_85_/_0.6)] bg-[oklch(0.78_0.13_85_/_0.2)] text-[oklch(0.62_0.13_85)]"
+      "border-(--codex-rank-gold)/60 bg-(--codex-rank-gold)/20 text-(--codex-rank-gold-ink)"
     ]
 
   defp podium_medallion_class(2),
@@ -329,7 +321,7 @@ defmodule CodexPoolerWeb.Admin.StatsPresentation do
   defp podium_medallion_class(3),
     do: [
       @podium_medallion_base,
-      "border-[oklch(0.62_0.11_55_/_0.5)] bg-[oklch(0.62_0.11_55_/_0.16)] text-[oklch(0.55_0.11_55)]"
+      "border-(--codex-rank-bronze)/50 bg-(--codex-rank-bronze)/16 text-(--codex-rank-bronze-ink)"
     ]
 
   attr :rows, :list, required: true

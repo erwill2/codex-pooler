@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer do
 
   use CodexPoolerWeb, :html
 
+  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.RequestLogDetailDrawer.Attempts
   alias CodexPoolerWeb.Admin.RequestLogDetailDrawer.Format
@@ -67,13 +68,13 @@ defmodule CodexPoolerWeb.Admin.RequestLogDetailDrawer do
                 </span>
                 <span
                   :if={attempt.final}
-                  class="badge badge-outline badge-sm border-primary/40 text-primary"
+                  class={AdminBadges.metadata_chip_class(:primary)}
                 >
                   final
                 </span>
                 <span
                   :if={attempt.retryable}
-                  class="badge badge-outline badge-sm border-warning/40 text-warning"
+                  class={AdminBadges.metadata_chip_class(:warning)}
                 >
                   retryable
                 </span>

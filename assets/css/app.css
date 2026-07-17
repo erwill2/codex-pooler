@@ -51,6 +51,9 @@
   --border: 1.5px;
   --depth: 1;
   --noise: 0;
+  /* Banked-reset resource color: a stored charge, deliberately outside the
+     status vocabulary (success/warning/error/info). */
+  --color-reset-bank: oklch(78% 0.12 295);
 }
 
 @plugin "daisyui/theme" {
@@ -86,6 +89,8 @@
   --border: 1.5px;
   --depth: 1;
   --noise: 0;
+  /* Banked-reset resource color (see dark theme note). */
+  --color-reset-bank: oklch(52% 0.22 295);
 }
 
 /* Add variants based on LiveView classes */
@@ -156,22 +161,52 @@
   --codex-primary-border: #e17d00;
   --codex-primary-hover: #f2a000;
   --codex-primary-active: #d87400;
+  /* Leaderboard podium metals (rank 1 and 3); theme-invariant. */
+  --codex-rank-gold: oklch(78% 0.13 85);
+  --codex-rank-gold-ink: oklch(62% 0.13 85);
+  --codex-rank-bronze: oklch(62% 0.11 55);
+  --codex-rank-bronze-ink: oklch(55% 0.11 55);
 }
 
 body {
   font-family: "Roboto Condensed", ui-sans-serif, system-ui, sans-serif;
 }
 
-[data-role="upstream-account-card"].border-l-success {
+/* Status stripes: a colored left edge reinforcing status text that is always
+   present elsewhere on the surface (footer routing label, status chips). The
+   tone/status arrives as a data attribute from the read model; presentation
+   stays here. */
+[data-role="upstream-account-card"][data-routing-tone="success"] {
   border-left-color: var(--color-success);
 }
 
-[data-role="upstream-account-card"].border-l-warning {
+[data-role="upstream-account-card"][data-routing-tone="warning"] {
   border-left-color: var(--color-warning);
 }
 
-[data-role="upstream-account-card"].border-l-error {
+[data-role="upstream-account-card"][data-routing-tone="error"] {
   border-left-color: var(--color-error);
+}
+
+#request-logs-table tr > td:first-child {
+  border-left: 1px solid var(--color-base-300);
+}
+
+#request-logs-table tr[data-status="succeeded"] > td:first-child {
+  border-left-color: var(--color-success);
+}
+
+#request-logs-table tr[data-status="failed"] > td:first-child,
+#request-logs-table tr[data-status="rejected"] > td:first-child {
+  border-left-color: var(--color-error);
+}
+
+#request-logs-table tr[data-status="cancelled"] > td:first-child {
+  border-left-color: var(--color-warning);
+}
+
+#request-logs-table tr[data-status="in_progress"] > td:first-child {
+  border-left-color: var(--color-info);
 }
 
 .policy-editor-tabs > li {

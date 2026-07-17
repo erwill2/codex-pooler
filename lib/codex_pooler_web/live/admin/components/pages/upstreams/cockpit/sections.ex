@@ -3,6 +3,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
 
   use CodexPoolerWeb, :html
 
+  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.Components, as: AdminComponents
   alias CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting
   alias CodexPoolerWeb.Admin.UpstreamPageComponents.ReinviteLink
@@ -481,7 +482,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
           </p>
         </div>
         <div class="flex flex-wrap items-center gap-2">
-          <span class="badge badge-outline">refresh {@cockpit.header.refresh_status}</span>
+          <span class={AdminBadges.metadata_chip_class(:neutral)}>refresh {@cockpit.header.refresh_status}</span>
           <AdminComponents.action_button
             id="upstream-refresh-data-button"
             icon="hero-arrow-path"
@@ -616,9 +617,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
   defp event_source_label("audit_log"), do: "audit log"
   defp event_source_label(source), do: source |> Formatting.status_text() |> String.downcase()
 
-  defp event_source_badge_class("request_log"), do: "badge badge-info badge-sm"
-  defp event_source_badge_class("audit_log"), do: "badge badge-primary badge-sm"
-  defp event_source_badge_class(_source), do: "badge badge-neutral badge-sm"
+  defp event_source_badge_class("request_log"), do: AdminBadges.metadata_chip_class(:info)
+  defp event_source_badge_class("audit_log"), do: AdminBadges.metadata_chip_class(:primary)
+  defp event_source_badge_class(_source), do: AdminBadges.metadata_chip_class(:neutral)
 
   defp quota_item_for(cockpit, assignment) do
     Enum.find(cockpit.charts.quota_health.items, &(&1.assignment_id == assignment.id))
@@ -635,6 +636,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Sections do
   defp action_state_label(%{available?: true}), do: "available"
   defp action_state_label(_action), do: "not available"
 
-  defp action_state_class(%{available?: true}), do: "badge badge-success"
-  defp action_state_class(_action), do: "badge badge-neutral"
+  defp action_state_class(%{available?: true}), do: AdminBadges.metadata_chip_class(:success)
+  defp action_state_class(_action), do: AdminBadges.metadata_chip_class(:neutral)
 end

@@ -101,7 +101,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
           class="min-w-0 truncate"
         >
           Auto redeem
-          <span :if={@meter_policy_active} class="font-medium text-violet-700 dark:text-violet-200">
+          <span :if={@meter_policy_active} class="font-medium text-(--color-reset-bank)">
             active
           </span>
           <span :if={!@meter_policy_active}>inactive</span>
@@ -132,7 +132,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
   defp saved_reset_count_badge_tone_class(_policy) do
     [
       saved_reset_count_badge_base_class(),
-      "border-violet-500/50 bg-violet-500/10 text-violet-700 hover:bg-violet-500/15 dark:border-violet-300/50 dark:bg-violet-400/10 dark:text-violet-200"
+      "border-(--color-reset-bank)/40 bg-(--color-reset-bank)/10 text-(--color-reset-bank) hover:bg-(--color-reset-bank)/15"
     ]
   end
 
@@ -145,7 +145,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
   end
 
   defp saved_reset_count_badge_icon_class(_policy) do
-    "size-3 shrink-0 text-violet-600 dark:text-violet-300"
+    "size-3 shrink-0 text-(--color-reset-bank)"
   end
 
   defp saved_reset_count_badge_aria_label(saved_resets),
@@ -202,10 +202,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard.SavedResetMete
   defp saved_reset_policy_active?(_policy), do: false
 
   defp saved_reset_meter_count_class(_policy),
-    do: "shrink-0 tabular-nums font-medium text-violet-700 dark:text-violet-200"
+    do: "shrink-0 tabular-nums font-medium text-(--color-reset-bank)"
 
   defp saved_reset_meter_segment_class(%{filled?: true}, _policy),
-    do: "h-1.5 rounded-full bg-violet-500/80 dark:bg-violet-300/80"
+    do: "h-1.5 rounded-full bg-(--color-reset-bank)/80"
 
   defp saved_reset_meter_segment_class(_segment, _policy),
     do: "h-1.5 rounded-full bg-base-300/70"
