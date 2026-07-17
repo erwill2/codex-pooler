@@ -193,8 +193,8 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
               <:actions>
                 <AdminComponents.action_button
                   id="alert-rule-delete-cancel"
-                  icon="hero-x-mark"
                   label="Cancel"
+                  variant={:ghost}
                   phx-click="cancel_delete_rule"
                 />
                 <AdminComponents.action_button
@@ -246,8 +246,8 @@ defmodule CodexPoolerWeb.Admin.AlertsLive do
               <:actions>
                 <AdminComponents.action_button
                   id="alert-channel-delete-cancel"
-                  icon="hero-x-mark"
                   label="Cancel"
+                  variant={:ghost}
                   phx-click="cancel_delete_channel"
                 />
                 <AdminComponents.action_button

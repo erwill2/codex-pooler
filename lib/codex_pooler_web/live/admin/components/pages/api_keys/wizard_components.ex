@@ -433,8 +433,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
       <:actions>
         <AdminComponents.action_button
           id={@cancel_id}
-          icon="hero-x-mark"
           label="Cancel"
+          variant={:ghost}
           phx-click={@cancel_event}
         />
         <AdminComponents.action_button

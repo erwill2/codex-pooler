@@ -560,10 +560,10 @@ defmodule CodexPoolerWeb.Admin.Components do
   end
 
   attr :id, :string, required: true
-  attr :icon, :string, required: true
+  attr :icon, :string, default: nil
   attr :label, :string, required: true
   attr :type, :string, default: "button"
-  attr :variant, :atom, default: :secondary, values: [:primary, :secondary, :danger]
+  attr :variant, :atom, default: :secondary, values: [:primary, :secondary, :danger, :ghost]
   attr :size, :atom, default: :sm, values: [:sm, :md]
 
   attr :rest, :global,
@@ -576,14 +576,14 @@ defmodule CodexPoolerWeb.Admin.Components do
     if assigns.rest[:href] || assigns.rest[:navigate] || assigns.rest[:patch] do
       ~H"""
       <.link id={@id} class={@class} {@rest}>
-        <.icon name={@icon} class="size-4" />
+        <.icon :if={@icon} name={@icon} class="size-4" />
         <span>{@label}</span>
       </.link>
       """
     else
       ~H"""
       <button id={@id} type={@type} class={@class} {@rest}>
-        <.icon name={@icon} class="size-4" />
+        <.icon :if={@icon} name={@icon} class="size-4" />
         <span>{@label}</span>
       </button>
       """
@@ -673,6 +673,10 @@ defmodule CodexPoolerWeb.Admin.Components do
   defp action_button_class(:primary, :sm), do: "btn btn-primary btn-sm gap-2"
 
   defp action_button_class(:danger, _size), do: "btn btn-error btn-outline btn-sm gap-2"
+
+  defp action_button_class(:ghost, _size),
+    do: "btn btn-ghost btn-sm gap-2 text-base-content/60 hover:text-base-content"
+
   defp action_button_class(_variant, _size), do: "btn btn-secondary btn-sm gap-2"
 
   defp metric_icon_class(:primary), do: "text-primary"

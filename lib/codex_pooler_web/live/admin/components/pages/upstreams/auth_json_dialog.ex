@@ -149,8 +149,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AuthJsonDialog do
           <:actions>
             <AdminComponents.action_button
               id="auth-json-import-cancel"
-              icon="hero-x-mark"
               label="Cancel"
+              variant={:ghost}
               phx-click="cancel_import_auth_json"
             />
             <AdminComponents.action_button

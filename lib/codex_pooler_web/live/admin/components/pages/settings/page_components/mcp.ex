@@ -342,8 +342,8 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.MCP do
           <:actions>
             <AdminComponents.action_button
               id="settings-mcp-delete-cancel"
-              icon="hero-x-mark"
               label="Cancel"
+              variant={:ghost}
               phx-click="cancel_delete_mcp_key"
             />
             <AdminComponents.action_button

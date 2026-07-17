@@ -169,8 +169,8 @@ defmodule CodexPoolerWeb.Admin.InviteCreationDialog do
           <:actions>
             <AdminComponents.action_button
               id="pool-invite-cancel"
-              icon="hero-x-mark"
               label="Cancel"
+              variant={:ghost}
               phx-click="cancel_create_invite"
             />
             <AdminComponents.action_button

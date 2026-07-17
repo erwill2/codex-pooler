@@ -83,8 +83,8 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
           <:actions>
             <AdminComponents.action_button
               id="operator-create-cancel"
-              icon="hero-x-mark"
               label="Cancel"
+              variant={:ghost}
               phx-click="cancel_create_operator"
             />
             <AdminComponents.action_button
@@ -156,8 +156,8 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
           <:actions>
             <AdminComponents.action_button
               id="operator-edit-cancel"
-              icon="hero-x-mark"
               label="Cancel"
+              variant={:ghost}
               phx-click="cancel_edit"
             />
             <AdminComponents.action_button
@@ -246,8 +246,8 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
           <:actions>
             <AdminComponents.action_button
               id="operator-reset-password-cancel"
-              icon="hero-x-mark"
               label="Cancel"
+              variant={:ghost}
               phx-click="cancel_reset"
             />
             <AdminComponents.action_button

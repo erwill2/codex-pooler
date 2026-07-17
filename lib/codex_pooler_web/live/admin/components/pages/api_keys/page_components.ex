@@ -143,8 +143,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
           <:actions>
             <AdminComponents.action_button
               id="api-key-delete-cancel"
-              icon="hero-x-mark"
               label="Cancel"
+              variant={:ghost}
               phx-click="cancel_delete_api_key"
             />
             <AdminComponents.action_button

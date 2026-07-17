@@ -177,8 +177,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
           <:actions>
             <AdminComponents.action_button
               id="cockpit-rename-upstream-account-cancel"
-              icon="hero-x-mark"
               label="Cancel"
+              variant={:ghost}
               phx-click="cancel_rename_account"
             />
             <AdminComponents.action_button
@@ -244,8 +244,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Dialogs do
           <:actions>
             <AdminComponents.action_button
               id="cockpit-delete-upstream-account-cancel"
-              icon="hero-x-mark"
               label="Cancel"
+              variant={:ghost}
               phx-click="cancel_delete_account"
             />
             <AdminComponents.action_button

@@ -271,10 +271,9 @@ defmodule CodexPoolerWeb.Admin.InvitesPageComponents do
             <button
               id="invite-revoke-cancel"
               type="button"
-              class="btn btn-secondary btn-sm gap-2"
+              class="btn btn-ghost btn-sm gap-2 text-base-content/60 hover:text-base-content"
               phx-click="cancel_revoke_invite"
             >
-              <.icon name="hero-x-mark" class="size-4" />
               <span>Cancel</span>
             </button>
             <button
