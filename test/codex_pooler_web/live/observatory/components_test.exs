@@ -55,6 +55,33 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTest do
     assert LazyHTML.query(fragment, "#observatory-logout-form input[name='_csrf_token']") != []
     assert LazyHTML.query(fragment, "#observatory-logout-form button.btn-ghost") != []
     refute html =~ ~r/\b(admin|Pool|upstream|operator)\b/i
+    # No window switch in flight: no button carries a spinner.
+    assert LazyHTML.query(fragment, ".observatory-window-button .loading") |> Enum.empty?()
+  end
+
+  test "toolbar spins the selected window button while a switch is in flight" do
+    html =
+      render_component(&Toolbar.toolbar/1, %{
+        display_name: "safe display",
+        selected_window: "7d",
+        freshness: "0s ago",
+        paused: false,
+        refreshing: true
+      })
+
+    fragment = LazyHTML.from_fragment(html)
+
+    # The pressed window shows an in-place spinner and is marked busy; its label
+    # stays in the DOM (invisible) so the button keeps its width.
+    assert LazyHTML.query(fragment, "#observatory-window-7d[aria-busy='true']") != []
+    assert LazyHTML.query(fragment, "#observatory-window-7d .loading.loading-spinner") != []
+    assert LazyHTML.query(fragment, "#observatory-window-7d span.invisible") != []
+
+    # Every other window is idle: no spinner, not busy.
+    for key <- ["1h", "5h", "24h"] do
+      assert LazyHTML.query(fragment, "#observatory-window-#{key}[aria-busy='false']") != []
+      assert LazyHTML.query(fragment, "#observatory-window-#{key} .loading") |> Enum.empty?()
+    end
   end
 
   test "telemetry renders stacked facts and direct-labeled model rows" do

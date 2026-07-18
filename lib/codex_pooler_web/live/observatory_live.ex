@@ -126,18 +126,11 @@ defmodule CodexPoolerWeb.ObservatoryLive do
           selected_window={@selected_window}
           freshness={@freshness}
           paused={@paused}
+          refreshing={@refreshing}
         />
 
-        <div
-          :if={@refreshing}
-          id="observatory-refreshing"
-          class="mt-4 flex justify-center"
-          aria-live="polite"
-        >
-          <span class="inline-flex items-center gap-2 rounded-full border border-base-300 bg-base-100 px-3 py-1.5 text-xs text-base-content/75 shadow-sm">
-            <span class="loading loading-spinner loading-xs" aria-hidden="true"></span>
-            Updating {@selected_window}…
-          </span>
+        <div :if={@refreshing} id="observatory-refreshing" class="sr-only" aria-live="polite">
+          Updating {@selected_window}…
         </div>
 
         <div

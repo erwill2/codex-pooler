@@ -9,6 +9,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Toolbar do
   attr :selected_window, :string, values: ~w(1h 5h 24h 7d), required: true
   attr :freshness, :string, required: true
   attr :paused, :boolean, default: false
+  attr :refreshing, :boolean, default: false
 
   def toolbar(assigns) do
     ~H"""
@@ -52,12 +53,20 @@ defmodule CodexPoolerWeb.Observatory.Components.Toolbar do
             :for={{key, label} <- [{"1h", "1h"}, {"5h", "5h"}, {"24h", "24h"}, {"7d", "7d"}]}
             id={"observatory-window-#{key}"}
             type="button"
-            class="observatory-window-button"
+            class="observatory-window-button relative"
             phx-click="select-window"
             phx-value-window={key}
             aria-pressed={to_string(@selected_window == key)}
+            aria-busy={to_string(@refreshing and @selected_window == key)}
           >
-            {label}
+            <span class={[(@refreshing and @selected_window == key) && "invisible"]}>{label}</span>
+            <span
+              :if={@refreshing and @selected_window == key}
+              class="absolute inset-0 flex items-center justify-center"
+              aria-hidden="true"
+            >
+              <span class="loading loading-spinner loading-xs"></span>
+            </span>
           </button>
         </div>
 
