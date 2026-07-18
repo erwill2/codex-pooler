@@ -407,8 +407,8 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
         %PoolUpstreamAssignment{status: @assignment_deleted} = assignment ->
           continue_with_pool_assignment_reactivation(assignment, opts)
 
-        %PoolUpstreamAssignment{} ->
-          {:cont, :ok}
+        %PoolUpstreamAssignment{} = assignment ->
+          continue_with_pool_assignment_priority_update(assignment, opts)
 
         nil ->
           continue_with_pool_assignment_create(pool, upstream_identity_id, opts)
@@ -417,21 +417,36 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
   end
 
   defp continue_with_pool_assignment_reactivation(assignment, opts) do
-    case activate_pool_assignment(assignment, %{
-           skip_quota_priming: Keyword.get(opts, :skip_quota_priming, false)
-         }) do
+    attrs =
+      %{skip_quota_priming: Keyword.get(opts, :skip_quota_priming, false)}
+      |> Map.merge(routing_priority_attrs(opts, assignment))
+
+    case activate_pool_assignment(assignment, attrs) do
+      {:ok, _assignment} -> {:cont, :ok}
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
+  end
+
+  defp continue_with_pool_assignment_priority_update(assignment, opts) do
+    assignment
+    |> maybe_update_routing_priority(routing_priority_attrs(opts, assignment))
+    |> case do
       {:ok, _assignment} -> {:cont, :ok}
       {:error, reason} -> {:halt, {:error, reason}}
     end
   end
 
   defp continue_with_pool_assignment_create(pool, upstream_identity_id, opts) do
-    case create_pool_assignment(pool, upstream_identity_id, %{
-           status: @assignment_active,
-           health_status: @health_active,
-           eligibility_status: @eligible,
-           skip_quota_priming: Keyword.get(opts, :skip_quota_priming, false)
-         }) do
+    attrs =
+      %{
+        status: @assignment_active,
+        health_status: @health_active,
+        eligibility_status: @eligible,
+        skip_quota_priming: Keyword.get(opts, :skip_quota_priming, false)
+      }
+      |> Map.merge(routing_priority_attrs(opts, upstream_identity_id))
+
+    case create_pool_assignment(pool, upstream_identity_id, attrs) do
       {:ok, _assignment} -> {:cont, :ok}
       {:error, reason} -> {:halt, {:error, reason}}
     end
@@ -491,15 +506,22 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
   end
 
   defp update_pool_assignment_state(_pool, assignment, true, opts) do
-    if assignment.status == @assignment_deleted do
-      case activate_pool_assignment(assignment, %{
-             skip_quota_priming: Keyword.get(opts, :skip_quota_priming, false)
-           }) do
-        {:ok, _assignment} -> :ok
-        {:error, reason} -> {:error, reason}
+    attrs = routing_priority_attrs(opts, assignment)
+
+    result =
+      if assignment.status == @assignment_deleted do
+        activation_attrs =
+          %{skip_quota_priming: Keyword.get(opts, :skip_quota_priming, false)}
+          |> Map.merge(attrs)
+
+        activate_pool_assignment(assignment, activation_attrs)
+      else
+        maybe_update_routing_priority(assignment, attrs)
       end
-    else
-      :ok
+
+    case result do
+      {:ok, _assignment} -> :ok
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -668,6 +690,35 @@ defmodule CodexPooler.Upstreams.Assignments.PoolAssignments do
       {key, value} -> {key, value}
     end)
   end
+
+  defp routing_priority_attrs(opts, %PoolUpstreamAssignment{} = assignment) do
+    opts
+    |> Keyword.get(:routing_priorities, %{})
+    |> fetch_routing_priority([assignment.upstream_identity_id, assignment.id])
+  end
+
+  defp routing_priority_attrs(opts, upstream_identity_id) when is_binary(upstream_identity_id) do
+    opts
+    |> Keyword.get(:routing_priorities, %{})
+    |> fetch_routing_priority([upstream_identity_id])
+  end
+
+  defp fetch_routing_priority(priorities, keys) when is_map(priorities) do
+    Enum.find_value(keys, %{}, fn key ->
+      case Map.fetch(priorities, key) do
+        {:ok, value} -> %{routing_priority: value}
+        :error -> nil
+      end
+    end)
+  end
+
+  defp fetch_routing_priority(_priorities, _keys), do: %{}
+
+  defp maybe_update_routing_priority(assignment, attrs) when map_size(attrs) == 0,
+    do: {:ok, assignment}
+
+  defp maybe_update_routing_priority(assignment, attrs),
+    do: update_pool_assignment(assignment, attrs)
 
   defp put_default(map, key, value) do
     case Map.get(map, key) do

@@ -13,6 +13,8 @@ defmodule CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment do
   @statuses ~w(pending active paused refresh_due refreshing refresh_failed reauth_required deleted disabled errored)
   @health_statuses ~w(unknown active cooldown degraded disabled errored)
   @eligibility_statuses ~w(eligible ineligible)
+  @default_routing_priority 100
+  @maximum_routing_priority 10_000
 
   @type t :: %__MODULE__{}
   @type attrs :: map()
@@ -24,6 +26,7 @@ defmodule CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment do
     field :pool_id, :binary_id
     field :upstream_identity_id, :binary_id
     field :assignment_label, :string
+    field :routing_priority, :integer, default: @default_routing_priority
     field :status, :string
     field :health_status, :string
     field :eligibility_status, :string
@@ -45,6 +48,7 @@ defmodule CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment do
       :pool_id,
       :upstream_identity_id,
       :assignment_label,
+      :routing_priority,
       :status,
       :health_status,
       :eligibility_status,
@@ -63,6 +67,7 @@ defmodule CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment do
       :pool_id,
       :upstream_identity_id,
       :assignment_label,
+      :routing_priority,
       :status,
       :health_status,
       :eligibility_status,
@@ -73,8 +78,21 @@ defmodule CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment do
     |> validate_inclusion(:status, @statuses)
     |> validate_inclusion(:health_status, @health_statuses)
     |> validate_inclusion(:eligibility_status, @eligibility_statuses)
+    |> validate_number(:routing_priority,
+      greater_than_or_equal_to: 1,
+      less_than_or_equal_to: @maximum_routing_priority
+    )
     |> unique_constraint(:upstream_identity_id, name: :pool_upstream_assignments_identity_uq)
+    |> check_constraint(:routing_priority,
+      name: :pool_upstream_assignments_routing_priority_check
+    )
   end
+
+  @spec default_routing_priority() :: pos_integer()
+  def default_routing_priority, do: @default_routing_priority
+
+  @spec maximum_routing_priority() :: pos_integer()
+  def maximum_routing_priority, do: @maximum_routing_priority
 
   @spec statuses() :: [status()]
   def statuses, do: @statuses

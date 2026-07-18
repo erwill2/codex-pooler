@@ -1171,6 +1171,11 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert has_element?(
              view,
+             "#pool-create-upstream-identity-options-priority-#{first_identity.id}[value='100'][min='1'][max='10000']"
+           )
+
+    assert has_element?(
+             view,
              "#pool-create-upstream-identity-options-plan-badge-#{first_identity.id}[data-role='plan-badge']",
              "Pro"
            )
@@ -1190,7 +1195,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
         "v1_compatibility_enabled" => "false",
         "request_compression_enabled" => "true",
         "upstream_websocket_bridge_enabled" => "true",
-        "upstream_identity_ids" => [first_identity.id, second_identity.id]
+        "upstream_identity_ids" => [first_identity.id, second_identity.id],
+        "upstream_priorities" => %{first_identity.id => "1", second_identity.id => "10"}
       }
     })
 
@@ -1209,6 +1215,12 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
              [first_identity.id, second_identity.id] |> Enum.sort()
 
     assert Enum.all?(assignments, &(&1.status == "active"))
+
+    assert Map.new(assignments, &{&1.upstream_identity_id, &1.routing_priority}) == %{
+             first_identity.id => 1,
+             second_identity.id => 10
+           }
+
     refute has_element?(view, "#pool-create-dialog")
     _ = await_pool_traffic(view)
   end
@@ -1342,7 +1354,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
         account_label: "Remove me",
         assignment_label: "Remove me",
         plan_label: "Pro",
-        identity_status: "active"
+        identity_status: "active",
+        routing_priority: 2
       })
 
     %{assignment: kept_assignment} =
@@ -1350,7 +1363,8 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
         account_label: "Keep me",
         assignment_label: "Keep me",
         plan_label: "Free",
-        identity_status: "refresh_due"
+        identity_status: "refresh_due",
+        routing_priority: 7
       })
 
     {:ok, view, _html} = live(conn, ~p"/admin/pools")
@@ -1477,6 +1491,11 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     assert has_element?(
              view,
+             "#pool-edit-upstream-assignment-options-priority-#{kept_assignment.upstream_identity_id}[value='7']"
+           )
+
+    assert has_element?(
+             view,
              "#pool-edit-upstream-assignment-options input[value='#{kept_assignment.upstream_identity_id}']"
            )
 
@@ -1530,6 +1549,7 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
         "v1_compatibility_enabled" => "false",
         "request_compression_enabled" => "true",
         "upstream_identity_ids" => [kept_assignment.upstream_identity_id],
+        "upstream_priorities" => %{kept_assignment.upstream_identity_id => "1"},
         "api_key_ids" => [linked_api_key.id, moved_api_key.id]
       }
     })
@@ -1543,7 +1563,9 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
     assert settings.v1_compatibility_enabled == false
     assert settings.request_compression_enabled == true
     assert Repo.get!(PoolUpstreamAssignment, removed_assignment.id).status == "deleted"
-    assert Repo.get!(PoolUpstreamAssignment, kept_assignment.id).status == "active"
+    kept_assignment = Repo.get!(PoolUpstreamAssignment, kept_assignment.id)
+    assert kept_assignment.status == "active"
+    assert kept_assignment.routing_priority == 1
     assert Repo.get!(APIKey, linked_api_key.id).pool_id == pool.id
     assert Repo.get!(APIKey, moved_api_key.id).pool_id == pool.id
     refute has_element?(view, "#pool-edit-dialog")

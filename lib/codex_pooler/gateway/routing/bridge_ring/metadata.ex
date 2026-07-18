@@ -20,6 +20,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing.Metadata do
         |> Map.merge(%{
           "bridge_candidate_id" => assignment.id,
           "bridge_candidate_rank" => rank + 1,
+          "routing_priority" => assignment.routing_priority,
           "upstream_identity_id" => identity.id
         })
     }

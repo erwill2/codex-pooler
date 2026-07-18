@@ -101,7 +101,6 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
         class="grid min-w-0 gap-4"
       >
         <.input :if={@mode == :edit} field={@form[:id]} type="hidden" />
-
         <div
           id={"#{@id}-section-details"}
           role="tabpanel"
@@ -111,10 +110,12 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
           <section id={"#{@id}-step-details-panel"} class="grid min-w-0 gap-5">
             <div class="grid gap-1">
               <h3 class="text-lg font-semibold text-base-content">Pool details</h3>
+
               <p class="text-sm leading-6 text-base-content/65">
                 Set the operator-facing name and lifecycle state for this Pool.
               </p>
             </div>
+
             <div class={[
               @mode == :edit && "grid gap-4 md:grid-cols-2",
               @mode == :create && "grid gap-4"
@@ -146,18 +147,22 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
           <section id={"#{@id}-step-routing-panel"} class="grid min-w-0 gap-5">
             <div class="grid gap-1">
               <h3 class="text-lg font-semibold text-base-content">Routing strategy</h3>
+
               <p class="text-sm leading-6 text-base-content/65">
                 Choose how this Pool selects upstream accounts for runtime requests.
               </p>
             </div>
+
             <div id={@routing_controls_id} class="pool-routing-policy-form grid">
               <div class="pool-routing-policy-row">
                 <div class="min-w-0">
                   <p class="text-sm font-semibold text-base-content">Selection policy</p>
+
                   <p class="text-xs leading-5 text-base-content/55">
                     Strategy and fan-out size used for runtime requests.
                   </p>
                 </div>
+
                 <div class="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,1fr)_9rem]">
                   <.input
                     field={@form[:routing_strategy]}
@@ -180,10 +185,12 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                 <div class="routing-matrix-section">
                   <div class="min-w-0">
                     <p class="text-sm font-semibold text-base-content">Continuity</p>
+
                     <p class="text-xs leading-5 text-base-content/55">
                       Identity-aware routing behavior.
                     </p>
                   </div>
+
                   <div class="routing-matrix-options">
                     <div class="routing-matrix-option">
                       <.input
@@ -195,6 +202,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                         Same upstream for websocket sessions with continuity identity.
                       </p>
                     </div>
+
                     <div class="routing-matrix-option">
                       <.input
                         field={@form[:sticky_http_sessions]}
@@ -205,6 +213,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                         Same upstream preference for related HTTP requests.
                       </p>
                     </div>
+
                     <div class="routing-matrix-option">
                       <.input
                         field={@form[:prompt_cache_affinity_enabled]}
@@ -222,10 +231,12 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                 <div class="routing-matrix-section">
                   <div class="min-w-0">
                     <p class="text-sm font-semibold text-base-content">Compatibility</p>
+
                     <p class="text-xs leading-5 text-base-content/55">
                       Optional client surfaces.
                     </p>
                   </div>
+
                   <div class="routing-matrix-options">
                     <div class="routing-matrix-option">
                       <.input
@@ -237,6 +248,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                         OpenAI-style `/v1` compatibility routes.
                       </p>
                     </div>
+
                     <div class="routing-matrix-option">
                       <.input
                         field={@form[:request_compression_enabled]}
@@ -247,6 +259,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                         Shrinks eligible Responses tool outputs before upstream dispatch.
                       </p>
                     </div>
+
                     <div class="routing-matrix-option">
                       <.input
                         field={@form[:upstream_websocket_bridge_enabled]}
@@ -278,10 +291,13 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
             >
               <div class="grid gap-1">
                 <h3 class="text-lg font-semibold text-base-content">Pool upstream assignments</h3>
+
                 <p class="text-sm leading-6 text-base-content/65">
-                  Select the upstream accounts available to this Pool.
+                  Select the upstream accounts available to this Pool. Lower priority numbers are
+                  tried first; equal priorities use the Pool's routing strategy.
                 </p>
               </div>
+
               <span
                 id={@upstream_count_id}
                 class={AdminBadges.count_chip_class()}
@@ -289,11 +305,14 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                 {length(@upstream_options)} available
               </span>
             </div>
+
             <.assignment_checkbox_cards
               id={@upstream_options_id}
               field={@form[@upstream_field]}
               options={@upstream_options}
               empty_label={@upstream_empty_label}
+              form_name={@form.name}
+              priority_values={@form[:upstream_priorities].value}
             />
           </section>
         </div>
@@ -311,10 +330,12 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
             >
               <div class="grid gap-1">
                 <h3 class="text-lg font-semibold text-base-content">API Keys</h3>
+
                 <p class="text-sm leading-6 text-base-content/65">
                   Select the API keys assigned to this Pool.
                 </p>
               </div>
+
               <span
                 id={@access_count_id}
                 class={AdminBadges.count_chip_class()}
@@ -322,6 +343,7 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                 {length(@api_key_options)} available
               </span>
             </div>
+
             <.assignment_checkbox_cards
               id={@access_options_id}
               field={@form[:api_key_ids]}
@@ -356,48 +378,73 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
   attr :field, Phoenix.HTML.FormField, required: true
   attr :options, :list, required: true
   attr :empty_label, :string, required: true
+  attr :form_name, :string, default: nil
+  attr :priority_values, :map, default: nil
 
   defp assignment_checkbox_cards(assigns) do
     ~H"""
     <section id={@id} class="grid gap-2">
       <input type="hidden" name={PoolForm.field_array_name(@field)} value="" />
       <div class="grid max-h-[8.5rem] gap-2 overflow-y-auto" data-assignment-scroll="true">
-        <label
+        <div
           :for={option <- @options}
           id={"#{@id}-card-#{PoolForm.dom_token(PoolForm.option_value(option))}"}
           class="flex min-h-12 min-w-0 cursor-pointer items-center gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-2 transition-colors hover:border-primary/50 hover:bg-primary/5"
         >
-          <input
-            type="checkbox"
-            class="checkbox checkbox-primary checkbox-sm shrink-0"
-            name={PoolForm.field_array_name(@field)}
-            value={PoolForm.option_value(option)}
-            checked={PoolForm.selected_value?(@field.value, PoolForm.option_value(option))}
-          />
-          <span class="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-2">
-            <span class="truncate text-sm font-medium text-base-content">
-              {PoolForm.option_label(option)}
-            </span>
-            <span class="flex shrink-0 flex-wrap items-center gap-2">
-              <AdminBadges.plan_badge
-                :if={PoolForm.option_badge_kind(option) == :plan}
-                id={"#{@id}-plan-badge-#{PoolForm.dom_token(PoolForm.option_value(option))}"}
-                data-role="plan-badge"
-                label={PoolForm.option_plan_label(option)}
-                family={PoolForm.option_plan_family(option)}
-              />
-              <span
-                :if={PoolForm.option_badge_kind(option) != :plan}
-                class={AdminBadges.count_chip_class()}
-              >
-                {PoolForm.option_plan_label(option)}
+          <label class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+            <input
+              type="checkbox"
+              class="checkbox checkbox-primary checkbox-sm shrink-0"
+              name={PoolForm.field_array_name(@field)}
+              value={PoolForm.option_value(option)}
+              checked={PoolForm.selected_value?(@field.value, PoolForm.option_value(option))}
+            />
+            <span class="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-2">
+              <span class="truncate text-sm font-medium text-base-content">
+                {PoolForm.option_label(option)}
               </span>
-              <span class={AdminBadges.lifecycle_chip_class(PoolForm.option_status(option))}>
-                {PoolForm.option_status(option)}
+
+              <span class="flex shrink-0 flex-wrap items-center gap-2">
+                <AdminBadges.plan_badge
+                  :if={PoolForm.option_badge_kind(option) == :plan}
+                  id={"#{@id}-plan-badge-#{PoolForm.dom_token(PoolForm.option_value(option))}"}
+                  data-role="plan-badge"
+                  label={PoolForm.option_plan_label(option)}
+                  family={PoolForm.option_plan_family(option)}
+                />
+                <span
+                  :if={PoolForm.option_badge_kind(option) != :plan}
+                  class={AdminBadges.count_chip_class()}
+                >
+                  {PoolForm.option_plan_label(option)}
+                </span>
+
+                <span class={AdminBadges.lifecycle_chip_class(PoolForm.option_status(option))}>
+                  {PoolForm.option_status(option)}
+                </span>
               </span>
             </span>
-          </span>
-        </label>
+          </label>
+
+          <label
+            :if={is_binary(@form_name) && is_map(@priority_values)}
+            class="grid w-20 shrink-0 gap-1 text-xs font-semibold text-base-content/60"
+          >
+            Priority
+            <input
+              id={"#{@id}-priority-#{PoolForm.dom_token(PoolForm.option_value(option))}"}
+              type="number"
+              class="input input-bordered input-sm w-full tabular-nums"
+              name={"#{@form_name}[upstream_priorities][#{PoolForm.option_value(option)}]"}
+              value={PoolForm.priority_value(@priority_values, PoolForm.option_value(option))}
+              min="1"
+              max={PoolForm.maximum_routing_priority()}
+              required
+              aria-label={"Routing priority for #{PoolForm.option_label(option)}; 1 is highest"}
+            />
+          </label>
+        </div>
+
         <p :if={@options == []} class="text-sm text-base-content/60">{@empty_label}</p>
       </div>
     </section>

@@ -22,7 +22,7 @@ Every runtime request follows the same broad path:
 3. It classifies the requested model and route surface, either the Codex backend compatibility route or the narrow OpenAI-compatible `/v1` surface.
 4. It finds the authenticated Pool and starts from that Pool's configured upstream assignments.
 5. It applies hard eligibility checks for assignment status, upstream status, model support, requested capabilities, quota, health, route-class circuit state, file affinity, and session continuity.
-6. It orders the remaining eligible upstream accounts using the Pool's routing strategy and routing preferences.
+6. It orders the remaining eligible upstream accounts by assignment priority, the Pool's routing strategy, and routing preferences.
 7. It tries the ordered shortlist. If one upstream fails in a retryable way, Codex Pooler can move to the next eligible account in that shortlist.
 8. It records metadata-only request, route, attempt, quota, and audit evidence. It doesn't store raw prompts, completions, files, audio, images, credentials, or websocket frames.
 
@@ -79,7 +79,7 @@ If every account fails eligibility, the request is rejected before upstream disp
 
 ## Strategy And Preference Choices
 
-After eligibility, Codex Pooler orders the remaining accounts. The Pool's strategy affects preference, not permission.
+After eligibility, Codex Pooler orders the remaining accounts. Each Pool assignment has a routing priority from `1` to `10000`; lower numbers are preferred. Accounts at the same priority keep the order produced by the Pool's routing strategy, so the default priority of `100` preserves existing behavior until an operator configures ranks. Priority affects preference, not permission.
 
 <table>
   <thead>
@@ -109,6 +109,10 @@ After eligibility, Codex Pooler orders the remaining accounts. The Pool's strate
 </table>
 
 The ring size controls how many ordered eligible accounts are tried for a request. A ring size of `3` means Codex Pooler prepares up to three eligible upstream accounts in order. If the first account fails in a retryable way, it can try the next one. The ring doesn't include accounts that failed eligibility.
+
+For a primary/fallback sequence, assign priorities `1`, `2`, `3`, and so on, and set the ring size high enough to include the desired fallback depth. Priority is scoped to a Pool, so one account can be primary in one Pool and a later fallback in another. Equal values form a priority tier and let the selected routing strategy decide the order within that tier.
+
+Durable continuity remains stronger than ordinary priority: an existing Codex session, idempotent request, or affinity record can keep work on the account that owns its state. Temporary failure demotion is also applied after priority, allowing a retryably failing primary to move behind healthy fallbacks. Hard eligibility always wins; an exhausted, paused, incompatible, or otherwise ineligible primary is removed before ordering.
 
 Temporary demotion also affects order. When an upstream attempt fails with a retryable backend or network reason, Codex Pooler can demote that assignment briefly so another eligible account is tried first. A later success clears that demotion.
 
@@ -211,7 +215,7 @@ Operators configure routing from the admin UI. The exact visibility depends on r
   <tbody>
     <tr>
       <td>Pools</td>
-      <td>Pool lifecycle, Pool assignments, Pool API key assignments, routing strategy, ring size, sticky websocket sessions, HTTP affinity, prompt-cache affinity, and <code>/v1</code> compatibility</td>
+      <td>Pool lifecycle, Pool assignments and their routing priorities, Pool API key assignments, routing strategy, ring size, sticky websocket sessions, HTTP affinity, prompt-cache affinity, and <code>/v1</code> compatibility</td>
     </tr>
     <tr>
       <td>Upstreams</td>
@@ -247,6 +251,10 @@ Session continuity protects resumable Codex work. If a request belongs to an exi
 ### What happens when the preferred upstream fails?
 
 For stateless work, Codex Pooler can try the next eligible upstream in the prepared ring when the first attempt fails in a retryable way. Fallback does not bypass hard checks, and session-bound work is intentionally stricter because moving state to another upstream can break the conversation.
+
+### How do I always try one account first?
+
+Edit the Pool, open the Upstreams step, and give the primary account priority `1`. Give its fallbacks `2`, `3`, and so on. Make sure the ring size includes the number of fallbacks you want available. Accounts with the same priority continue to use the Pool's configured routing strategy.
 
 ### Does prompt-cache locality store prompts?
 

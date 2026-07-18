@@ -32,6 +32,52 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
       assert second_plan.selected_assignment_id == hd(expected_ids)
     end
 
+    test "routing priority orders accounts before the configured strategy tie-breaker" do
+      setup = routing_setup(3)
+      [first, second, third] = setup.candidates
+
+      candidates = [
+        prioritize_candidate(first, 30),
+        prioritize_candidate(second, 1),
+        prioritize_candidate(third, 10)
+      ]
+
+      plan = plan_for(setup, "bridge_ring", "priority-order-seed", candidates: candidates)
+
+      assert candidate_ids(plan.candidates) == [
+               elem(second, 0).id,
+               elem(third, 0).id,
+               elem(first, 0).id
+             ]
+    end
+
+    test "routing priority remains ahead of prompt-cache locality while equal levels keep locality order" do
+      setup = routing_setup(3)
+      [first, second, third] = setup.candidates
+      prompt_cache_key = "priority-locality-key"
+
+      candidates = [
+        prioritize_candidate(first, 50),
+        prioritize_candidate(second, 1),
+        prioritize_candidate(third, 50)
+      ]
+
+      plan =
+        plan_for_prompt_cache(
+          setup,
+          "bridge_ring",
+          "priority-locality-request",
+          prompt_cache_key,
+          candidates: candidates
+        )
+
+      expected_equal_priority_ids =
+        prompt_cache_order_ids(setup, [first, third], prompt_cache_key)
+
+      assert candidate_ids(plan.candidates) == [elem(second, 0).id | expected_equal_priority_ids]
+      assert plan.selected_assignment_id == elem(second, 0).id
+    end
+
     test "deterministic_rotation rotates the current candidate list by seed" do
       setup = routing_setup(4)
       seed = "rotation-seed"
@@ -1037,6 +1083,15 @@ defmodule CodexPooler.Gateway.Routing.BridgeRingTest do
 
   defp candidate_ids(candidates),
     do: Enum.map(candidates, fn {assignment, _identity} -> assignment.id end)
+
+  defp prioritize_candidate({assignment, identity}, routing_priority) do
+    assignment =
+      assignment
+      |> Ecto.Changeset.change(%{routing_priority: routing_priority})
+      |> Repo.update!()
+
+    {assignment, identity}
+  end
 
   defp candidate_by_id!(candidates, assignment_id) do
     Enum.find(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end) ||

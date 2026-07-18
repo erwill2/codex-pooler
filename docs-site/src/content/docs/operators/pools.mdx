@@ -24,7 +24,7 @@ A Pool is the boundary that a runtime client authenticates against. Clients do n
 A Pool controls:
 
 1. `status`, which decides whether the Pool can receive new work
-2. upstream assignments, which decide which accounts are available to the Pool
+2. upstream assignments and priorities, which decide which accounts are available and which eligible account is tried first
 3. Pool API key assignments, which decide which client credentials can use the Pool
 4. routing strategy, which decides how eligible upstreams are ordered
 5. continuity settings, which decide when related requests should prefer the same upstream
@@ -235,7 +235,9 @@ Request logs may show compression savings when safe aggregate data exists. The U
 
 ## Upstreams Step
 
-The Upstreams step selects which active upstream accounts are available to the Pool. A checked upstream becomes a Pool assignment. Runtime routing still applies eligibility checks before using it.
+The Upstreams step selects which active upstream accounts are available to the Pool. A checked upstream becomes a Pool assignment. Each assignment also has a routing priority from `1` to `10000`; lower numbers are tried first, while equal values use the configured routing strategy as a tie-breaker. New and existing assignments default to `100`, so ranking changes nothing until you set different values. Runtime routing still applies eligibility checks before using an account.
+
+To create a strict primary/fallback order, use priorities `1`, `2`, `3`, and so on. Keep the ring size at least as large as the fallback depth you want Codex Pooler to attempt. Priorities are per Pool, so an account's rank can differ between Pools. Session continuity can keep existing state on its owning account, and a retryably failing primary can be temporarily demoted behind a healthy fallback.
 
 Assign more than one upstream when you want load distribution, fallback, quota flexibility, or account maintenance without moving clients to a different API key. Keep an upstream unassigned when it should not receive work for that Pool.
 

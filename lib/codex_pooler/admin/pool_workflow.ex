@@ -35,6 +35,7 @@ defmodule CodexPooler.Admin.PoolWorkflow do
                pool,
                selected_upstream_identity_ids(attrs),
                select_by: :upstream_identity_id,
+               routing_priorities: routing_priorities(attrs),
                skip_quota_priming: true
              ),
            :ok <-
@@ -98,6 +99,7 @@ defmodule CodexPooler.Admin.PoolWorkflow do
          :ok <-
            UpstreamAssignments.sync_pool_assignments_for_pool_edit(pool, assignment_ids,
              select_by: select_by,
+             routing_priorities: routing_priorities(attrs),
              skip_quota_priming: true
            ),
          :ok <- Access.assign_api_keys_to_pool(scope, pool, api_key_ids) do
@@ -119,6 +121,7 @@ defmodule CodexPooler.Admin.PoolWorkflow do
          :ok <-
            UpstreamAssignments.sync_pool_assignments_for_pool_edit(pool, assignment_ids,
              select_by: select_by,
+             routing_priorities: routing_priorities(attrs),
              skip_quota_priming: true
            ),
          {:ok, pool} <- Pools.update_pool(scope, pool, pool_edit_attrs(attrs), broadcast?: false) do
@@ -182,6 +185,13 @@ defmodule CodexPooler.Admin.PoolWorkflow do
 
   defp selected_upstream_identity_ids(attrs), do: selected_ids(attrs, "upstream_identity_ids")
   defp selected_assignment_ids(attrs), do: selected_ids(attrs, "upstream_assignment_ids")
+
+  defp routing_priorities(attrs) do
+    case Map.get(attrs, "upstream_priorities", %{}) do
+      priorities when is_map(priorities) -> priorities
+      _priorities -> %{}
+    end
+  end
 
   defp selected_pool_assignment_targets(attrs) do
     if Map.has_key?(attrs, "upstream_identity_ids") do

@@ -225,6 +225,12 @@ defmodule CodexPooler.SchemaContractTest do
     assert constraints["operator_pool_assignments_status_check"] =~ "'revoked'"
     refute constraints["operator_pool_assignments_status_check"] =~ "'disabled'"
 
+    assert constraints["pool_upstream_assignments_routing_priority_check"] =~
+             "routing_priority >= 1"
+
+    assert constraints["pool_upstream_assignments_routing_priority_check"] =~
+             "routing_priority <= 10000"
+
     for endpoint <- [
           "/backend-api/codex/models",
           "/backend-api/codex/responses",
@@ -407,6 +413,7 @@ defmodule CodexPooler.SchemaContractTest do
     assert column_type("codex_files", "pool_upstream_assignment_id") == "uuid"
     assert column_type("codex_files", "upstream_identity_id") == "uuid"
     assert column_type("upstream_identities", "account_email") == "text"
+    assert column_type("pool_upstream_assignments", "routing_priority") == "integer"
     assert column_type("upstream_oauth_flows", "state_token_hash") == "bytea"
     assert column_type("upstream_oauth_flows", "code_verifier_ciphertext") == "bytea"
     assert column_type("upstream_oauth_flows", "device_auth_id_ciphertext") == "bytea"

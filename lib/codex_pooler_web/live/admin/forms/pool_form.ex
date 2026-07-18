@@ -9,6 +9,7 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
   alias CodexPooler.Pools.RoutingSettings
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
+  alias CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
   alias CodexPoolerWeb.Admin.OptionLoaderFallback
 
@@ -77,6 +78,7 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
   def edit_form(pool, attrs \\ %{}, errors \\ []) do
     attrs = Map.new(attrs)
     settings = PoolRouting.routing_settings_by_pool_ids([pool.id]) |> Map.fetch!(pool.id)
+    {upstream_identity_ids, upstream_priorities} = active_upstream_assignment_values(pool)
 
     %{
       "id" => pool.id,
@@ -90,7 +92,8 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
       "v1_compatibility_enabled" => settings.v1_compatibility_enabled,
       "request_compression_enabled" => settings.request_compression_enabled,
       "upstream_websocket_bridge_enabled" => settings.upstream_websocket_bridge_enabled,
-      "upstream_identity_ids" => active_upstream_identity_ids(pool),
+      "upstream_identity_ids" => upstream_identity_ids,
+      "upstream_priorities" => upstream_priorities,
       "api_key_ids" => active_api_key_ids(pool)
     }
     |> Map.merge(attrs)
@@ -164,6 +167,15 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
 
   def selected_value?(values, value), do: value in list_input_values(values)
 
+  def priority_value(values, upstream_identity_id) when is_map(values) do
+    Map.get(values, upstream_identity_id, PoolUpstreamAssignment.default_routing_priority())
+  end
+
+  def priority_value(_values, _upstream_identity_id),
+    do: PoolUpstreamAssignment.default_routing_priority()
+
+  def maximum_routing_priority, do: PoolUpstreamAssignment.maximum_routing_priority()
+
   def option_label(%{label: label}), do: label
   def option_label({label, _value}), do: label
 
@@ -202,6 +214,7 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
       "request_compression_enabled" => false,
       "upstream_websocket_bridge_enabled" => false,
       "upstream_identity_ids" => [],
+      "upstream_priorities" => %{},
       "api_key_ids" => []
     }
     |> Map.merge(Map.new(attrs))
@@ -234,11 +247,16 @@ defmodule CodexPoolerWeb.Admin.PoolForm do
   defp list_input_values(value) when is_binary(value), do: if(value == "", do: [], else: [value])
   defp list_input_values(_value), do: []
 
-  defp active_upstream_identity_ids(pool) do
-    pool
-    |> UpstreamAssignments.list_pool_assignments()
-    |> Enum.reject(&(&1.status == "deleted"))
-    |> Enum.map(& &1.upstream_identity_id)
+  defp active_upstream_assignment_values(pool) do
+    assignments =
+      pool
+      |> UpstreamAssignments.list_pool_assignments()
+      |> Enum.reject(&(&1.status == "deleted"))
+
+    {
+      Enum.map(assignments, & &1.upstream_identity_id),
+      Map.new(assignments, &{&1.upstream_identity_id, &1.routing_priority})
+    }
   end
 
   defp active_api_key_ids(pool) do

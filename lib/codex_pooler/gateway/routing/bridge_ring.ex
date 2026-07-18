@@ -110,6 +110,7 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
         route_state
       )
       |> apply_prompt_cache_locality(prompt_cache_locality)
+      |> apply_routing_priority()
       |> apply_affinity(affinity)
       |> apply_codex_session_preference(request_options)
       |> apply_demotions(demotions)
@@ -323,6 +324,19 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   end
 
   defp apply_prompt_cache_locality(candidates, _locality), do: candidates
+
+  # Priority is an operator preference layered over the configured strategy.
+  # Keeping the strategy position as the second key makes equal-priority rows
+  # behave exactly as they did before priorities were configured.
+  defp apply_routing_priority(candidates) do
+    candidates
+    |> Enum.with_index()
+    |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
+      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
+       strategy_index}
+    end)
+    |> Enum.map(&elem(&1, 0))
+  end
 
   defp prompt_cache_locality_context(
          auth,
