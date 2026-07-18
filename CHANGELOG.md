@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.4.34](https://github.com/icoretech/codex-pooler/compare/codex-pooler-v0.4.33...codex-pooler-v0.4.34) (2026-07-18)
+
+
+### Features
+
+* **admin:** add an Observatory nav link with a celestial icon ([c575797](https://github.com/icoretech/codex-pooler/commit/c5757974d4d66057583c25a24f2930a41b7f5fef))
+* **admin:** surface Observatory access on API keys and refine the rows ([c4c0ebe](https://github.com/icoretech/codex-pooler/commit/c4c0ebe45945e098df66c411c09ec01a060e45a2))
+* **observatory:** add per-key usage dashboard ([07dd826](https://github.com/icoretech/codex-pooler/commit/07dd826eae9ce3f75e06be256ddb84f7771c6466))
+* **observatory:** drop the key prefix from the dashboard toolbar ([c8b1410](https://github.com/icoretech/codex-pooler/commit/c8b1410ce624f1aba94fea6f20acc25c5c5dd2f5))
+* **observatory:** rework facts, model distribution, and toolbar ([5e31b58](https://github.com/icoretech/codex-pooler/commit/5e31b58d049bad6dd7fb582241646d36db85190d))
+* **observatory:** rework the dashboard chart, header, and layout ([f98e92c](https://github.com/icoretech/codex-pooler/commit/f98e92c8f92bd660901c8a4b9bb5244afab1bad1))
+* **openai:** accept bounded Responses audio formats ([0dd89da](https://github.com/icoretech/codex-pooler/commit/0dd89da435c75929a7f796ae18cd74ade6983ad1))
+
+
+### Bug Fixes
+
+* **admin:** clear upstream cockpit quality warnings ([ffc8aab](https://github.com/icoretech/codex-pooler/commit/ffc8aab86dc3aaa8a48cd616782f54a0bbbe2d0b))
+* **deps:** update dependency astro to v7.1.1 ([#191](https://github.com/icoretech/codex-pooler/issues/191)) ([1c18d01](https://github.com/icoretech/codex-pooler/commit/1c18d017c0a6713c5b82c32b5248a362a5b7c477))
+
+
+### Performance Improvements
+
+* **admin:** move the pools traffic read off the LiveView process ([eb2a84d](https://github.com/icoretech/codex-pooler/commit/eb2a84d1d7e6b818de25e1b8c83c022160fd635f))
+
 ## [0.4.33](https://github.com/icoretech/codex-pooler/compare/codex-pooler-v0.4.32...codex-pooler-v0.4.33) (2026-07-17)
 
 
