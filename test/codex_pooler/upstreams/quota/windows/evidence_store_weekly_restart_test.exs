@@ -464,6 +464,79 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStoreWeeklyRestartTest do
              Routing.eligibility_from_windows([row], at: row.observed_at)
   end
 
+  test "a live idle zero tolerates small forward reset drift without starving stale" do
+    t0 = DateTime.utc_now() |> DateTime.add(-30, :minute) |> DateTime.truncate(:microsecond)
+    identity = identity!()
+    canonical_reset = DateTime.add(t0, 5, :day)
+
+    assert {:ok, _row} =
+             used_row!(identity, t0, "0",
+               reset_at: canonical_reset,
+               metadata: %{
+                 "reset_after_seconds" => DateTime.diff(canonical_reset, t0, :second)
+               }
+             )
+
+    live_at = DateTime.add(t0, 20, :minute)
+    drifted_reset = DateTime.add(canonical_reset, 301, :second)
+    remaining_seconds = DateTime.diff(drifted_reset, live_at, :second)
+    candidate_at = DateTime.add(live_at, -4, :minute)
+
+    account_row(identity)
+    |> Ecto.Changeset.change(
+      metadata: %{
+        "reset_after_seconds" => DateTime.diff(canonical_reset, t0, :second),
+        "__quota_confirmed_candidate_v1" => %{
+          "version" => 1,
+          "used_percent" => "0",
+          "reset_at" => DateTime.to_iso8601(drifted_reset),
+          "observed_at" => DateTime.to_iso8601(candidate_at),
+          "count" => 1
+        },
+        "__quota_relative_candidate_liveness_v1" => DateTime.to_iso8601(candidate_at)
+      }
+    )
+    |> Repo.update!()
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               floating_zero(live_at,
+                 reset_at: drifted_reset,
+                 reset_after_seconds: remaining_seconds
+               ),
+               live_at,
+               live_at
+             )
+
+    row = account_row(identity)
+    assert Decimal.equal?(row.used_percent, Decimal.new("0"))
+    assert DateTime.compare(row.observed_at, live_at) == :eq
+    assert DateTime.compare(row.reset_at, drifted_reset) == :eq
+    refute Map.has_key?(row.metadata, "__quota_confirmed_candidate_v1")
+    refute Map.has_key?(row.metadata, "__quota_relative_candidate_liveness_v1")
+
+    assert %{eligible?: true, routing_state: :weekly_only_probe} =
+             Routing.eligibility_from_windows([row], at: live_at)
+
+    replayed_at = DateTime.add(live_at, 16, :minute)
+
+    assert {:ok, _row} =
+             EvidenceStore.record_evidence(
+               identity,
+               floating_zero(replayed_at,
+                 reset_at: drifted_reset,
+                 reset_after_seconds: remaining_seconds
+               ),
+               replayed_at,
+               replayed_at
+             )
+
+    replayed = account_row(identity)
+    assert DateTime.compare(replayed.observed_at, live_at) == :eq
+    assert Evidence.current_freshness_state(replayed, replayed_at) == "stale"
+  end
+
   test "a cached superseded reset cannot keep an accepted weekly zero fresh" do
     t0 = DateTime.utc_now() |> DateTime.add(-20, :minute) |> DateTime.truncate(:microsecond)
     identity = identity!()

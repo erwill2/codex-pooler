@@ -618,9 +618,31 @@ defmodule CodexPooler.Upstreams.Quota.Windows.EvidenceStore do
     candidate_valid?(candidate, timestamp) and
       zero_candidate?(candidate) and
       reset_times_equivalent?(candidate.reset_at, evidence.reset_at) and
-      exhausted_by_used_percent?(existing) and
+      (exhausted_by_used_percent?(existing) or
+         confirmed_idle_zero_forward_anchor?(evidence, existing)) and
       forward_of_existing_cycle?(evidence, existing)
   end
+
+  # An accepted idle weekly zero can receive a provider-timed anchor a few
+  # minutes ahead of its canonical reset. Let that zero-to-zero correction use
+  # the existing candidate, liveness, and confirmation-span gates instead of
+  # restarting the candidate forever. Larger shifts remain new-cycle evidence.
+  defp confirmed_idle_zero_forward_anchor?(
+         %Evidence{reset_at: %DateTime{} = incoming_reset, used_percent: %Decimal{} = incoming} =
+           evidence,
+         %Quota.AccountQuotaWindow{
+           reset_at: %DateTime{} = existing_reset,
+           used_percent: %Decimal{} = existing
+         } = window
+       ) do
+    zero_percent?(incoming) and
+      zero_percent?(existing) and
+      anchored_forward_weekly_cycle?(evidence, window) and
+      DateTime.diff(incoming_reset, existing_reset, :second) <=
+        @usage_reset_reanchor_min_shift_seconds
+  end
+
+  defp confirmed_idle_zero_forward_anchor?(_evidence, _existing), do: false
 
   defp forward_of_existing_cycle?(
          %Evidence{reset_at: %DateTime{} = incoming_reset},
