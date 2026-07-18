@@ -63,7 +63,7 @@ defmodule CodexPoolerWeb.ObservatoryDashboardLiveTest do
     assert :empty == :sys.get_state(view.pid).socket.assigns.observatory_state
     assert has_element?(view, "#observatory-toolbar")
     assert has_element?(view, "#observatory-principal", api_key.display_name)
-    assert has_element?(view, "#observatory-key-prefix", api_key.key_prefix)
+    refute has_element?(view, "#observatory-key-prefix")
     assert has_element?(view, "#observatory-toolbar-controls")
     assert has_element?(view, "#observatory-window-24h[aria-pressed='true']")
 

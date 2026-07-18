@@ -6,7 +6,6 @@ defmodule CodexPoolerWeb.Observatory.Components.Toolbar do
   use CodexPoolerWeb, :html
 
   attr :display_name, :string, required: true
-  attr :key_prefix, :string, required: true
   attr :selected_window, :string, values: ~w(1h 5h 24h 7d), required: true
   attr :freshness, :string, required: true
   attr :paused, :boolean, default: false
@@ -35,12 +34,6 @@ defmodule CodexPoolerWeb.Observatory.Components.Toolbar do
           </span>
           <span id="observatory-principal" class="min-w-0 truncate font-semibold">
             {@display_name}
-          </span>
-          <span
-            id="observatory-key-prefix"
-            class="hidden truncate font-mono text-xs text-base-content/55 sm:inline"
-          >
-            {@key_prefix}
           </span>
         </span>
       </div>

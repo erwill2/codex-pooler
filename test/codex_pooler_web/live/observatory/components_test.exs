@@ -9,7 +9,6 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTest do
     html =
       render_component(&Toolbar.toolbar/1, %{
         display_name: "safe display",
-        key_prefix: "safe-prefix",
         selected_window: "24h",
         freshness: "Updated 8s ago",
         paused: true
@@ -22,10 +21,9 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTest do
     assert LazyHTML.query(fragment, "#observatory-wordmark") != []
     assert LazyHTML.query(fragment, "#observatory-key-chip") != []
     assert LazyHTML.query(fragment, "#observatory-principal") != []
-    assert LazyHTML.query(fragment, "#observatory-key-prefix.hidden") != []
+    assert LazyHTML.query(fragment, "#observatory-key-prefix") |> Enum.empty?()
     assert html =~ "safe display"
-    assert html =~ "safe-prefix"
-    assert length(:binary.matches(html, "safe-prefix")) == 1
+    refute html =~ "safe-prefix"
     assert html =~ "Updated 8s ago"
     assert html =~ "Paused"
     assert LazyHTML.query(fragment, "#observatory-resume[aria-label='Resume auto-refresh']") != []

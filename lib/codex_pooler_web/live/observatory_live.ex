@@ -115,7 +115,6 @@ defmodule CodexPoolerWeb.ObservatoryLive do
       >
         <Toolbar.toolbar
           display_name={principal_label(@dashboard_principal)}
-          key_prefix={@dashboard_principal.key_prefix}
           selected_window={@selected_window}
           freshness={@freshness}
           paused={@paused}

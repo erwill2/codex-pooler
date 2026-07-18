@@ -30,7 +30,7 @@ defmodule CodexPoolerWeb.ObservatoryLiveTest do
     assert has_element?(view, "#observatory-shell")
     assert has_element?(view, "#observatory-page")
     assert has_element?(view, "#observatory-principal", api_key.display_name)
-    assert has_element?(view, "#observatory-key-prefix", api_key.key_prefix)
+    refute has_element?(view, "#observatory-key-prefix")
     assert has_element?(view, "#observatory-logout-form[action='#{@logout_path}']")
     assert has_element?(view, "#observatory-logout-form[method='post']")
     assert has_element?(view, "#observatory-logout-form input[name='_method'][value='delete']")

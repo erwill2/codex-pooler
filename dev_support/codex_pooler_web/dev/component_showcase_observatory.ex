@@ -27,7 +27,6 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseObservatory do
 
       <Toolbar.toolbar
         display_name="Sample key"
-        key_prefix="sk-cxp-demo…0042"
         selected_window="24h"
         freshness={if @paused, do: "Updates paused", else: "Updated 0s ago"}
         paused={@paused}
