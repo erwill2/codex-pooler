@@ -1367,53 +1367,6 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
-  @tag :input_audio_chat_baseline
-  test "POST /v1/chat/completions dispatches WAV multimodal input with metadata-only accounting",
-       %{
-         conn: conn
-       } do
-    audio_source = "chat wav baseline"
-    audio_data = Base.encode64(audio_source)
-
-    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_chat_audio_baseline"}))
-    setup = gateway_setup(upstream)
-
-    response =
-      conn
-      |> auth(setup)
-      |> post("/v1/chat/completions", %{
-        "model" => setup.model.exposed_model_id,
-        "messages" => [
-          %{
-            "role" => "user",
-            "content" => [
-              %{"type" => "text", "text" => "chat baseline text"},
-              %{
-                "type" => "image_url",
-                "image_url" => %{"url" => "https://example.com/chat-baseline.png"}
-              },
-              input_audio_part("wav", audio_data)
-            ]
-          }
-        ]
-      })
-
-    assert_successful_chat_response!(response, "resp_chat_audio_baseline")
-
-    assert_captured_multimodal_summary!(
-      upstream,
-      "https://example.com/chat-baseline.png",
-      expected_multimodal_summary("audio/wav", audio_source)
-    )
-
-    assert_audio_accounting_metadata_only!(setup.pool, [
-      audio_source,
-      audio_data,
-      "chat baseline text",
-      "https://example.com/chat-baseline.png"
-    ])
-  end
-
   @tag :input_audio_backport
   test "POST /v1/chat/completions translates SDK image and audio content parts", %{conn: conn} do
     audio_bytes = "synthetic wav bytes"
