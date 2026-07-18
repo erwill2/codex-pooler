@@ -509,8 +509,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     |> Enum.filter(&recent_oauth_event?/1)
   end
 
-  defp oauth_recent_event_items(_oauth_flows), do: []
-
   # A pending flow past its deadline is expired in fact; present it as such
   # without waiting for the expiry sweeper to relabel the row.
   defp normalize_oauth_flow_status(

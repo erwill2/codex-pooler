@@ -45,8 +45,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Formatting do
     |> String.replace("_", " ")
   end
 
-  def status_badge_class(status),
-    do: CodexPoolerWeb.Admin.BadgeComponents.status_chip_class(status)
+  def status_badge_class(status), do: AdminBadges.status_chip_class(status)
 
   def humanize_state(state) do
     state
