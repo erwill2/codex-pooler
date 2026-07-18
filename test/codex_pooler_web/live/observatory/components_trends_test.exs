@@ -9,9 +9,18 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTrendsTest do
     html =
       render_component(&Telemetry.telemetry/1, %{
         overview: %{
-          success_rate: %{label: "90.0%", trend: trend("-5.0 pp", :error, :down)},
-          cache_rate: %{label: "25.0%", trend: trend("+10.0 pp", :success, :up)},
-          throughput: %{p50_label: "125.5 tok/s", trend: trend("+20.0%", :success, :up)}
+          success_rate: %{
+            measure: %{value: "90.0", unit: "%"},
+            trend: trend("-5.0 pp", :error, :down)
+          },
+          cache_rate: %{
+            measure: %{value: "25.0", unit: "%"},
+            trend: trend("+10.0 pp", :success, :up)
+          },
+          throughput: %{
+            measure: %{value: "125.5", unit: "tok/s"},
+            trend: trend("+20.0%", :success, :up)
+          }
         },
         models: []
       })
@@ -29,7 +38,9 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTrendsTest do
       assert html =~ label
     end
 
-    assert html =~ "125.5 tok/s"
+    throughput = LazyHTML.query(fragment, "#observatory-fact-throughput") |> LazyHTML.text()
+    assert throughput =~ "125.5"
+    assert throughput =~ "tok/s"
     assert html =~ "Median settled token rate"
   end
 

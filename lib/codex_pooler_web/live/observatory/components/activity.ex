@@ -4,6 +4,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
   use CodexPoolerWeb, :html
 
   alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
+  alias CodexPoolerWeb.Observatory.Components.Section
 
   @max_outcomes 12
 
@@ -28,16 +29,8 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
         class="grid min-w-0 gap-4"
         aria-labelledby="observatory-traffic-heading"
       >
-        <header class="flex flex-wrap items-end justify-between gap-3 border-b border-base-300/50 pb-3">
-          <div class="grid min-w-0 gap-1">
-            <h2
-              id="observatory-traffic-heading"
-              class="text-lg font-semibold tracking-tight text-base-content"
-            >
-              Traffic
-            </h2>
-            <p class="text-xs tabular-nums text-base-content/55">{@traffic.total_label}</p>
-          </div>
+        <Section.divider id="observatory-traffic-heading" label="Traffic" />
+        <div class="flex justify-end">
           <div
             id="observatory-traffic-mode-control"
             class="observatory-segmented-control"
@@ -62,7 +55,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
               {label}
             </button>
           </div>
-        </header>
+        </div>
 
         <div
           id="observatory-traffic-scroll"
@@ -145,15 +138,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
         class="grid min-w-0 gap-4"
         aria-labelledby="observatory-outcomes-heading"
       >
-        <header class="grid min-w-0 gap-1 border-b border-base-300/50 pb-3">
-          <h2
-            id="observatory-outcomes-heading"
-            class="text-lg font-semibold tracking-tight text-base-content"
-          >
-            Recent outcomes
-          </h2>
-          <p class="text-xs text-base-content/55">metadata only; request content is not shown.</p>
-        </header>
+        <Section.divider id="observatory-outcomes-heading" label="Recent outcomes" />
         <div id="observatory-outcomes-scroll" class="overflow-x-auto">
           <table id="observatory-outcomes-table" class="table table-sm min-w-160">
             <caption class="sr-only">Recent request outcomes</caption>
@@ -162,10 +147,10 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
                 <th scope="col">Time</th>
                 <th scope="col">Model</th>
                 <th scope="col">Endpoint</th>
-                <th scope="col">Status</th>
-                <th scope="col">Latency</th>
-                <th scope="col">Tokens</th>
-                <th scope="col">Cost</th>
+                <th scope="col" class="text-center">Status</th>
+                <th scope="col" class="text-right">Latency</th>
+                <th scope="col" class="text-right">Tokens</th>
+                <th scope="col" class="text-right">Cost</th>
               </tr>
             </thead>
             <tbody>
@@ -175,12 +160,17 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
                 data-status={status_data_status(outcome.status.data_status)}
                 class="align-middle"
               >
-                <td class="whitespace-nowrap font-mono text-xs tabular-nums text-base-content/55">
+                <td
+                  data-label="Time"
+                  class="whitespace-nowrap text-xs tabular-nums text-base-content/55"
+                >
                   {outcome.timestamp}
                 </td>
-                <th scope="row" class="max-w-40 truncate font-medium">{outcome.model}</th>
-                <td class="text-base-content/60">{outcome.endpoint}</td>
-                <td>
+                <th scope="row" data-label="Model" class="max-w-40 truncate font-medium">
+                  {outcome.model}
+                </th>
+                <td data-label="Endpoint" class="text-base-content/60">{outcome.endpoint}</td>
+                <td data-label="Status" class="text-center">
                   <span
                     class={[
                       AdminBadges.status_chip_class(status_for_tone(outcome.status.tone)),
@@ -193,13 +183,22 @@ defmodule CodexPoolerWeb.Observatory.Components.Activity do
                     {outcome.status.label}
                   </span>
                 </td>
-                <td class="whitespace-nowrap text-right font-mono text-xs tabular-nums">
+                <td
+                  data-label="Latency"
+                  class="observatory-metric whitespace-nowrap text-right font-mono tabular-nums"
+                >
                   {outcome.latency.label}
                 </td>
-                <td class="whitespace-nowrap text-right font-mono text-xs tabular-nums">
+                <td
+                  data-label="Tokens"
+                  class="observatory-metric whitespace-nowrap text-right font-mono tabular-nums"
+                >
                   {outcome.tokens.label}
                 </td>
-                <td class="whitespace-nowrap text-right font-mono text-xs tabular-nums">
+                <td
+                  data-label="Cost"
+                  class="observatory-metric whitespace-nowrap text-right font-mono tabular-nums"
+                >
                   {outcome.cost.label}
                 </td>
               </tr>

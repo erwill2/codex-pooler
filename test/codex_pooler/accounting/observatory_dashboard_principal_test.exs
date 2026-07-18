@@ -67,7 +67,8 @@ defmodule CodexPooler.Accounting.ObservatoryDashboardPrincipalTest do
                label: "gpt-observatory-principal",
                request_count: 3,
                total_tokens: 25,
-               share_percent: 100.0
+               share_percent: 100.0,
+               cost_micros: 375
              }
            ]
 

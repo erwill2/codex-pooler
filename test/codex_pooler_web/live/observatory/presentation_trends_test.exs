@@ -37,7 +37,7 @@ defmodule CodexPoolerWeb.Observatory.PresentationTrendsTest do
              direction: :down
            }
 
-    assert model.overview.throughput.p50_label == "20 tok/s"
+    assert model.overview.throughput.measure == %{value: "20", unit: "tok/s"}
   end
 
   test "renders missing trend data as neutral and finite" do

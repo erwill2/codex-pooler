@@ -139,7 +139,9 @@ defmodule CodexPooler.Accounting.Usage.Observatory.Queries do
           select: %{
             label: fact.model_label,
             request_count: count(fact.request_id),
-            total_tokens: sum(fact.total_tokens)
+            total_tokens: sum(fact.total_tokens),
+            settled_cost_micros: sum(fact.settled_cost_micros),
+            estimated_cost_micros: sum(fact.estimated_cost_micros)
           }
         ),
         telemetry_options: [reporting_projection: :observatory_models]

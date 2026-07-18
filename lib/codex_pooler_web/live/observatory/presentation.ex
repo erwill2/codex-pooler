@@ -73,10 +73,17 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
         detail: cost_detail(estimated),
         confidence: confidence(get(cost, :confidence), total)
       },
+      tokens: %{
+        value: token_label(non_negative(get(tokens, :total))),
+        detail: request_detail(total)
+      },
       throughput: throughput(performance, Safety.trend(get(trends, :throughput), :percent)),
       latency: latency(performance)
     }
   end
+
+  defp request_detail(1), do: "1 request"
+  defp request_detail(count), do: "#{grouped_integer(count)} requests"
 
   defp cache_detail(cached, input),
     do: "#{token_label(cached)} of #{token_label(input)} input tokens served from cache"
@@ -86,31 +93,47 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
 
     %{
       percent: percent,
-      label: percent_label(percent),
+      measure: percent_measure(percent),
       detail: if(percent, do: detail, else: "not available"),
       minibar: percent || 0.0,
       trend: trend
     }
   end
 
+  defp percent_measure(nil), do: %{value: "not available", unit: nil}
+  defp percent_measure(percent), do: %{value: "#{percent}", unit: "%"}
+
   defp throughput(performance, trend) do
     values = map(get(performance, :throughput_tokens_per_second))
-    %{p50_label: rate_label(get(values, :p50)), trend: trend}
+    %{measure: rate_measure(get(values, :p50)), trend: trend}
   end
 
   defp latency(performance) do
     values = map(get(performance, :latency_ms))
     mean = nullable_integer(get(values, :mean))
-    p50 = nullable_integer(get(values, :p50))
-    p95 = nullable_integer(get(values, :p95))
     max = nullable_integer(get(values, :max))
 
     %{
-      p50_label: latency_label(p50),
-      p95_label: latency_label(p95),
+      p50: latency_measure(nullable_integer(get(values, :p50)), "p50"),
+      p95: latency_measure(nullable_integer(get(values, :p95)), "p95"),
       detail: latency_detail(mean, max)
     }
   end
+
+  # Facts split the numeric value from its unit so the render model can show a
+  # big number with a small, muted unit suffix (matching the ledger mockup).
+  defp rate_measure(value) when is_number(value),
+    do: %{value: grouped_integer(round(value)), unit: "tok/s"}
+
+  defp rate_measure(_value), do: %{value: "not available", unit: nil}
+
+  defp latency_measure(nil, _percentile), do: %{value: "not available", unit: nil}
+
+  defp latency_measure(ms, percentile) when is_integer(ms) and ms >= 1000,
+    do: %{value: "#{Float.round(ms / 1000, 1)}", unit: "s #{percentile}"}
+
+  defp latency_measure(ms, percentile) when is_integer(ms),
+    do: %{value: "#{ms}", unit: "ms #{percentile}"}
 
   defp latency_detail(mean, max) when is_integer(mean) and is_integer(max),
     do: "Mean #{latency_label(mean)} · slowest settled #{latency_label(max)}"
@@ -266,24 +289,44 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   end
 
   defp models(value, _total_tokens) when is_list(value) do
-    rows = Enum.take(value, 12)
-    max_tokens = Enum.max(Enum.map(rows, &non_negative(get(map(&1), :total_tokens))), fn -> 0 end)
+    rows =
+      value
+      |> Enum.reject(&(non_negative(get(map(&1), :total_tokens)) == 0))
+      |> Enum.take(12)
 
     Enum.with_index(rows)
     |> Enum.map(fn {value, index} ->
       row = map(value)
-      tokens = non_negative(get(row, :total_tokens))
+      share = get(row, :share_percent)
 
       %{
         label: Safety.sanitize_text(get(row, :label), "Unknown model"),
-        token_label: token_label(tokens),
-        bar_percent: bar_percent(tokens, max_tokens),
-        tone: Enum.at([:primary, :info, :success, :neutral], rem(index, 4))
+        requests_label: request_short(non_negative(get(row, :request_count))),
+        share_label: model_share_label(share),
+        token_label: "#{token_label(non_negative(get(row, :total_tokens)))} tks",
+        cost_label: money_label(non_negative(get(row, :cost_micros))),
+        bar_percent: model_bar_percent(share),
+        tone: Enum.at([:primary, :info, :success, :neutral], rem(index, 4)),
+        shine_delay: shine_delay(index)
       }
     end)
   end
 
   defp models(_value, _total_tokens), do: []
+
+  defp request_short(1), do: "1 req"
+  defp request_short(count), do: "#{grouped_integer(count)} reqs"
+
+  defp model_share_label(value) when is_number(value), do: "#{value}%"
+  defp model_share_label(_value), do: "—"
+
+  defp model_bar_percent(value) when is_number(value), do: min(max(value * 1.0, 0.0), 100.0)
+  defp model_bar_percent(_value), do: 0.0
+
+  # Stagger the gloss sweep so the model bars shimmer out of phase, matching the
+  # banked-reset life bars in the upstream cockpit.
+  defp shine_delay(index), do: Float.round(rem(index, 6) * 0.4, 2)
+
   defp outcomes(value) when is_list(value), do: Enum.take(value, 12) |> Enum.map(&outcome/1)
   defp outcomes(_value), do: []
 
@@ -347,8 +390,6 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   defp confidence(_value, _total), do: "settled"
   defp percentage(_part, 0), do: nil
   defp percentage(part, total), do: Float.round(non_negative(part) * 100 / total, 1)
-  defp percent_label(nil), do: "not available"
-  defp percent_label(value), do: "#{value}%"
 
   defp traffic_label(tokens, cost_micros),
     do: "#{token_label(tokens)} tokens · #{money_label(cost_micros)}"
@@ -360,14 +401,7 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   defp token_label(value) when value < 999_950, do: "#{Float.round(value / 1_000, 1)}K"
   defp token_label(value) when value < 999_950_000, do: "#{Float.round(value / 1_000_000, 1)}M"
   defp token_label(value), do: "#{Float.round(value / 1_000_000_000, 1)}B"
-  defp bar_percent(_value, 0), do: 0.0
 
-  defp bar_percent(value, total),
-    do: min(Float.round(non_negative(value) * 100 / total, 1), 100.0)
-
-  defp rate_label(nil), do: "not available"
-  defp rate_label(value) when is_number(value), do: "#{grouped_integer(round(value))} tok/s"
-  defp rate_label(_value), do: "not available"
   defp latency_label(nil), do: "not available"
   defp latency_label(ms) when is_integer(ms) and ms >= 1000, do: "#{Float.round(ms / 1000, 1)}s"
   defp latency_label(ms) when is_integer(ms), do: "#{ms} ms"

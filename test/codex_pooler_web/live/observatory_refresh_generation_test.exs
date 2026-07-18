@@ -39,7 +39,7 @@ defmodule CodexPoolerWeb.ObservatoryRefreshGenerationTest do
              "#observatory-pause[data-observatory-refresh-action='pause']:not([phx-click])"
            )
 
-    assert has_element?(view, "[data-role='observatory-freshness-label']", "Updated 0s ago")
+    assert has_element?(view, "[data-role='observatory-freshness-label']", "0s ago")
     assert has_element?(view, "[data-role='observatory-refresh-status']", "Live")
   end
 
@@ -89,7 +89,7 @@ defmodule CodexPoolerWeb.ObservatoryRefreshGenerationTest do
 
     complete_read(success, {:ok, report(444)})
     assert has_element?(view, "#observatory-page[data-freshness-generation='1']")
-    assert has_element?(view, "[data-role='observatory-freshness-label']", "Updated 0s ago")
+    assert has_element?(view, "[data-role='observatory-freshness-label']", "0s ago")
 
     failure = start_refresh(view)
     complete_read(failure, {:error, :current_failure})

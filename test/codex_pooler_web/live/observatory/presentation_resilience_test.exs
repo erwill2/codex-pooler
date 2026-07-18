@@ -8,15 +8,38 @@ defmodule CodexPoolerWeb.Observatory.PresentationResilienceTest do
     partial = Presentation.build(partial_projection())
 
     assert empty.state == :empty
-    assert empty.overview.success_rate.label == "not available"
+    assert empty.overview.success_rate.measure == %{value: "not available", unit: nil}
     assert empty.overview.success_rate.minibar == 0.0
-    assert empty.overview.cache_rate.label == "not available"
+    assert empty.overview.cache_rate.measure == %{value: "not available", unit: nil}
     assert empty.overview.cost.confidence == "unavailable"
-    assert empty.overview.throughput.p50_label == "not available"
-    assert empty.overview.latency.p50_label == "not available"
-    assert empty.overview.latency.p95_label == "not available"
+    assert empty.overview.tokens == %{value: "0", detail: "0 requests"}
+    assert empty.overview.throughput.measure == %{value: "not available", unit: nil}
+    assert empty.overview.latency.p50 == %{value: "not available", unit: nil}
+    assert empty.overview.latency.p95 == %{value: "not available", unit: nil}
     assert empty.traffic.total_label == "0 tokens · $0.00"
     assert partial.state == :partial
+  end
+
+  test "drops models with no token usage from the distribution" do
+    model =
+      Presentation.build(%{
+        totals: %{requests: %{total: 5}, tokens: %{total: 100}},
+        accounting: %{status: "complete"},
+        models: [
+          %{
+            label: "used",
+            request_count: 5,
+            total_tokens: 100,
+            share_percent: 100.0,
+            cost_micros: 0
+          },
+          %{label: "ghost", request_count: 3, total_tokens: 0, share_percent: 0.0, cost_micros: 0}
+        ]
+      })
+
+    assert Enum.map(model.models, & &1.label) == ["used"]
+    assert hd(model.models).requests_label == "5 reqs"
+    assert hd(model.models).token_label == "100 tks"
   end
 
   test "accepts nil fields and keeps render output finite and metadata-only" do
@@ -27,7 +50,7 @@ defmodule CodexPoolerWeb.Observatory.PresentationResilienceTest do
         performance: nil,
         accounting: nil,
         buckets: nil,
-        models: [%{label: "safe-model", total_tokens: nil}],
+        models: [%{label: "safe-model", total_tokens: 5}],
         outcomes: [
           %{
             model: nil,
@@ -42,7 +65,10 @@ defmodule CodexPoolerWeb.Observatory.PresentationResilienceTest do
 
     assert model.window.key == "1h"
     assert model.traffic.categories == []
-    assert hd(model.models).token_label == "0"
+    assert hd(model.models).token_label == "5 tks"
+    assert hd(model.models).requests_label == "0 reqs"
+    assert hd(model.models).share_label == "—"
+    assert hd(model.models).cost_label == "$0.00"
     assert hd(model.outcomes).model == "Unknown model"
     assert hd(model.outcomes).endpoint == "other"
     assert hd(model.outcomes).code == nil
@@ -92,16 +118,16 @@ defmodule CodexPoolerWeb.Observatory.PresentationResilienceTest do
     assert model.traffic.total_label == model.traffic.fallback.total_label
 
     assert Enum.map(model.models, & &1.token_label) == [
-             "999",
-             "1.0K",
-             "1.1K",
-             "999.9K",
-             "1.0M",
-             "1.3M",
-             "999.9M",
-             "1.0B",
-             "1.3B",
-             "80.3M"
+             "999 tks",
+             "1.0K tks",
+             "1.1K tks",
+             "999.9K tks",
+             "1.0M tks",
+             "1.3M tks",
+             "999.9M tks",
+             "1.0B tks",
+             "1.3B tks",
+             "80.3M tks"
            ]
 
     [row] = model.traffic.fallback.rows

@@ -95,9 +95,27 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseData do
         throughput: %{delta: 12.0}
       },
       models: [
-        %{label: "alpha-model", total_tokens: 10_000},
-        %{label: "beta-model", total_tokens: 5_000},
-        %{label: "gamma-model", total_tokens: 2_500}
+        %{
+          label: "alpha-model",
+          request_count: 412,
+          total_tokens: 10_000,
+          share_percent: 57.1,
+          cost_micros: 4_820_000
+        },
+        %{
+          label: "beta-model",
+          request_count: 205,
+          total_tokens: 5_000,
+          share_percent: 28.6,
+          cost_micros: 2_110_000
+        },
+        %{
+          label: "gamma-model",
+          request_count: 96,
+          total_tokens: 2_500,
+          share_percent: 14.3,
+          cost_micros: 940_000
+        }
       ],
       buckets: [
         bucket(~U[2026-07-17 11:00:00Z], 7_000, 2_000, 9),

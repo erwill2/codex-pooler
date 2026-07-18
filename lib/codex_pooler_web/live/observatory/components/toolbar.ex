@@ -110,10 +110,30 @@ defmodule CodexPoolerWeb.Observatory.Components.Toolbar do
           </form>
         </div>
 
-        <CodexPoolerWeb.Layouts.theme_toggle
+        <div
           id="observatory-theme-toggle"
-          class="card relative flex h-8 shrink-0 flex-row items-center rounded-full border border-base-300 bg-base-300"
-        />
+          class="observatory-window-control observatory-theme-control"
+          role="group"
+          aria-label="Theme"
+        >
+          <button
+            :for={
+              {theme, icon, label} <- [
+                {"system", "hero-computer-desktop-micro", "Match system theme"},
+                {"light", "hero-sun-micro", "Light theme"},
+                {"dark", "hero-moon-micro", "Dark theme"}
+              ]
+            }
+            type="button"
+            class="observatory-window-button observatory-theme-button"
+            data-phx-theme={theme}
+            phx-click={JS.dispatch("phx:set-theme")}
+            aria-label={label}
+            title={label}
+          >
+            <.icon name={icon} class="size-4" />
+          </button>
+        </div>
       </div>
     </header>
     """

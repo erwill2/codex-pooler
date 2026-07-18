@@ -1,7 +1,7 @@
 defmodule CodexPoolerWeb.Observatory.Components.Telemetry do
   use Phoenix.Component
 
-  alias CodexPoolerWeb.Admin.BadgeComponents, as: AdminBadges
+  alias CodexPoolerWeb.Observatory.Components.Section
 
   attr :overview, :map, required: true
   attr :models, :list, required: true
@@ -19,9 +19,13 @@ defmodule CodexPoolerWeb.Observatory.Components.Telemetry do
         <div id="observatory-fact-success" class="observatory-fact observatory-fact-lead">
           <dt class="observatory-fact-label">Success rate</dt>
           <dd class="observatory-fact-value-row">
-            <span class="observatory-fact-value font-mono tabular-nums">
-              {text(@overview, :success_rate, :label, "Unavailable")}
-            </span>
+            <span class="observatory-fact-value font-mono tabular-nums">{text(
+              @overview,
+              :success_rate,
+              :measure,
+              :value,
+              "Unavailable"
+            )}<span class="observatory-fact-unit">{text(@overview, :success_rate, :measure, :unit, "")}</span></span>
             <span
               id="observatory-success-trend"
               data-role="observatory-trend"
@@ -56,9 +60,13 @@ defmodule CodexPoolerWeb.Observatory.Components.Telemetry do
         <div id="observatory-fact-cache" class="observatory-fact">
           <dt class="observatory-fact-label">Cache rate</dt>
           <dd class="observatory-fact-value-row">
-            <span class="observatory-fact-value font-mono tabular-nums">
-              {text(@overview, :cache_rate, :label, "Unavailable")}
-            </span>
+            <span class="observatory-fact-value font-mono tabular-nums">{text(
+              @overview,
+              :cache_rate,
+              :measure,
+              :value,
+              "Unavailable"
+            )}<span class="observatory-fact-unit">{text(@overview, :cache_rate, :measure, :unit, "")}</span></span>
             <span
               id="observatory-cache-trend"
               data-role="observatory-trend"
@@ -75,31 +83,34 @@ defmodule CodexPoolerWeb.Observatory.Components.Telemetry do
 
         <div id="observatory-fact-cost" class="observatory-fact">
           <dt class="observatory-fact-label">Cost</dt>
-          <dd class="flex flex-wrap items-center justify-between gap-2">
-            <span class="observatory-fact-value font-mono tabular-nums">
-              {text(@overview, :cost, :settled, :label, "Unavailable")}
-            </span>
-            <span
-              id="observatory-cost-settled"
-              class={[
-                AdminBadges.metadata_chip_class(:neutral),
-                "observatory-metadata-chip uppercase !px-2 !py-0.5"
-              ]}
-            >
-              settled
-            </span>
+          <dd class="observatory-fact-value font-mono tabular-nums">
+            {text(@overview, :cost, :settled, :label, "Unavailable")}
           </dd>
           <dd class="observatory-fact-detail">
             {text(@overview, :cost, :detail, "Cost details unavailable")}
           </dd>
         </div>
 
+        <div id="observatory-fact-tokens" class="observatory-fact">
+          <dt class="observatory-fact-label">Tokens</dt>
+          <dd class="observatory-fact-value font-mono tabular-nums">
+            {text(@overview, :tokens, :value, "Unavailable")}
+          </dd>
+          <dd class="observatory-fact-detail">
+            {text(@overview, :tokens, :detail, "No token details available")}
+          </dd>
+        </div>
+
         <div id="observatory-fact-throughput" class="observatory-fact">
           <dt class="observatory-fact-label">Throughput</dt>
           <dd class="observatory-fact-value-row">
-            <span class="observatory-fact-value font-mono tabular-nums">
-              {text(@overview, :throughput, :p50_label, "Unavailable")}
-            </span>
+            <span class="observatory-fact-value font-mono tabular-nums">{text(
+              @overview,
+              :throughput,
+              :measure,
+              :value,
+              "Unavailable"
+            )}<span class="observatory-fact-unit">{text(@overview, :throughput, :measure, :unit, "")}</span></span>
             <span
               id="observatory-throughput-trend"
               data-role="observatory-trend"
@@ -114,13 +125,21 @@ defmodule CodexPoolerWeb.Observatory.Components.Telemetry do
 
         <div id="observatory-fact-latency" class="observatory-fact">
           <dt class="observatory-fact-label">Latency</dt>
-          <dd class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-            <span class="observatory-fact-value font-mono tabular-nums">
-              P50 {text(@overview, :latency, :p50_label, "Unavailable")}
-            </span>
-            <span class="text-sm font-mono tabular-nums text-base-content/60">
-              P95 {text(@overview, :latency, :p95_label, "Unavailable")}
-            </span>
+          <dd class="observatory-fact-value-row">
+            <span class="observatory-fact-value font-mono tabular-nums">{text(
+              @overview,
+              :latency,
+              :p50,
+              :value,
+              "Unavailable"
+            )}<span class="observatory-fact-unit">{text(@overview, :latency, :p50, :unit, "")}</span></span>
+            <span class="font-mono text-sm tabular-nums text-base-content/55">{text(
+              @overview,
+              :latency,
+              :p95,
+              :value,
+              "Unavailable"
+            )}<span class="observatory-fact-unit">{text(@overview, :latency, :p95, :unit, "")}</span></span>
           </dd>
           <dd class="observatory-fact-detail">
             {text(@overview, :latency, :detail, "Latency details unavailable")}
@@ -131,24 +150,34 @@ defmodule CodexPoolerWeb.Observatory.Components.Telemetry do
 
     <section
       id="observatory-models"
-      class="observatory-card mt-4 overflow-hidden"
+      class="mt-6 grid gap-4"
       aria-labelledby="observatory-models-title"
     >
-      <header class="border-b border-base-300 bg-base-200/35 px-4 py-3">
-        <h2 id="observatory-models-title" class="text-base font-semibold">Models</h2>
-        <p class="text-xs leading-5 text-base-content/60">Settled tokens</p>
-      </header>
-      <ol class="grid gap-0.5 px-4 py-2">
+      <Section.divider id="observatory-models-title" label="Model Distribution" />
+      <ol class="grid gap-3.5">
         <li
           :for={{model, rank} <- ranked_models(@models)}
           id={"observatory-model-#{rank}"}
           data-role="observatory-model-row"
-          class="observatory-model-row grid min-w-0 items-center gap-3 py-1.5"
+          class="grid min-w-0 gap-1.5"
         >
-          <span class="min-w-0 truncate text-xs font-medium">{safe_model_label(model)}</span>
+          <div class="flex min-w-0 items-baseline justify-between gap-3">
+            <span class="min-w-0 truncate text-sm font-semibold leading-5 text-base-content">
+              {safe_model_label(model)}
+              <span class="ml-0.5 text-xs font-normal text-base-content/55">
+                {model_requests(model)}
+              </span>
+            </span>
+            <span class={[
+              "shrink-0 text-xs font-medium leading-4 tabular-nums",
+              tone_text_class(Map.get(model, :tone))
+            ]}>
+              {model_share(model)}
+            </span>
+          </div>
           <div
             data-role="observatory-model-bar"
-            class="h-1.5 min-w-0 overflow-hidden rounded-full bg-base-300"
+            class="-mt-px h-1.5 overflow-hidden rounded-full bg-base-300/70"
             role="progressbar"
             aria-label={"Model #{rank} share"}
             aria-valuemin="0"
@@ -156,13 +185,27 @@ defmodule CodexPoolerWeb.Observatory.Components.Telemetry do
             aria-valuenow={bar_percent(model)}
           >
             <span
-              class={["block h-full rounded-full", tone_class(Map.get(model, :tone))]}
-              style={"width: #{bar_percent(model)}%"}
+              class={[
+                "saved-reset-life-fill block h-full rounded-full",
+                tone_class(Map.get(model, :tone))
+              ]}
+              style={"width: #{bar_percent(model)}%; --shine-delay: #{model_shine_delay(model)}s"}
             ></span>
           </div>
-          <span class="text-right text-xs font-mono tabular-nums text-base-content/75">
-            {safe_model_tokens(model)}
-          </span>
+          <div class="flex items-baseline justify-between gap-3">
+            <span class={[
+              "observatory-metric min-w-0 truncate tabular-nums",
+              tone_text_class(Map.get(model, :tone))
+            ]}>
+              {safe_model_tokens(model)}
+            </span>
+            <span class={[
+              "observatory-metric shrink-0 tabular-nums",
+              tone_text_class(Map.get(model, :tone))
+            ]}>
+              {model_cost(model)}
+            </span>
+          </div>
         </li>
       </ol>
     </section>
@@ -179,6 +222,18 @@ defmodule CodexPoolerWeb.Observatory.Components.Telemetry do
 
   defp safe_model_label(model), do: text(model, :label, "Unnamed model")
   defp safe_model_tokens(model), do: text(model, :token_label, "No token data")
+  defp model_requests(model), do: text(model, :requests_label, "No request data")
+  defp model_share(model), do: text(model, :share_label, "—")
+  defp model_cost(model), do: text(model, :cost_label, "—")
+
+  defp model_shine_delay(model) when is_map(model) do
+    case Map.get(model, :shine_delay) do
+      value when is_number(value) -> value
+      _value -> 0
+    end
+  end
+
+  defp model_shine_delay(_model), do: 0
 
   defp text(map, key, fallback) when is_map(map), do: scalar(Map.get(map, key), fallback)
   defp text(_map, _key, fallback), do: fallback
@@ -278,4 +333,13 @@ defmodule CodexPoolerWeb.Observatory.Components.Telemetry do
   defp tone_class(:warning), do: "bg-warning"
   defp tone_class(:error), do: "bg-error"
   defp tone_class(_tone), do: "bg-neutral"
+
+  # The share value echoes its bar's fill color so eye can pair them; the
+  # neutral tone reads as muted text instead of dark-on-dark.
+  defp tone_text_class(:primary), do: "text-primary"
+  defp tone_text_class(:info), do: "text-info"
+  defp tone_text_class(:success), do: "text-success"
+  defp tone_text_class(:warning), do: "text-warning"
+  defp tone_text_class(:error), do: "text-error"
+  defp tone_text_class(_tone), do: "text-base-content/60"
 end

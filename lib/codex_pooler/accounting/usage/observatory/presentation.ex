@@ -200,7 +200,10 @@ defmodule CodexPooler.Accounting.Usage.Observatory.Presentation do
         label: row.label,
         request_count: integer(row.request_count),
         total_tokens: integer(row.total_tokens),
-        share_percent: percentage(row.total_tokens, total_tokens)
+        share_percent: percentage(row.total_tokens, total_tokens),
+        cost_micros:
+          integer(Map.get(row, :settled_cost_micros)) +
+            integer(Map.get(row, :estimated_cost_micros))
       }
     end)
   end

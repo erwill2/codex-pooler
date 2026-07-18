@@ -134,7 +134,7 @@ defmodule CodexPoolerWeb.ObservatoryLive do
         <div
           :if={@observatory_report && @observatory_state in [:ready, :partial, :stale]}
           id="observatory-widgets"
-          class="grid min-w-0 gap-4 observatory-split:grid-cols-[minmax(0,4fr)_minmax(0,8fr)]"
+          class="mt-4 grid min-w-0 gap-4 observatory-split:grid-cols-[minmax(0,4fr)_minmax(0,8fr)]"
         >
           <aside
             id="observatory-left-rail"
@@ -146,7 +146,7 @@ defmodule CodexPoolerWeb.ObservatoryLive do
             />
           </aside>
 
-          <div id="observatory-right-rail" class="min-w-0">
+          <div id="observatory-right-rail" class="min-w-0 observatory-split:pt-3.5">
             <Activity.activity
               traffic={@observatory_report.traffic}
               outcomes={@observatory_report.outcomes}
@@ -186,7 +186,7 @@ defmodule CodexPoolerWeb.ObservatoryLive do
     assign(socket,
       applied_generation: generation,
       freshness_generation: generation,
-      freshness: "Updated 0s ago",
+      freshness: "0s ago",
       last_applied_at_ms: System.system_time(:millisecond),
       loading: false,
       observatory_report: presentation,

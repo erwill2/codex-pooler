@@ -201,12 +201,12 @@ test("repaints freshness from the last applied result", () => {
 		appliedAt: 5_000,
 	});
 
-	assert.equal(statuses.at(-1).label, "Updated 0s ago");
+	assert.equal(statuses.at(-1).label, "0s ago");
 	controller.markRequested(1);
 	clock.advanceBy(2_000);
-	assert.equal(statuses.at(-1).label, "Updated 2s ago");
+	assert.equal(statuses.at(-1).label, "2s ago");
 	controller.syncAppliedAt(12_000, 2);
-	assert.equal(statuses.at(-1).label, "Updated 0s ago");
+	assert.equal(statuses.at(-1).label, "0s ago");
 });
 
 test("ignores positive and negative server clock skew", () => {
@@ -216,9 +216,9 @@ test("ignores positive and negative server clock skew", () => {
 			appliedAt: 1_000_000 + serverSkew,
 		});
 
-		assert.equal(statuses.at(-1).label, "Updated 0s ago");
+		assert.equal(statuses.at(-1).label, "0s ago");
 		clock.advanceBy(2_500);
-		assert.equal(statuses.at(-1).label, "Updated 2s ago");
+		assert.equal(statuses.at(-1).label, "2s ago");
 		controller.destroy();
 	}
 });
@@ -233,15 +233,15 @@ test("resets freshness only when the applied generation changes", () => {
 
 	clock.advanceBy(4_000);
 	controller.syncAppliedAt(serverAppliedAt, 1);
-	assert.equal(statuses.at(-1).label, "Updated 4s ago");
+	assert.equal(statuses.at(-1).label, "4s ago");
 	controller.syncAppliedAt(serverAppliedAt + 1, 1);
-	assert.equal(statuses.at(-1).label, "Updated 4s ago");
+	assert.equal(statuses.at(-1).label, "4s ago");
 
 	controller.syncAppliedAt(serverAppliedAt, 2);
-	assert.equal(statuses.at(-1).label, "Updated 0s ago");
+	assert.equal(statuses.at(-1).label, "0s ago");
 	clock.advanceBy(3_000);
 	controller.syncAppliedAt(serverAppliedAt, 2);
-	assert.equal(statuses.at(-1).label, "Updated 3s ago");
+	assert.equal(statuses.at(-1).label, "3s ago");
 });
 
 test("does not overwrite a server error for an unchanged freshness generation", () => {
@@ -262,7 +262,7 @@ test("does not overwrite a server error for an unchanged freshness generation", 
 
 	hook.mounted.call(context);
 	clock.advanceBy(4_000);
-	assert.equal(label.textContent, "Updated 4s ago");
+	assert.equal(label.textContent, "4s ago");
 
 	label.textContent = "Update unavailable";
 	hook.updated.call(context);

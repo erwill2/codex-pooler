@@ -21,7 +21,7 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
 
     assert model.overview.success_rate == %{
              percent: 90.0,
-             label: "90.0%",
+             measure: %{value: "90.0", unit: "%"},
              detail: "9 succeeded · 1 failed",
              minibar: 90.0,
              trend: %{label: "not available", tone: :neutral, direction: :unavailable}
@@ -32,12 +32,19 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
     assert model.overview.cost.estimated.label == "$0.30"
     assert model.overview.cost.detail == "+ $0.30 estimated, awaiting settlement"
     assert model.overview.cost.confidence == "estimated"
-    assert model.overview.throughput.p50_label == "126 tok/s"
-    assert model.overview.latency.p95_label == "200 ms"
+    assert model.overview.tokens == %{value: "130", detail: "10 requests"}
+    assert model.overview.throughput.measure == %{value: "126", unit: "tok/s"}
+    assert model.overview.latency.p50 == %{value: "120", unit: "ms p50"}
+    assert model.overview.latency.p95 == %{value: "200", unit: "ms p95"}
     assert model.overview.latency.detail == "Mean 160 ms · slowest settled 240 ms"
 
     assert length(model.models) == 12
-    assert hd(model.models).bar_percent == 100.0
+    top = hd(model.models)
+    assert top.bar_percent == 99.2
+    assert top.share_label == "99.2%"
+    assert top.requests_label == "1 req"
+    assert top.token_label == "129 tks"
+    assert top.cost_label == "$1.29"
 
     assert Enum.map(model.models, & &1.tone) ==
              [
@@ -258,7 +265,16 @@ defmodule CodexPoolerWeb.Observatory.PresentationTest do
         bucket(~U[2026-07-17 12:00:00Z], 20, 5, 40, 4, 500_000)
       ],
       models:
-        Enum.map(1..13, &%{label: "model-#{&1}", request_count: &1, total_tokens: 130 - &1}),
+        Enum.map(
+          1..13,
+          &%{
+            label: "model-#{&1}",
+            request_count: &1,
+            total_tokens: 130 - &1,
+            share_percent: Float.round((130 - &1) / 130 * 100, 1),
+            cost_micros: (130 - &1) * 10_000
+          }
+        ),
       model_buckets: [
         %{bucket_index: 0, label: "model-1", total_tokens: 50},
         %{bucket_index: 1, label: "model-1", total_tokens: 20},

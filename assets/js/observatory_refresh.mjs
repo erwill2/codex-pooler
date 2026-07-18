@@ -56,7 +56,7 @@ const statusFor = ({ connected, now, paused, receiptAt, visible }) => {
 	return {
 		ariaLabel: "Refresh live",
 		kind: "live",
-		label: `Updated ${seconds}s ago`,
+		label: `${seconds}s ago`,
 		spoken: "Live",
 	};
 };

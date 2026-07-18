@@ -10,7 +10,7 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTest do
       render_component(&Toolbar.toolbar/1, %{
         display_name: "safe display",
         selected_window: "24h",
-        freshness: "Updated 8s ago",
+        freshness: "8s ago",
         paused: true
       })
 
@@ -24,7 +24,7 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTest do
     assert LazyHTML.query(fragment, "#observatory-key-prefix") |> Enum.empty?()
     assert html =~ "safe display"
     refute html =~ "safe-prefix"
-    assert html =~ "Updated 8s ago"
+    assert html =~ "8s ago"
     assert html =~ "Paused"
     assert LazyHTML.query(fragment, "#observatory-resume[aria-label='Resume auto-refresh']") != []
 
@@ -67,19 +67,37 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTest do
     assert LazyHTML.query(fragment, "#observatory-success-minibar[role='progressbar']") != []
     assert LazyHTML.query(fragment, "#observatory-fact-cache") != []
     assert LazyHTML.query(fragment, "#observatory-fact-cost") != []
-    assert LazyHTML.query(fragment, "#observatory-cost-settled") != []
-    assert LazyHTML.query(fragment, "#observatory-cost-settled[class*='badge']") |> Enum.empty?()
-
-    assert LazyHTML.query(fragment, "#observatory-cost-settled[class*='text-base-content/70']") !=
-             []
-
+    assert LazyHTML.query(fragment, "#observatory-cost-settled") |> Enum.empty?()
+    assert LazyHTML.query(fragment, "#observatory-fact-tokens") != []
+    assert html =~ "42 requests"
     assert LazyHTML.query(fragment, "#observatory-fact-throughput") != []
     assert LazyHTML.query(fragment, "#observatory-fact-latency") != []
     assert LazyHTML.query(fragment, "#observatory-models") != []
     assert LazyHTML.query(fragment, "[data-role='observatory-model-row']") |> Enum.count() == 3
     assert LazyHTML.query(fragment, "[data-role='observatory-model-bar']") |> Enum.count() == 3
+
+    assert LazyHTML.query(fragment, "[data-role='observatory-model-bar'] .saved-reset-life-fill") !=
+             []
+
     assert html =~ "alpha-model"
-    assert html =~ "120 ms"
+    assert html =~ "9,441 reqs"
+    assert html =~ "78.5%"
+    assert html =~ "$79.62"
+    # top model's share value echoes its primary bar color; metrics are not mono
+    assert LazyHTML.query(fragment, "#observatory-model-1 span.text-primary") != []
+
+    assert LazyHTML.query(fragment, "#observatory-model-1 .observatory-metric.font-mono")
+           |> Enum.empty?()
+
+    latency = LazyHTML.query(fragment, "#observatory-fact-latency") |> LazyHTML.text()
+    assert latency =~ "120"
+    assert latency =~ "ms p50"
+    assert latency =~ "200"
+    assert latency =~ "ms p95"
+
+    throughput = LazyHTML.query(fragment, "#observatory-fact-throughput") |> LazyHTML.text()
+    assert throughput =~ "125.5"
+    assert throughput =~ "tok/s"
     refute html =~ ~r/\b(admin|Pool|upstream|operator)\b/i
   end
 
@@ -155,8 +173,8 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTest do
       assert LazyHTML.query(fragment, selector) != []
     end
 
-    assert html =~ "metadata only"
-    assert html =~ "130 tokens · $2.40"
+    refute html =~ "metadata only"
+    assert html =~ "Recent outcomes"
     assert html =~ "Total: 80 tokens · $1.20"
     assert html =~ "Succeeded"
     assert html =~ "In progress"
@@ -166,30 +184,47 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTest do
 
   defp overview do
     %{
-      success_rate: %{label: "90.0%", detail: "9 succeeded · 1 failed", minibar: 90.0},
-      cache_rate: %{label: "25.0%", detail: "20 of 80 input tokens served from cache"},
+      success_rate: %{
+        measure: %{value: "90.0", unit: "%"},
+        detail: "9 succeeded · 1 failed",
+        minibar: 90.0
+      },
+      cache_rate: %{
+        measure: %{value: "25.0", unit: "%"},
+        detail: "20 of 80 input tokens served from cache"
+      },
       cost: %{
         settled: %{label: "$1.25"},
         estimated: %{label: "$0.30"},
         confidence: "estimated",
         detail: "+ $0.30 estimated, awaiting settlement"
       },
-      throughput: %{p50_label: "125.5 tok/s"},
+      tokens: %{value: "130", detail: "42 requests"},
+      throughput: %{measure: %{value: "125.5", unit: "tok/s"}},
       latency: %{
-        p50_label: "120 ms",
-        p95_label: "200 ms",
+        p50: %{value: "120", unit: "ms p50"},
+        p95: %{value: "200", unit: "ms p95"},
         detail: "Mean 160 ms · slowest settled 240 ms"
       }
     }
   end
 
   defp models do
-    for {label, tone, percent, tokens} <- [
-          {"alpha-model", :primary, 100.0, "1k"},
-          {"beta-model", :info, 40.0, "400"},
-          {"gamma-model", :success, 10.0, "100"}
+    for {label, tone, percent, tokens, requests, cost} <- [
+          {"alpha-model", :primary, 78.5, "1k tks", "9,441 reqs", "$79.62"},
+          {"beta-model", :info, 40.0, "400 tks", "512 reqs", "$12.40"},
+          {"gamma-model", :success, 10.0, "100 tks", "88 reqs", "$1.20"}
         ] do
-      %{label: label, tone: tone, bar_percent: percent, token_label: tokens}
+      %{
+        label: label,
+        tone: tone,
+        bar_percent: percent,
+        token_label: tokens,
+        share_label: "#{percent}%",
+        requests_label: requests,
+        cost_label: cost,
+        shine_delay: 0.4
+      }
     end
   end
 
