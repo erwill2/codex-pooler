@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
 
   alias CodexPooler.Gateway.OpenAICompatibility.{PublicResponse, Responses}
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
+  alias CodexPooler.Gateway.Transports.Streaming.FunctionCallArguments
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponsesSequence
 
@@ -41,7 +42,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
           required(:passthrough_terminal) => nil,
           required(:passthrough_terminal_kind) => atom() | nil,
           required(:passthrough_terminal_failure) => StreamProtocol.terminal_failure() | nil,
-          required(:passthrough_terminal_seen?) => boolean()
+          required(:passthrough_terminal_seen?) => boolean(),
+          required(:function_call_arguments) => %{optional(term()) => binary()}
         }
 
   @spec new_state(map()) :: state()
@@ -61,7 +63,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
       passthrough_terminal: nil,
       passthrough_terminal_kind: nil,
       passthrough_terminal_failure: nil,
-      passthrough_terminal_seen?: false
+      passthrough_terminal_seen?: false,
+      function_call_arguments: %{}
     }
   end
 
@@ -355,6 +358,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     case PublicResponsesSequence.public_shape(event_type, decoded) do
       {:ok, type, decoded} ->
         decoded = normalize_public_event(type, decoded)
+        {decoded, state} = normalize_function_call_arguments(type, decoded, state)
 
         terminal_in_block? =
           type in ["response.completed", "response.failed", "response.incomplete", "error"]
@@ -533,6 +537,91 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
     else
       decoded
     end
+  end
+
+  defp normalize_function_call_arguments("response.output_item.added", decoded, state),
+    do: seed_function_call_arguments(decoded, state)
+
+  defp normalize_function_call_arguments("response.output_item.done", decoded, state),
+    do: reconcile_function_call_arguments(decoded, state)
+
+  defp normalize_function_call_arguments(
+         "response.function_call_arguments.delta",
+         decoded,
+         state
+       ) do
+    case function_call_key(decoded) do
+      nil ->
+        {decoded, state}
+
+      key ->
+        previous = Map.get(state.function_call_arguments, key, "")
+        incoming = decoded_string(decoded, "delta") || ""
+        {delta, arguments} = FunctionCallArguments.normalize_delta(previous, incoming)
+
+        {
+          Map.put(decoded, "delta", delta),
+          put_function_call_arguments(state, key, arguments)
+        }
+    end
+  end
+
+  defp normalize_function_call_arguments(
+         "response.function_call_arguments.done",
+         decoded,
+         state
+       ),
+       do: reconcile_function_call_arguments(decoded, state)
+
+  defp normalize_function_call_arguments(_type, decoded, state), do: {decoded, state}
+
+  defp seed_function_call_arguments(decoded, state) do
+    with key when not is_nil(key) <- function_call_key(decoded),
+         arguments when is_binary(arguments) <- function_call_item_arguments(decoded) do
+      arguments_by_call = Map.put_new(state.function_call_arguments, key, arguments)
+      {decoded, %{state | function_call_arguments: arguments_by_call}}
+    else
+      _missing_function_call -> {decoded, state}
+    end
+  end
+
+  defp reconcile_function_call_arguments(decoded, state) do
+    with key when not is_nil(key) <- function_call_key(decoded),
+         arguments when is_binary(arguments) <- function_call_snapshot(decoded) do
+      previous = Map.get(state.function_call_arguments, key, "")
+      {_delta, reconciled} = FunctionCallArguments.reconcile_snapshot(previous, arguments)
+      {decoded, put_function_call_arguments(state, key, reconciled)}
+    else
+      _missing_function_call -> {decoded, state}
+    end
+  end
+
+  defp function_call_key(decoded) when is_map(decoded) do
+    case Map.fetch(decoded, "output_index") do
+      {:ok, index} -> {:output_index, index}
+      :error -> function_call_item_key(decoded)
+    end
+  end
+
+  defp function_call_key(_decoded), do: nil
+
+  defp function_call_item_key(decoded) do
+    item_id = Map.get(decoded, "item_id") || get_in(decoded, ["item", "id"])
+    if is_binary(item_id), do: {:item_id, item_id}, else: nil
+  end
+
+  defp function_call_item_arguments(%{"item" => %{"type" => "function_call"} = item}),
+    do: decoded_string(item, "arguments") || ""
+
+  defp function_call_item_arguments(_decoded), do: nil
+
+  defp function_call_snapshot(%{"arguments" => arguments}) when is_binary(arguments),
+    do: arguments
+
+  defp function_call_snapshot(decoded), do: function_call_item_arguments(decoded)
+
+  defp put_function_call_arguments(state, key, arguments) do
+    %{state | function_call_arguments: Map.put(state.function_call_arguments, key, arguments)}
   end
 
   @spec normalize_terminal_errors(String.t() | nil, map()) :: map()
@@ -878,7 +967,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.PublicResponse
         created?: false,
         text_delta?: false,
         passthrough?: false,
-        passthrough_terminal: nil
+        passthrough_terminal: nil,
+        function_call_arguments: %{}
     }
   end
 

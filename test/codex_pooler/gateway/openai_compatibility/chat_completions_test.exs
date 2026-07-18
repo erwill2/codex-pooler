@@ -178,7 +178,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletionsTest do
       refute state.discarding_oversized?
     end
 
-    test "emits function-call arguments only when the item is added" do
+    test "does not replay unchanged function-call arguments when the item completes" do
       state = ChatCompletions.stream_state(%{"model" => "gpt-example"})
       arguments = ~s({"timezone":"UTC"})
 
@@ -262,6 +262,39 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletionsTest do
                  %{"index" => 0, "custom" => %{"input" => "print(\"hel"}},
                  %{"index" => 0, "custom" => %{"input" => "lo\")\nreturn 42"}}
                ]
+    end
+
+    test "converts cumulative function argument snapshots into non-overlapping deltas" do
+      arguments = ~s({"file_path":"references/native-mcp.md","name":"hermes-agent"})
+
+      events = [
+        function_call_item_event("response.output_item.added", ""),
+        function_arguments_event(~s({"file)),
+        function_arguments_event(~s({"file_path":"references/)),
+        function_arguments_event(arguments),
+        function_call_item_event("response.output_item.done", arguments)
+      ]
+
+      {stream, _state} = normalize_events(events)
+
+      assert tool_argument_fragments(stream) |> Enum.join() == arguments
+      assert tool_call_ids(stream) == ["call_hermes"]
+    end
+
+    test "preserves true argument deltas and reconciles a missing suffix from done" do
+      arguments = ~s({"file_path":"references/native-mcp.md","name":"hermes-agent"})
+
+      events = [
+        function_call_item_event("response.output_item.added", ""),
+        function_arguments_event(~s({"file)),
+        function_arguments_event(~s(_path":"references/)),
+        function_arguments_done_event(arguments)
+      ]
+
+      {stream, _state} = normalize_events(events)
+
+      assert tool_argument_fragments(stream) |> Enum.join() == arguments
+      assert tool_call_ids(stream) == ["call_hermes"]
     end
 
     test "adds a literal tier only to chunks emitted after it is observed" do
@@ -428,4 +461,87 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletionsTest do
     |> Enum.reject(&String.contains?(&1, "[DONE]"))
     |> Enum.map(&Jason.decode!/1)
   end
+
+  defp normalize_events(events) do
+    Enum.reduce(
+      events,
+      {"", ChatCompletions.stream_state(%{"model" => "gpt-example"})},
+      fn event, {stream, state} ->
+        {chunk, state} =
+          ChatCompletions.normalize_stream_data(IO.iodata_to_binary(event), state)
+
+        {stream <> chunk, state}
+      end
+    )
+  end
+
+  defp function_call_item_event(type, arguments) do
+    sse_event(type, %{
+      "type" => type,
+      "output_index" => 0,
+      "item" => %{
+        "type" => "function_call",
+        "id" => "fc_hermes",
+        "call_id" => "call_hermes",
+        "name" => "read_file",
+        "arguments" => arguments
+      }
+    })
+  end
+
+  defp function_arguments_event(arguments) do
+    sse_event("response.function_call_arguments.delta", %{
+      "type" => "response.function_call_arguments.delta",
+      "output_index" => 0,
+      "item_id" => "fc_hermes",
+      "delta" => arguments
+    })
+  end
+
+  defp function_arguments_done_event(arguments) do
+    sse_event("response.function_call_arguments.done", %{
+      "type" => "response.function_call_arguments.done",
+      "output_index" => 0,
+      "item_id" => "fc_hermes",
+      "arguments" => arguments
+    })
+  end
+
+  defp tool_argument_fragments(stream) do
+    stream
+    |> chat_chunks()
+    |> Enum.flat_map(fn chunk ->
+      case get_in(chunk, ["choices", Access.at(0), "delta", "tool_calls"]) do
+        tool_calls when is_list(tool_calls) ->
+          Enum.flat_map(tool_calls, fn tool_call ->
+            case get_in(tool_call, ["function", "arguments"]) do
+              arguments when is_binary(arguments) and arguments != "" -> [arguments]
+              _arguments -> []
+            end
+          end)
+
+        _tool_calls ->
+          []
+      end
+    end)
+  end
+
+  defp tool_call_ids(stream) do
+    stream
+    |> chat_chunks()
+    |> Enum.flat_map(fn chunk ->
+      case get_in(chunk, ["choices", Access.at(0), "delta", "tool_calls"]) do
+        tool_calls when is_list(tool_calls) ->
+          Enum.flat_map(tool_calls, fn
+            %{"id" => id} when is_binary(id) -> [id]
+            _tool_call -> []
+          end)
+
+        _tool_calls ->
+          []
+      end
+    end)
+  end
+
+  defp chat_chunks(stream), do: normalized_sse_payloads(stream)
 end
