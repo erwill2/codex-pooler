@@ -86,11 +86,8 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLivePolicyTest do
 
     api_key = Repo.one!(APIKey)
 
-    assert has_element?(
-             view,
-             "#api-key-row-#{api_key.id}-models",
-             "gpt-allowed, custom/manual-test-model"
-           )
+    assert has_element?(view, "#api-key-row-#{api_key.id}-models", "gpt-allowed")
+    assert has_element?(view, "#api-key-row-#{api_key.id}-models", "custom/manual-test-model")
 
     assert has_element?(view, "#api-key-row-#{api_key.id}-notes-content", "limited rollout")
 

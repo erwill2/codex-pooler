@@ -83,7 +83,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
           <.input
             field={@form[:dashboard_access]}
             type="checkbox"
-            label="Dashboard access"
+            label="Observatory access"
             class="checkbox checkbox-primary checkbox-sm"
             disabled={@disabled}
           />
@@ -91,7 +91,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents do
             id="api-key-dashboard-access-help"
             class="text-sm leading-5 text-base-content/60"
           >
-            Allow this key to open the read-only Observatory. Runtime API policy stays independent.
+            Allow this key to open the read-only Observatory.
           </p>
         </div>
       </div>

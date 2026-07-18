@@ -129,7 +129,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
     |> maybe_add_error(blank_to_nil(params["pool_id"]) == nil, "Pool is required")
     |> maybe_add_error(
       invalid_dashboard_access?(params["dashboard_access"]),
-      "Dashboard access must be enabled or disabled"
+      "Observatory access must be enabled or disabled"
     )
     |> maybe_add_error(
       invalid_expiry?(params["expires_at"]),
@@ -436,7 +436,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
       {"Name", blank_to_nil(form[:display_name].value) || "Missing"},
       {"Pool", selected_pool_name(selected_pool)},
       {"Status", form[:status].value || "active"},
-      {"Dashboard access", dashboard_access_label(form[:dashboard_access].value)},
+      {"Observatory access", dashboard_access_label(form[:dashboard_access].value)},
       {"Expires", blank_to_nil(form[:expires_at].value) || "Never"}
     ]
   end

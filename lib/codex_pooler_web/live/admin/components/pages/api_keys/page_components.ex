@@ -304,6 +304,22 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                   <span class="truncate font-semibold text-base-content">
                     {api_key.display_name}
                   </span>
+                </div>
+                <div
+                  :if={api_key.dashboard_access or ApiKeysReadModel.api_key_operator_notes(api_key)}
+                  class="flex flex-wrap items-center gap-x-3 gap-y-1 xl:flex-col xl:items-start xl:gap-x-0 xl:gap-y-1"
+                >
+                  <.link
+                    :if={api_key.dashboard_access}
+                    id={"api-key-row-#{api_key.id}-observatory"}
+                    href={~p"/observatory/login"}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="inline-flex w-fit items-center gap-1 text-xs font-medium text-primary transition-colors hover:text-primary/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                  >
+                    <.icon name="hero-chart-bar-square" class="size-3.5" />
+                    <span>Observatory</span>
+                  </.link>
                   <.api_key_notes_popover
                     :if={ApiKeysReadModel.api_key_operator_notes(api_key)}
                     id={"api-key-row-#{api_key.id}-notes"}
@@ -311,73 +327,74 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                   />
                 </div>
               </div>
-              <dl class="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm text-base-content/70 xl:grid xl:content-start xl:gap-2">
-                <div
-                  id={"api-key-row-#{api_key.id}-last-used"}
-                  class="flex items-baseline gap-1.5 xl:grid xl:gap-0.5"
-                >
-                  <dt class="text-xs font-medium text-base-content/50">Last used</dt>
-                  <dd>{last_used_label(api_key.last_used_at, @datetime_preferences)}</dd>
-                </div>
-                <div class="flex min-w-0 items-baseline gap-1.5 xl:grid xl:gap-0.5">
-                  <dt class="text-xs font-medium text-base-content/50">Prefix</dt>
-                  <dd class="min-w-0 truncate">
-                    {api_key.key_prefix}
-                  </dd>
-                </div>
-              </dl>
-              <div class="grid min-w-0 gap-1 text-sm text-base-content/70 xl:content-start xl:gap-2">
-                <div
-                  id={"api-key-row-#{api_key.id}-expires"}
-                  class="flex items-baseline gap-1.5 xl:grid xl:gap-0.5"
-                >
-                  <span class="text-xs font-medium text-base-content/50">Expires</span>
-                  <span class={expiry_label_class(api_key.expires_at)}>
-                    {expiry_label(api_key.expires_at, @datetime_preferences)}
-                  </span>
-                </div>
-                <div class="flex min-w-0 items-baseline gap-1.5 xl:grid xl:gap-0.5">
-                  <span class="text-xs font-medium text-base-content/50">Model access</span>
-                  <span
-                    id={"api-key-row-#{api_key.id}-models"}
-                    class="min-w-0 truncate xl:whitespace-normal"
+              <div class="flex min-w-0 flex-wrap items-baseline gap-x-6 gap-y-1 text-sm text-base-content/70 xl:contents">
+                <dl class="contents xl:grid xl:content-start xl:gap-2">
+                  <div
+                    id={"api-key-row-#{api_key.id}-last-used"}
+                    class="flex items-baseline gap-1.5 xl:grid xl:gap-0.5"
                   >
-                    {ApiKeysReadModel.model_policy_label(api_key.allowed_model_identifiers)}
+                    <dt class="text-xs font-medium text-base-content/50">Last used</dt>
+                    <dd>{last_used_label(api_key.last_used_at, @datetime_preferences)}</dd>
+                  </div>
+                  <div class="flex min-w-0 items-baseline gap-1.5 xl:grid xl:gap-0.5">
+                    <dt class="text-xs font-medium text-base-content/50">Prefix</dt>
+                    <dd class="flex min-w-0 items-center gap-1">
+                      <span class="min-w-0 truncate">{api_key.key_prefix}</span>
+                      <button
+                        id={"api-key-row-#{api_key.id}-prefix-copy"}
+                        type="button"
+                        phx-hook="ClipboardCopy"
+                        data-copy-text={api_key.key_prefix}
+                        class="inline-grid size-5 shrink-0 place-items-center rounded text-base-content/40 transition-colors hover:bg-base-200 hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary"
+                        aria-label="Copy key prefix"
+                      >
+                        <.icon name="hero-clipboard-document" class="copy-icon size-3.5" />
+                      </button>
+                    </dd>
+                  </div>
+                </dl>
+                <div class="contents xl:grid xl:content-start xl:gap-2">
+                  <div
+                    id={"api-key-row-#{api_key.id}-expires"}
+                    class="flex items-baseline gap-1.5 xl:grid xl:gap-0.5"
+                  >
+                    <span class="text-xs font-medium text-base-content/50">Expires</span>
+                    <span class={expiry_label_class(api_key.expires_at)}>
+                      {expiry_label(api_key.expires_at, @datetime_preferences)}
+                    </span>
+                  </div>
+                  <div class="flex min-w-0 items-baseline gap-1.5 xl:grid xl:gap-1">
+                    <span class="text-xs font-medium text-base-content/50">Model access</span>
+                    <div
+                      id={"api-key-row-#{api_key.id}-models"}
+                      class="flex min-w-0 flex-wrap items-center gap-1"
+                    >
+                      <.model_access_badges models={api_key.allowed_model_identifiers} />
+                    </div>
+                  </div>
+                  <span
+                    :if={
+                      ApiKeysReadModel.model_policy_warning_label(
+                        Map.get(@model_policy_summaries, api_key.id)
+                      )
+                    }
+                    id={"api-key-row-#{api_key.id}-model-policy-warning"}
+                    class="inline-flex basis-full items-start gap-1.5 text-xs font-medium leading-5 text-warning xl:basis-auto"
+                  >
+                    <.icon name="hero-exclamation-triangle" class="mt-0.5 size-3.5 shrink-0" />
+                    <span>
+                      {ApiKeysReadModel.model_policy_warning_label(
+                        Map.get(@model_policy_summaries, api_key.id)
+                      )}
+                    </span>
                   </span>
                 </div>
-                <span
-                  :if={
-                    ApiKeysReadModel.model_policy_warning_label(
-                      Map.get(@model_policy_summaries, api_key.id)
-                    )
-                  }
-                  id={"api-key-row-#{api_key.id}-model-policy-warning"}
-                  class="inline-flex items-start gap-1.5 text-xs font-medium leading-5 text-warning"
-                >
-                  <.icon name="hero-exclamation-triangle" class="mt-0.5 size-3.5 shrink-0" />
-                  <span>
-                    {ApiKeysReadModel.model_policy_warning_label(
-                      Map.get(@model_policy_summaries, api_key.id)
-                    )}
-                  </span>
-                </span>
               </div>
             </div>
             <div
               data-role="api-key-actions"
               class="relative z-10 flex items-center gap-2 justify-self-end"
             >
-              <span
-                id={"api-key-row-#{api_key.id}-dashboard-access"}
-                class={[
-                  AdminBadges.status_chip_class(
-                    if(api_key.dashboard_access, do: "active", else: "disabled")
-                  ),
-                  "shrink-0"
-                ]}
-              >
-                Dashboard {if(api_key.dashboard_access, do: "enabled", else: "disabled")}
-              </span>
               <span
                 id={"api-key-row-#{api_key.id}-status"}
                 class={[AdminBadges.lifecycle_chip_class(api_key.status), "shrink-0"]}
@@ -538,24 +555,53 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
 
   defp api_key_notes_popover(assigns) do
     ~H"""
-    <span id={@id} class="dropdown dropdown-hover dropdown-right inline-flex">
-      <button
+    <details
+      id={@id}
+      class="dropdown inline-flex"
+      phx-click-away={JS.remove_attribute("open", to: "##{@id}")}
+    >
+      <summary
         id={"#{@id}-button"}
-        type="button"
-        class="btn btn-ghost btn-xs btn-circle text-base-content/45 transition-colors hover:bg-base-200 hover:text-base-content"
-        tabindex="0"
+        class="inline-flex w-fit cursor-pointer list-none items-center gap-1 text-xs font-medium text-base-content/55 transition-colors hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary [&::-webkit-details-marker]:hidden"
         aria-label="Show API key notes"
       >
-        <.icon name="hero-information-circle" class="size-4" />
-      </button>
-      <span
+        <.icon name="hero-document-text" class="size-3.5" />
+        <span>Notes</span>
+      </summary>
+      <div
         id={"#{@id}-content"}
-        tabindex="0"
-        class="dropdown-content z-20 ml-2 block w-72 rounded-box border border-base-300 bg-base-100 p-3 text-left text-xs font-normal leading-5 text-base-content/70 shadow-xl"
+        class="dropdown-content z-50 mt-2 w-72 overflow-hidden rounded-box border border-base-300 bg-base-100 p-3 text-left shadow-2xl"
       >
-        {@notes}
-      </span>
-    </span>
+        <p class="font-mono text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-primary">
+          Operator notes
+        </p>
+        <p class="mt-2 text-xs font-normal leading-5 text-base-content/70">{@notes}</p>
+      </div>
+    </details>
     """
   end
+
+  attr :models, :any, required: true
+
+  defp model_access_badges(%{models: nil} = assigns) do
+    ~H"""
+    <span class="min-w-0 truncate">All models</span>
+    """
+  end
+
+  defp model_access_badges(%{models: []} = assigns) do
+    ~H"""
+    <span class="min-w-0 truncate text-warning">No models</span>
+    """
+  end
+
+  defp model_access_badges(assigns) do
+    ~H"""
+    <span :for={model <- @models} class={model_chip_class()} title={model}>{model}</span>
+    """
+  end
+
+  defp model_chip_class,
+    do:
+      "inline-flex max-w-full items-center truncate rounded-full border border-base-300 bg-base-200 px-2 py-0.5 text-[0.7rem] font-medium leading-4 text-base-content/70"
 end

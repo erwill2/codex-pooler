@@ -28,7 +28,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveDashboardAccessTest do
     refute has_element?(view, "#api_key_dashboard_access[checked]")
 
     select_api_key_section(view, "review")
-    assert has_element?(view, "#api-key-review-summary", "Dashboard access")
+    assert has_element?(view, "#api-key-review-summary", "Observatory access")
     assert has_element?(view, "#api-key-review-summary", "Disabled")
 
     view
@@ -44,11 +44,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveDashboardAccessTest do
 
     refute api_key.dashboard_access
 
-    assert has_element?(
-             view,
-             "#api-key-row-#{api_key.id}-dashboard-access",
-             "Dashboard disabled"
-           )
+    refute has_element?(view, "#api-key-row-#{api_key.id}-observatory")
   end
 
   test "keeps mobile API key actions in the original right-hand column without overlap", %{
@@ -93,7 +89,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveDashboardAccessTest do
              "#{row_selector} > [data-role='api-key-actions'] > [data-role='api-key-actions-menu'][class~='dropdown'][class~='dropdown-end'][class~='relative'][class~='inline-block'][class~='focus-within:z-50']"
            )
 
-    assert has_element?(view, "#{row_selector}-dashboard-access", "Dashboard disabled")
+    refute has_element?(view, "#{row_selector}-observatory")
     assert has_element?(view, "#{row_selector}-status", "active")
 
     assert has_element?(
@@ -130,7 +126,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveDashboardAccessTest do
              "#{row_selector}[class~='xl:grid-cols-[minmax(0,0.9fr)_minmax(0,0.85fr)_minmax(0,1fr)_auto]']"
            )
 
-    assert has_element?(view, "#{row_selector}-dashboard-access", "Dashboard disabled")
+    refute has_element?(view, "#{row_selector}-observatory")
     assert has_element?(view, "#{row_selector}-status", "active")
 
     assert has_element?(
@@ -158,7 +154,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveDashboardAccessTest do
              "#{row_selector} > [data-role='api-key-actions'] > [data-role='api-key-actions-menu'][class~='dropdown'][class~='dropdown-end'][class~='relative'][class~='inline-block'][class~='focus-within:z-50']"
            )
 
-    assert has_element?(view, "#{row_selector}-dashboard-access", "Dashboard disabled")
+    refute has_element?(view, "#{row_selector}-observatory")
     assert has_element?(view, "#{row_selector}-status", "active")
 
     assert has_element?(
@@ -207,8 +203,19 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveDashboardAccessTest do
 
     assert has_element?(
              view,
-             "#api-key-row-#{api_key.id}-dashboard-access",
-             "Dashboard enabled"
+             "#api-key-row-#{api_key.id}-observatory[href='/observatory/login']",
+             "Observatory"
+           )
+
+    # The Observatory affordance sits in the key column, not the actions cluster.
+    assert has_element?(
+             view,
+             "#api-key-row-#{api_key.id}-key #api-key-row-#{api_key.id}-observatory"
+           )
+
+    refute has_element?(
+             view,
+             "[data-role='api-key-actions'] #api-key-row-#{api_key.id}-observatory"
            )
 
     create_audit =
@@ -239,11 +246,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveDashboardAccessTest do
 
     refute Repo.get!(APIKey, api_key.id).dashboard_access
 
-    assert has_element?(
-             view,
-             "#api-key-row-#{api_key.id}-dashboard-access",
-             "Dashboard disabled"
-           )
+    refute has_element?(view, "#api-key-row-#{api_key.id}-observatory")
 
     assert Repo.aggregate(
              from(session in APIKeyDashboardSession,
@@ -295,7 +298,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeysLiveDashboardAccessTest do
     assert has_element?(
              view,
              "#api-key-review-errors",
-             "Dashboard access must be enabled or disabled"
+             "Observatory access must be enabled or disabled"
            )
 
     assert Repo.aggregate(APIKey, :count) == 0
