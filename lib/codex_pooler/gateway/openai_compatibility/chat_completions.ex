@@ -3,6 +3,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
 
   alias CodexPooler.Gateway.OpenAICompatibility.PublicResponse
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
+  alias CodexPooler.Gateway.Transports.Streaming.FunctionCallArguments
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
 
   @spec normalize_response(map(), map()) :: map()
@@ -33,7 +34,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
           required(:model) => String.t() | nil,
           required(:role_sent?) => boolean(),
           required(:include_usage?) => boolean(),
-          required(:discarding_oversized?) => boolean()
+          required(:discarding_oversized?) => boolean(),
+          required(:tool_calls) => %{
+            optional(non_neg_integer()) => %{
+              required(:introduced?) => boolean(),
+              required(:arguments) => binary()
+            }
+          }
         }
 
   @max_incomplete_chat_sse_block_bytes 1_048_576
@@ -122,15 +129,24 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
     text_delta_chunk(decoded_string(decoded, "delta") || "", state)
   end
 
-  defp normalize_stream_event(type, decoded, state)
-       when type in ["response.output_item.added", "response.output_item.done"] do
+  defp normalize_stream_event("response.output_item.added", decoded, state) do
     state = sync_response_state(state, decoded)
-    tool_call_item_chunk(decoded["item"], decoded, state)
+    tool_call_item_added_chunk(decoded["item"], decoded, state)
+  end
+
+  defp normalize_stream_event("response.output_item.done", decoded, state) do
+    state = sync_response_state(state, decoded)
+    tool_call_item_done_chunk(decoded["item"], decoded, state)
   end
 
   defp normalize_stream_event("response.function_call_arguments.delta", decoded, state) do
     state = sync_response_state(state, decoded)
     tool_call_arguments_chunk(decoded, state)
+  end
+
+  defp normalize_stream_event("response.function_call_arguments.done", decoded, state) do
+    state = sync_response_state(state, decoded)
+    tool_call_arguments_done_chunk(decoded, state)
   end
 
   defp normalize_stream_event(type, decoded, state) when is_binary(type) do
@@ -186,19 +202,81 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
   defp text_delta_chunk(delta, state),
     do: {chat_sse_chunk(%{"content" => delta}, nil, state), state}
 
-  defp tool_call_item_chunk(%{"type" => "function_call"} = item, context, state) do
+  defp tool_call_item_added_chunk(%{"type" => "function_call"} = item, context, state) do
+    index = tool_call_index(item, context)
+    arguments = decoded_string(item, "arguments") || ""
+
+    if tool_call_introduced?(state, index) do
+      reconcile_tool_call_arguments(arguments, index, state)
+    else
+      delta = %{
+        "tool_calls" => [
+          %{
+            "index" => index,
+            "id" => tool_call_id(item, context, index),
+            "type" => "function",
+            "function" => %{
+              "name" => decoded_string(item, "name") || "tool",
+              "arguments" => arguments
+            }
+          }
+        ]
+      }
+
+      state = put_tool_call(state, index, true, arguments)
+      {chat_sse_chunk(delta, nil, state), state}
+    end
+  end
+
+  defp tool_call_item_added_chunk(_item, _context, state), do: {[], state}
+
+  defp tool_call_item_done_chunk(%{"type" => "function_call"} = item, context, state) do
     index = tool_call_index(item, context)
 
+    if tool_call_introduced?(state, index) do
+      reconcile_tool_call_arguments(decoded_string(item, "arguments") || "", index, state)
+    else
+      tool_call_item_added_chunk(item, context, state)
+    end
+  end
+
+  defp tool_call_item_done_chunk(_item, _context, state), do: {[], state}
+
+  defp tool_call_arguments_chunk(decoded, state) do
+    index = Map.get(decoded, "output_index") || 0
+    incoming = decoded_string(decoded, "delta") || ""
+    previous = tool_call_arguments(state, index)
+    {delta_arguments, arguments} = FunctionCallArguments.normalize_delta(previous, incoming)
+    state = put_tool_call(state, index, tool_call_introduced?(state, index), arguments)
+
+    tool_call_arguments_delta_chunk(delta_arguments, index, state)
+  end
+
+  defp tool_call_arguments_done_chunk(decoded, state) do
+    index = Map.get(decoded, "output_index") || 0
+
+    reconcile_tool_call_arguments(
+      decoded_string(decoded, "arguments") || "",
+      index,
+      state
+    )
+  end
+
+  defp reconcile_tool_call_arguments(arguments, index, state) do
+    previous = tool_call_arguments(state, index)
+    {delta, reconciled} = FunctionCallArguments.reconcile_snapshot(previous, arguments)
+    state = put_tool_call(state, index, tool_call_introduced?(state, index), reconciled)
+    tool_call_arguments_delta_chunk(delta, index, state)
+  end
+
+  defp tool_call_arguments_delta_chunk("", _index, state), do: {[], state}
+
+  defp tool_call_arguments_delta_chunk(arguments, index, state) do
     delta = %{
       "tool_calls" => [
         %{
           "index" => index,
-          "id" => tool_call_id(item, context, index),
-          "type" => "function",
-          "function" => %{
-            "name" => decoded_string(item, "name") || "tool",
-            "arguments" => decoded_string(item, "arguments") || ""
-          }
+          "function" => %{"arguments" => arguments}
         }
       ]
     }
@@ -206,21 +284,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
     {chat_sse_chunk(delta, nil, state), state}
   end
 
-  defp tool_call_item_chunk(_item, _context, state), do: {[], state}
+  defp tool_call_introduced?(state, index) do
+    get_in(state, [:tool_calls, index, :introduced?]) == true
+  end
 
-  defp tool_call_arguments_chunk(decoded, state) do
-    index = Map.get(decoded, "output_index") || 0
+  defp tool_call_arguments(state, index) do
+    get_in(state, [:tool_calls, index, :arguments]) || ""
+  end
 
-    delta = %{
-      "tool_calls" => [
-        %{
-          "index" => index,
-          "function" => %{"arguments" => decoded_string(decoded, "delta") || ""}
-        }
-      ]
-    }
-
-    {chat_sse_chunk(delta, nil, state), state}
+  defp put_tool_call(state, index, introduced?, arguments) do
+    tool_call = %{introduced?: introduced?, arguments: arguments}
+    %{state | tool_calls: Map.put(state.tool_calls, index, tool_call)}
   end
 
   defp terminal_stream_chunk(type, decoded, %{role_sent?: false} = state)
@@ -286,7 +360,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.ChatCompletions do
       model: Map.get(chat_payload, "model"),
       role_sent?: false,
       include_usage?: get_in(chat_payload, ["stream_options", "include_usage"]) == true,
-      discarding_oversized?: false
+      discarding_oversized?: false,
+      tool_calls: %{}
     }
   end
 

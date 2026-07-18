@@ -123,6 +123,79 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
              }
     end
 
+    test "normalizes cumulative function argument snapshots into true deltas" do
+      state = StreamProtocol.public_openai_responses_stream_state()
+      first_arguments = ~s({"file_path":"references/native-mcp.md","name":"hermes-agent"})
+      second_arguments = ~s({"name":"second-tool"})
+
+      stream =
+        IO.iodata_to_binary([
+          sse_event("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 0,
+            "item" => %{
+              "id" => "fc_hermes",
+              "call_id" => "call_hermes",
+              "type" => "function_call",
+              "name" => "read_file",
+              "arguments" => ""
+            }
+          }),
+          sse_event("response.output_item.added", %{
+            "type" => "response.output_item.added",
+            "output_index" => 1,
+            "item" => %{
+              "id" => "fc_second",
+              "call_id" => "call_second",
+              "type" => "function_call",
+              "name" => "second_tool",
+              "arguments" => ""
+            }
+          }),
+          function_arguments_delta(0, ~s({"file)),
+          function_arguments_delta(1, ~s({"name")),
+          function_arguments_delta(0, first_arguments),
+          function_arguments_delta(1, ~s(:"second-tool"})),
+          function_arguments_delta(0, first_arguments),
+          sse_event("response.function_call_arguments.done", %{
+            "type" => "response.function_call_arguments.done",
+            "output_index" => 0,
+            "item_id" => "fc_hermes",
+            "arguments" => first_arguments
+          }),
+          sse_event("response.output_item.done", %{
+            "type" => "response.output_item.done",
+            "output_index" => 0,
+            "item" => %{
+              "id" => "fc_hermes",
+              "call_id" => "call_hermes",
+              "type" => "function_call",
+              "name" => "read_file",
+              "arguments" => first_arguments
+            }
+          })
+        ])
+
+      assert {chunk, _state} =
+               StreamProtocol.normalize_public_openai_responses_sse_data(stream, state)
+
+      deltas_by_index =
+        chunk
+        |> public_sse_events()
+        |> Enum.filter(&(&1["event"] == "response.function_call_arguments.delta"))
+        |> Enum.group_by(&get_in(&1, ["data", "output_index"]), &get_in(&1, ["data", "delta"]))
+
+      assert Enum.join(deltas_by_index[0]) == first_arguments
+      assert List.last(deltas_by_index[0]) == ""
+      assert Enum.join(deltas_by_index[1]) == second_arguments
+
+      assert %{"arguments" => ^first_arguments} =
+               chunk
+               |> public_sse_events()
+               |> Enum.find(&(&1["event"] == "response.function_call_arguments.done"))
+               |> get_in(["data"])
+    end
+
     test "passes keepalive events through without changing terminal state" do
       state = StreamProtocol.public_openai_responses_stream_state()
 
@@ -867,6 +940,15 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocolTest do
           "total_tokens" => 12
         }
       }
+    })
+  end
+
+  defp function_arguments_delta(output_index, delta) do
+    sse_event("response.function_call_arguments.delta", %{
+      "type" => "response.function_call_arguments.delta",
+      "output_index" => output_index,
+      "item_id" => "fc_#{output_index}",
+      "delta" => delta
     })
   end
 
