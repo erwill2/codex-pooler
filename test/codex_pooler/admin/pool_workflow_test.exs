@@ -270,6 +270,47 @@ defmodule CodexPooler.Admin.PoolWorkflowTest do
   end
 
   describe "pool routing settings workflow" do
+    test "creation persists per-pool upstream routing priorities" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "priority-owner@example.com"})
+      scope = Scope.for_user(owner, ["instance_owner"])
+
+      first = active_upstream_identity_fixture(%{chatgpt_account_id: "acct_priority_first"})
+      second = active_upstream_identity_fixture(%{chatgpt_account_id: "acct_priority_second"})
+
+      assert {:ok, pool} =
+               PoolWorkflow.create_pool_with_related_settings(scope, %{
+                 "name" => "Priority Workflow",
+                 "routing_strategy" => "quota_first",
+                 "upstream_identity_ids" => [first.id, second.id],
+                 "upstream_priorities" => %{first.id => "1", second.id => "20"},
+                 "api_key_ids" => []
+               })
+
+      priorities =
+        pool
+        |> Upstreams.list_pool_assignments()
+        |> Map.new(&{&1.upstream_identity_id, &1.routing_priority})
+
+      assert priorities == %{first.id => 1, second.id => 20}
+    end
+
+    test "invalid upstream routing priority rolls back the coordinated workflow" do
+      %{user: owner} = bootstrap_owner_fixture(%{"email" => "priority-invalid@example.com"})
+      scope = Scope.for_user(owner, ["instance_owner"])
+      identity = active_upstream_identity_fixture(%{chatgpt_account_id: "acct_priority_invalid"})
+
+      assert {:error, %Ecto.Changeset{} = changeset} =
+               PoolWorkflow.create_pool_with_related_settings(scope, %{
+                 "name" => "Invalid Priority Workflow",
+                 "upstream_identity_ids" => [identity.id],
+                 "upstream_priorities" => %{identity.id => "0"},
+                 "api_key_ids" => []
+               })
+
+      assert "must be greater than or equal to 1" in errors_on(changeset).routing_priority
+      refute Repo.get_by(Pool, slug: "invalid-priority-workflow")
+    end
+
     test "creation persists request compression routing setting when enabled" do
       %{user: owner} = bootstrap_owner_fixture(%{"email" => "owner@example.com"})
       scope = Scope.for_user(owner, ["instance_owner"])

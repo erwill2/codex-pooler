@@ -97,7 +97,8 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
     },
     "upstreams" => %{
       title: "Pool upstream assignments",
-      description: "Select the upstream accounts available to this Pool."
+      description:
+        "Select the upstream accounts available to this Pool. Lower priority numbers are tried first; equal priorities use the Pool's routing strategy."
     },
     "api-keys" => %{
       title: "API Keys",
@@ -344,6 +345,8 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
                 empty_label={@upstream_empty_label}
                 filter_placeholder="Filter accounts…"
                 count_id={@upstream_count_id}
+                form_name={@form.name}
+                priority_values={@form[:upstream_priorities].value}
               />
             </section>
           </div>
@@ -453,6 +456,8 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
   attr :empty_label, :string, required: true
   attr :filter_placeholder, :string, default: "Filter…"
   attr :count_id, :string, required: true
+  attr :form_name, :string, default: nil
+  attr :priority_values, :map, default: nil
 
   defp assignment_checkbox_cards(assigns) do
     assigns = assign(assigns, :options, sort_selected_first(assigns.options, assigns.field))
@@ -497,42 +502,65 @@ defmodule CodexPoolerWeb.Admin.PoolWizardComponents do
         class="grid max-h-[max(8.5rem,calc(100dvh-23rem))] content-start gap-2 overflow-y-auto sm:grid-cols-2"
         data-assignment-scroll="true"
       >
-        <label
+        <div
           :for={option <- @options}
           id={"#{@id}-card-#{PoolForm.dom_token(PoolForm.option_value(option))}"}
           class="flex min-h-10 min-w-0 cursor-pointer items-center gap-3 rounded-box border border-base-300 bg-base-100 px-3 py-1.5 transition-colors hover:border-primary/50 hover:bg-primary/5 has-[:checked]:border-primary/40 has-[:checked]:bg-primary/5"
         >
-          <input
-            type="checkbox"
-            class="checkbox checkbox-primary checkbox-sm shrink-0"
-            name={PoolForm.field_array_name(@field)}
-            value={PoolForm.option_value(option)}
-            checked={PoolForm.selected_value?(@field.value, PoolForm.option_value(option))}
-          />
-          <span class="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-2">
-            <span class="truncate text-sm font-medium text-base-content">
-              {PoolForm.option_label(option)}
-            </span>
-            <span class="flex shrink-0 flex-wrap items-center gap-2">
-              <AdminBadges.plan_badge
-                :if={PoolForm.option_badge_kind(option) == :plan}
-                id={"#{@id}-plan-badge-#{PoolForm.dom_token(PoolForm.option_value(option))}"}
-                data-role="plan-badge"
-                label={PoolForm.option_plan_label(option)}
-                family={PoolForm.option_plan_family(option)}
-              />
-              <span
-                :if={PoolForm.option_badge_kind(option) != :plan}
-                class={AdminBadges.count_chip_class()}
-              >
-                {PoolForm.option_plan_label(option)}
+          <label class="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
+            <input
+              type="checkbox"
+              class="checkbox checkbox-primary checkbox-sm shrink-0"
+              name={PoolForm.field_array_name(@field)}
+              value={PoolForm.option_value(option)}
+              checked={PoolForm.selected_value?(@field.value, PoolForm.option_value(option))}
+            />
+            <span class="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-2">
+              <span class="truncate text-sm font-medium text-base-content">
+                {PoolForm.option_label(option)}
               </span>
-              <span class={AdminBadges.lifecycle_chip_class(PoolForm.option_status(option))}>
-                {PoolForm.option_status(option)}
+
+              <span class="flex shrink-0 flex-wrap items-center gap-2">
+                <AdminBadges.plan_badge
+                  :if={PoolForm.option_badge_kind(option) == :plan}
+                  id={"#{@id}-plan-badge-#{PoolForm.dom_token(PoolForm.option_value(option))}"}
+                  data-role="plan-badge"
+                  label={PoolForm.option_plan_label(option)}
+                  family={PoolForm.option_plan_family(option)}
+                />
+                <span
+                  :if={PoolForm.option_badge_kind(option) != :plan}
+                  class={AdminBadges.count_chip_class()}
+                >
+                  {PoolForm.option_plan_label(option)}
+                </span>
+
+                <span class={AdminBadges.lifecycle_chip_class(PoolForm.option_status(option))}>
+                  {PoolForm.option_status(option)}
+                </span>
               </span>
             </span>
-          </span>
-        </label>
+          </label>
+
+          <label
+            :if={is_binary(@form_name) && is_map(@priority_values)}
+            class="grid w-20 shrink-0 gap-1 text-xs font-semibold text-base-content/60"
+          >
+            Priority
+            <input
+              id={"#{@id}-priority-#{PoolForm.dom_token(PoolForm.option_value(option))}"}
+              type="number"
+              class="input input-bordered input-sm w-full tabular-nums"
+              name={"#{@form_name}[upstream_priorities][#{PoolForm.option_value(option)}]"}
+              value={PoolForm.priority_value(@priority_values, PoolForm.option_value(option))}
+              min="1"
+              max={PoolForm.maximum_routing_priority()}
+              required
+              aria-label={"Routing priority for #{PoolForm.option_label(option)}; 1 is highest"}
+            />
+          </label>
+        </div>
+
         <p :if={@options == []} class="text-sm text-base-content/60">{@empty_label}</p>
       </div>
     </section>
