@@ -388,6 +388,70 @@ defmodule CodexPoolerWeb.Runtime.CompatibilityContractTest do
       assert v1_fixture.responses_builtin_tools == expected_responses_builtin_tools
     end
 
+    @tag :input_audio_backport
+    test "documents bounded five-format input audio compatibility" do
+      feature = CompatibilityMatrix.by_slug!(:responses_chat)
+      fixture = CompatibilityMatrix.fixture!(:responses_chat)
+
+      assert feature.routes == [
+               %{method: :post, path: "/backend-api/codex/responses"},
+               %{method: :post, path: "/v1/responses"},
+               %{method: :post, path: "/v1/chat/completions"}
+             ]
+
+      assert fixture.routes == ["/v1/responses", "/v1/chat/completions"]
+
+      assert fixture.public_format_to_mime == %{
+               "wav" => "audio/wav",
+               "mp3" => "audio/mpeg",
+               "m4a" => "audio/mp4",
+               "webm" => "audio/webm",
+               "ogg" => "audio/ogg"
+             }
+
+      assert fixture.decoded_max_bytes == 52_428_800
+      assert fixture.encoded_non_whitespace_max_bytes == 69_905_068
+
+      assert fixture.backend_audio_shape == %{
+               type: "input_audio",
+               field: "audio_url",
+               value: "data:<canonical-mime>;base64,<canonical-data>"
+             }
+
+      assert fixture.accepted_ascii_whitespace == %{
+               byte_values: [9, 10, 13, 32],
+               ignored_during_decode: true,
+               ignored_for_encoded_limit: true,
+               canonical_reencoding: "no_ascii_whitespace"
+             }
+
+      assert fixture.failure_behavior == %{
+               rejected_inputs: [
+                 "malformed_base64",
+                 "empty_data",
+                 "unsupported_format",
+                 "oversized_decoded_data"
+               ],
+               response: %{status: 400, code: "invalid_request", param: "input"},
+               upstream_dispatch: false,
+               accounting_rows: false
+             }
+
+      assert fixture.ingress_envelope_precedence == %{
+               evaluation_order: ["configured_request_envelope", "audio_adapter"],
+               may_reject_before_adapter: true,
+               exact_decoded_limit_scope: "adapter_boundary"
+             }
+
+      assert fixture.privacy == %{
+               mode: "metadata_only",
+               raw_audio_persisted: false,
+               raw_base64_logged: false,
+               raw_data_url_exposed: false,
+               safe_summary_fields: ["type", "canonical_mime", "decoded_bytes", "sha256"]
+             }
+    end
+
     test "documents compaction trigger bridge and context-overflow recovery boundary" do
       responses_chat = CompatibilityMatrix.by_slug!(:responses_chat)
       fixture = CompatibilityMatrix.fixture!(:responses_chat)

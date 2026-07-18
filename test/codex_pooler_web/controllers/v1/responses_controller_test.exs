@@ -5808,6 +5808,127 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
+  @tag :input_audio_responses_baseline
+  test "POST /v1/responses dispatches WAV input audio with metadata-only accounting", %{
+    conn: conn
+  } do
+    audio_source = "wav response baseline"
+    audio_data = Base.encode64(audio_source)
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_v1_audio_baseline"}))
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "role" => "user",
+            "content" => [input_audio_part("wav", audio_data)]
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_v1_audio_baseline"} = json_response(response, 200)
+    assert FakeUpstream.count(upstream) == 1
+
+    assert_captured_audio_summary!(
+      upstream,
+      expected_audio_summary("audio/wav", audio_source)
+    )
+
+    assert_audio_accounting_metadata_only!(setup.pool, [audio_source, audio_data])
+  end
+
+  @tag :input_audio_backport
+  test "POST /v1/responses translates M4A input audio with a safe upstream summary", %{
+    conn: conn
+  } do
+    audio_source = "m4a response fixture"
+    canonical_data = Base.encode64(audio_source)
+    audio_data = base64_with_ascii_whitespace(canonical_data)
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_v1_audio_m4a"}))
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "role" => "user",
+            "content" => [input_audio_part("m4a", audio_data)]
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_v1_audio_m4a"} = json_response(response, 200)
+    assert FakeUpstream.count(upstream) == 1
+
+    assert_captured_audio_summary!(
+      upstream,
+      expected_audio_summary("audio/mp4", audio_source)
+    )
+
+    assert_audio_accounting_metadata_only!(setup.pool, [audio_source, audio_data, canonical_data])
+  end
+
+  @tag :input_audio_backport
+  test "POST /v1/responses rejects malformed input audio before side effects", %{conn: conn} do
+    audio_data = "not base64"
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "role" => "user",
+            "content" => [input_audio_part("m4a", audio_data)]
+          }
+        ]
+      })
+
+    assert_sanitized_audio_error_response!(response, "input_audio data must be base64", [
+      audio_data
+    ])
+
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  @tag :input_audio_backport
+  test "POST /v1/responses rejects FLAC input audio before side effects", %{conn: conn} do
+    audio_source = "flac response fixture"
+    audio_data = Base.encode64(audio_source)
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "role" => "user",
+            "content" => [input_audio_part("flac", audio_data)]
+          }
+        ]
+      })
+
+    assert_sanitized_audio_error_response!(response, nil, [audio_source, audio_data, "flac"])
+    assert FakeUpstream.count(upstream) == 0
+    assert Repo.aggregate(Request, :count) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
   test "POST /v1/responses forwards supported SDK-shaped image and file parts safely", %{
     conn: conn
   } do
@@ -6335,6 +6456,135 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     Enum.each(sentinels, fn sentinel ->
       if text =~ sentinel, do: flunk("projection leaked structured tool-result sentinel")
     end)
+  end
+
+  defp input_audio_part(format, data) do
+    %{
+      "type" => "input_audio",
+      "input_audio" => %{"data" => data, "format" => format}
+    }
+  end
+
+  defp expected_audio_summary(mime, source) do
+    %{
+      type: "input_audio",
+      mime: mime,
+      canonical_whitespace_free?: true,
+      decoded_bytes: byte_size(source),
+      sha256: :crypto.hash(:sha256, source) |> Base.encode16(case: :lower)
+    }
+  end
+
+  defp assert_captured_audio_summary!(upstream, expected) do
+    case FakeUpstream.requests(upstream) do
+      [captured] ->
+        case captured_audio_summary(captured) do
+          {:ok, ^expected} ->
+            :ok
+
+          {:ok, _summary} ->
+            flunk("captured audio summary did not match expected metadata")
+
+          {:error, :unexpected_audio_shape} ->
+            flunk("captured request lacked safe audio metadata")
+        end
+
+      _requests ->
+        flunk("expected one captured request with safe audio metadata")
+    end
+  end
+
+  defp captured_audio_summary(%{json: %{"input" => [%{"content" => [part]}]}}) do
+    safe_audio_part_summary(part)
+  end
+
+  defp captured_audio_summary(_captured), do: {:error, :unexpected_audio_shape}
+
+  defp safe_audio_part_summary(part) when is_map(part) and map_size(part) == 2 do
+    with %{"type" => type, "audio_url" => audio_url} when is_binary(audio_url) <- part,
+         ["data:" <> metadata, encoded] <- String.split(audio_url, ",", parts: 2),
+         [mime, "base64"] <- String.split(metadata, ";", parts: 2),
+         {:ok, decoded} <- Base.decode64(encoded, ignore: :whitespace) do
+      {:ok,
+       %{
+         type: type,
+         mime: mime,
+         canonical_whitespace_free?: encoded == Base.encode64(decoded),
+         decoded_bytes: byte_size(decoded),
+         sha256: :crypto.hash(:sha256, decoded) |> Base.encode16(case: :lower)
+       }}
+    else
+      _value -> {:error, :unexpected_audio_shape}
+    end
+  end
+
+  defp safe_audio_part_summary(_part), do: {:error, :unexpected_audio_shape}
+
+  defp base64_with_ascii_whitespace(encoded) do
+    encoded
+    |> String.graphemes()
+    |> Enum.chunk_every(4)
+    |> Enum.map_join(" \n", &Enum.join/1)
+  end
+
+  defp assert_sanitized_audio_error_response!(response, expected_message, forbidden_values) do
+    unless response.status == 400 do
+      flunk("expected sanitized audio validation status")
+    end
+
+    case Jason.decode(response.resp_body) do
+      {:ok, %{"error" => error}} when is_map(error) ->
+        expected = %{
+          "type" => "invalid_request_error",
+          "code" => "invalid_request",
+          "param" => "input"
+        }
+
+        expected =
+          if is_binary(expected_message),
+            do: Map.put(expected, "message", expected_message),
+            else: expected
+
+        unless Map.take(error, Map.keys(expected)) == expected do
+          flunk("expected sanitized audio validation error")
+        end
+
+      _other ->
+        flunk("expected OpenAI-shaped sanitized audio validation error")
+    end
+
+    if Enum.any?(forbidden_values, &String.contains?(response.resp_body, &1)) do
+      flunk("audio validation response echoed input data")
+    end
+  end
+
+  defp assert_audio_accounting_metadata_only!(pool, protected_values) do
+    requests = Repo.all(from(r in Request, where: r.pool_id == ^pool.id))
+
+    if length(requests) != 1 do
+      flunk("expected one accounted request")
+    end
+
+    request = hd(requests)
+    attempts = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+    if length(attempts) != 1 do
+      flunk("expected one accounted attempt")
+    end
+
+    attempt = hd(attempts)
+
+    unless request.status == "succeeded" and attempt.status == "succeeded" do
+      flunk("expected successful metadata-only accounting")
+    end
+
+    persistence_text = inspect({request.request_metadata, attempt.response_metadata})
+
+    if String.contains?(persistence_text, "data:") or
+         String.contains?(persistence_text, "audio_url") or
+         Enum.any?(protected_values, &String.contains?(persistence_text, &1)) do
+      flunk("audio accounting contained raw payload data")
+    end
   end
 
   defp public_sse_events(body) do

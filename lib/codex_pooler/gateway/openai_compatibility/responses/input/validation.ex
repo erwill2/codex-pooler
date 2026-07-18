@@ -2,9 +2,9 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
   @moduledoc false
 
   alias CodexPooler.Gateway.OpenAICompatibility.Error
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Audio
   alias CodexPooler.Gateway.Payloads.ToolResultShape
 
-  @input_audio_formats ~w(mp3 wav)
   @metadata_passthrough_key "internal_chat_message_metadata_passthrough"
 
   def validate_input(%{"input" => input}) when is_binary(input), do: :ok
@@ -597,12 +597,25 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
        when is_binary(filename) and filename != "" and is_binary(file_data),
        do: :ok
 
-  defp validate_unmarked_message_content_part(%{
-         "type" => "input_audio",
-         "input_audio" => %{"data" => data, "format" => format}
-       })
-       when is_binary(data) and format in @input_audio_formats,
-       do: validate_base64_audio(data)
+  defp validate_unmarked_message_content_part(
+         %{
+           "type" => "input_audio",
+           "input_audio" => %{"data" => data, "format" => format} = input_audio
+         } = part
+       )
+       when is_binary(data) and is_binary(format) do
+    with :ok <- validate_content_part_keys(part, ["type", "input_audio"]),
+         :ok <- validate_content_part_keys(input_audio, ["data", "format"]),
+         true <- Audio.supported_format?(format) do
+      :ok
+    else
+      false ->
+        {:error, Error.invalid_request("message content part is not translatable", "input")}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   defp validate_unmarked_message_content_part(_part),
     do: {:error, Error.invalid_request("message content part is not translatable", "input")}
@@ -709,16 +722,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
        )}
 
   defp validate_prompt_cache_breakpoint(_part), do: :ok
-
-  defp validate_base64_audio(data) do
-    case Base.decode64(data, ignore: :whitespace) do
-      {:ok, bytes} when byte_size(bytes) > 0 ->
-        :ok
-
-      _value ->
-        {:error, Error.invalid_request("input_audio data must be base64", "input")}
-    end
-  end
 
   defp validate_each(items, validator) when is_list(items) and is_function(validator, 1) do
     Enum.reduce_while(items, :ok, fn item, :ok ->

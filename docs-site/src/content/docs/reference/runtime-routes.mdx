@@ -310,7 +310,7 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td><code>/backend-api/codex/responses</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>OpenAI Responses payloads are coerced to Codex-compatible work. System/developer input-message text is lifted into top-level instructions. Encrypted <code>type: "compaction"</code> replay items from prior remote compaction turns are forwarded. Remote MCP tool definitions are rejected before dispatch. Streaming responses use the public Responses stream adapter, and early terminal errors emit first without synthetic success prefixes. For public HTTP SSE only, if upstream has already emitted public Responses-visible data and ends before a terminal Responses event, Codex Pooler emits a sanitized <code>response.failed</code> terminal with <code>upstream_stream_error</code>; backend raw streams and websocket surfaces are not rewritten.</td>
+      <td>OpenAI Responses payloads are coerced to Codex-compatible work. Input audio uses the public <code>&#123;data, format&#125;</code> shape and accepts <code>WAV</code>, <code>MP3</code>, <code>M4A</code>, <code>WebM</code>, and <code>OGG</code>. The decoded audio ceiling is 50 MiB (52,428,800 bytes), while the configured request envelope may reject a request earlier. Malformed, unsupported, or oversized audio returns a sanitized <code>invalid_request</code> before upstream dispatch. System/developer input-message text is lifted into top-level instructions. Encrypted <code>type: "compaction"</code> replay items from prior remote compaction turns are forwarded. Remote MCP tool definitions are rejected before dispatch. Streaming responses use the public Responses stream adapter, and early terminal errors emit first without synthetic success prefixes. For public HTTP SSE only, if upstream has already emitted public Responses-visible data and ends before a terminal Responses event, Codex Pooler emits a sanitized <code>response.failed</code> terminal with <code>upstream_stream_error</code>; backend raw streams and websocket surfaces are not rewritten.</td>
     </tr>
     <tr>
       <td><code>GET /v1/responses</code></td>
@@ -324,7 +324,7 @@ Supported work is translated into Codex-compatible requests and then routed thro
       <td><code>/backend-api/codex/responses</code></td>
       <td>Yes</td>
       <td>Translated</td>
-      <td>Chat Completions payloads are coerced to Codex Responses work and normalized back to Chat Completions shape. Early streaming terminal errors emit one public error chunk before any assistant role chunk.</td>
+      <td>Chat Completions payloads are coerced to Codex Responses work and normalized back to Chat Completions shape. Input audio uses the public <code>&#123;data, format&#125;</code> shape and accepts <code>WAV</code>, <code>MP3</code>, <code>M4A</code>, <code>WebM</code>, and <code>OGG</code>. The decoded audio ceiling is 50 MiB (52,428,800 bytes), while the configured request envelope may reject a request earlier. Malformed, unsupported, or oversized audio returns a sanitized <code>invalid_request</code> before upstream dispatch. Early streaming terminal errors emit one public error chunk before any assistant role chunk.</td>
     </tr>
     <tr>
       <td><code>GET /v1/usage</code></td>

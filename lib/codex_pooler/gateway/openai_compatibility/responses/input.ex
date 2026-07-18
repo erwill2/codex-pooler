@@ -1,7 +1,11 @@
 defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input do
   @moduledoc false
 
+  alias CodexPooler.Gateway.OpenAICompatibility.Error
   alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.{Normalization, Validation}
+
+  @spec normalize_audio_input(map()) :: {:ok, map()} | {:error, Error.reason()}
+  defdelegate normalize_audio_input(payload), to: Normalization
 
   @spec normalize_input(map()) :: {:ok, map()} | {:error, term()}
   defdelegate normalize_input(payload), to: Normalization

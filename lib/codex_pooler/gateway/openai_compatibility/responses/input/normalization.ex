@@ -2,10 +2,13 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
   @moduledoc false
 
   alias CodexPooler.Gateway.OpenAICompatibility.Error
+  alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Audio
   alias CodexPooler.Gateway.OpenAICompatibility.Responses.Input.InstructionLifter
   alias CodexPooler.Gateway.Payloads.ToolResultShape
 
   @metadata_passthrough_key "internal_chat_message_metadata_passthrough"
+
+  @typep audio_normalization_result :: {:ok, map()} | {:error, Error.reason()}
 
   def normalize_input(%{"input" => input} = payload) when is_binary(input) do
     {:ok, Map.put(payload, "input", [input_text_message(input)])}
@@ -22,6 +25,15 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
   end
 
   def normalize_input(payload), do: {:ok, payload}
+
+  @spec normalize_audio_input(map()) :: audio_normalization_result()
+  def normalize_audio_input(%{"input" => input} = payload) when is_list(input) do
+    with {:ok, input} <- normalize_audio_input_items(input) do
+      {:ok, Map.put(payload, "input", input)}
+    end
+  end
+
+  def normalize_audio_input(payload), do: {:ok, payload}
 
   def normalize_list_input(%{"input" => input} = payload) when is_list(input) do
     with {:ok, input} <- normalize_input_items(input) do
@@ -127,6 +139,51 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
     end)
     |> case do
       {:ok, input} -> {:ok, Enum.reverse(input)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec normalize_audio_input_items([map()]) ::
+          {:ok, [map()]} | {:error, Error.reason()}
+  defp normalize_audio_input_items(input) do
+    input
+    |> Enum.reduce_while({:ok, []}, fn item, {:ok, acc} ->
+      case normalize_audio_input_item(item) do
+        {:ok, item} -> {:cont, {:ok, [item | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, input} -> {:ok, Enum.reverse(input)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec normalize_audio_input_item(map()) :: {:ok, map()} | {:error, Error.reason()}
+  defp normalize_audio_input_item(%{"content" => content} = item) when is_list(content) do
+    with {:ok, content} <- normalize_audio_content_parts(content) do
+      {:ok, Map.put(item, "content", content)}
+    end
+  end
+
+  defp normalize_audio_input_item(item), do: {:ok, item}
+
+  @spec normalize_audio_content_parts([map()]) ::
+          {:ok, [map()]} | {:error, Error.reason()}
+  defp normalize_audio_content_parts(content) do
+    content
+    |> Enum.reduce_while({:ok, []}, fn
+      %{"type" => "input_audio"} = part, {:ok, acc} ->
+        case Audio.normalize_part(part) do
+          {:ok, part} -> {:cont, {:ok, [part | acc]}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+
+      part, {:ok, acc} ->
+        {:cont, {:ok, [part | acc]}}
+    end)
+    |> case do
+      {:ok, content} -> {:ok, Enum.reverse(content)}
       {:error, reason} -> {:error, reason}
     end
   end

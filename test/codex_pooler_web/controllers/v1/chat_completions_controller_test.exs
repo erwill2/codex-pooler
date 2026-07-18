@@ -1354,6 +1354,54 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
     assert Repo.aggregate(Attempt, :count) == 0
   end
 
+  @tag :input_audio_chat_baseline
+  test "POST /v1/chat/completions dispatches WAV multimodal input with metadata-only accounting",
+       %{
+         conn: conn
+       } do
+    audio_source = "chat wav baseline"
+    audio_data = Base.encode64(audio_source)
+
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_chat_audio_baseline"}))
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/chat/completions", %{
+        "model" => setup.model.exposed_model_id,
+        "messages" => [
+          %{
+            "role" => "user",
+            "content" => [
+              %{"type" => "text", "text" => "chat baseline text"},
+              %{
+                "type" => "image_url",
+                "image_url" => %{"url" => "https://example.com/chat-baseline.png"}
+              },
+              input_audio_part("wav", audio_data)
+            ]
+          }
+        ]
+      })
+
+    assert_successful_chat_response!(response, "resp_chat_audio_baseline")
+
+    assert_captured_multimodal_summary!(
+      upstream,
+      "https://example.com/chat-baseline.png",
+      expected_multimodal_summary("audio/wav", audio_source)
+    )
+
+    assert_audio_accounting_metadata_only!(setup.pool, [
+      audio_source,
+      audio_data,
+      "chat baseline text",
+      "https://example.com/chat-baseline.png"
+    ])
+  end
+
+  @tag :input_audio_backport
   test "POST /v1/chat/completions translates SDK image and audio content parts", %{conn: conn} do
     audio_bytes = "synthetic wav bytes"
     audio_data = Base.encode64(audio_bytes)
@@ -1394,20 +1442,82 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
 
     conn = conn |> auth(setup) |> post("/v1/chat/completions", payload)
 
-    assert %{"id" => "resp_chat_multimodal"} = json_response(conn, 200)
+    assert_successful_chat_response!(conn, "resp_chat_multimodal")
 
-    assert [captured] = FakeUpstream.requests(upstream)
-    assert [%{"content" => content}] = captured.json["input"]
-    assert Enum.map(content, & &1["type"]) == ["input_text", "input_image", "input_audio"]
-    assert Enum.at(content, 1)["image_url"] == "https://example.com/sample.png"
-    assert get_in(Enum.at(content, 2), ["input_audio", "format"]) == "wav"
+    assert_captured_multimodal_summary!(
+      upstream,
+      "https://example.com/sample.png",
+      expected_multimodal_summary("audio/wav", audio_bytes)
+    )
 
-    [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
-    metadata = inspect(request.request_metadata)
-    refute metadata =~ "synthetic multimodal chat"
-    refute metadata =~ audio_bytes
-    refute metadata =~ audio_data
-    refute metadata =~ "https://example.com/sample.png"
+    assert_audio_accounting_metadata_only!(setup.pool, [
+      audio_bytes,
+      audio_data,
+      "synthetic multimodal chat",
+      "https://example.com/sample.png"
+    ])
+  end
+
+  @tag :input_audio_backport
+  test "POST /v1/chat/completions translates OGG input audio with a safe upstream summary", %{
+    conn: conn
+  } do
+    audio_source = "synthetic ogg fixture"
+    canonical_data = Base.encode64(audio_source)
+    audio_data = base64_with_ascii_whitespace(canonical_data)
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_chat_audio_ogg"}))
+    setup = gateway_setup(upstream)
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/chat/completions", %{
+        "model" => setup.model.exposed_model_id,
+        "messages" => [
+          %{
+            "role" => "user",
+            "content" => [input_audio_part("ogg", audio_data)]
+          }
+        ]
+      })
+
+    assert_successful_chat_response!(response, "resp_chat_audio_ogg")
+    assert_captured_audio_summary!(upstream, expected_audio_summary("audio/ogg", audio_source))
+
+    assert_audio_accounting_metadata_only!(setup.pool, [audio_source, audio_data, canonical_data])
+  end
+
+  @tag :input_audio_backport
+  test "POST /v1/chat/completions rejects malformed and unsupported input audio before side effects",
+       %{
+         conn: conn
+       } do
+    malformed_data = "not base64"
+    flac_source = "synthetic flac fixture"
+    flac_data = Base.encode64(flac_source)
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "must_not_dispatch"}))
+    setup = gateway_setup(upstream)
+
+    invalid_cases = [
+      {input_audio_part("ogg", malformed_data), "input_audio data must be base64",
+       [malformed_data]},
+      {input_audio_part("flac", flac_data), nil, [flac_source, flac_data, "flac"]}
+    ]
+
+    Enum.each(invalid_cases, fn {audio_part, expected_message, forbidden_values} ->
+      response =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/v1/chat/completions", %{
+          "model" => setup.model.exposed_model_id,
+          "messages" => [%{"role" => "user", "content" => [audio_part]}]
+        })
+
+      assert_sanitized_audio_error_response!(response, expected_message, forbidden_values)
+    end)
+
+    assert_no_audio_side_effects!(upstream)
   end
 
   test "POST /v1/chat/completions rejects unsupported multimodal content before dispatch", %{
@@ -1589,6 +1699,252 @@ defmodule CodexPoolerWeb.V1.ChatCompletionsControllerTest do
         %{"role" => "user", "content" => "Synthetic user"}
       ]
     }
+  end
+
+  defp input_audio_part(format, data) do
+    %{
+      "type" => "input_audio",
+      "input_audio" => %{"data" => data, "format" => format}
+    }
+  end
+
+  defp expected_audio_summary(mime, source) do
+    %{
+      type: "input_audio",
+      mime: mime,
+      canonical_whitespace_free?: true,
+      decoded_bytes: byte_size(source),
+      sha256: :crypto.hash(:sha256, source) |> Base.encode16(case: :lower)
+    }
+  end
+
+  defp expected_multimodal_summary(mime, source) do
+    %{
+      content_types: ["input_text", "input_image", "input_audio"],
+      image_url_preserved?: true,
+      audio: expected_audio_summary(mime, source)
+    }
+  end
+
+  defp assert_successful_chat_response!(response, expected_id) do
+    unless response.status == 200 do
+      flunk("expected successful Chat response status")
+    end
+
+    case Jason.decode(response.resp_body) do
+      {:ok, %{"id" => ^expected_id}} ->
+        :ok
+
+      {:ok, _response_body} ->
+        flunk("expected successful Chat response id")
+
+      _other ->
+        flunk("expected JSON Chat response")
+    end
+  end
+
+  defp assert_captured_multimodal_summary!(upstream, expected_image_url, expected) do
+    case FakeUpstream.requests(upstream) do
+      [captured] ->
+        case captured_multimodal_summary(captured, expected_image_url) do
+          {:ok, ^expected} ->
+            :ok
+
+          {:ok, _summary} ->
+            flunk("captured multimodal summary did not match expected metadata")
+
+          {:error, :unexpected_multimodal_shape} ->
+            flunk("captured request lacked safe multimodal metadata")
+        end
+
+      _requests ->
+        flunk("expected one captured request with safe multimodal metadata")
+    end
+  end
+
+  defp captured_multimodal_summary(
+         %{json: %{"input" => [%{"content" => content}]}},
+         expected_image_url
+       )
+       when is_list(content) do
+    with {:ok, content_types} <- safe_content_types(content),
+         {:ok, audio_summary} <- safe_audio_summary_from_content(content) do
+      {:ok,
+       %{
+         content_types: content_types,
+         image_url_preserved?: image_url_preserved?(content, expected_image_url),
+         audio: audio_summary
+       }}
+    else
+      _value -> {:error, :unexpected_multimodal_shape}
+    end
+  end
+
+  defp captured_multimodal_summary(_captured, _expected_image_url),
+    do: {:error, :unexpected_multimodal_shape}
+
+  defp safe_content_types(content) do
+    content
+    |> Enum.reduce_while([], fn
+      %{"type" => type}, types when is_binary(type) ->
+        {:cont, [type | types]}
+
+      _part, _types ->
+        {:halt, :error}
+    end)
+    |> case do
+      :error -> {:error, :unexpected_multimodal_shape}
+      types -> {:ok, Enum.reverse(types)}
+    end
+  end
+
+  defp safe_audio_summary_from_content(content) do
+    content
+    |> Enum.find(fn
+      %{"type" => "input_audio"} -> true
+      _part -> false
+    end)
+    |> safe_audio_part_summary()
+  end
+
+  defp image_url_preserved?(content, expected_image_url) do
+    case Enum.at(content, 1) do
+      %{"type" => "input_image", "image_url" => ^expected_image_url} -> true
+      _part -> false
+    end
+  end
+
+  defp assert_captured_audio_summary!(upstream, expected) do
+    case FakeUpstream.requests(upstream) do
+      [captured] ->
+        case captured_audio_summary(captured) do
+          {:ok, ^expected} ->
+            :ok
+
+          {:ok, _summary} ->
+            flunk("captured audio summary did not match expected metadata")
+
+          {:error, :unexpected_audio_shape} ->
+            flunk("captured request lacked safe audio metadata")
+        end
+
+      _requests ->
+        flunk("expected one captured request with safe audio metadata")
+    end
+  end
+
+  defp captured_audio_summary(%{json: %{"input" => [%{"content" => content}]}})
+       when is_list(content) do
+    case Enum.find(content, &match?(%{"type" => "input_audio"}, &1)) do
+      nil ->
+        {:error, :unexpected_audio_shape}
+
+      part ->
+        safe_audio_part_summary(part)
+    end
+  end
+
+  defp captured_audio_summary(_captured), do: {:error, :unexpected_audio_shape}
+
+  defp safe_audio_part_summary(part) when is_map(part) and map_size(part) == 2 do
+    with %{"type" => type, "audio_url" => audio_url} when is_binary(audio_url) <- part,
+         ["data:" <> metadata, encoded] <- String.split(audio_url, ",", parts: 2),
+         [mime, "base64"] <- String.split(metadata, ";", parts: 2),
+         {:ok, decoded} <- Base.decode64(encoded, ignore: :whitespace) do
+      {:ok,
+       %{
+         type: type,
+         mime: mime,
+         canonical_whitespace_free?: encoded == Base.encode64(decoded),
+         decoded_bytes: byte_size(decoded),
+         sha256: :crypto.hash(:sha256, decoded) |> Base.encode16(case: :lower)
+       }}
+    else
+      _value -> {:error, :unexpected_audio_shape}
+    end
+  end
+
+  defp safe_audio_part_summary(_part), do: {:error, :unexpected_audio_shape}
+
+  defp base64_with_ascii_whitespace(encoded) do
+    encoded
+    |> String.graphemes()
+    |> Enum.chunk_every(4)
+    |> Enum.map_join(" \n", &Enum.join/1)
+  end
+
+  defp assert_sanitized_audio_error_response!(response, expected_message, forbidden_values) do
+    unless response.status == 400 do
+      flunk("expected sanitized audio validation status")
+    end
+
+    case Jason.decode(response.resp_body) do
+      {:ok, %{"error" => error}} when is_map(error) ->
+        expected = %{
+          "type" => "invalid_request_error",
+          "code" => "invalid_request",
+          "param" => "input"
+        }
+
+        expected =
+          if is_binary(expected_message),
+            do: Map.put(expected, "message", expected_message),
+            else: expected
+
+        unless Map.take(error, Map.keys(expected)) == expected do
+          flunk("expected sanitized audio validation error")
+        end
+
+      _other ->
+        flunk("expected OpenAI-shaped sanitized audio validation error")
+    end
+
+    if Enum.any?(forbidden_values, &String.contains?(response.resp_body, &1)) do
+      flunk("audio validation response echoed input data")
+    end
+  end
+
+  defp assert_no_audio_side_effects!(upstream) do
+    unless FakeUpstream.count(upstream) == 0 do
+      flunk("audio validation unexpectedly dispatched upstream")
+    end
+
+    unless Repo.aggregate(Request, :count) == 0 do
+      flunk("audio validation unexpectedly created a Request row")
+    end
+
+    unless Repo.aggregate(Attempt, :count) == 0 do
+      flunk("audio validation unexpectedly created an Attempt row")
+    end
+  end
+
+  defp assert_audio_accounting_metadata_only!(pool, protected_values) do
+    requests = Repo.all(from(r in Request, where: r.pool_id == ^pool.id))
+
+    if length(requests) != 1 do
+      flunk("expected one accounted request")
+    end
+
+    request = hd(requests)
+    attempts = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+    if length(attempts) != 1 do
+      flunk("expected one accounted attempt")
+    end
+
+    attempt = hd(attempts)
+
+    unless request.status == "succeeded" and attempt.status == "succeeded" do
+      flunk("expected successful metadata-only accounting")
+    end
+
+    persistence_text = inspect({request.request_metadata, attempt.response_metadata})
+
+    if String.contains?(persistence_text, "data:") or
+         String.contains?(persistence_text, "audio_url") or
+         Enum.any?(protected_values, &String.contains?(persistence_text, &1)) do
+      flunk("audio accounting contained raw payload data")
+    end
   end
 
   defp set_reasoning_policy!(setup, attrs) do

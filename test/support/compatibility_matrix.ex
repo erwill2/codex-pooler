@@ -135,11 +135,15 @@ defmodule CodexPooler.CompatibilityMatrix do
       status: :supported,
       current: :proxied_json_and_sse,
       categories: [:route, :auth, :error, :streaming, :ownership],
-      routes: [%{method: :post, path: "/backend-api/codex/responses"}],
+      routes: [
+        %{method: :post, path: "/backend-api/codex/responses"},
+        %{method: :post, path: "/v1/responses"},
+        %{method: :post, path: "/v1/chat/completions"}
+      ],
       future_routes: [],
       fixture: :responses_chat,
       contract:
-        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path; chat completions use messages when present and fall back to top-level input only when messages is absent or empty, with omitted fallback instructions defaulting to a blank string; /v1/responses and translated /v1/chat/completions validate and preserve prompt_cache_options plus explicit supported content-part prompt_cache_breakpoint controls, while Pool affinity remains exclusively keyed by prompt_cache_key; request-shaped additional_tools input items are preserved as non-executable input, never merged into executable tools, and never used to satisfy tool_choice; OpenAI Responses remote MCP tool definitions are rejected before dispatch in both top-level tools and nested additional_tools.tools locations; Responses namespace tool definitions are accepted only for non-empty namespace name/description values and nested function tools; Responses truncation accepts auto and disabled locally but is not forwarded upstream; terminal compaction_trigger backend payloads bridge through /backend-api/codex/responses/compact with compact accounting and backend Responses SSE compaction output, while malformed trigger placement is rejected before dispatch; public /v1 Responses accepts encrypted compaction output replay items from prior remote compaction turns; backend regular HTTP Responses and compact routes forward approved metadata headers, including request-scoped x-codex-turn-state, x-codex-window-id, and x-codex-installation-id, and relay upstream x-codex-turn-state response headers downstream, while public /v1 and websocket request-header lanes do not; context-overflow recovery stays client/upstream-owned with no server-side hidden replay, no server-side memory tool injection, no client store=false-to-true override policy, and no stored prompt/frame reconstruction; Hermes assistant replay may include safe assistant status metadata; OpenClaw assistant replay drops thinking metadata and normalizes text before upstream dispatch; safe OpenAI Responses fields, prompt-cache locality, SDK-control rejection, and backend-only control stripping stay scope-specific"
+        "Responses and chat completions proxy JSON/SSE through the shared gateway accounting path; chat completions use messages when present and fall back to top-level input only when messages is absent or empty, with omitted fallback instructions defaulting to a blank string; /v1/responses and translated /v1/chat/completions validate and preserve prompt_cache_options plus explicit supported content-part prompt_cache_breakpoint controls, while Pool affinity remains exclusively keyed by prompt_cache_key; request-shaped additional_tools input items are preserved as non-executable input, never merged into executable tools, and never used to satisfy tool_choice; OpenAI Responses remote MCP tool definitions are rejected before dispatch in both top-level tools and nested additional_tools.tools locations; Responses namespace tool definitions are accepted only for non-empty namespace name/description values and nested function tools; Responses truncation accepts auto and disabled locally but is not forwarded upstream; terminal compaction_trigger backend payloads bridge through /backend-api/codex/responses/compact with compact accounting and backend Responses SSE compaction output, while malformed trigger placement is rejected before dispatch; public /v1 Responses accepts encrypted compaction output replay items from prior remote compaction turns; backend regular HTTP Responses and compact routes forward approved metadata headers, including request-scoped x-codex-turn-state, x-codex-window-id, and x-codex-installation-id, and relay upstream x-codex-turn-state response headers downstream, while public /v1 and websocket request-header lanes do not; context-overflow recovery stays client/upstream-owned with no server-side hidden replay, no server-side memory tool injection, no client store=false-to-true override policy, and no stored prompt/frame reconstruction; Hermes assistant replay may include safe assistant status metadata; OpenClaw assistant replay drops thinking metadata and normalizes text before upstream dispatch; public /v1/responses and /v1/chat/completions accept exactly five lowercase input_audio labels (wav=>audio/wav, mp3=>audio/mpeg, m4a=>audio/mp4, webm=>audio/webm, ogg=>audio/ogg), apply a 52,428,800 decoded-byte maximum and a 69,905,068 non-whitespace encoded-byte precheck, canonicalize backend input_audio to an audio_url data URL after accepted ASCII whitespace normalization, reject malformed/empty/unsupported/oversized input as sanitized invalid_request without dispatch or accounting, honor configured request-envelope rejection before adapter checks, and keep audio metadata-only outside dispatch; safe OpenAI Responses fields, prompt-cache locality, SDK-control rejection, and backend-only control stripping stay scope-specific"
     },
     %{
       slug: :response_body_cap,
@@ -523,6 +527,50 @@ defmodule CodexPooler.CompatibilityMatrix do
       raw_error_message_or_value: "never_projected"
     },
     responses_chat: %{
+      routes: ["/v1/responses", "/v1/chat/completions"],
+      public_format_to_mime: %{
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "webm" => "audio/webm",
+        "ogg" => "audio/ogg"
+      },
+      decoded_max_bytes: 52_428_800,
+      encoded_non_whitespace_max_bytes: 69_905_068,
+      backend_audio_shape: %{
+        type: "input_audio",
+        field: "audio_url",
+        value: "data:<canonical-mime>;base64,<canonical-data>"
+      },
+      accepted_ascii_whitespace: %{
+        byte_values: [9, 10, 13, 32],
+        ignored_during_decode: true,
+        ignored_for_encoded_limit: true,
+        canonical_reencoding: "no_ascii_whitespace"
+      },
+      failure_behavior: %{
+        rejected_inputs: [
+          "malformed_base64",
+          "empty_data",
+          "unsupported_format",
+          "oversized_decoded_data"
+        ],
+        response: %{status: 400, code: "invalid_request", param: "input"},
+        upstream_dispatch: false,
+        accounting_rows: false
+      },
+      ingress_envelope_precedence: %{
+        evaluation_order: ["configured_request_envelope", "audio_adapter"],
+        may_reject_before_adapter: true,
+        exact_decoded_limit_scope: "adapter_boundary"
+      },
+      privacy: %{
+        mode: "metadata_only",
+        raw_audio_persisted: false,
+        raw_base64_logged: false,
+        raw_data_url_exposed: false,
+        safe_summary_fields: ["type", "canonical_mime", "decoded_bytes", "sha256"]
+      },
       prompt_cache_routing: %{
         setting: "prompt_cache_affinity_enabled",
         default_enabled: true,

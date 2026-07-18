@@ -42,7 +42,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses do
          :ok <- validate_stream_options(payload),
          :ok <- StrictSchema.validate(payload),
          :ok <- InputShape.validate(payload) do
-      {:ok, payload}
+      Input.normalize_audio_input(payload)
     end
   end
 
