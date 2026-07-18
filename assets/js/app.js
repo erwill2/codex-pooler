@@ -154,15 +154,40 @@ const buildChartTooltip = ({categories, series, unit, units, valueKinds, safeToo
 }
 const ClipboardCopy = {
   mounted() {
+    this.originalAriaLabel = this.el.getAttribute("aria-label") || ""
+
     this.el.addEventListener("click", async () => {
       const icon = this.el.querySelector(".copy-icon")
       const label = this.el.querySelector("[data-copy-label]")
       window.clearTimeout(this.timeout)
       await navigator.clipboard.writeText(this.el.dataset.copyText)
 
+      const copiedText = this.el.dataset.copiedLabel || "Copied"
       if (label) {
-        label.textContent = this.el.dataset.copiedLabel || "Copied"
+        label.textContent = copiedText
       }
+
+      if (this.originalAriaLabel) {
+        this.el.setAttribute("aria-label", copiedText)
+      }
+
+      let announcer = document.getElementById("clipboard-live-announcer")
+      if (!announcer) {
+        announcer = document.createElement("div")
+        announcer.id = "clipboard-live-announcer"
+        announcer.setAttribute("aria-live", "polite")
+        announcer.style.position = "absolute"
+        announcer.style.width = "1px"
+        announcer.style.height = "1px"
+        announcer.style.padding = "0"
+        announcer.style.margin = "-1px"
+        announcer.style.overflow = "hidden"
+        announcer.style.clip = "rect(0, 0, 0, 0)"
+        announcer.style.whiteSpace = "nowrap"
+        announcer.style.border = "0"
+        document.body.appendChild(announcer)
+      }
+      announcer.textContent = `${copiedText} to clipboard`
 
       icon?.classList.remove("hero-clipboard-document")
       icon?.classList.add("hero-check")
@@ -175,6 +200,15 @@ const ClipboardCopy = {
 
         if (label) {
           label.textContent = this.el.dataset.copyLabel || "Copy"
+        }
+
+        if (this.originalAriaLabel) {
+          this.el.setAttribute("aria-label", this.originalAriaLabel)
+        }
+
+        const currentAnnouncer = document.getElementById("clipboard-live-announcer")
+        if (currentAnnouncer) {
+          currentAnnouncer.textContent = ""
         }
       }, 1400)
     })
