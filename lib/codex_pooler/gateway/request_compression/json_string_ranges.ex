@@ -94,8 +94,10 @@ defmodule CodexPooler.Gateway.RequestCompression.JsonStringRanges do
 
   defp parse_string_value(json, offset, path, ranges, size) do
     with {:ok, byte_start, byte_end} <- parse_string(json, offset, size) do
+      # Since we accumulate the path in reverse order to avoid O(N) list appends (path ++ [key]),
+      # we reverse it here once to construct the correct forward path.
       range = %{
-        path: path,
+        path: Enum.reverse(path),
         byte_start: byte_start,
         byte_end: byte_end,
         encoded_byte_size: byte_end - byte_start
@@ -122,7 +124,7 @@ defmodule CodexPooler.Gateway.RequestCompression.JsonStringRanges do
 
       with ?: <- byte_at(json, after_key, size),
            {:ok, offset, ranges} <-
-             parse_value(json, after_key + 1, path ++ [key], ranges, size) do
+             parse_value(json, after_key + 1, [key | path], ranges, size) do
         parse_object_separator(json, offset, path, ranges, size)
       else
         _error -> :error
@@ -162,7 +164,7 @@ defmodule CodexPooler.Gateway.RequestCompression.JsonStringRanges do
   end
 
   defp parse_array_values(json, offset, path, ranges, size, index) do
-    with {:ok, offset, ranges} <- parse_value(json, offset, path ++ [index], ranges, size) do
+    with {:ok, offset, ranges} <- parse_value(json, offset, [index | path], ranges, size) do
       parse_array_separator(json, offset, path, ranges, size, index)
     end
   end
