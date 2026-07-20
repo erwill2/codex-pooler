@@ -19,9 +19,20 @@ defmodule CodexPoolerWeb.BrowserSecurity do
     secure_headers(nil)
   end
 
+  @default_secure_headers %{
+    "x-frame-options" => "SAMEORIGIN",
+    "x-xss-protection" => "0",
+    "x-content-type-options" => "nosniff",
+    "x-download-options" => "noopen",
+    "x-permitted-cross-domain-policies" => "none",
+    "referrer-policy" => "strict-origin-when-cross-origin"
+  }
+
   @spec secure_headers(Plug.Conn.t() | nil) :: %{String.t() => String.t()}
   def secure_headers(conn) do
-    %{"content-security-policy" => content_security_policy(conn)}
+    Map.merge(@default_secure_headers, %{
+      "content-security-policy" => content_security_policy(conn)
+    })
   end
 
   @spec codex_desktop_browser?(Plug.Conn.t()) :: boolean()
