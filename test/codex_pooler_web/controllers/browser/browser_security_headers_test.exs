@@ -33,6 +33,17 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     :ok
   end
 
+  test "browser response includes standard security headers", %{conn: conn} do
+    conn = get(conn, ~p"/login")
+
+    assert get_resp_header(conn, "x-frame-options") == ["SAMEORIGIN"]
+    assert get_resp_header(conn, "x-xss-protection") == ["0"]
+    assert get_resp_header(conn, "x-content-type-options") == ["nosniff"]
+    assert get_resp_header(conn, "x-download-options") == ["noopen"]
+    assert get_resp_header(conn, "x-permitted-cross-domain-policies") == ["none"]
+    assert get_resp_header(conn, "referrer-policy") == ["strict-origin-when-cross-origin"]
+  end
+
   test "browser CSP includes configured extra sources without allowing structural directives to expand",
        %{
          conn: conn
