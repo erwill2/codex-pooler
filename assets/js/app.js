@@ -185,15 +185,26 @@ const buildChartTooltip = ({
 };
 const ClipboardCopy = {
 	mounted() {
+		this.originalAriaLabel = this.el.getAttribute("aria-label");
+		this.srAnnouncer = document.createElement("span");
+		this.srAnnouncer.className = "sr-only";
+		this.srAnnouncer.setAttribute("aria-live", "polite");
+		this.el.appendChild(this.srAnnouncer);
+
 		this.el.addEventListener("click", async () => {
 			const icon = this.el.querySelector(".copy-icon");
 			const label = this.el.querySelector("[data-copy-label]");
 			window.clearTimeout(this.timeout);
 			await navigator.clipboard.writeText(this.el.dataset.copyText);
 
+			const copiedLabel = this.el.dataset.copiedLabel || "Copied";
+
 			if (label) {
-				label.textContent = this.el.dataset.copiedLabel || "Copied";
+				label.textContent = copiedLabel;
 			}
+
+			this.el.setAttribute("aria-label", copiedLabel);
+			this.srAnnouncer.textContent = copiedLabel;
 
 			icon?.classList.remove("hero-clipboard-document");
 			icon?.classList.add("hero-check");
@@ -207,6 +218,14 @@ const ClipboardCopy = {
 				if (label) {
 					label.textContent = this.el.dataset.copyLabel || "Copy";
 				}
+
+				if (this.originalAriaLabel) {
+					this.el.setAttribute("aria-label", this.originalAriaLabel);
+				} else {
+					this.el.removeAttribute("aria-label");
+				}
+
+				this.srAnnouncer.textContent = "";
 			}, 1400);
 		});
 	},
