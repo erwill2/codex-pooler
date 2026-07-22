@@ -240,6 +240,17 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     refute conn.resp_body =~ "impeccable-live"
   end
 
+  test "browser response includes other standard secure browser headers", %{conn: conn} do
+    conn = get(conn, ~p"/login")
+
+    assert get_resp_header(conn, "x-frame-options") == ["SAMEORIGIN"]
+    assert get_resp_header(conn, "x-xss-protection") == ["1; mode=block"]
+    assert get_resp_header(conn, "x-content-type-options") == ["nosniff"]
+    assert get_resp_header(conn, "x-download-options") == ["noopen"]
+    assert get_resp_header(conn, "x-permitted-cross-domain-policies") == ["none"]
+    assert get_resp_header(conn, "referrer-policy") == ["strict-origin-when-cross-origin"]
+  end
+
   test "robots.txt disallows crawling the whole site", %{conn: conn} do
     conn = get(conn, ~p"/robots.txt")
 
