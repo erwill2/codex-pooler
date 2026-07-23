@@ -213,13 +213,14 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
   end
 
   defp plan_rank(%UpstreamIdentity{} = identity) do
-    plan = identity.plan_family || plan_label(identity.plan_label) || ""
+    # Optimize by avoiding expensive regex =~ ~r/.../i. String.contains?/2 is much faster.
+    plan = String.downcase(identity.plan_family || plan_label(identity.plan_label) || "")
 
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      String.contains?(plan, ["enterprise", "team"]) -> 4
+      String.contains?(plan, "pro") -> 3
+      String.contains?(plan, "plus") -> 2
+      String.contains?(plan, "free") -> 1
       true -> 0
     end
   end
