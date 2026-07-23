@@ -14,6 +14,18 @@ defmodule CodexPoolerWeb.BrowserSecurity do
     style_src: ["'self'", "'unsafe-inline'"]
   ]
 
+  # Standard Phoenix secure browser headers.
+  # When custom headers are passed to put_secure_browser_headers/2, the defaults are overridden.
+  # We define them here explicitly to merge them with our dynamic CSP, ensuring we do not strip
+  # these critical standard browser security protections (defense in depth).
+  @default_headers %{
+    "x-frame-options" => "SAMEORIGIN",
+    "x-xss-protection" => "1; mode=block",
+    "x-content-type-options" => "nosniff",
+    "x-download-options" => "noopen",
+    "x-permitted-cross-domain-policies" => "none"
+  }
+
   @spec secure_headers() :: %{String.t() => String.t()}
   def secure_headers do
     secure_headers(nil)
@@ -21,7 +33,9 @@ defmodule CodexPoolerWeb.BrowserSecurity do
 
   @spec secure_headers(Plug.Conn.t() | nil) :: %{String.t() => String.t()}
   def secure_headers(conn) do
-    %{"content-security-policy" => content_security_policy(conn)}
+    Map.merge(@default_headers, %{
+      "content-security-policy" => content_security_policy(conn)
+    })
   end
 
   @spec codex_desktop_browser?(Plug.Conn.t()) :: boolean()
