@@ -185,15 +185,36 @@ const buildChartTooltip = ({
 };
 const ClipboardCopy = {
 	mounted() {
+		// Cache the original aria-label to prevent corruption from rapid clicks
+		this.originalAriaLabel = this.el.getAttribute("aria-label") || "";
+
+		// Ensure there is a live region for screen readers to announce updates politely
+		let liveAnnouncer = document.getElementById("clipboard-live-announcer");
+		if (!liveAnnouncer) {
+			liveAnnouncer = document.createElement("div");
+			liveAnnouncer.id = "clipboard-live-announcer";
+			liveAnnouncer.className = "sr-only";
+			liveAnnouncer.setAttribute("aria-live", "polite");
+			document.body.appendChild(liveAnnouncer);
+		}
+
 		this.el.addEventListener("click", async () => {
 			const icon = this.el.querySelector(".copy-icon");
 			const label = this.el.querySelector("[data-copy-label]");
 			window.clearTimeout(this.timeout);
 			await navigator.clipboard.writeText(this.el.dataset.copyText);
 
+			const copiedText = this.el.dataset.copiedLabel || "Copied";
+
 			if (label) {
-				label.textContent = this.el.dataset.copiedLabel || "Copied";
+				label.textContent = copiedText;
 			}
+
+			// Politely announce to screen readers
+			liveAnnouncer.textContent = copiedText;
+
+			// Update the button's dynamic aria-label
+			this.el.setAttribute("aria-label", copiedText);
 
 			icon?.classList.remove("hero-clipboard-document");
 			icon?.classList.add("hero-check");
@@ -207,6 +228,16 @@ const ClipboardCopy = {
 				if (label) {
 					label.textContent = this.el.dataset.copyLabel || "Copy";
 				}
+
+				// Restore the cached original aria-label
+				if (this.originalAriaLabel) {
+					this.el.setAttribute("aria-label", this.originalAriaLabel);
+				} else {
+					this.el.removeAttribute("aria-label");
+				}
+
+				// Reset announcer content
+				liveAnnouncer.textContent = "";
 			}, 1400);
 		});
 	},
