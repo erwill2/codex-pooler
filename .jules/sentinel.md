@@ -1,0 +1,4 @@
+## 2026-04-26 - Phoenix custom security headers override vulnerability
+**Vulnerability:** Invoking `Phoenix.Controller.put_secure_browser_headers/2` with a custom map completely overrides standard browser security headers (such as `x-frame-options`, `x-content-type-options`, `x-xss-protection`, etc.) rather than merging them, leaving the application vulnerable to clickjacking, MIME-sniffing, and referrer leakage.
+**Learning:** In Phoenix, when you provide custom headers to `put_secure_browser_headers/2`, it is used to perform a simple merge against the connection response headers rather than merging them with default secure headers. This means standard secure browser headers are stripped unless they are explicitly merged by the custom header generator.
+**Prevention:** Ensure any dynamic browser security header helper explicitly merges standard secure browser headers with custom dynamic headers before passing them to `put_secure_browser_headers/2`.
