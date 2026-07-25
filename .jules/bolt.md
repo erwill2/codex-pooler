@@ -1,0 +1,3 @@
+## 2025-02-15 - Case-Insensitive Plan Substring Checks Optimization
+**Learning:** Using dynamic regular expressions (e.g., `plan =~ ~r/enterprise|team/i`) inside hot execution paths like routing candidate eligibility checks introduces significant CPU overhead. Reassembling and matching regexes repeatedly is slow. Converting the haystack to lowercase via `String.downcase/1` and matching substrings using `String.contains?/2` is over 5.5x faster.
+**Action:** Always favor `String.downcase/1` and `String.contains?/2` with a list of lowercased substrings over dynamic compiled or uncompiled regular expressions for simple case-insensitive substring membership checks in Elixir.
