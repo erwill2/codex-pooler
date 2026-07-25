@@ -1,6 +1,8 @@
 defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
   use CodexPoolerWeb.ConnCase, async: false
 
+  import CodexPooler.AccountsFixtures
+
   alias CodexPooler.InstanceSettings
   alias CodexPooler.InstanceSettings.Settings
   alias CodexPooler.Repo
@@ -16,6 +18,7 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     System.delete_env("DISABLE_FORCE_SSL")
 
     Repo.delete_all(Settings)
+    reset_bootstrap_state_fixture!()
     InstanceSettings.reset_cache_for_test()
 
     on_exit(fn ->
@@ -265,6 +268,20 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
                  "User-agent: *\nDisallow: /\n"
       end
     end
+  end
+
+  test "browser responses include all standard secure headers", %{conn: conn} do
+    conn = get(conn, ~p"/login")
+
+    assert [csp] = get_resp_header(conn, "content-security-policy")
+    assert csp =~ "default-src 'self'"
+
+    assert ["SAMEORIGIN"] = get_resp_header(conn, "x-frame-options")
+    assert ["1; mode=block"] = get_resp_header(conn, "x-xss-protection")
+    assert ["nosniff"] = get_resp_header(conn, "x-content-type-options")
+    assert ["noopen"] = get_resp_header(conn, "x-download-options")
+    assert ["none"] = get_resp_header(conn, "x-permitted-cross-domain-policies")
+    assert ["strict-origin-when-cross-origin"] = get_resp_header(conn, "referrer-policy")
   end
 
   defp csp_directives(csp) do
