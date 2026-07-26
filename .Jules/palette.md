@@ -1,0 +1,3 @@
+## 2026-07-26 - Accessible Client-Side Clipboard Copying
+**Learning:** Copy-to-clipboard buttons often fail to provide screen reader feedback when the state changes to "Copied". Standard screen readers do not dynamically read visual-only class toggles or text shifts.
+**Action:** Always wrap state updates with a visually hidden `aria-live="polite"` announcer element in the DOM and dynamically update/restore the button's `aria-label`. Cache the original `aria-label` on mount to prevent state corruption on rapid successive clicks, and remove the `aria-label` attribute entirely if it was not originally defined.

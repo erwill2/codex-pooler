@@ -185,15 +185,32 @@ const buildChartTooltip = ({
 };
 const ClipboardCopy = {
 	mounted() {
+		this.originalAriaLabel = this.el.getAttribute("aria-label") || "";
 		this.el.addEventListener("click", async () => {
 			const icon = this.el.querySelector(".copy-icon");
 			const label = this.el.querySelector("[data-copy-label]");
 			window.clearTimeout(this.timeout);
 			await navigator.clipboard.writeText(this.el.dataset.copyText);
 
+			const copiedText = this.el.dataset.copiedLabel || "Copied";
 			if (label) {
-				label.textContent = this.el.dataset.copiedLabel || "Copied";
+				label.textContent = copiedText;
 			}
+			this.el.setAttribute("aria-label", copiedText);
+
+			let announcer = document.getElementById("clipboard-announcer");
+			if (!announcer) {
+				announcer = document.createElement("div");
+				announcer.id = "clipboard-announcer";
+				announcer.className = "sr-only";
+				announcer.setAttribute("aria-live", "polite");
+				announcer.setAttribute("aria-atomic", "true");
+				document.body.appendChild(announcer);
+			}
+			announcer.textContent = "";
+			window.requestAnimationFrame(() => {
+				announcer.textContent = copiedText;
+			});
 
 			icon?.classList.remove("hero-clipboard-document");
 			icon?.classList.add("hero-check");
@@ -203,6 +220,11 @@ const ClipboardCopy = {
 				icon?.classList.remove("hero-check");
 				icon?.classList.add("hero-clipboard-document");
 				this.el.classList.remove("btn-success");
+				if (this.originalAriaLabel) {
+					this.el.setAttribute("aria-label", this.originalAriaLabel);
+				} else {
+					this.el.removeAttribute("aria-label");
+				}
 
 				if (label) {
 					label.textContent = this.el.dataset.copyLabel || "Copy";
