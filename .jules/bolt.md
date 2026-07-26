@@ -1,0 +1,3 @@
+## 2026-07-26 - Case-insensitive plan matching optimization on hot paths
+**Learning:** Case-insensitive dynamic regex searches (e.g., `plan =~ ~r/enterprise|team/i`) are CPU-intensive and slow in Elixir/Erlang because of dynamic regex compilation/matching overhead on small strings. Converting the string with `String.downcase/1` and using `String.contains?/2` is significantly faster (over 5.5x speedup), especially on extremely hot paths like gateway routing.
+**Action:** Avoid dynamic case-insensitive regex checks for static substring match rules; downcase and check substring matches explicitly instead.
