@@ -1,0 +1,3 @@
+## 2025-05-10 - Accessible Client-side Clipboard Copy Feedback
+**Learning:** Client-side copy interactions (like clipboard copying) often lack proper feedback for assistive technologies. Simply updating the visual label text or switching icons is insufficient for screen readers. Using a visually hidden `aria-live="polite"` element along with dynamic `aria-label` updates provides polite, immediate feedback. Caching the original `aria-label` on mount ensures that rapid successive clicks do not corrupt the button's initial state when reverting.
+**Action:** Always implement a dedicated ARIA live-region and cache the button's original `aria-label` attribute upon component mounting for client-side copy interactions to preserve state stability.
