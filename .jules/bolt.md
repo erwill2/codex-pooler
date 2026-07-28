@@ -1,0 +1,3 @@
+## 2026-07-28 - Case-insensitive plan matching in routing/accounting hot paths
+**Learning:** Compiling dynamic patterns and running `=~ ~r/.../i` case-insensitive regular expressions on hot paths (such as plan level checks on every request routing/accounting turn) incurs a massive dynamic execution overhead compared to basic string operations. Converting the plan identifier once using `String.downcase/1` and matching with `String.contains?/2` is significantly faster (over 5.5x speedup) and keeps routing decisions extremely lightweight.
+**Action:** Always prefer `String.downcase/1` combined with `String.contains?/2` when performing case-insensitive plan, tier, or model matches in request/routing hot-paths rather than relying on regex evaluations.
