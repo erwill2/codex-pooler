@@ -1,0 +1,3 @@
+## 2026-07-28 - Client-side Copy Accessibility and Robustness
+**Learning:** For client-side copy interactions (such as the ClipboardCopy hook), state updates are announced politely to screen readers using a visually hidden `aria-live="polite"` element and dynamic `aria-label` updates, caching the original `aria-label` on mount to prevent state corruption from rapid successive clicks.
+**Action:** Always capture and restore original element accessibility attributes (`aria-label`, etc.) and provide clean DOM setup and tear-down within the `mounted()` and `destroyed()` hook lifecycle methods of Phoenix LiveView client hooks.

@@ -185,14 +185,33 @@ const buildChartTooltip = ({
 };
 const ClipboardCopy = {
 	mounted() {
-		this.el.addEventListener("click", async () => {
+		// Cache original aria-label
+		this.originalAriaLabel = this.el.getAttribute("aria-label");
+
+		// Create a visually hidden aria-live announcement container
+		this.liveAnnouncer = document.createElement("span");
+		this.liveAnnouncer.className = "sr-only";
+		this.liveAnnouncer.setAttribute("aria-live", "polite");
+		this.el.appendChild(this.liveAnnouncer);
+
+		this.clickHandler = async () => {
 			const icon = this.el.querySelector(".copy-icon");
 			const label = this.el.querySelector("[data-copy-label]");
 			window.clearTimeout(this.timeout);
-			await navigator.clipboard.writeText(this.el.dataset.copyText);
+
+			const copyText = this.el.dataset.copyText || "";
+			await navigator.clipboard.writeText(copyText);
+
+			const copiedText = this.el.dataset.copiedLabel || "Copied";
 
 			if (label) {
-				label.textContent = this.el.dataset.copiedLabel || "Copied";
+				label.textContent = copiedText;
+			}
+
+			// Update screen reader attributes politely
+			this.el.setAttribute("aria-label", copiedText);
+			if (this.liveAnnouncer) {
+				this.liveAnnouncer.textContent = copiedText;
 			}
 
 			icon?.classList.remove("hero-clipboard-document");
@@ -207,11 +226,29 @@ const ClipboardCopy = {
 				if (label) {
 					label.textContent = this.el.dataset.copyLabel || "Copy";
 				}
+
+				// Restore original aria-label and clear live announcement
+				if (this.originalAriaLabel) {
+					this.el.setAttribute("aria-label", this.originalAriaLabel);
+				} else {
+					this.el.removeAttribute("aria-label");
+				}
+				if (this.liveAnnouncer) {
+					this.liveAnnouncer.textContent = "";
+				}
 			}, 1400);
-		});
+		};
+
+		this.el.addEventListener("click", this.clickHandler);
 	},
 	destroyed() {
 		window.clearTimeout(this.timeout);
+		if (this.clickHandler) {
+			this.el.removeEventListener("click", this.clickHandler);
+		}
+		if (this.liveAnnouncer) {
+			this.liveAnnouncer.remove();
+		}
 	},
 };
 const WorkerFailureMarker = {
