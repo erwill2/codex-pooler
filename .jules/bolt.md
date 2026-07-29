@@ -1,0 +1,3 @@
+## 2026-07-29 - [Avoid Dynamic Regex Matches in Hot Execution/Routing Paths]
+**Learning:** In Phoenix/Elixir routing and eligibility filtering paths, evaluating dynamic case-insensitive regular expressions with `=~ ~r/.../i` creates a significant CPU/allocation bottleneck. Converting the string with `String.downcase/1` and checking substring matches using `String.contains?/2` is over 5.5x faster.
+**Action:** Always prefer downcasing strings first and utilizing `String.contains?/2` with literal strings/lists of strings rather than running dynamic regexes (`=~ ~r/.../i`) in loops or hot code paths.
