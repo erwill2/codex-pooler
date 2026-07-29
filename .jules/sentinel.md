@@ -1,0 +1,4 @@
+## 2026-07-20 - Overridden Phoenix Secure Browser Headers
+**Vulnerability:** Invoking `Phoenix.Controller.put_secure_browser_headers/2` with a custom map (e.g., for dynamic content-security-policy) completely overrides the default browser security headers (such as `x-frame-options`, `x-content-type-options`, `x-xss-protection`, etc.) instead of merging them. This silently strips critical standard browser protections (MIME-sniffing, clickjacking protection, etc.).
+**Learning:** Phoenix's `put_secure_browser_headers/2` is not a merge function when given an explicit headers map. If a custom security configuration (like a dynamic CSP module) only specifies `"content-security-policy"`, it overrides the entire set of baseline headers.
+**Prevention:** Explicitly define and merge a standard set of default secure browser headers with any dynamic headers (such as CSP) before sending them to `put_secure_browser_headers/2`.
