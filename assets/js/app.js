@@ -185,15 +185,27 @@ const buildChartTooltip = ({
 };
 const ClipboardCopy = {
 	mounted() {
-		this.el.addEventListener("click", async () => {
+		this.originalAriaLabel = this.el.getAttribute("aria-label");
+
+		const liveContainer = document.createElement("span");
+		liveContainer.className = "sr-only";
+		liveContainer.setAttribute("aria-live", "polite");
+		this.el.appendChild(liveContainer);
+		this.liveContainer = liveContainer;
+
+		this.handleClick = async () => {
 			const icon = this.el.querySelector(".copy-icon");
 			const label = this.el.querySelector("[data-copy-label]");
 			window.clearTimeout(this.timeout);
 			await navigator.clipboard.writeText(this.el.dataset.copyText);
 
+			const copiedLabel = this.el.dataset.copiedLabel || "Copied";
 			if (label) {
-				label.textContent = this.el.dataset.copiedLabel || "Copied";
+				label.textContent = copiedLabel;
 			}
+
+			this.el.setAttribute("aria-label", copiedLabel);
+			this.liveContainer.textContent = copiedLabel;
 
 			icon?.classList.remove("hero-clipboard-document");
 			icon?.classList.add("hero-check");
@@ -207,11 +219,24 @@ const ClipboardCopy = {
 				if (label) {
 					label.textContent = this.el.dataset.copyLabel || "Copy";
 				}
+
+				if (this.originalAriaLabel) {
+					this.el.setAttribute("aria-label", this.originalAriaLabel);
+				} else {
+					this.el.removeAttribute("aria-label");
+				}
+				this.liveContainer.textContent = "";
 			}, 1400);
-		});
+		};
+
+		this.el.addEventListener("click", this.handleClick);
 	},
 	destroyed() {
 		window.clearTimeout(this.timeout);
+		this.el.removeEventListener("click", this.handleClick);
+		if (this.liveContainer && this.el.contains(this.liveContainer)) {
+			this.liveContainer.remove();
+		}
 	},
 };
 const WorkerFailureMarker = {
