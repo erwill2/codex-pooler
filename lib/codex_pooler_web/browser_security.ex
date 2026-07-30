@@ -21,7 +21,20 @@ defmodule CodexPoolerWeb.BrowserSecurity do
 
   @spec secure_headers(Plug.Conn.t() | nil) :: %{String.t() => String.t()}
   def secure_headers(conn) do
-    %{"content-security-policy" => content_security_policy(conn)}
+    # Defense in depth: Explicitly include standard secure browser headers.
+    # In some contexts, invoking Phoenix.Controller.put_secure_browser_headers/2
+    # with a custom map completely overrides standard browser headers rather than
+    # merging them. We explicitly merge them here to ensure older/newer browser
+    # protections (such as clickjacking and MIME-sniffing prevention) are active.
+    %{
+      "content-security-policy" => content_security_policy(conn),
+      "x-frame-options" => "SAMEORIGIN",
+      "x-xss-protection" => "1; mode=block",
+      "x-content-type-options" => "nosniff",
+      "x-download-options" => "noopen",
+      "x-permitted-cross-domain-policies" => "none",
+      "referrer-policy" => "strict-origin-when-cross-origin"
+    }
   end
 
   @spec codex_desktop_browser?(Plug.Conn.t()) :: boolean()

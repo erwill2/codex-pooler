@@ -247,6 +247,17 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
              "User-agent: *\nDisallow: /\n"
   end
 
+  test "browser responses contain all standard secure browser headers explicitly", %{conn: conn} do
+    conn = get(conn, ~p"/login")
+
+    assert get_resp_header(conn, "x-frame-options") == ["SAMEORIGIN"]
+    assert get_resp_header(conn, "x-xss-protection") == ["1; mode=block"]
+    assert get_resp_header(conn, "x-content-type-options") == ["nosniff"]
+    assert get_resp_header(conn, "x-download-options") == ["noopen"]
+    assert get_resp_header(conn, "x-permitted-cross-domain-policies") == ["none"]
+    assert get_resp_header(conn, "referrer-policy") == ["strict-origin-when-cross-origin"]
+  end
+
   test "tracked top-level static assets are served without a digest manifest", %{conn: conn} do
     for logical_path <- [
           "favicon.ico",
