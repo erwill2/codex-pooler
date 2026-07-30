@@ -1,0 +1,3 @@
+## 2026-07-30 - [Overhead of Dynamic Regular Expressions in Hot Path Plan Ranking]
+**Learning:** Using dynamic regular expression matchers (`=~ ~r/.../i`) in core candidate selection, routing, and accounting paths introduces a significant bottleneck (~5x slower) because regular expression evaluation and compilation (via PCRE/NIF boundary) overheads are repeatedly incurred during hot path execution.
+**Action:** Always prefer downcasing strings via `String.downcase/1` and matching with `String.contains?/2` using explicit substrings or lists of substrings for case-insensitive keyword classification.
