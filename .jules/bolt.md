@@ -1,0 +1,3 @@
+## 2026-07-31 - Case-Insensitive Substring Match Performance in Hot Paths
+**Learning:** In Elixir/Phoenix hot paths (such as candidate routing or usage read models), performing case-insensitive plan name checks using dynamic regular expression matching (`=~ ~r/pattern/i`) introduces substantial runtime regex compilation and execution overhead. Using Elixir's highly optimized binary-based `String.downcase/1` paired with `String.contains?/2` is over 1.53x faster.
+**Action:** Avoid dynamic regular expression patterns for simple case-insensitive substring checks in frequently traversed code paths. Pre-downcase strings and use string binary checks instead.

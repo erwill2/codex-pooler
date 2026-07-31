@@ -214,12 +214,14 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
 
   defp plan_rank(%UpstreamIdentity{} = identity) do
     plan = identity.plan_family || plan_label(identity.plan_label) || ""
+    downcased_plan = String.downcase(plan)
 
+    # Bolt Optimization: Replace slow dynamic regex with faster String.downcase and String.contains?
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      String.contains?(downcased_plan, ["enterprise", "team"]) -> 4
+      String.contains?(downcased_plan, "pro") -> 3
+      String.contains?(downcased_plan, "plus") -> 2
+      String.contains?(downcased_plan, "free") -> 1
       true -> 0
     end
   end
