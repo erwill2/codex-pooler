@@ -1,0 +1,4 @@
+## 2026-10-24 - Stripping of default browser security headers in custom controllers or plug pipelines
+**Vulnerability:** In Phoenix, invoking `Phoenix.Controller.put_secure_browser_headers/2` with a custom map containing only `"content-security-policy"` overrides and strips other default secure browser headers (like `x-frame-options`, `x-content-type-options`, `x-xss-protection`, etc.), leaving the application vulnerable to clickjacking and MIME sniffing.
+**Learning:** Although Phoenix defaults are safe, custom routers or pipelines that dynamically generate or configure individual headers like CSP often inadvertently strip standard security headers when applying custom maps to browser headers.
+**Prevention:** Ensure that custom browser security header maps explicitly define and merge all essential default secure headers (`x-frame-options`, `x-content-type-options`, `x-xss-protection`, etc.) along with the dynamic custom CSP directives.
