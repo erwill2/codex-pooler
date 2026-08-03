@@ -487,12 +487,13 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
   defp model_source_plan_rank(%UpstreamIdentity{} = identity) do
     plan = identity.plan_family || identity.plan_label || ""
+    plan_lower = String.downcase(plan)
 
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      String.contains?(plan_lower, "enterprise") or String.contains?(plan_lower, "team") -> 4
+      String.contains?(plan_lower, "pro") -> 3
+      String.contains?(plan_lower, "plus") -> 2
+      String.contains?(plan_lower, "free") -> 1
       true -> 0
     end
   end

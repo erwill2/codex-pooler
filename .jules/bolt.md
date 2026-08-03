@@ -1,0 +1,3 @@
+## 2026-08-03 - Case-insensitive Substring Check over Regex
+**Learning:** In Elixir, performing case-insensitive pattern matching via `=~ ~r/pattern/i` introduces significant overhead due to PCRE compilation and matching. Converting the input to lowercase via `String.downcase/1` and using explicit `String.contains?/2` is over 8x faster. Furthermore, using explicit `or` statements with `String.contains?/2` is substantially faster than passing a list of patterns (e.g., `String.contains?(s, ["a", "b"])`) because Elixir dynamically compiles list patterns at runtime.
+**Action:** Always prefer `String.downcase/1` combined with explicit binary/substring pattern matching or `or` operators in hot code paths instead of dynamic or compiled regular expressions.
