@@ -321,6 +321,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModelTest do
     scope: scope
   } do
     for size <- [1, 50] do
+      Repo.delete_all(CodexPooler.Catalog.Model)
+      Repo.delete_all(CodexPooler.Upstreams.Schemas.PoolUpstreamAssignment)
+      Repo.delete_all(CodexPooler.Upstreams.Schemas.UpstreamIdentity)
+      Repo.delete_all(CodexPooler.Pools.Pool)
+
       pools =
         for index <- 1..size do
           pool = pool_fixture()
