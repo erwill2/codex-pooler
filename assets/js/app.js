@@ -183,16 +183,43 @@ const buildChartTooltip = ({
 		},
 	};
 };
+let sharedLiveAnnouncer = null;
+const getOrCreateLiveAnnouncer = () => {
+	if (!sharedLiveAnnouncer) {
+		sharedLiveAnnouncer = document.getElementById("shared-copy-announcer");
+		if (!sharedLiveAnnouncer) {
+			sharedLiveAnnouncer = document.createElement("span");
+			sharedLiveAnnouncer.id = "shared-copy-announcer";
+			sharedLiveAnnouncer.className = "sr-only";
+			sharedLiveAnnouncer.setAttribute("aria-live", "polite");
+			document.body.appendChild(sharedLiveAnnouncer);
+		}
+	}
+	return sharedLiveAnnouncer;
+};
+
 const ClipboardCopy = {
 	mounted() {
+		this.originalAriaLabel = this.el.getAttribute("aria-label");
+
 		this.el.addEventListener("click", async () => {
 			const icon = this.el.querySelector(".copy-icon");
 			const label = this.el.querySelector("[data-copy-label]");
 			window.clearTimeout(this.timeout);
 			await navigator.clipboard.writeText(this.el.dataset.copyText);
 
+			const copiedText = this.el.dataset.copiedLabel || "Copied";
+
 			if (label) {
-				label.textContent = this.el.dataset.copiedLabel || "Copied";
+				label.textContent = copiedText;
+			}
+
+			// Update accessibility attributes
+			this.el.setAttribute("aria-label", copiedText);
+			const announcer = getOrCreateLiveAnnouncer();
+			if (announcer) {
+				announcer.textContent = "";
+				announcer.textContent = copiedText;
 			}
 
 			icon?.classList.remove("hero-clipboard-document");
@@ -206,6 +233,16 @@ const ClipboardCopy = {
 
 				if (label) {
 					label.textContent = this.el.dataset.copyLabel || "Copy";
+				}
+
+				// Restore accessibility attributes
+				if (this.originalAriaLabel !== null) {
+					this.el.setAttribute("aria-label", this.originalAriaLabel);
+				} else {
+					this.el.removeAttribute("aria-label");
+				}
+				if (sharedLiveAnnouncer) {
+					sharedLiveAnnouncer.textContent = "";
 				}
 			}, 1400);
 		});
