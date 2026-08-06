@@ -362,12 +362,15 @@ defmodule CodexPooler.Catalog do
 
   defp model_source_plan_rank(%UpstreamIdentity{} = identity) do
     plan = identity.plan_family || identity.plan_label || ""
+    downcased = String.downcase(plan)
 
+    # Performance optimization: String.contains?/2 with explicit logic is significantly faster
+    # than dynamic regex matches on hot paths.
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      String.contains?(downcased, "enterprise") or String.contains?(downcased, "team") -> 4
+      String.contains?(downcased, "pro") -> 3
+      String.contains?(downcased, "plus") -> 2
+      String.contains?(downcased, "free") -> 1
       true -> 0
     end
   end

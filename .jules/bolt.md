@@ -1,0 +1,4 @@
+## 2025-02-13 - [Elixir Case-Insensitive Substring Match Optimization]
+**Learning:** In Elixir/Phoenix hot paths (such as routing eligibility checks and read-model plan ranking), executing dynamic regex matching (like `plan =~ ~r/enterprise|team/i`) incurs substantial overhead because it delegates to Erlang's `:re` module.
+Using `String.downcase/1` paired with `String.contains?/2` is significantly faster. Crucially, passing a list of substrings to `String.contains?/2` (e.g., `String.contains?(s, ["a", "b"])`) is much slower than using explicit `or` conditions (e.g., `String.contains?(s, "a") or String.contains?(s, "b")`) because Elixir compiles list patterns at runtime.
+**Action:** Always prefer explicit `or` checks with `String.contains?/2` on pre-downcased strings over dynamic regex matches or substring list matching in performance-critical code blocks.
