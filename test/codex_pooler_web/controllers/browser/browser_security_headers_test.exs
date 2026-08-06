@@ -267,6 +267,20 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     end
   end
 
+  test "browser responses include standard secure browser headers", %{conn: conn} do
+    conn = get(conn, ~p"/login")
+
+    assert [csp] = get_resp_header(conn, "content-security-policy")
+    assert csp =~ "default-src 'self'"
+
+    assert ["SAMEORIGIN"] = get_resp_header(conn, "x-frame-options")
+    assert ["1; mode=block"] = get_resp_header(conn, "x-xss-protection")
+    assert ["nosniff"] = get_resp_header(conn, "x-content-type-options")
+    assert ["noopen"] = get_resp_header(conn, "x-download-options")
+    assert ["none"] = get_resp_header(conn, "x-permitted-cross-domain-policies")
+    assert ["strict-origin-when-cross-origin"] = get_resp_header(conn, "referrer-policy")
+  end
+
   defp csp_directives(csp) do
     csp
     |> String.split(";")
