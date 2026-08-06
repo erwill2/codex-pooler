@@ -1,0 +1,3 @@
+## 2026-02-14 - Screen Reader Announcements for Clipboard Copy Actions
+**Learning:** Sighted users receive instant visual feedback (icon changes, button colors, text change) when clicking a Copy button. However, screen reader users do not automatically receive these updates. Using a visually hidden, shared `aria-live="polite"` container combined with dynamic `aria-label` updates on the button provides a native, seamless acoustic confirmation without introducing visual clutter or multiple redundant announcer nodes.
+**Action:** Always employ a shared, visually-hidden `aria-live` announcer singleton and update the interactive element's accessibility attributes during client-side state transitions.

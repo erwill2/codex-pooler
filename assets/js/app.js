@@ -183,35 +183,69 @@ const buildChartTooltip = ({
 		},
 	};
 };
-const ClipboardCopy = {
+export const ClipboardCopy = {
 	mounted() {
-		this.el.addEventListener("click", async () => {
+		this.originalAriaLabel = this.el.getAttribute("aria-label");
+		this.handleClick = async () => {
 			const icon = this.el.querySelector(".copy-icon");
 			const label = this.el.querySelector("[data-copy-label]");
 			window.clearTimeout(this.timeout);
 			await navigator.clipboard.writeText(this.el.dataset.copyText);
 
+			const copiedText = this.el.dataset.copiedLabel || "Copied";
+
 			if (label) {
-				label.textContent = this.el.dataset.copiedLabel || "Copied";
+				label.textContent = copiedText;
 			}
 
 			icon?.classList.remove("hero-clipboard-document");
 			icon?.classList.add("hero-check");
 			this.el.classList.add("btn-success");
+			this.el.setAttribute("aria-label", copiedText);
+
+			let announcer = document.getElementById("clipboard-live-announcer");
+			if (!announcer) {
+				announcer = document.createElement("div");
+				announcer.id = "clipboard-live-announcer";
+				announcer.className = "sr-only";
+				announcer.setAttribute("aria-live", "polite");
+				announcer.style.cssText = "position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;";
+				document.body.appendChild(announcer);
+			}
+			announcer.textContent = "";
+			// Force browser repaint to trigger screen reader announcement
+			void announcer.offsetHeight;
+			announcer.textContent = copiedText;
 
 			this.timeout = window.setTimeout(() => {
 				icon?.classList.remove("hero-check");
 				icon?.classList.add("hero-clipboard-document");
 				this.el.classList.remove("btn-success");
 
+				if (this.originalAriaLabel !== null) {
+					this.el.setAttribute("aria-label", this.originalAriaLabel);
+				} else {
+					this.el.removeAttribute("aria-label");
+				}
+
 				if (label) {
 					label.textContent = this.el.dataset.copyLabel || "Copy";
 				}
+				if (announcer) {
+					announcer.textContent = "";
+				}
 			}, 1400);
-		});
+		};
+
+		this.el.addEventListener("click", this.handleClick);
 	},
 	destroyed() {
+		this.el.removeEventListener("click", this.handleClick);
 		window.clearTimeout(this.timeout);
+		const announcer = document.getElementById("clipboard-live-announcer");
+		if (announcer) {
+			announcer.textContent = "";
+		}
 	},
 };
 const WorkerFailureMarker = {
