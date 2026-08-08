@@ -455,11 +455,27 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
     values =
       @limit_fields
       |> Enum.flat_map(fn field ->
+        default_key =
+          case field do
+            "max_requests_per_minute" -> :default_max_requests_per_minute
+            "max_tokens_per_day" -> :default_max_tokens_per_day
+            "max_tokens_per_week" -> :default_max_tokens_per_week
+            "max_input_tokens_per_request" -> :default_max_input_tokens_per_request
+            "max_output_tokens_per_request" -> :default_max_output_tokens_per_request
+          end
+
+        model_key =
+          case field do
+            "max_requests_per_minute" -> :model_max_requests_per_minute
+            "max_tokens_per_day" -> :model_max_tokens_per_day
+            "max_tokens_per_week" -> :model_max_tokens_per_week
+            "max_input_tokens_per_request" -> :model_max_input_tokens_per_request
+            "max_output_tokens_per_request" -> :model_max_output_tokens_per_request
+          end
+
         [
-          {"Default #{limit_field_label(field)}",
-           normalized_limit_value(form[String.to_atom("default_#{field}")].value)},
-          {"Model #{limit_field_label(field)}",
-           normalized_limit_value(form[String.to_atom("model_#{field}")].value)}
+          {"Default #{limit_field_label(field)}", normalized_limit_value(form[default_key].value)},
+          {"Model #{limit_field_label(field)}", normalized_limit_value(form[model_key].value)}
         ]
       end)
       |> Enum.reject(fn {_label, value} -> is_nil(value) end)

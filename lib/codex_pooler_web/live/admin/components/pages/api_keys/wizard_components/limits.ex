@@ -50,7 +50,21 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents.Limits do
   attr :prefix, :string, required: true
 
   def limit_input(assigns) do
-    assigns = assign(assigns, :field_atom, String.to_atom("#{assigns.prefix}_#{assigns.field}"))
+    field_atom =
+      case {assigns.prefix, assigns.field} do
+        {"default", "max_requests_per_minute"} -> :default_max_requests_per_minute
+        {"model", "max_requests_per_minute"} -> :model_max_requests_per_minute
+        {"default", "max_tokens_per_day"} -> :default_max_tokens_per_day
+        {"model", "max_tokens_per_day"} -> :model_max_tokens_per_day
+        {"default", "max_tokens_per_week"} -> :default_max_tokens_per_week
+        {"model", "max_tokens_per_week"} -> :model_max_tokens_per_week
+        {"default", "max_input_tokens_per_request"} -> :default_max_input_tokens_per_request
+        {"model", "max_input_tokens_per_request"} -> :model_max_input_tokens_per_request
+        {"default", "max_output_tokens_per_request"} -> :default_max_output_tokens_per_request
+        {"model", "max_output_tokens_per_request"} -> :model_max_output_tokens_per_request
+      end
+
+    assigns = assign(assigns, :field_atom, field_atom)
 
     ~H"""
     <.input
