@@ -185,14 +185,47 @@ const buildChartTooltip = ({
 };
 const ClipboardCopy = {
 	mounted() {
-		this.el.addEventListener("click", async () => {
+		this.originalAriaLabel = this.el.getAttribute("aria-label");
+		this.originalTitle = this.el.getAttribute("title");
+
+		this.clickHandler = async () => {
 			const icon = this.el.querySelector(".copy-icon");
 			const label = this.el.querySelector("[data-copy-label]");
 			window.clearTimeout(this.timeout);
 			await navigator.clipboard.writeText(this.el.dataset.copyText);
 
+			const copiedLabel = this.el.dataset.copiedLabel || "Copied";
+
 			if (label) {
-				label.textContent = this.el.dataset.copiedLabel || "Copied";
+				label.textContent = copiedLabel;
+			}
+
+			// Accessibility: Announce to screen readers politely using shared aria-live element
+			let liveEl = document.getElementById("clipboard-live-announcer");
+			if (!liveEl) {
+				liveEl = document.createElement("div");
+				liveEl.id = "clipboard-live-announcer";
+				liveEl.className = "sr-only";
+				liveEl.setAttribute("aria-live", "polite");
+				document.body.appendChild(liveEl);
+			}
+			liveEl.textContent = "";
+			// Small delay to ensure screen readers register the text change
+			window.setTimeout(() => {
+				if (liveEl) {
+					const objectLabel = this.originalAriaLabel || this.originalTitle || "Text";
+					liveEl.textContent = `${objectLabel} ${copiedLabel.toLowerCase()}`;
+				}
+			}, 50);
+
+			if (this.originalAriaLabel) {
+				this.el.setAttribute("aria-label", `${this.originalAriaLabel} (${copiedLabel})`);
+			} else {
+				this.el.setAttribute("aria-label", copiedLabel);
+			}
+
+			if (this.originalTitle) {
+				this.el.setAttribute("title", `${this.originalTitle} (${copiedLabel})`);
 			}
 
 			icon?.classList.remove("hero-clipboard-document");
@@ -207,11 +240,34 @@ const ClipboardCopy = {
 				if (label) {
 					label.textContent = this.el.dataset.copyLabel || "Copy";
 				}
+
+				if (this.originalAriaLabel) {
+					this.el.setAttribute("aria-label", this.originalAriaLabel);
+				} else {
+					this.el.removeAttribute("aria-label");
+				}
+
+				if (this.originalTitle) {
+					this.el.setAttribute("title", this.originalTitle);
+				} else {
+					this.el.removeAttribute("title");
+				}
 			}, 1400);
-		});
+		};
+
+		this.el.addEventListener("click", this.clickHandler);
 	},
 	destroyed() {
 		window.clearTimeout(this.timeout);
+		if (this.clickHandler) {
+			this.el.removeEventListener("click", this.clickHandler);
+		}
+		if (this.originalAriaLabel) {
+			this.el.setAttribute("aria-label", this.originalAriaLabel);
+		}
+		if (this.originalTitle) {
+			this.el.setAttribute("title", this.originalTitle);
+		}
 	},
 };
 const WorkerFailureMarker = {
