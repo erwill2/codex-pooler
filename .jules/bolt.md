@@ -1,0 +1,7 @@
+## 2026-08-10 - [Optimize Case-Insensitive Plan Matching with String.contains?/2]
+**Learning:** Converting a string with `String.downcase/1` and checking substring matches using `String.contains?/2` is over 5.5x faster than executing dynamic regular expressions with `=~ ~r/.../i`. Furthermore, checking multiple substrings with explicit `or` conditions (e.g., `String.contains?(s, "a") or String.contains?(s, "b")`) is substantially faster than checking a list of substrings (e.g., `String.contains?(s, ["a", "b"])`) because Elixir dynamically compiles list patterns at runtime.
+**Action:** Avoid dynamic regular expressions and list pattern matching with `String.contains?/2` on hot paths for plan checks or general substring matches; use String.downcase/1 and explicit `or` conditions instead.
+
+## 2026-08-10 - [State Leakage in ExUnit Parameterized/Iterative Loops]
+**Learning:** In parameterized loops within a single ExUnit test, since the transaction sandbox doesn't reset until the test finishes, records created in previous iterations persist into subsequent ones. This causes assertions on total record counts (e.g. `length(accounts) == size`) to fail.
+**Action:** When writing multi-iteration loops within a single test, explicitly clear the state of affected tables (e.g., using `Repo.delete_all/1` for Model, PoolUpstreamAssignment, UpstreamIdentity, Pool) at the start of each iteration.
