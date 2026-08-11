@@ -1,0 +1,4 @@
+## 2026-07-20 - Unsafe Dynamic Atom Generation (DoS via Erlang Atom Table Exhaustion)
+**Vulnerability:** Dynamic atom generation via dynamic string interpolation (such as `:"#{key}_iso"`) or unvetted `String.to_atom/1` with variables that are subject to input or dynamically resolved fields, which can exhaust the Erlang VM's atom table and crash the entire system.
+**Learning:** Erlang/BEAM VM does not garbage-collect atoms. Generating atoms dynamically can lead to VM exhaustion and Denial of Service. In `SavedResetFirstSeenEvaluator`, dynamic interpolation of `:"#{key}_iso"` was used to dynamically fetch keys from map. Since `key` is dynamically selected, Sobelow flagged this as an unsafe dynamic atom interpolation.
+**Prevention:** Avoid dynamic atom generation by explicitly pattern-matching or mapping dynamic/interpolated values to static, pre-defined/pre-vetted safe atoms.
