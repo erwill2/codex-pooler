@@ -213,13 +213,15 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
   end
 
   defp plan_rank(%UpstreamIdentity{} = identity) do
+    # Optimize case-insensitive regex matching with faster string operations
     plan = identity.plan_family || plan_label(identity.plan_label) || ""
+    plan_down = String.downcase(plan)
 
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      String.contains?(plan_down, "enterprise") or String.contains?(plan_down, "team") -> 4
+      String.contains?(plan_down, "pro") -> 3
+      String.contains?(plan_down, "plus") -> 2
+      String.contains?(plan_down, "free") -> 1
       true -> 0
     end
   end
