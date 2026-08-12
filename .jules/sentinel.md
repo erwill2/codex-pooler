@@ -1,0 +1,4 @@
+## 2026-08-12 - Explicit Standard HTTP Security Headers Preservation in Phoenix Custom CSP Overrides
+**Vulnerability:** Invoking `Phoenix.Controller.put_secure_browser_headers/2` with a custom map containing only a Content-Security-Policy (CSP) header completely overrides the default browser security headers (such as `x-frame-options`, `x-content-type-options`, etc.) rather than merging with them, stripping essential clickjacking and MIME-sniffing protections.
+**Learning:** When custom browser security configurations are specified as a plain map of headers, Phoenix Controller replaces standard browser defaults.
+**Prevention:** Explicitly define and merge all standard secure browser headers (`x-frame-options`, `x-xss-protection`, `x-content-type-options`, `x-download-options`, `x-permitted-cross-domain-policies`, and `referrer-policy`) along with custom dynamic headers such as CSP.
