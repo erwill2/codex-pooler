@@ -1,0 +1,3 @@
+## 2026-07-20 - Fitts's Law Overlay Links & Screen Reader Context
+**Learning:** Absolute-positioned links that overlay cards or metric cells to provide larger click targets (enhancing Fitts's Law) can disconnect the screen reader from the visual context. Statically-defined `aria-label` values like "Open Upstreams" omit the current values of those metrics, resulting in poor accessibility when navigating by links list or tab order.
+**Action:** Always include the dynamic metric value within the overlay link's `aria-label` (e.g. `"Open Upstreams details, current: 2"`) to ensure screen reader users receive full, relevant context before navigating.
