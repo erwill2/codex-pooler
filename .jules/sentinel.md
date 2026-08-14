@@ -1,0 +1,4 @@
+## 2026-07-19 - Unsafe Dynamic Atom Generation in Map Lookup and String Interpolation
+**Vulnerability:** Untrusted string map keys passed to `String.to_atom/1` in `Settings.map_get/2` and dynamic atom interpolation `:"#{key}_iso"` in `SavedResetFirstSeenEvaluator` allowed dynamic creation of BEAM atoms.
+**Learning:** In the Erlang/BEAM VM, atoms are stored in a fixed-size system table (default ~1M) and are never garbage-collected. Dynamically constructing atoms from untrusted map keys or string interpolation allows attackers to exhaust the atom table and cause a BEAM Denial of Service (DoS) crash.
+**Prevention:** Always use `String.to_existing_atom/1` inside a `try/rescue` block or explicit pattern matching on safe static atoms instead of `String.to_atom/1` or dynamic atom string interpolation `:"#{var}"`.

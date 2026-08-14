@@ -27,6 +27,42 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
     :ok
   end
 
+  test "instance settings changeset with unknown string keys does not allocate new atoms" do
+    unatomized_key = "unatomized_key_#{System.unique_integer([:positive])}"
+
+    refute_atom_exists = fn key ->
+      assert_raise ArgumentError, fn ->
+        String.to_existing_atom(key)
+      end
+    end
+
+    refute_atom_exists.(unatomized_key)
+
+    bulkheads = %{
+      "backend" => %{
+        "max_concurrency" => 10,
+        "queue_limit" => 10,
+        "queue_timeout_ms" => 1000,
+        unatomized_key => "value"
+      },
+      "public_v1" => %{"max_concurrency" => 10, "queue_limit" => 10, "queue_timeout_ms" => 1000},
+      "public_codex" => %{
+        "max_concurrency" => 10,
+        "queue_limit" => 10,
+        "queue_timeout_ms" => 1000
+      },
+      "admin" => %{"max_concurrency" => 10, "queue_limit" => 10, "queue_timeout_ms" => 1000},
+      "observatory" => %{"max_concurrency" => 10, "queue_limit" => 10, "queue_timeout_ms" => 1000},
+      "mcp" => %{"max_concurrency" => 10, "queue_limit" => 10, "queue_timeout_ms" => 1000}
+    }
+
+    settings = Settings.default()
+    changeset = Settings.changeset(settings, %{"gateway" => %{"bulkheads" => bulkheads}})
+
+    refute changeset.valid?
+    refute_atom_exists.(unatomized_key)
+  end
+
   test "only owner scopes can update singleton settings through the context", %{
     scope: owner_scope
   } do
