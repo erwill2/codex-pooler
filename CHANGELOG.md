@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.3](https://github.com/icoretech/codex-pooler/compare/codex-pooler-v0.6.2...codex-pooler-v0.6.3) (2026-08-14)
+
+
+### Bug Fixes
+
+* **test:** keep EPMD alive across test partitions ([197aafa](https://github.com/icoretech/codex-pooler/commit/197aafa9e2d5f132598a95408c12e6ab596a130a))
+
 ## [0.6.2](https://github.com/icoretech/codex-pooler/compare/codex-pooler-v0.6.1...codex-pooler-v0.6.2) (2026-08-14)
 
 
