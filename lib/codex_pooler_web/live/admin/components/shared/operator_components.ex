@@ -82,6 +82,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents do
       >
         <summary
           data-role="status-filter-trigger"
+          aria-label="Filter by status"
           class="select select-bordered flex min-h-10 w-full cursor-pointer items-center gap-2 pr-8 text-left text-sm font-normal"
         >
           <.icon name={@selected.icon} class={["size-4 shrink-0", @selected.icon_class]} />
