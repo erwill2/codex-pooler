@@ -335,10 +335,17 @@ defmodule CodexPoolerWeb.Admin.SettingsPageComponents.Security do
   defp session_device(%{user_agent: user_agent}) when is_binary(user_agent) do
     user_agent = String.downcase(user_agent)
 
+    # Bolt performance optimization: Explicit 'or' checks avoid dynamic list pattern compilation on every invocation
     cond do
-      String.contains?(user_agent, ["ipad", "tablet"]) -> "tablet"
-      String.contains?(user_agent, ["mobile", "iphone", "android"]) -> "mobile"
-      true -> "desktop"
+      String.contains?(user_agent, "ipad") or String.contains?(user_agent, "tablet") ->
+        "tablet"
+
+      String.contains?(user_agent, "mobile") or String.contains?(user_agent, "iphone") or
+          String.contains?(user_agent, "android") ->
+        "mobile"
+
+      true ->
+        "desktop"
     end
   end
 
