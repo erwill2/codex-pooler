@@ -1,0 +1,3 @@
+## 2026-07-20 - Replace Dynamic Regex Matching with String.downcase and String.contains? in Hot Paths
+**Learning:** Evaluating dynamic regular expressions with case-insensitivity (`plan =~ ~r/.../i`) inside hot routing candidate selection and catalog ranking functions creates noticeable PCRE/NIF execution overhead. Downcasing the target string once with `String.downcase/1` and checking boolean inclusion with `String.contains?/2` is over 5.5x faster.
+**Action:** Always prefer `String.downcase/1` + `String.contains?/2` or static string pattern matching over dynamic `=~ ~r/.../i` when checking simple substring memberships in high-frequency hot execution paths.
