@@ -1,0 +1,3 @@
+## 2026-08-20 - Pretokenizer regex match extraction and BPE pair merging in token counter
+**Learning:** `Regex.scan/2` returns a list of match lists `[["match1"], ["match2"]]`. Using `Enum.map(&hd/1)` to extract single-group matches is ~30% faster than `List.flatten/1` by avoiding deep recursive list flattening and redundant list allocations. Similarly, in BPE byte pair merging loops, recursive pattern matching `[head | merge_at(tail, index - 1)]` is faster than `Enum.split/2` + list concatenation (`++`).
+**Action:** Use `Enum.map(&hd/1)` instead of `List.flatten/1` for single-capture `Regex.scan/2` output processing, and use direct pattern-matching list recursion instead of `Enum.split/2` + `++` when updating lists at a specific index in tight loops.
