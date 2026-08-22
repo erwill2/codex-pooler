@@ -17,8 +17,10 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter.Pretokenizer do
     do: scan(@o200k_pattern, text)
 
   defp scan(pattern, text) do
+    # Optimization: Enum.map(&hd/1) extracts single-element match list heads in O(n)
+    # avoiding List.flatten/1 deep recursive structure traversal and extra list allocations.
     pattern
     |> Regex.scan(text)
-    |> List.flatten()
+    |> Enum.map(&hd/1)
   end
 end
