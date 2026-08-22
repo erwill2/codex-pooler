@@ -504,7 +504,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
         <.link
           navigate={@href}
           class={footer_metric_link_class(@position)}
-          aria-label={"Open #{@label}"}
+          aria-label={"Open #{@label} details, current: #{@value}"}
         >
           <span class="sr-only">{@label}</span>
         </.link>
