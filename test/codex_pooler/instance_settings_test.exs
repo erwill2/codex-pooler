@@ -113,6 +113,37 @@ defmodule CodexPooler.InstanceSettingsTest do
 
   defp dynamic_term(term), do: term |> :erlang.term_to_binary() |> :erlang.binary_to_term()
 
+  test "changeset safely ignores untrusted string keys in bulkheads without atom table exhaustion" do
+    settings = InstanceSettings.ensure_singleton!()
+    unknown_key = "untrusted_key_#{System.unique_integer([:positive])}"
+
+    assert {:error, changeset} =
+             InstanceSettings.update_system_settings(settings, %{
+               "gateway" => %{
+                 "bulkheads" => %{
+                   "proxy_http" => %{
+                     "max_concurrency" => 10,
+                     "queue_limit" => 5,
+                     "queue_timeout_ms" => 1000,
+                     unknown_key => "malicious_value"
+                   }
+                 }
+               }
+             })
+
+    assert errors_on(changeset).gateway != []
+
+    atom_exists? =
+      try do
+        _ = String.to_existing_atom(unknown_key)
+        true
+      rescue
+        ArgumentError -> false
+      end
+
+    refute atom_exists?
+  end
+
   test "changeset rejects invalid CIDR, negative TTL, invalid TLS, invalid model overrides, malformed bulkheads, and invalid websocket idle timeout" do
     settings = InstanceSettings.ensure_singleton!()
 
