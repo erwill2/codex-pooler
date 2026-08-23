@@ -176,6 +176,7 @@ defmodule CodexPoolerWeb.CoreComponents do
           name={@name}
           class={[@class || "w-full select", @errors != [] && (@error_class || "select-error")]}
           multiple={@multiple}
+          aria-invalid={if @errors != [], do: "true"}
           {@rest}
         >
           <option :if={@prompt} value="">{@prompt}</option>
@@ -199,6 +200,7 @@ defmodule CodexPoolerWeb.CoreComponents do
             @class || "w-full textarea",
             @errors != [] && (@error_class || "textarea-error")
           ]}
+          aria-invalid={if @errors != [], do: "true"}
           {@rest}
         >{Form.normalize_value("textarea", @value)}</textarea>
       </label>
@@ -221,6 +223,7 @@ defmodule CodexPoolerWeb.CoreComponents do
             @class || "w-full input",
             @errors != [] && (@error_class || "input-error")
           ]}
+          aria-invalid={if @errors != [], do: "true"}
           {@rest}
         />
       </label>
@@ -287,6 +290,7 @@ defmodule CodexPoolerWeb.CoreComponents do
           name={@name}
           value={@value}
           data-otp-value
+          aria-invalid={if @errors != [], do: "true"}
           {@rest}
         />
         <div class="codex-otp-groups">
