@@ -457,9 +457,9 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
       |> Enum.flat_map(fn field ->
         [
           {"Default #{limit_field_label(field)}",
-           normalized_limit_value(form[String.to_atom("default_#{field}")].value)},
+           normalized_limit_value(form[to_limit_field_atom("default", field)].value)},
           {"Model #{limit_field_label(field)}",
-           normalized_limit_value(form[String.to_atom("model_#{field}")].value)}
+           normalized_limit_value(form[to_limit_field_atom("model", field)].value)}
         ]
       end)
       |> Enum.reject(fn {_label, value} -> is_nil(value) end)
@@ -600,5 +600,15 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
   defp blank_to_nil(value) do
     value = String.trim(to_string(value))
     if value == "", do: nil, else: value
+  end
+
+  defp to_limit_field_atom(prefix, field) do
+    name = "#{prefix}_#{field}"
+
+    try do
+      String.to_existing_atom(name)
+    rescue
+      ArgumentError -> String.to_atom(name)
+    end
   end
 end

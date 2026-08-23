@@ -50,7 +50,14 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents.Limits do
   attr :prefix, :string, required: true
 
   def limit_input(assigns) do
-    assigns = assign(assigns, :field_atom, String.to_atom("#{assigns.prefix}_#{assigns.field}"))
+    field_atom =
+      try do
+        String.to_existing_atom("#{assigns.prefix}_#{assigns.field}")
+      rescue
+        ArgumentError -> String.to_atom("#{assigns.prefix}_#{assigns.field}")
+      end
+
+    assigns = assign(assigns, :field_atom, field_atom)
 
     ~H"""
     <.input
