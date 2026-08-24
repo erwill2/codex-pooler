@@ -361,13 +361,14 @@ defmodule CodexPooler.Catalog do
   end
 
   defp model_source_plan_rank(%UpstreamIdentity{} = identity) do
-    plan = identity.plan_family || identity.plan_label || ""
+    plan = String.downcase(identity.plan_family || identity.plan_label || "")
 
+    # Optimize hotpath plan ranking: String.contains?/2 with explicit ORs avoids dynamic regex evaluation.
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      String.contains?(plan, "enterprise") or String.contains?(plan, "team") -> 4
+      String.contains?(plan, "pro") -> 3
+      String.contains?(plan, "plus") -> 2
+      String.contains?(plan, "free") -> 1
       true -> 0
     end
   end
