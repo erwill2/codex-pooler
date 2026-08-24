@@ -99,7 +99,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_create_operator">close</button>
+        <button type="button" phx-click="cancel_create_operator" aria-label="Close modal backdrop">close</button>
       </form>
     </dialog>
     """
@@ -172,7 +172,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_edit">close</button>
+        <button type="button" phx-click="cancel_edit" aria-label="Close modal backdrop">close</button>
       </form>
     </dialog>
     """
@@ -262,7 +262,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_reset">close</button>
+        <button type="button" phx-click="cancel_reset" aria-label="Close modal backdrop">close</button>
       </form>
     </dialog>
     """
@@ -275,10 +275,11 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
 
   defp operator_email_input(%{field: %Phoenix.HTML.FormField{} = field} = assigns) do
     errors = if Phoenix.Component.used_input?(field), do: field.errors, else: []
+    input_id = assigns[:id] || field.id || "operator-email"
 
     assigns =
       assigns
-      |> assign(:id, field.id)
+      |> assign(:id, input_id)
       |> assign(:name, field.name)
       |> assign(:value, field.value)
       |> assign(:errors, Enum.map(errors, &translate_error(&1)))
@@ -297,14 +298,18 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
             placeholder={@placeholder}
             autocomplete="email"
             required={@required}
+            aria-invalid={@errors != [] && "true"}
+            aria-describedby={if(@errors != [], do: "#{@id}-error")}
           />
         </span>
       </label>
       <div class="validator-hint hidden">Enter valid email address</div>
-      <p :for={msg <- @errors} class="mt-1.5 flex items-center gap-2 text-sm text-error">
-        <.icon name="hero-exclamation-circle" class="size-5" />
-        {msg}
-      </p>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <p :for={msg <- @errors} class="mt-1.5 flex items-center gap-2 text-sm text-error">
+          <.icon name="hero-exclamation-circle" class="size-5" />
+          {msg}
+        </p>
+      </div>
     </div>
     """
   end
