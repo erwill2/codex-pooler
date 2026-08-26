@@ -154,13 +154,21 @@ defmodule CodexPooler.Access.Invites.ReadModel do
   defp maybe_filter_email(query, ""), do: query
 
   defp maybe_filter_email(query, email) when is_binary(email) do
-    pattern = "%#{String.downcase(String.trim(email))}%"
+    escaped = escape_like(String.downcase(String.trim(email)))
+    pattern = "%#{escaped}%"
 
     from [invite, ...] in query,
       where: fragment("lower(?) LIKE ?", invite.invited_email, ^pattern)
   end
 
   defp maybe_filter_email(query, _email), do: query
+
+  defp escape_like(string) when is_binary(string) do
+    string
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
+  end
 
   defp effective_status(%Invite{status: @status_active, expires_at: %DateTime{} = expires_at}) do
     if DateTime.compare(expires_at, now()) == :gt, do: @status_active, else: @status_expired

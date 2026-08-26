@@ -215,6 +215,22 @@ defmodule CodexPooler.Access.InviteTest do
     assert acceptance.accepted_by_email == "accepted@example.com"
   end
 
+  test "list_invites safely escapes SQL LIKE wildcards in email filter" do
+    pool = pool_fixture(%{slug: "like-wildcard-pool", name: "Wildcard Pool"})
+    scope = fixture_owner_scope()
+
+    {:ok, %{invite: matching_percent}} =
+      Access.create_invite(scope, pool, %{invited_email: "user%test@example.com"})
+
+    {:ok, %{invite: _other}} =
+      Access.create_invite(scope, pool, %{invited_email: "user123test@example.com"})
+
+    assert {:ok, %{items: [row], total: 1}} =
+             Access.list_invites(scope, filters: [email: "user%test"])
+
+    assert row.id == matching_percent.id
+  end
+
   test "list_invites returns operator-facing invite rows" do
     pool = pool_fixture(%{slug: "invite-rows", name: "Invite Rows"})
     scope = fixture_owner_scope()
