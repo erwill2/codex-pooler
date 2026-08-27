@@ -156,6 +156,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
 
   defp normalize_input_items(input) do
     Enum.reduce_while(input, {:ok, []}, fn item, {:ok, acc} ->
+      item = sanitize_reserved_metadata(item)
+
       case normalize_input_item(item) do
         {:ok, items} when is_list(items) -> {:cont, {:ok, Enum.reverse(items) ++ acc}}
         {:ok, item} -> {:cont, {:ok, [item | acc]}}
@@ -167,6 +169,19 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp sanitize_reserved_metadata(%{@metadata_passthrough_key => metadata} = item)
+       when is_map(metadata) do
+    sanitized = Map.delete(metadata, "executed_tool_calls")
+
+    if map_size(sanitized) == 0 do
+      Map.delete(item, @metadata_passthrough_key)
+    else
+      Map.put(item, @metadata_passthrough_key, sanitized)
+    end
+  end
+
+  defp sanitize_reserved_metadata(item), do: item
 
   @spec normalize_audio_input_items([map()]) ::
           {:ok, [map()]} | {:error, Error.reason()}

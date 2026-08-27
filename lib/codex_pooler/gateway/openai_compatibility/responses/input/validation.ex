@@ -32,15 +32,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Validation do
     end
   end
 
-  defp validate_reserved_metadata(%{@metadata_passthrough_key => metadata})
-       when is_map(metadata) do
-    if Map.has_key?(metadata, "executed_tool_calls") do
-      {:error, Error.invalid_request("executed_tool_calls is reserved", "input")}
-    else
-      :ok
-    end
-  end
-
   defp validate_reserved_metadata(_item), do: :ok
 
   defp validate_input_item(%{"type" => "item_reference"} = item, payload, has_tool_result?),
