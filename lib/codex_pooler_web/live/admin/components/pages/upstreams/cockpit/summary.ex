@@ -87,6 +87,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitComponents.Summary do
                 phx-hook="ClipboardCopy"
                 phx-update="ignore"
                 data-copy-text={@flow.device.user_code}
+                title="Copy device code"
                 aria-label="Copy device code"
               >
                 <.icon name="hero-clipboard-document" class="copy-icon size-3.5" />
