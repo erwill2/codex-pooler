@@ -9,7 +9,8 @@ config :codex_pooler, CodexPoolerWeb.Endpoint,
     exclude: [
       hosts: ["localhost", "127.0.0.1"],
       paths: ["/metrics"],
-      conn: {CodexPoolerWeb.Plugs.ForwardedSSL, :websocket_over_forwarded_ssl?, []}
+      # Runtime DISABLE_FORCE_SSL and wss-over-proxy are handled here (force_ssl is compile-time).
+      conn: {CodexPoolerWeb.Plugs.ForwardedSSL, :force_ssl_excluded?, []}
     ]
   ]
 
