@@ -101,7 +101,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   end
 
   @compact_support_key "supports_compact_responses"
-  @active_model_status "active"
+  @routable_model_statuses ~w(active stale)
   @health_excluded [
     AssignmentStatus.cooldown_health_status(),
     AssignmentStatus.disabled_health_status(),
@@ -437,7 +437,7 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   defp list_active_models(pool_id) do
     Repo.all(
       from model in Model,
-        where: model.pool_id == ^pool_id and model.status == ^@active_model_status,
+        where: model.pool_id == ^pool_id and model.status in ^@routable_model_statuses,
         order_by: [asc: model.exposed_model_id]
     )
   end
