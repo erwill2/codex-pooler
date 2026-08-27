@@ -3034,6 +3034,84 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
     end
   end
 
+  test "POST /v1/responses streams V2 compact-trigger metadata and keeps Lite incremental input",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.sse_stream([
+          {"response.output_item.done",
+           %{
+             "type" => "response.output_item.done",
+             "item" => %{
+               "type" => "compaction",
+               "encrypted_content" => "synthetic-v2-compact-encrypted"
+             }
+           }},
+          {"response.completed",
+           %{
+             "type" => "response.completed",
+             "response" => %{
+               "id" => "resp_v1_v2_compact",
+               "object" => "response",
+               "status" => "completed",
+               "output" => [
+                 %{
+                   "type" => "compaction",
+                   "encrypted_content" => "synthetic-v2-compact-encrypted"
+                 }
+               ],
+               "usage" => %{"input_tokens" => 6, "output_tokens" => 2, "total_tokens" => 8}
+             }
+           }}
+        ])
+      )
+
+    setup =
+      upstream
+      |> gateway_setup(compact?: true)
+      |> put_setup_model_source_metadata!(%{
+        "use_responses_lite" => true,
+        "capabilities" => %{"reasoning" => true, "responses" => true, "tools" => true}
+      })
+
+    response =
+      conn
+      |> auth(setup)
+      |> post("/v1/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "previous_response_id" => "resp_v1_v2_compact_previous",
+        "instructions" => "synthetic compact instructions",
+        "tools" => [
+          %{
+            "type" => "function",
+            "name" => "lookup_fixture",
+            "parameters" => %{"type" => "object", "properties" => %{}}
+          }
+        ],
+        "input" => public_tool_output_compaction_trigger_input("synthetic v2 compact"),
+        "client_metadata" => %{
+          "x-codex-turn-metadata" =>
+            Jason.encode!(%{"compaction" => %{"implementation" => "responses_compaction_v2"}})
+        }
+      })
+
+    assert response.status == 200
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+    assert captured.json["stream"] == true
+    assert captured.json["store"] == false
+    assert captured.json["previous_response_id"] == "resp_v1_v2_compact_previous"
+    refute Enum.any?(captured.json["input"], &match?(%{"type" => "additional_tools"}, &1))
+
+    assert Enum.map(captured.json["input"], & &1["type"]) == [
+             "function_call_output",
+             "compaction_trigger"
+           ]
+
+    assert captured.json["tools"]
+    refute Map.has_key?(captured.json, "include")
+  end
+
   @tag :public_compaction_trigger_http_qa
   test "live curl bridges a public terminal compaction trigger as Responses SSE" do
     prompt_text = "synthetic public compaction curl input"
@@ -4808,21 +4886,30 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
   end
 
   @tag :custom_tool_replay
-  @tag :invalid_request_error
-  test "POST /v1/responses rejects reserved tool-call metadata before dispatch or accounting", %{
+  test "POST /v1/responses strips reserved tool-call metadata before dispatch", %{
     conn: conn
   } do
     reserved_key = "executed_tool_calls"
     reserved_sentinel = "reserved-executed-tool-calls-http-sentinel"
-    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "should_not_dispatch"}))
-    setup = gateway_setup(upstream)
-    assert :ok = Events.subscribe_pool(setup.pool)
 
-    response =
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_reserved_metadata_stripped",
+          "object" => "response",
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream)
+
+    conn =
       conn
       |> auth(setup)
       |> post("/v1/responses", %{
         "model" => setup.model.exposed_model_id,
+        "previous_response_id" => "resp_v1_reserved_metadata_previous",
+        "store" => false,
         "input" => [
           %{
             "type" => "custom_tool_call_output",
@@ -4837,20 +4924,27 @@ defmodule CodexPoolerWeb.V1.ResponsesControllerTest do
         ]
       })
 
-    assert %{"error" => error} = json_response(response, 400)
-    assert error["type"] == "invalid_request_error"
-    assert error["code"] == "invalid_request"
-    assert error["param"] == "input"
-    refute response.resp_body =~ "internal_chat_message_metadata_passthrough"
-    refute response.resp_body =~ reserved_sentinel
-    assert FakeUpstream.count(upstream) == 0
-    assert Repo.aggregate(Request, :count) == 0
-    assert Repo.aggregate(Attempt, :count) == 0
-    refute_received {Events, %{reason: "request_finalized"}}
+    assert %{"id" => "resp_v1_reserved_metadata_stripped", "object" => "response"} =
+             json_response(conn, 200)
 
-    persistence_text = inspect(RequestLogs.list(setup.pool))
+    assert FakeUpstream.count(upstream) == 1
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert [custom_output] = captured.json["input"]
+    assert custom_output["type"] == "custom_tool_call_output"
+
+    assert custom_output["internal_chat_message_metadata_passthrough"] == %{
+             "turn_id" => "turn_reserved_metadata_http"
+           }
+
+    refute inspect(captured.json) =~ reserved_sentinel
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+
+    persistence_text = inspect({request.request_metadata, RequestLogs.list(setup.pool)})
     refute persistence_text =~ reserved_key
     refute persistence_text =~ reserved_sentinel
+    refute persistence_text =~ "turn_reserved_metadata_http"
   end
 
   @tag :custom_tool_replay

@@ -1749,6 +1749,35 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
     end
 
     @tag :custom_tool_replay
+    test "custom tool replay drops in_progress status metadata" do
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "previous_response_id" => "resp_fixture_custom_tool_in_progress",
+        "store" => false,
+        "input" => [
+          %{
+            "type" => "custom_tool_call",
+            "call_id" => "call_fixture_custom_in_progress",
+            "name" => "lookup",
+            "input" => "{}",
+            "status" => "in_progress"
+          },
+          %{
+            "type" => "custom_tool_call_output",
+            "call_id" => "call_fixture_custom_in_progress",
+            "output" => "ok"
+          }
+        ]
+      }
+
+      assert {:ok, result} = Responses.coerce(payload)
+      assert [custom_call, custom_output] = result.payload["input"]
+      assert custom_call["type"] == "custom_tool_call"
+      assert custom_output["type"] == "custom_tool_call_output"
+      refute Map.has_key?(custom_call, "status")
+    end
+
+    @tag :custom_tool_replay
     test "custom tool replay rejects malformed custom item shapes" do
       invalid_payloads = [
         [
@@ -1784,21 +1813,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
             "type" => "custom_tool_call",
             "call_id" => "call_fixture_custom",
             "name" => "lookup"
-          },
-          %{
-            "type" => "custom_tool_call_output",
-            "call_id" => "call_fixture_custom",
-            "output" => "ok"
-          }
-        ],
-        [
-          %{
-            "type" => "custom_tool_call",
-            "call_id" => "call_fixture_custom",
-            "namespace" => "browser.search",
-            "name" => "lookup",
-            "input" => "{}",
-            "status" => "in_progress"
           },
           %{
             "type" => "custom_tool_call_output",
@@ -2295,6 +2309,18 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
             "call_id" => "call_fixture_incomplete",
             "output" => "synthetic incomplete tool output"
           },
+          %{
+            "type" => "function_call",
+            "call_id" => "call_fixture_in_progress",
+            "name" => "lookup_fixture",
+            "arguments" => "{\"value\":\"in_progress\"}",
+            "status" => "in_progress"
+          },
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_fixture_in_progress",
+            "output" => "synthetic in-progress tool output"
+          },
           %{"role" => "user", "content" => "synthetic follow-up"}
         ]
       }
@@ -2306,11 +2332,153 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
                %{"type" => "function_call_output"},
                %{"type" => "function_call"} = incomplete_call,
                %{"type" => "function_call_output"},
+               %{"type" => "function_call"} = in_progress_call,
+               %{"type" => "function_call_output"},
                %{"type" => "message", "role" => "user"}
              ] = coerced["input"]
 
       refute Map.has_key?(completed_call, "status")
       refute Map.has_key?(incomplete_call, "status")
+      refute Map.has_key?(in_progress_call, "status")
+    end
+
+    @tag :codex_native_replay
+    test "Codex native hosted-call and agent replay items stay translatable" do
+      passthrough_key = "internal_chat_message_metadata_passthrough"
+
+      payload = %{
+        "model" => "gpt-fixture-text",
+        "previous_response_id" => "resp_fixture_codex_native_replay",
+        "input" => [
+          %{
+            "type" => "reasoning",
+            "id" => "rs_fixture_status",
+            "summary" => [%{"type" => "summary_text", "text" => "synthetic reasoning"}],
+            "encrypted_content" => "synthetic-encrypted-reasoning",
+            "status" => "completed"
+          },
+          %{
+            "type" => "web_search_call",
+            "id" => "ws_fixture",
+            "status" => "completed",
+            "action" => %{"type" => "search", "query" => "synthetic query"}
+          },
+          %{
+            "type" => "image_generation_call",
+            "id" => "ig_fixture",
+            "status" => "completed",
+            "revised_prompt" => "synthetic cat",
+            "result" => "synthetic-image-result"
+          },
+          %{
+            "type" => "agent_message",
+            "id" => "amsg_fixture",
+            "author" => "root",
+            "recipient" => "subagent",
+            "content" => [%{"type" => "input_text", "text" => "synthetic agent note"}]
+          },
+          %{
+            "type" => "compaction_summary",
+            "encrypted_content" => "synthetic-encrypted-compaction",
+            "id" => "cmp_fixture_summary"
+          },
+          %{
+            "type" => "context_compaction",
+            "id" => "cmp_fixture_context",
+            "encrypted_content" => "synthetic-encrypted-context-compaction",
+            passthrough_key => %{
+              "turn_id" => "turn_fixture_context",
+              "create_time" => 1_777_248_000,
+              "content_item_kinds" => ["user_message"]
+            }
+          },
+          %{
+            "type" => "compaction",
+            "encrypted_content" => "synthetic-encrypted-compaction-extra",
+            "id" => "cmp_fixture_extra",
+            passthrough_key => %{
+              "turn_id" => "turn_fixture_extra",
+              "create_time" => 1_777_248_001
+            }
+          },
+          %{
+            "type" => "local_shell_call",
+            "id" => "lsh_fixture",
+            "call_id" => "call_local_shell",
+            "status" => "completed",
+            "action" => %{"type" => "exec", "command" => ["echo", "synthetic"]}
+          },
+          %{
+            "type" => "local_shell_call_output",
+            "call_id" => "call_local_shell",
+            "output" => "synthetic\n"
+          },
+          %{
+            "type" => "tool_search_call",
+            "id" => "tsc_fixture",
+            "call_id" => "call_tool_search",
+            "status" => "completed",
+            "execution" => "tool_search",
+            "arguments" => %{"query" => "synthetic"}
+          },
+          %{
+            "type" => "tool_search_output",
+            "id" => "tso_fixture",
+            "call_id" => "call_tool_search",
+            "status" => "completed",
+            "execution" => "tool_search",
+            "tools" => [%{"type" => "function", "name" => "lookup_fixture"}]
+          },
+          %{
+            "type" => "apply_patch_call",
+            "call_id" => "call_apply_patch",
+            "status" => "completed",
+            "operation" => %{
+              "type" => "create_file",
+              "path" => "synthetic.txt",
+              "diff" => "synthetic"
+            }
+          },
+          %{
+            "type" => "apply_patch_call_output",
+            "call_id" => "call_apply_patch",
+            "status" => "completed",
+            "output" => "synthetic patch applied"
+          },
+          %{"role" => "user", "content" => "synthetic follow-up"}
+        ]
+      }
+
+      assert {:ok, %{payload: %{"input" => input}}} = Responses.coerce(payload)
+
+      assert [
+               %{"type" => "reasoning", "id" => "rs_fixture_status"} = reasoning,
+               %{"type" => "web_search_call", "id" => "ws_fixture", "status" => "completed"},
+               %{"type" => "image_generation_call", "id" => "ig_fixture"},
+               %{"type" => "agent_message", "author" => "root"},
+               %{
+                 "type" => "compaction",
+                 "encrypted_content" => "synthetic-encrypted-compaction",
+                 "id" => "cmp_fixture_summary"
+               },
+               %{"type" => "context_compaction", "id" => "cmp_fixture_context"},
+               %{"type" => "compaction", "id" => "cmp_fixture_extra"} = extra_compaction,
+               %{
+                 "type" => "local_shell_call",
+                 "id" => "lsh_fixture",
+                 "action" => %{"type" => "exec"}
+               },
+               %{"type" => "local_shell_call_output", "output" => "synthetic\n"},
+               %{"type" => "tool_search_call", "execution" => "tool_search"},
+               %{"type" => "tool_search_output", "tools" => [_tool]},
+               %{"type" => "apply_patch_call", "operation" => %{"type" => "create_file"}},
+               %{"type" => "apply_patch_call_output", "call_id" => "call_apply_patch"},
+               %{"type" => "message", "role" => "user"}
+             ] = input
+
+      refute Map.has_key?(reasoning, "status")
+
+      assert get_in(extra_compaction, [passthrough_key, "create_time"]) == 1_777_248_001
     end
 
     test "OMP 16.3.14 GPT-5.6 clean first turn preserves supported Responses fields" do
@@ -2539,24 +2707,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "type" => "compaction",
           "encrypted_content" => "opaque-encrypted-fixture",
           "id" => "cmp_opaque_fixture",
-          passthrough_key => %{"turn_id" => "turn_opaque_fixture", "extra" => true}
-        },
-        %{
-          "type" => "compaction",
-          "encrypted_content" => "opaque-encrypted-fixture",
-          "id" => "cmp_opaque_fixture",
-          passthrough_key => %{"executed_tool_calls" => []}
-        },
-        %{
-          "type" => "compaction",
-          "encrypted_content" => "opaque-encrypted-fixture",
-          "id" => "cmp_opaque_fixture",
           "created_by" => "fixture"
-        },
-        %{
-          "type" => "compaction_summary",
-          "encrypted_content" => "opaque-encrypted-fixture",
-          "id" => "cmp_opaque_fixture"
         },
         %{
           "type" => "compaction",
@@ -2991,12 +3142,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         %{
           "type" => "reasoning",
           "summary" => [%{"type" => "summary_text", "text" => "bad"}],
-          "encrypted_content" => "synthetic-encrypted-reasoning",
-          "status" => "completed"
-        },
-        %{
-          "type" => "reasoning",
-          "summary" => [%{"type" => "summary_text", "text" => "bad"}],
           "content" => [%{"type" => "reasoning_text", "text" => 42}],
           "encrypted_content" => "synthetic-encrypted-reasoning"
         },
@@ -3010,12 +3155,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "id" => "rs_fixture",
           "summary" => [],
           "encrypted_content" => %{}
-        },
-        %{
-          "type" => "reasoning",
-          "id" => "rs_fixture",
-          "summary" => [],
-          "status" => "completed"
         },
         %{
           "type" => "function_call",
@@ -3034,13 +3173,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
           "call_id" => "call_fixture",
           "name" => "lookup_fixture",
           "arguments" => "{}",
-          "status" => "in_progress"
-        },
-        %{
-          "type" => "function_call",
-          "call_id" => "call_fixture",
-          "name" => "lookup_fixture",
-          "arguments" => "{}",
           "namespace" => " "
         },
         %{
@@ -3050,7 +3182,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         },
         %{"type" => "local_shell_call", "call_id" => "call_fixture"},
         %{"type" => "mcp_approval_response", "call_id" => "call_fixture", "output" => "bad"},
-        %{"type" => "web_search_call", "id" => "ws_fixture"},
         %{"type" => "unknown_fixture", "id" => "item_fixture"}
       ]
 
@@ -3299,8 +3430,8 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              }
     end
 
-    test "previous_response_id without semantic tool output is rejected" do
-      invalid_payloads = [
+    test "previous_response_id without semantic tool output is preserved for continuation" do
+      payloads = [
         %{
           "previous_response_id" => "resp_fixture_ordinary",
           "input" => "synthetic ordinary continuation"
@@ -3308,7 +3439,21 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         %{
           "previous_response_id" => "resp_fixture_message_only",
           "input" => [%{"role" => "user", "content" => "synthetic ordinary continuation"}]
-        },
+        }
+      ]
+
+      Enum.each(payloads, fn payload ->
+        assert {:ok, result} =
+                 payload
+                 |> Map.put("model", "gpt-fixture-text")
+                 |> Responses.coerce()
+
+        assert result.payload["previous_response_id"] == payload["previous_response_id"]
+      end)
+    end
+
+    test "blank or non-string previous_response_id is still rejected" do
+      invalid_payloads = [
         %{
           "previous_response_id" => "",
           "input" => [
@@ -5387,6 +5532,11 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
         {%{
            "model" => "gpt-fixture-text",
            "input" => "synthetic input",
+           "tools" => [%{"type" => "local_shell"}]
+         }, "tool shape is not translatable", "tools"},
+        {%{
+           "model" => "gpt-fixture-text",
+           "input" => "synthetic input",
            "tools" => [%{"type" => "shell"}]
          }, "tool shape is not translatable", "tools"},
         {%{
@@ -5686,103 +5836,333 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityTest do
              List.duplicate(passthrough, 6)
   end
 
-  test "Responses rejects reserved executed tool calls on native function call outputs" do
+  test "Responses strips reserved executed tool calls on native function call outputs" do
     passthrough_key = "internal_chat_message_metadata_passthrough"
 
     for executed_tool_calls <- [nil, %{"synthetic" => true}] do
-      input = %{
-        "type" => "function_call_output",
-        "call_id" => "call_native_reserved_fixture",
-        "output" => "synthetic native output",
-        passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
-      }
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "type" => "function_call_output",
+                     "call_id" => "call_native_reserved_fixture",
+                     "output" => "synthetic native output",
+                     passthrough_key => %{
+                       "turn_id" => "turn_native_reserved_fixture",
+                       "executed_tool_calls" => executed_tool_calls
+                     }
+                   }
+                 ])
+               )
 
-      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
-               Responses.coerce(responses_payload([input]))
+      assert [item] = result.payload["input"]
+      assert item[passthrough_key] == %{"turn_id" => "turn_native_reserved_fixture"}
+    end
+
+    for executed_tool_calls <- [nil, %{"synthetic" => true}] do
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "type" => "function_call_output",
+                     "call_id" => "call_native_reserved_fixture",
+                     "output" => "synthetic native output",
+                     passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
+                   }
+                 ])
+               )
+
+      assert [item] = result.payload["input"]
+      refute Map.has_key?(item, passthrough_key)
     end
   end
 
-  test "Responses rejects reserved executed tool calls on translated assistant tool calls" do
+  test "Responses strips reserved executed tool calls on translated assistant tool calls" do
     passthrough_key = "internal_chat_message_metadata_passthrough"
 
     for executed_tool_calls <- [nil, %{"synthetic" => true}] do
-      input = %{
-        "role" => "assistant",
-        passthrough_key => %{"executed_tool_calls" => executed_tool_calls},
-        "tool_calls" => [
-          %{
-            "id" => "call_translated_assistant_reserved_fixture",
-            "type" => "function",
-            "function" => %{"name" => "lookup_fixture", "arguments" => "{}"}
-          }
-        ]
-      }
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "role" => "assistant",
+                     passthrough_key => %{
+                       "turn_id" => "turn_translated_assistant_reserved_fixture",
+                       "executed_tool_calls" => executed_tool_calls
+                     },
+                     "tool_calls" => [
+                       %{
+                         "id" => "call_translated_assistant_reserved_fixture",
+                         "type" => "function",
+                         "function" => %{"name" => "lookup_fixture", "arguments" => "{}"}
+                       }
+                     ]
+                   }
+                 ])
+               )
 
-      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
-               Responses.coerce(responses_payload([input]))
+      assert [item] = result.payload["input"]
+      assert item["type"] == "function_call"
+      assert item[passthrough_key] == %{"turn_id" => "turn_translated_assistant_reserved_fixture"}
+    end
+
+    for executed_tool_calls <- [nil, %{"synthetic" => true}] do
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "role" => "assistant",
+                     passthrough_key => %{"executed_tool_calls" => executed_tool_calls},
+                     "tool_calls" => [
+                       %{
+                         "id" => "call_translated_assistant_reserved_fixture",
+                         "type" => "function",
+                         "function" => %{"name" => "lookup_fixture", "arguments" => "{}"}
+                       }
+                     ]
+                   }
+                 ])
+               )
+
+      assert [item] = result.payload["input"]
+      assert item["type"] == "function_call"
+      refute Map.has_key?(item, passthrough_key)
     end
   end
 
-  test "Responses rejects reserved executed tool calls on translated tool outputs" do
+  test "Responses strips reserved executed tool calls on nested assistant tool call passthrough" do
+    passthrough_key = "internal_chat_message_metadata_passthrough"
+
+    assert {:ok, result} =
+             Responses.coerce(
+               responses_payload([
+                 %{
+                   "role" => "assistant",
+                   "tool_calls" => [
+                     %{
+                       "id" => "call_translated_assistant_child_reserved_fixture",
+                       "type" => "function",
+                       passthrough_key => %{
+                         "turn_id" => "turn_translated_assistant_child_reserved_fixture",
+                         "executed_tool_calls" => %{"synthetic" => true}
+                       },
+                       "function" => %{"name" => "lookup_fixture", "arguments" => "{}"}
+                     }
+                   ]
+                 }
+               ])
+             )
+
+    assert [item] = result.payload["input"]
+    assert item["type"] == "function_call"
+    assert item["call_id"] == "call_translated_assistant_child_reserved_fixture"
+
+    assert item[passthrough_key] == %{
+             "turn_id" => "turn_translated_assistant_child_reserved_fixture"
+           }
+  end
+
+  test "Responses strips reserved executed tool calls on translated tool outputs" do
     passthrough_key = "internal_chat_message_metadata_passthrough"
 
     for executed_tool_calls <- [nil, %{"synthetic" => true}] do
-      input = %{
-        "role" => "tool",
-        "tool_call_id" => "call_translated_tool_reserved_fixture",
-        "content" => "synthetic translated output",
-        passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
-      }
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "role" => "tool",
+                     "tool_call_id" => "call_translated_tool_reserved_fixture",
+                     "content" => "synthetic translated output",
+                     passthrough_key => %{
+                       "turn_id" => "turn_translated_tool_reserved_fixture",
+                       "executed_tool_calls" => executed_tool_calls
+                     }
+                   }
+                 ])
+               )
 
-      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
-               Responses.coerce(responses_payload([input]))
+      assert [item] = result.payload["input"]
+      assert item["type"] == "function_call_output"
+      assert item[passthrough_key] == %{"turn_id" => "turn_translated_tool_reserved_fixture"}
+    end
+
+    for executed_tool_calls <- [nil, %{"synthetic" => true}] do
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "role" => "tool",
+                     "tool_call_id" => "call_translated_tool_reserved_fixture",
+                     "content" => "synthetic translated output",
+                     passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
+                   }
+                 ])
+               )
+
+      assert [item] = result.payload["input"]
+      assert item["type"] == "function_call_output"
+      refute Map.has_key?(item, passthrough_key)
     end
   end
 
-  test "Responses rejects reserved executed tool calls on ordinary messages" do
+  test "Responses strips reserved executed tool calls on ordinary messages" do
     passthrough_key = "internal_chat_message_metadata_passthrough"
 
     for executed_tool_calls <- [nil, %{"synthetic" => true}] do
-      input = %{
-        "type" => "message",
-        "role" => "user",
-        "content" => [%{"type" => "input_text", "text" => "synthetic message"}],
-        passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
-      }
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "type" => "message",
+                     "role" => "user",
+                     "content" => [%{"type" => "input_text", "text" => "synthetic message"}],
+                     passthrough_key => %{
+                       "turn_id" => "turn_message_reserved_fixture",
+                       "executed_tool_calls" => executed_tool_calls
+                     }
+                   }
+                 ])
+               )
 
-      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
-               Responses.coerce(responses_payload([input]))
+      assert [item] = result.payload["input"]
+      assert item[passthrough_key] == %{"turn_id" => "turn_message_reserved_fixture"}
+    end
+
+    for executed_tool_calls <- [nil, %{"synthetic" => true}] do
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "type" => "message",
+                     "role" => "user",
+                     "content" => [%{"type" => "input_text", "text" => "synthetic message"}],
+                     passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
+                   }
+                 ])
+               )
+
+      assert [item] = result.payload["input"]
+      refute Map.has_key?(item, passthrough_key)
     end
   end
 
-  test "Responses rejects reserved executed tool calls on top-level input files" do
+  test "Responses strips reserved executed tool calls on top-level input files" do
     passthrough_key = "internal_chat_message_metadata_passthrough"
 
     for executed_tool_calls <- [nil, %{"synthetic" => true}] do
-      input = %{
-        "type" => "input_file",
-        "file_id" => "file_reserved_fixture",
-        passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
-      }
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "type" => "input_file",
+                     "file_id" => "file_reserved_fixture",
+                     passthrough_key => %{
+                       "turn_id" => "turn_file_reserved_fixture",
+                       "executed_tool_calls" => executed_tool_calls
+                     }
+                   }
+                 ])
+               )
 
-      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
-               Responses.coerce(responses_payload([input]))
+      assert [item] = result.payload["input"]
+      assert item[passthrough_key] == %{"turn_id" => "turn_file_reserved_fixture"}
+    end
+
+    for executed_tool_calls <- [nil, %{"synthetic" => true}] do
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "type" => "input_file",
+                     "file_id" => "file_reserved_fixture",
+                     passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
+                   }
+                 ])
+               )
+
+      assert [item] = result.payload["input"]
+      refute Map.has_key?(item, passthrough_key)
     end
   end
 
-  test "Responses rejects reserved executed tool calls on generic tool result shapes" do
+  test "Responses strips reserved executed tool calls on generic tool result shapes" do
     passthrough_key = "internal_chat_message_metadata_passthrough"
 
     for executed_tool_calls <- [nil, %{"synthetic" => true}] do
-      input = %{
-        "call_id" => "call_generic_reserved_fixture",
-        "result" => %{"ok" => true},
-        passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
-      }
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "call_id" => "call_generic_reserved_fixture",
+                     "result" => %{"ok" => true},
+                     passthrough_key => %{
+                       "turn_id" => "turn_generic_reserved_fixture",
+                       "executed_tool_calls" => executed_tool_calls
+                     }
+                   }
+                 ])
+               )
 
-      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
-               Responses.coerce(responses_payload([input]))
+      assert [item] = result.payload["input"]
+      assert item[passthrough_key] == %{"turn_id" => "turn_generic_reserved_fixture"}
     end
+
+    for executed_tool_calls <- [nil, %{"synthetic" => true}] do
+      assert {:ok, result} =
+               Responses.coerce(
+                 responses_payload([
+                   %{
+                     "call_id" => "call_generic_reserved_fixture",
+                     "result" => %{"ok" => true},
+                     passthrough_key => %{"executed_tool_calls" => executed_tool_calls}
+                   }
+                 ])
+               )
+
+      assert [item] = result.payload["input"]
+      refute Map.has_key?(item, passthrough_key)
+    end
+  end
+
+  test "compaction replay strips reserved executed tool calls from passthrough" do
+    passthrough_key = "internal_chat_message_metadata_passthrough"
+
+    assert {:ok, result} =
+             Responses.coerce(%{
+               "model" => "gpt-fixture-text",
+               "input" => [
+                 %{
+                   "type" => "compaction",
+                   "encrypted_content" => "opaque-encrypted-fixture",
+                   "id" => "cmp_opaque_fixture",
+                   passthrough_key => %{
+                     "turn_id" => "turn_opaque_fixture",
+                     "executed_tool_calls" => []
+                   }
+                 }
+               ]
+             })
+
+    assert [item] = result.payload["input"]
+    assert item[passthrough_key] == %{"turn_id" => "turn_opaque_fixture"}
+
+    assert {:ok, stripped} =
+             Responses.coerce(%{
+               "model" => "gpt-fixture-text",
+               "input" => [
+                 %{
+                   "type" => "compaction",
+                   "encrypted_content" => "opaque-encrypted-fixture",
+                   "id" => "cmp_opaque_fixture",
+                   passthrough_key => %{"executed_tool_calls" => []}
+                 }
+               ]
+             })
+
+    assert [stripped_item] = stripped.payload["input"]
+    refute Map.has_key?(stripped_item, passthrough_key)
+    assert stripped_item["type"] == "compaction"
+    assert stripped_item["id"] == "cmp_opaque_fixture"
   end
 
   test "Responses rejects malformed Codex internal turn metadata on translated replay items" do

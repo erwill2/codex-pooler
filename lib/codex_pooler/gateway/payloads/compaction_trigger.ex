@@ -284,7 +284,8 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTrigger do
   defp visible_text?(value) when is_binary(value), do: String.trim(value) != ""
   defp visible_text?(_value), do: false
 
-  defp compact_payload(payload), do: project_responses_payload(payload)
+  defp compact_payload(payload),
+    do: project_responses_payload(payload, compaction_result_transport(payload))
 
   defp remove_compaction_triggers(%{"input" => input} = payload) when is_list(input) do
     Map.put(payload, "input", Enum.reject(input, &match?(%{"type" => "compaction_trigger"}, &1)))

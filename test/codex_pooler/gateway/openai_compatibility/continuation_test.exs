@@ -1451,6 +1451,34 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
     end
 
     @tag :tool_result_previous_response
+    test "v1 Responses forwards ordinary previous_response_id without a tool-output continuation",
+         %{conn: conn} do
+      upstream =
+        start_upstream(
+          FakeUpstream.json_response(%{
+            "id" => "resp_v1_ordinary_previous_forwarded",
+            "object" => "response",
+            "usage" => %{"input_tokens" => 2, "output_tokens" => 2, "total_tokens" => 4}
+          })
+        )
+
+      setup = gateway_setup(upstream)
+
+      response_conn =
+        conn
+        |> auth(setup)
+        |> post("/v1/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "previous_response_id" => "resp_v1_ordinary_previous",
+          "input" => "synthetic ordinary continuation"
+        })
+
+      assert %{"id" => "resp_v1_ordinary_previous_forwarded"} = json_response(response_conn, 200)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.json["previous_response_id"] == "resp_v1_ordinary_previous"
+    end
+
+    @tag :tool_result_previous_response
     test "v1 Responses rejects stale or malformed previous-response references before dispatch",
          _context do
       upstream =
@@ -1498,10 +1526,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
 
       invalid_payloads =
         [
-          {%{
-             "previous_response_id" => "resp_v1_stale_ordinary",
-             "input" => "synthetic ordinary continuation"
-           }, "previous_response_id"},
           {%{
              "previous_response_id" => "resp_v1_stale_item_reference",
              "input" => [
@@ -1604,7 +1628,6 @@ defmodule CodexPooler.Gateway.OpenAICompatibilityContinuationTest do
       metadata = persisted_gateway_metadata(setup.pool.id)
       assert %{items: [], total: 0} = RequestLogs.list(setup.pool)
       refute metadata =~ "synthetic ordinary continuation"
-      refute metadata =~ "resp_v1_stale_ordinary"
       refute metadata =~ "resp_v1_stale_item_reference"
       refute metadata =~ "resp_v1_broad_reference"
       refute metadata =~ "msg_existing_stale"

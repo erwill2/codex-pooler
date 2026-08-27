@@ -515,7 +515,8 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
          payload,
          %RequestOptions{} = request_options
        ) do
-    if RequestOptions.use_responses_lite?(request_options) do
+    if RequestOptions.use_responses_lite?(request_options) and
+         not compaction_trigger_bridge?(request_options) do
       {tools_present?, tools, payload} = pop_responses_lite_tools(payload)
       {instructions, payload} = Map.pop(payload, "instructions")
       input = Map.get(payload, "input", [])
@@ -531,6 +532,13 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
       payload
     end
   end
+
+  defp compaction_trigger_bridge?(%RequestOptions{
+         payload_context: %{compaction_trigger_bridge?: true}
+       }),
+       do: true
+
+  defp compaction_trigger_bridge?(_request_options), do: false
 
   defp maybe_project_compact_payload(
          payload,
@@ -752,10 +760,17 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizer do
 
   defp remove_schema_list_markers(value), do: value
 
-  defp maybe_drop_backend_codex_previous_response_id(payload, _opts) do
-    if backend_codex_tool_result_continuation?(payload),
-      do: payload,
-      else: Map.delete(payload, "previous_response_id")
+  defp maybe_drop_backend_codex_previous_response_id(payload, opts) do
+    cond do
+      backend_codex_tool_result_continuation?(payload) ->
+        payload
+
+      RequestOptions.use_responses_lite?(opts) ->
+        Map.delete(payload, "previous_response_id")
+
+      true ->
+        payload
+    end
   end
 
   defp backend_codex_tool_result_continuation?(%{"previous_response_id" => response_id} = payload)

@@ -1251,7 +1251,7 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
                  http_options
                )
 
-      refute Map.has_key?(Jason.decode!(http_encoded), "previous_response_id")
+      assert Jason.decode!(http_encoded)["previous_response_id"] == previous_response_id
       assert normalized_http_options.continuity.previous_response_id == previous_response_id
 
       websocket_options = RequestOptions.for_websocket(http_options, payload)
@@ -2382,6 +2382,50 @@ defmodule CodexPooler.Gateway.Payloads.PayloadNormalizerTest do
                )
 
       assert Jason.decode!(alias_encoded) == first
+    end
+
+    test "keeps Lite compact-trigger incremental frames free of additional_tools rewrite" do
+      payload = %{
+        "model" => "gpt-5.6-terra",
+        "previous_response_id" => "resp_compact_incremental",
+        "instructions" => "compact instructions",
+        "tools" => [%{"type" => "function", "name" => "lookup_fixture"}],
+        "input" => [
+          %{
+            "type" => "function_call_output",
+            "call_id" => "call_compact_incremental",
+            "output" => "synthetic tool output"
+          },
+          %{"type" => "compaction_trigger"}
+        ]
+      }
+
+      request_options =
+        serving_mode_opts("lite")
+        |> RequestOptions.build("/backend-api/codex/responses/compact", payload)
+        |> RequestOptions.put_payload_context(compaction_trigger_bridge?: true)
+
+      assert {:ok, encoded} =
+               PayloadNormalizer.upstream_payload(
+                 payload,
+                 %Model{upstream_model_id: "provider-model"},
+                 "/backend-api/codex/responses/compact",
+                 request_options
+               )
+
+      upstream = Jason.decode!(encoded)
+
+      refute Enum.any?(upstream["input"], &match?(%{"type" => "additional_tools"}, &1))
+      assert Enum.map(upstream["input"], & &1["type"]) == [
+               "function_call_output",
+               "compaction_trigger"
+             ]
+
+      assert upstream["tools"] == payload["tools"]
+      assert upstream["instructions"] == "compact instructions"
+      assert upstream["previous_response_id"] == "resp_compact_incremental"
+      assert upstream["parallel_tool_calls"] == false
+      assert get_in(upstream, ["reasoning", "context"]) == "all_turns"
     end
 
     test "uses the pre-dispatch applied effort for compact payloads without re-deciding policy" do

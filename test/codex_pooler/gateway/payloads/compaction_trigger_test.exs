@@ -232,6 +232,18 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
       assert result_transport(fixture["request"]) == :sse
     end
 
+    test "public compact projection streams when the request carries the V2 marker" do
+      payload =
+        incremental_scenario!("anchored_tool_output_and_trigger")
+        |> Map.put("model", "gpt-fixture")
+
+      assert {:ok, projected} = CompactionTrigger.prepare_bridge("/v1/responses", payload)
+      assert projected["stream"] == true
+      assert projected["store"] == false
+      assert projected["previous_response_id"] == payload["previous_response_id"]
+      assert projected["input"] == payload["input"]
+    end
+
     test "streams V2 metadata with pre-turn phase and unrelated prompt-like additive metadata" do
       turn_metadata = %{
         "request_kind" => "compaction",

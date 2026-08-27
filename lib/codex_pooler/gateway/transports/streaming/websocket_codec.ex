@@ -399,6 +399,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
 
       {:ok, compact_payload} ->
         downstream_payload = coerced.payload
+        result_transport = CompactionTrigger.compaction_result_transport(payload)
 
         request_options =
           coerced.request_options
@@ -411,6 +412,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
           )
           |> RequestOptions.put_payload_context(
             compaction_trigger_bridge?: true,
+            compaction_result_transport: result_transport,
             compaction_projection_context:
               CompactionProjectionContext.new(downstream_payload, compact_payload)
           )

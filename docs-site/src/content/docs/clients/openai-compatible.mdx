@@ -207,8 +207,10 @@ history for stateless replay and semantic tool-output continuations without
 requiring call/output pairing or a particular item order.
 
 This is history forwarding only. Codex Pooler does not execute shell commands or
-accept a top-level shell tool declaration. `local_shell_call` history and remote
-MCP tool definitions remain unsupported. It also does not implement SDK-local
+accept a top-level shell or local_shell tool declaration. Remote MCP tool
+definitions remain unsupported. Codex-native `local_shell_call` history is
+accepted as passthrough on the native replay path; it is not part of the closed
+hosted-shell `shell_call` subset. It also does not implement SDK-local
 command-index accumulation or claim general hosted-tool parity.
 
 Responses SSE and the narrow Responses websocket preserve the five hosted-shell

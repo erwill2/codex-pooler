@@ -46,6 +46,8 @@ defmodule CodexPoolerWeb.V1.ResponsesController do
         PublicGatewayDispatch.dispatch_coerced(conn, auth, coerced)
 
       {:ok, compact_payload} ->
+        result_transport = CompactionTrigger.compaction_result_transport(payload)
+
         request_options =
           coerced.request_options
           |> RequestOptions.retarget(@compact_responses_endpoint, compact_payload)
@@ -56,6 +58,7 @@ defmodule CodexPoolerWeb.V1.ResponsesController do
           )
           |> RequestOptions.put_payload_context(
             compaction_trigger_bridge?: true,
+            compaction_result_transport: result_transport,
             compaction_projection_context:
               CompactionProjectionContext.new(payload, compact_payload)
           )

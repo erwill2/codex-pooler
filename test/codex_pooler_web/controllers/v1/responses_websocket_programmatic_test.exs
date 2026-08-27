@@ -1616,10 +1616,9 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     end
   end
 
-  test "GET /v1/responses websocket rejects reserved metadata before dispatch" do
-    upstream =
-      start_upstream(FakeUpstream.sse_stream(programmatic_response_events(), done: false))
-
+  test "GET /v1/responses websocket strips reserved metadata before dispatch" do
+    reserved_sentinel = "RESERVED_TOOL_METADATA_SENTINEL"
+    upstream = start_upstream(completed_websocket_response("resp_ws_reserved_metadata_stripped"))
     setup = gateway_setup(upstream)
     assert :ok = Events.subscribe_pool(setup.pool)
     port = start_public_endpoint!()
@@ -1632,47 +1631,40 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       )
 
     try do
-      post_upgrade_baseline = settled_post_upgrade_counts!(upstream)
-
       {conn, websocket} =
-        public_websocket_send_text!(
-          conn,
-          websocket,
-          ref,
-          Jason.encode!(%{
-            "type" => "response.create",
-            "model" => setup.model.exposed_model_id,
-            "input" => [
-              %{
-                "type" => "function_call_output",
-                "call_id" => "call_reserved_tool_metadata",
-                "output" => "synthetic reserved tool metadata output",
-                "internal_chat_message_metadata_passthrough" => %{
-                  "executed_tool_calls" => "RESERVED_TOOL_METADATA_SENTINEL"
-                }
+        send_response_create!(conn, websocket, ref, setup, %{
+          "input" => [
+            %{
+              "type" => "function_call_output",
+              "call_id" => "call_reserved_tool_metadata",
+              "output" => "synthetic reserved tool metadata output",
+              "internal_chat_message_metadata_passthrough" => %{
+                "turn_id" => "turn_reserved_tool_metadata",
+                "executed_tool_calls" => reserved_sentinel
               }
-            ],
-            "stream" => true
-          })
-        )
+            }
+          ]
+        })
 
-      {conn, websocket, error_frame} = public_websocket_receive_text!(conn, websocket, ref)
+      {conn, websocket, frames} = receive_websocket_until_terminal!(conn, websocket, ref, [])
+      assert Enum.map(frames, & &1["type"]) == ["response.completed"]
 
-      assert %{
-               "type" => "error",
-               "status" => 400,
-               "error" => %{"code" => "invalid_request", "param" => "input"}
-             } = Jason.decode!(error_frame)
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert [function_output] = captured.json["input"]
+      assert function_output["type"] == "function_call_output"
 
-      assert lifecycle_counts(upstream) == post_upgrade_baseline
-      refute_received {Events, %{reason: "request_finalized"}}
+      assert function_output["internal_chat_message_metadata_passthrough"] == %{
+               "turn_id" => "turn_reserved_tool_metadata"
+             }
+
+      refute inspect(captured.json) =~ reserved_sentinel
+
+      assert_successful_websocket_lifecycle!(setup)
 
       persistence_text = inspect(RequestLogs.list(setup.pool))
-
-      refute error_frame =~ "internal_chat_message_metadata_passthrough"
-      refute error_frame =~ "RESERVED_TOOL_METADATA_SENTINEL"
       refute persistence_text =~ "internal_chat_message_metadata_passthrough"
-      refute persistence_text =~ "RESERVED_TOOL_METADATA_SENTINEL"
+      refute persistence_text =~ reserved_sentinel
+      refute persistence_text =~ "turn_reserved_tool_metadata"
 
       {conn, websocket}
     after
@@ -2116,8 +2108,23 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
     end
   end
 
-  test "GET /v1/responses websocket rejects a compaction anchor without tool output before dispatch" do
-    upstream = start_upstream(completed_websocket_response("should_not_dispatch_anchor"))
+  test "GET /v1/responses websocket forwards a compaction previous_response_id without tool output" do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_v1_websocket_compaction_unanchored",
+          "object" => "response.compaction",
+          "output" => [
+            %{
+              "type" => "compaction",
+              "encrypted_content" => "synthetic-websocket-unanchored-encrypted",
+              "id" => nil
+            }
+          ],
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 1, "total_tokens" => 5}
+        })
+      )
+
     setup = gateway_setup(upstream, compact?: true)
     port = start_public_endpoint!()
 
@@ -2125,35 +2132,30 @@ defmodule CodexPoolerWeb.V1.ResponsesWebsocketProgrammaticTest do
       public_v1_websocket_connect!(
         port,
         setup,
-        "invalid-compaction-anchor-#{System.unique_integer([:positive])}"
+        "unanchored-compaction-#{System.unique_integer([:positive])}"
       )
 
     try do
-      post_upgrade_baseline = settled_post_upgrade_counts!(upstream)
-
       {conn, websocket} =
         send_response_create!(conn, websocket, ref, setup, %{
           "previous_response_id" => "resp_v1_websocket_compaction_without_tool_output",
-          "input" => websocket_compaction_trigger_input("synthetic invalid anchored compact"),
+          "input" => websocket_compaction_trigger_input("synthetic unanchored compact"),
           "stream" => false
         })
 
-      {conn, websocket, frame} = public_websocket_receive_text!(conn, websocket, ref)
+      {_conn, _websocket, frames} =
+        receive_websocket_until_terminal_or_error!(conn, websocket, ref, [])
 
-      assert Jason.decode!(frame) == %{
-               "type" => "error",
-               "status" => 400,
-               "error" => %{
-                 "type" => "invalid_request_error",
-                 "code" => "invalid_request",
-                 "message" => "previous_response_id requires a tool-output continuation",
-                 "param" => "previous_response_id"
-               }
-             }
+      assert Enum.map(frames, & &1["type"]) == [
+               "response.output_item.done",
+               "response.completed"
+             ]
 
-      assert lifecycle_counts(upstream) == post_upgrade_baseline
-      assert FakeUpstream.count(upstream) == 0
-      {conn, websocket}
+      assert [captured] = FakeUpstream.requests(upstream)
+      assert captured.json["previous_response_id"] ==
+               "resp_v1_websocket_compaction_without_tool_output"
+
+      assert List.last(captured.json["input"]) == %{"type" => "compaction_trigger"}
     after
       Mint.HTTP.close(conn)
     end

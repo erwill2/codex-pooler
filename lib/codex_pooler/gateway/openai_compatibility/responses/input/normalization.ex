@@ -7,11 +7,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
   alias CodexPooler.Gateway.Payloads.ToolResultShape
 
   @metadata_passthrough_key "internal_chat_message_metadata_passthrough"
+  @reserved_passthrough_metadata_key "executed_tool_calls"
   @known_input_item_types ~w(
     additional_tools
     message
     reasoning
     compaction
+    compaction_summary
+    context_compaction
     compaction_trigger
     program
     program_output
@@ -23,7 +26,17 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
     item_reference
     shell_call
     shell_call_output
+    local_shell_call
+    local_shell_call_output
+    web_search_call
+    image_generation_call
+    tool_search_call
+    tool_search_output
+    apply_patch_call
+    apply_patch_call_output
+    agent_message
   )
+  @replay_status_values ~w(completed incomplete in_progress searching)
 
   @typep audio_normalization_result :: {:ok, map()} | {:error, Error.reason()}
 
@@ -170,18 +183,37 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
     end
   end
 
-  defp sanitize_reserved_metadata(%{@metadata_passthrough_key => metadata} = item)
-       when is_map(metadata) do
-    sanitized = Map.delete(metadata, "executed_tool_calls")
-
-    if map_size(sanitized) == 0 do
-      Map.delete(item, @metadata_passthrough_key)
-    else
-      Map.put(item, @metadata_passthrough_key, sanitized)
-    end
+  defp sanitize_reserved_metadata(item) when is_map(item) do
+    item
+    |> sanitize_item_passthrough()
+    |> sanitize_nested_tool_calls()
   end
 
   defp sanitize_reserved_metadata(item), do: item
+
+  defp sanitize_item_passthrough(%{@metadata_passthrough_key => metadata} = item)
+       when is_map(metadata) do
+    if Map.has_key?(metadata, @reserved_passthrough_metadata_key) do
+      sanitized = Map.delete(metadata, @reserved_passthrough_metadata_key)
+
+      if map_size(sanitized) == 0 do
+        Map.delete(item, @metadata_passthrough_key)
+      else
+        Map.put(item, @metadata_passthrough_key, sanitized)
+      end
+    else
+      item
+    end
+  end
+
+  defp sanitize_item_passthrough(item), do: item
+
+  defp sanitize_nested_tool_calls(%{"tool_calls" => tool_calls} = item)
+       when is_list(tool_calls) do
+    Map.put(item, "tool_calls", Enum.map(tool_calls, &sanitize_reserved_metadata/1))
+  end
+
+  defp sanitize_nested_tool_calls(item), do: item
 
   @spec normalize_audio_input_items([map()]) ::
           {:ok, [map()]} | {:error, Error.reason()}
@@ -255,11 +287,16 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
     end
   end
 
-  defp normalize_input_item(%{"type" => "reasoning", "encrypted_content" => nil} = item) do
-    {:ok, Map.delete(item, "encrypted_content")}
+  defp normalize_input_item(%{"type" => "reasoning"} = item) do
+    {:ok,
+     item
+     |> drop_replay_status()
+     |> drop_nil_encrypted_content()}
   end
 
-  defp normalize_input_item(%{"type" => "reasoning"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "compaction_summary"} = item) do
+    normalize_input_item(Map.put(item, "type", "compaction"))
+  end
 
   defp normalize_input_item(
          %{
@@ -276,6 +313,7 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
   end
 
   defp normalize_input_item(%{"type" => "compaction"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "context_compaction"} = item), do: {:ok, item}
   defp normalize_input_item(%{"type" => "compaction_trigger"} = item), do: {:ok, item}
 
   defp normalize_input_item(%{"type" => "program"} = item), do: {:ok, item}
@@ -283,20 +321,34 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
 
   defp normalize_input_item(%{"type" => "shell_call"} = item), do: {:ok, item}
   defp normalize_input_item(%{"type" => "shell_call_output"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "local_shell_call"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "local_shell_call_output"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "web_search_call"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "image_generation_call"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "tool_search_call"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "tool_search_output"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "apply_patch_call"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "apply_patch_call_output"} = item), do: {:ok, item}
+  defp normalize_input_item(%{"type" => "agent_message"} = item), do: {:ok, item}
 
   defp normalize_input_item(%{"type" => "function_call", "status" => status} = item)
-       when status in ["completed", "incomplete"],
+       when status in @replay_status_values,
        do: {:ok, Map.delete(item, "status")}
 
   defp normalize_input_item(%{"type" => "function_call"} = item), do: {:ok, item}
 
   defp normalize_input_item(%{"type" => "custom_tool_call", "status" => status} = item)
-       when status in ["completed", "incomplete"],
+       when status in ["completed", "incomplete", "in_progress"],
        do: {:ok, Map.delete(item, "status")}
 
   defp normalize_input_item(%{"type" => "custom_tool_call"} = item), do: {:ok, item}
 
   defp normalize_input_item(%{"type" => "custom_tool_call_output"} = item), do: {:ok, item}
+
+  defp normalize_input_item(%{"type" => "function_call_output", "status" => status} = item)
+       when status in ["completed", "incomplete", "in_progress"] do
+    normalize_input_item(Map.delete(item, "status"))
+  end
 
   defp normalize_input_item(%{"type" => "function_call_output", "output" => output} = item)
        when is_list(output) do
@@ -576,4 +628,14 @@ defmodule CodexPooler.Gateway.OpenAICompatibility.Responses.Input.Normalization 
     do: Map.put(item, "role", "developer")
 
   defp normalize_message_role(item), do: item
+
+  defp drop_replay_status(%{"status" => status} = item) when status in @replay_status_values,
+    do: Map.delete(item, "status")
+
+  defp drop_replay_status(item), do: item
+
+  defp drop_nil_encrypted_content(%{"encrypted_content" => nil} = item),
+    do: Map.delete(item, "encrypted_content")
+
+  defp drop_nil_encrypted_content(item), do: item
 end
