@@ -357,6 +357,23 @@ defmodule CodexPoolerWeb.Admin.AuthLiveTest do
       assert_html_selector(html, "#admin-test-link-action", "Open")
     end
 
+    test "CoreComponents input renders aria-invalid and aria-describedby when errors exist" do
+      assigns = %{
+        errors: ["can't be blank"]
+      }
+
+      html =
+        rendered_to_string(~H"""
+        <.input id="user_email" name="user[email]" value="" errors={@errors} label="Email" />
+        """)
+
+      assert html =~ ~s(id="user_email")
+      assert html =~ ~s(aria-invalid="true")
+      assert html =~ ~s(aria-describedby="user_email-error")
+      assert html =~ ~s(id="user_email-error")
+      assert html =~ "can&#39;t be blank"
+    end
+
     test "shared policy editor dialog shell renders stable operator-facing regions" do
       assigns = %{
         steps: [
