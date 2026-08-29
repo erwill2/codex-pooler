@@ -99,6 +99,11 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
   ]
   @visible_identity_statuses IdentityRouting.model_routable_statuses()
 
+  @enterprise_team_pattern ~r/enterprise|team/i
+  @pro_pattern ~r/pro/i
+  @plus_pattern ~r/plus/i
+  @free_pattern ~r/free/i
+
   @type candidate :: {PoolUpstreamAssignment.t(), UpstreamIdentity.t()}
   @type gateway_error :: Contracts.gateway_error()
   @type quota_decision :: %{optional(String.t()) => term()}
@@ -489,10 +494,10 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
     plan = identity.plan_family || identity.plan_label || ""
 
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
+      plan =~ @enterprise_team_pattern -> 4
+      plan =~ @pro_pattern -> 3
+      plan =~ @plus_pattern -> 2
+      plan =~ @free_pattern -> 1
       true -> 0
     end
   end
