@@ -281,4 +281,33 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
 
     assert has_element?(remounted_smtp_view, "#instance-settings-smtp-password[value='']")
   end
+
+  test "map_get handles non-existent atom keys safely without atom creation" do
+    non_existent_key = "non_existent_atom_key_#{System.unique_integer([:positive])}"
+
+    # Verify key is not an existing atom
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(non_existent_key)
+    end
+
+    changeset = Settings.changeset(Settings.default(), %{
+      "gateway" => %{
+        "bulkheads" => %{
+          "responses" => %{
+            "max_concurrency" => 10,
+            "queue_limit" => 5,
+            "queue_timeout_ms" => 1000,
+            non_existent_key => "test"
+          }
+        }
+      }
+    })
+
+    refute changeset.valid?
+
+    # Verify atom was NOT created during validation
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(non_existent_key)
+    end
+  end
 end
