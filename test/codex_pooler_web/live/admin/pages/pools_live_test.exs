@@ -365,17 +365,17 @@ defmodule CodexPoolerWeb.Admin.PoolsLiveTest do
 
     metric_links = [
       {"pool-upstream-count-cell", "pool-row-#{pool.id}-upstream-account-count",
-       "/admin/upstreams?pool_id=#{pool.id}", "Upstreams", "1"},
+       "/admin/upstreams?pool_id=#{pool.id}", "Upstreams", "1", "Open Upstreams details for Summary Pool, current: 1"},
       {"pool-api-key-count-cell", "pool-row-#{pool.id}-api-key-count",
-       "/admin/api-keys?pool_id=#{pool.id}", "API keys", "2"},
+       "/admin/api-keys?pool_id=#{pool.id}", "API keys", "2", "Open API keys details for Summary Pool, current: 2"},
       {"pool-request-count-cell", "pool-row-#{pool.id}-request-throughput",
-       "/admin/request-logs?pool_id=#{pool.id}", "Req/TPS 24h", "0 / 0"}
+       "/admin/request-logs?pool_id=#{pool.id}", "Req/TPS 24h", "0 / 0", "Open Req/TPS 24h details for Summary Pool, current: 0 requests, 0 tokens per second"}
     ]
 
-    for {role, value_id, href, label, value} <- metric_links do
+    for {role, value_id, href, label, value, aria_label} <- metric_links do
       assert has_element?(
                view,
-               "#pool-row-#{pool.id} > footer [data-role='#{role}'] dt a[href='#{href}'].hover\\:bg-primary\\/5",
+               "#pool-row-#{pool.id} > footer [data-role='#{role}'] dt a[href='#{href}'][aria-label='#{aria_label}'].hover\\:bg-primary\\/5",
                label
              )
 
