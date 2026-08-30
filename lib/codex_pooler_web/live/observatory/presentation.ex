@@ -355,8 +355,31 @@ defmodule CodexPoolerWeb.Observatory.Presentation do
   defp traffic_label(tokens, cost_micros),
     do: "#{token_label(tokens)} tokens · #{money_label(cost_micros)}"
 
-  defp grouped_integer(value),
-    do: Regex.replace(~r/\d(?=(\d{3})+$)/, Integer.to_string(value), &(&1 <> ","))
+  # Formats integer with comma separators without regex engine overhead.
+  defp grouped_integer(value) when is_integer(value) and value < 0 do
+    "-" <> grouped_integer(-value)
+  end
+
+  defp grouped_integer(value) when is_integer(value) do
+    str = Integer.to_string(value)
+    len = byte_size(str)
+
+    if len <= 3 do
+      str
+    else
+      rem_len = rem(len, 3)
+      {head, tail} = if rem_len == 0, do: {"", str}, else: String.split_at(str, rem_len)
+      chunks = for <<chunk::binary-3 <- tail>>, do: chunk
+
+      if head == "" do
+        Enum.join(chunks, ",")
+      else
+        head <> "," <> Enum.join(chunks, ",")
+      end
+    end
+  end
+
+  defp grouped_integer(value), do: grouped_integer(integer(value))
 
   defp token_label(value) when value < 1_000, do: "#{value}"
   defp token_label(value) when value < 999_950, do: "#{Float.round(value / 1_000, 1)}K"

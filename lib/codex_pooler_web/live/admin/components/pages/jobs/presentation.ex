@@ -370,14 +370,13 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
 
   defp compact_marker_glyph(token) do
     token = String.upcase(String.trim(token))
-    digits = Regex.scan(~r/\d+/, token) |> List.flatten()
 
     cond do
       token == "" ->
         "?"
 
-      digits != [] ->
-        "#{String.first(token)}#{digits |> List.last() |> String.last()}"
+      last_digit = last_digit_char(token) ->
+        "#{String.first(token)}#{last_digit}"
 
       String.length(token) >= 2 ->
         String.slice(token, 0, 2)
@@ -386,6 +385,18 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
         token
     end
   end
+
+  defp last_digit_char(<<byte::utf8, rest::binary>>) do
+    last_digit_char(rest, if(byte in ?0..?9, do: <<byte::utf8>>, else: nil))
+  end
+
+  defp last_digit_char(""), do: nil
+
+  defp last_digit_char(<<byte::utf8, rest::binary>>, acc) do
+    last_digit_char(rest, if(byte in ?0..?9, do: <<byte::utf8>>, else: acc))
+  end
+
+  defp last_digit_char("", acc), do: acc
 
   defp marker_title(job, target) do
     [
