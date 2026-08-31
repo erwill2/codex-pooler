@@ -1,0 +1,3 @@
+## 2026-08-31 - Form Control Error Accessibility & Container Associations
+**Learning:** In Phoenix LiveView core components, connecting inputs to error messages via `aria-describedby` requires wrapping errors in a single container `div` with `id={"#{@id}-error"}` (or omitting when `@id` is nil/empty) rather than assigning IDs directly to looped `<p>` elements. This prevents DOM ID duplication and ensures screen readers announce all error messages smoothly.
+**Action:** Always wrap error lists in a uniquely ID'd container div and conditionally set `aria-invalid` and `aria-describedby` on form inputs.
