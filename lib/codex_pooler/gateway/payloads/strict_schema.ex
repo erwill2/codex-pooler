@@ -30,14 +30,13 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
   defp function_tool_targets(%{"tools" => tools}) when is_list(tools) do
     tools
     |> Enum.with_index()
-    |> Enum.reduce([], fn {tool, index}, acc ->
+    |> Enum.flat_map(fn {tool, index} ->
       case function_tool_target(tool, index) do
-        nil -> acc
-        targets when is_list(targets) -> targets ++ acc
-        target -> [target | acc]
+        nil -> []
+        targets when is_list(targets) -> targets
+        target -> [target]
       end
     end)
-    |> Enum.reverse()
   end
 
   defp function_tool_targets(_payload), do: []
@@ -153,9 +152,41 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
     if Map.has_key?(schema, "$ref") do
       validate_ref_schema(schema, path, root_schema, ref_stack)
     else
-      schema
-      |> validation_steps(path, root_schema, ref_stack)
-      |> run_validation_steps()
+      with :ok <- validate_type(schema, path),
+           :ok <- validate_object_constraints(schema, path),
+           :ok <- validate_properties(schema, path, root_schema, ref_stack),
+           :ok <-
+             validate_named_schemas(
+               Map.get(schema, "$defs"),
+               path <> ".$defs",
+               root_schema,
+               ref_stack
+             ),
+           :ok <-
+             validate_named_schemas(
+               Map.get(schema, "definitions"),
+               path <> ".definitions",
+               root_schema,
+               ref_stack
+             ),
+           :ok <-
+             validate_items(Map.get(schema, "items"), path <> ".items", root_schema, ref_stack),
+           :ok <-
+             validate_schema_list(
+               Map.get(schema, "anyOf"),
+               path <> ".anyOf",
+               root_schema,
+               ref_stack
+             ),
+           :ok <-
+             validate_schema_list(
+               Map.get(schema, "oneOf"),
+               path <> ".oneOf",
+               root_schema,
+               ref_stack
+             ) do
+        validate_schema_list(Map.get(schema, "allOf"), path <> ".allOf", root_schema, ref_stack)
+      end
     end
   end
 
@@ -252,10 +283,14 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
   defp parse_json_pointer(_pointer), do: {:error, "$ref must be a JSON Pointer fragment"}
 
   defp unescape_json_pointer_token(token) do
-    if Regex.match?(~r/~($|[^01])/, token) do
-      {:error, "malformed local $ref JSON Pointer"}
+    if String.contains?(token, "~") do
+      if Regex.match?(~r/~($|[^01])/, token) do
+        {:error, "malformed local $ref JSON Pointer"}
+      else
+        {:ok, token |> String.replace("~1", "/") |> String.replace("~0", "~")}
+      end
     else
-      {:ok, token |> String.replace("~1", "/") |> String.replace("~0", "~")}
+      {:ok, token}
     end
   end
 
@@ -307,46 +342,6 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
 
   defp resolve_tokens(_value, _tokens), do: :error
 
-  defp validation_steps(schema, path, root_schema, ref_stack) do
-    [
-      fn -> validate_type(schema, path) end,
-      fn -> validate_object_constraints(schema, path) end,
-      fn -> validate_properties(schema, path, root_schema, ref_stack) end,
-      fn ->
-        validate_named_schemas(Map.get(schema, "$defs"), path <> ".$defs", root_schema, ref_stack)
-      end,
-      fn ->
-        validate_named_schemas(
-          Map.get(schema, "definitions"),
-          path <> ".definitions",
-          root_schema,
-          ref_stack
-        )
-      end,
-      fn ->
-        validate_items(Map.get(schema, "items"), path <> ".items", root_schema, ref_stack)
-      end,
-      fn ->
-        validate_schema_list(Map.get(schema, "anyOf"), path <> ".anyOf", root_schema, ref_stack)
-      end,
-      fn ->
-        validate_schema_list(Map.get(schema, "oneOf"), path <> ".oneOf", root_schema, ref_stack)
-      end,
-      fn ->
-        validate_schema_list(Map.get(schema, "allOf"), path <> ".allOf", root_schema, ref_stack)
-      end
-    ]
-  end
-
-  defp run_validation_steps(steps) do
-    Enum.reduce_while(steps, :ok, fn step, _acc ->
-      case step.() do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-  end
-
   defp validate_type(schema, path) do
     case Map.get(schema, "type") do
       type when is_binary(type) and type != "" ->
@@ -370,16 +365,13 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
   end
 
   defp validate_object_constraints(schema, path) do
-    if object_schema?(schema),
-      do: run_validation_steps(object_constraint_steps(schema, path)),
-      else: :ok
-  end
-
-  defp object_constraint_steps(schema, path) do
-    [
-      fn -> validate_additional_properties(schema, path) end,
-      fn -> validate_required_properties(schema, path) end
-    ]
+    if object_schema?(schema) do
+      with :ok <- validate_additional_properties(schema, path) do
+        validate_required_properties(schema, path)
+      end
+    else
+      :ok
+    end
   end
 
   defp validate_additional_properties(schema, path) do
@@ -420,10 +412,16 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
   defp validate_required_coverage(nil, _required, _path), do: :ok
 
   defp validate_required_coverage(properties, required, path) do
-    missing_properties = missing_required_properties(properties, required)
-    extra_required = extra_required_properties(properties, required)
+    # Fast path: when required and properties have equal size and all keys match, avoid sorting and list allocations
+    if map_size(properties) == length(required) and
+         Enum.all?(properties, fn {key, _} -> key in required end) do
+      :ok
+    else
+      missing_properties = missing_required_properties(properties, required)
+      extra_required = extra_required_properties(properties, required)
 
-    required_coverage_result(missing_properties, extra_required, path)
+      required_coverage_result(missing_properties, extra_required, path)
+    end
   end
 
   defp missing_required_properties(properties, required) do
@@ -459,17 +457,6 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
      )}
   end
 
-  defp validate_property_schemas(properties, path, root_schema, ref_stack) do
-    properties
-    |> Enum.sort_by(fn {name, _value} -> name end)
-    |> Enum.reduce_while(:ok, fn {name, child_schema}, _acc ->
-      case validate_schema(child_schema, path <> ".properties." <> name, root_schema, ref_stack) do
-        :ok -> {:cont, :ok}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-  end
-
   defp validate_properties(schema, path, root_schema, ref_stack) do
     case Map.get(schema, "properties") do
       nil ->
@@ -483,9 +470,62 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
     end
   end
 
+  defp validate_property_schemas(properties, path, root_schema, ref_stack) do
+    case validate_property_schemas_unsorted(properties, path, root_schema, ref_stack) do
+      :ok ->
+        :ok
+
+      {:error, _reason} ->
+        validate_property_schemas_sorted(properties, path, root_schema, ref_stack)
+    end
+  end
+
+  defp validate_property_schemas_unsorted(properties, path, root_schema, ref_stack) do
+    Enum.reduce_while(properties, :ok, fn {name, child_schema}, _acc ->
+      case validate_schema(child_schema, path <> ".properties." <> name, root_schema, ref_stack) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_property_schemas_sorted(properties, path, root_schema, ref_stack) do
+    properties
+    |> Enum.sort_by(fn {name, _value} -> name end)
+    |> Enum.reduce_while(:ok, fn {name, child_schema}, _acc ->
+      case validate_schema(child_schema, path <> ".properties." <> name, root_schema, ref_stack) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
   defp validate_named_schemas(nil, _path, _root_schema, _ref_stack), do: :ok
 
   defp validate_named_schemas(schemas, path, root_schema, ref_stack) when is_map(schemas) do
+    case validate_named_schemas_unsorted(schemas, path, root_schema, ref_stack) do
+      :ok ->
+        :ok
+
+      {:error, _reason} ->
+        validate_named_schemas_sorted(schemas, path, root_schema, ref_stack)
+    end
+  end
+
+  defp validate_named_schemas(_schemas, path, _root_schema, _ref_stack) do
+    {:error, invalid_schema(path, "definitions must be an object")}
+  end
+
+  defp validate_named_schemas_unsorted(schemas, path, root_schema, ref_stack) do
+    Enum.reduce_while(schemas, :ok, fn {name, child_schema}, _acc ->
+      case validate_schema(child_schema, path <> "." <> name, root_schema, ref_stack) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp validate_named_schemas_sorted(schemas, path, root_schema, ref_stack) do
     schemas
     |> Enum.sort_by(fn {name, _value} -> name end)
     |> Enum.reduce_while(:ok, fn {name, child_schema}, _acc ->
@@ -494,10 +534,6 @@ defmodule CodexPooler.Gateway.Payloads.StrictSchema do
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
-  end
-
-  defp validate_named_schemas(_schemas, path, _root_schema, _ref_stack) do
-    {:error, invalid_schema(path, "definitions must be an object")}
   end
 
   defp validate_items(nil, _path, _root_schema, _ref_stack), do: :ok
