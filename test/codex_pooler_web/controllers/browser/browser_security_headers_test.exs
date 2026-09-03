@@ -50,6 +50,9 @@ defmodule CodexPoolerWeb.Browser.BrowserSecurityHeadersTest do
     conn = get(conn, ~p"/login")
 
     assert [csp] = get_resp_header(conn, "content-security-policy")
+    assert get_resp_header(conn, "x-frame-options") == ["SAMEORIGIN"]
+    assert get_resp_header(conn, "x-content-type-options") == ["nosniff"]
+    assert get_resp_header(conn, "x-xss-protection") == ["1; mode=block"]
     directives = csp_directives(csp)
 
     assert directives["connect-src"] =~ "https://events.example.com"
