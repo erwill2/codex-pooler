@@ -487,13 +487,25 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility do
 
   defp model_source_plan_rank(%UpstreamIdentity{} = identity) do
     plan = identity.plan_family || identity.plan_label || ""
+    # Optimization: Using String.downcase/1 and String.contains?/2 with explicit `or`
+    # avoids dynamic regex compilation in candidate routing hot paths.
+    downcase_plan = String.downcase(plan)
 
     cond do
-      plan =~ ~r/enterprise|team/i -> 4
-      plan =~ ~r/pro/i -> 3
-      plan =~ ~r/plus/i -> 2
-      plan =~ ~r/free/i -> 1
-      true -> 0
+      String.contains?(downcase_plan, "enterprise") or String.contains?(downcase_plan, "team") ->
+        4
+
+      String.contains?(downcase_plan, "pro") ->
+        3
+
+      String.contains?(downcase_plan, "plus") ->
+        2
+
+      String.contains?(downcase_plan, "free") ->
+        1
+
+      true ->
+        0
     end
   end
 
