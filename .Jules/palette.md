@@ -1,0 +1,3 @@
+## 2026-09-05 - Associating LiveView Form Validation Errors via ARIA
+**Learning:** In Phoenix LiveView form components, error messages must be associated with input fields via `aria-describedby` and `aria-invalid="true"`. Wrapping looped error messages in a single container `div` with `id={"#{@id}-error"}` prevents duplicate DOM IDs while ensuring screen readers correctly announce form input validation errors.
+**Action:** Always wrap form input error messages in a single `#{@id}-error` container div and set `aria-invalid="true"` and `aria-describedby={"#{@id}-error"}` on the input, select, or textarea element when errors exist.
