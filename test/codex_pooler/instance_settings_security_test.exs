@@ -281,4 +281,32 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
 
     assert has_element?(remounted_smtp_view, "#instance-settings-smtp-password[value='']")
   end
+
+  test "bulkhead validation safely handles arbitrary untrusted keys without dynamic atom creation" do
+    untrusted_key = "untrusted_dynamic_key_#{System.unique_integer([:positive])}"
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(untrusted_key)
+    end
+
+    changeset =
+      Settings.changeset(Settings.default(), %{
+        "gateway" => %{
+          "bulkheads" => %{
+            "default" => %{
+              "max_concurrency" => 10,
+              "queue_limit" => 5,
+              "queue_timeout_ms" => 1000,
+              untrusted_key => "malicious_value"
+            }
+          }
+        }
+      })
+
+    refute changeset.valid?
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(untrusted_key)
+    end
+  end
 end
