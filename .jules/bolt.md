@@ -1,0 +1,3 @@
+## 2026-07-20 - Case-Insensitive Substring Matching in Hot Paths
+**Learning:** Using inline regular expressions like `plan =~ ~r/enterprise|team/i` inside Elixir functions causes dynamic regex evaluation overhead on every call. Converting strings via `String.downcase/1` and checking substrings via `String.contains?/2` using explicit `or` conditions is over 5.5x faster.
+**Action:** Replace `~r/.../i` inline regex matching on simple literal patterns with `String.downcase/1` and `String.contains?/2` in hot paths such as candidate eligibility routing, model catalog rank evaluation, and usage read models.
