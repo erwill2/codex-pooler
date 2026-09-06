@@ -4,15 +4,19 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
   """
 
   alias CodexPooler.Accounting
+  alias CodexPooler.Accounting.ClientRetry
   alias CodexPooler.Accounting.FailureResponse
   alias CodexPooler.Gateway.Contracts, as: GatewayContracts
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.RequestOptions.ResetProbe
   alias CodexPooler.Gateway.Persistence.RoutingCircuitState
+  alias CodexPooler.Gateway.Routing.CandidateEligibility.Quota
   alias CodexPooler.Gateway.Routing.{ModelMetadata, RouteLifecycle, RoutingSelection}
   alias CodexPooler.Gateway.Runtime.Dispatch.Context
+  alias CodexPooler.Gateway.Runtime.Dispatch.ReplayPreparation
   alias CodexPooler.Gateway.Runtime.Dispatch.SelectedCandidateContext
   alias CodexPooler.Gateway.Runtime.Finalization.AttemptSettlement
+  alias CodexPooler.Gateway.Websocket.DirectCleanup
 
   @type dispatch_callback ::
           (SelectedCandidateContext.t() ->
@@ -38,7 +42,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
     |> Enum.with_index()
     |> Enum.drop(start_index)
     |> Enum.reduce_while({:retry, nil}, fn {{assignment, identity}, index}, _last ->
-      allow_retry? = index < length(context.route_plan.candidates) - 1
+      allow_retry? =
+        index < length(context.route_plan.candidates) - 1 and
+          not RequestOptions.connection_bound_compaction?(context.request_options) and
+          not client_retry_dispatch?(context)
 
       case dispatch_candidate(
              context,
@@ -48,11 +55,22 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
              allow_retry?,
              transport_dispatch
            ) do
-        {:retry, reason} -> {:cont, {:retry, reason}}
-        {:ok, result} -> {:halt, {:ok, result}}
-        {:error, reason} -> {:halt, {:error, reason}}
+        {:retry, reason} ->
+          dispatch_retry_reduction(context, reason)
+
+        {:ok, result} ->
+          {:halt, {:ok, result}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
       end
     end)
+  end
+
+  defp dispatch_retry_reduction(context, reason) do
+    if client_retry_dispatch?(context),
+      do: {:halt, {:retry, reason}},
+      else: {:cont, {:retry, reason}}
   end
 
   @spec candidate_available?(dispatch_context(), non_neg_integer()) :: boolean()
@@ -103,10 +121,23 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
 
     with {:ok, context} <- apply_route_selection(context, selection, allow_retry?),
          {:ok, context} <- validate_reset_probe_scope(context),
+         {:ok, context} <- validate_provider_permission(context),
          {:ok, context} <- persist_route_metadata(context),
          {:ok, context} <- begin_candidate_circuit(context, selection),
          {:ok, context} <- start_dispatch_attempt(context, selection) do
       transport_dispatch.(context)
+    end
+  end
+
+  defp validate_provider_permission(%SelectedCandidateContext{} = context) do
+    if Quota.provider_permission_current?(
+         context.model,
+         {context.assignment, context.identity},
+         context.route_state
+       ) do
+      {:ok, context}
+    else
+      handle_unavailable_routing_circuit(context, :provider_permission_changed)
     end
   end
 
@@ -292,16 +323,39 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
          %SelectedCandidateContext{} = context,
          %RoutingSelection{} = selection
        ) do
-    case Accounting.create_attempt(context.reserved.request, context.assignment, %{
-           model: context.model,
-           pricing_snapshot: Map.get(context.reserved, :pricing_snapshot),
-           upstream_identity: context.identity,
-           response_metadata:
-             Map.merge(context.request_options.routing.routing_attempt_metadata || %{}, %{
-               "pool_upstream_assignment_id" => context.assignment.id,
-               "upstream_identity_id" => context.identity.id
-             })
-         }) do
+    attrs = %{
+      admitted_attempt_bind:
+        DirectCleanup.attempt_callback(
+          context.request_options.runtime.direct_cleanup,
+          context.reserved.request
+        ),
+      model: context.model,
+      pricing_snapshot: Map.get(context.reserved, :pricing_snapshot),
+      upstream_identity: context.identity,
+      response_metadata:
+        (context.request_options.routing.routing_attempt_metadata || %{})
+        |> Map.merge(ReplayPreparation.attempt_metadata(context))
+        |> Map.merge(%{
+          "pool_upstream_assignment_id" => context.assignment.id,
+          "upstream_identity_id" => context.identity.id
+        })
+    }
+
+    result =
+      case context.client_retry_dispatch_authority do
+        %ClientRetry.DispatchAuthority{} = authority ->
+          Accounting.create_client_retry_dispatch_attempt(
+            context.reserved.request,
+            context.assignment,
+            authority,
+            attrs
+          )
+
+        nil ->
+          Accounting.create_attempt(context.reserved.request, context.assignment, attrs)
+      end
+
+    case result do
       {:ok, attempt} ->
         {:ok, %{context | attempt: attempt, started: System.monotonic_time(:millisecond)}}
 
@@ -320,6 +374,25 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
            "request"
          )}
 
+      {:error, %{code: code}}
+      when code in [
+             :client_retry_dispatch_claimed,
+             :invalid_client_retry_dispatch_authority
+           ] ->
+        release_unstarted_attempt_circuit(
+          context,
+          selection,
+          "release_rejected_client_retry_dispatch_circuit_probe"
+        )
+
+        {:error,
+         error(
+           409,
+           "duplicate_turn",
+           "a request with the same turn identity already exists",
+           "request"
+         )}
+
       {:error, reason} ->
         release_unstarted_attempt_circuit(
           context,
@@ -335,6 +408,13 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch do
         )
     end
   end
+
+  defp client_retry_dispatch?(%{
+         client_retry_dispatch_authority: %ClientRetry.DispatchAuthority{}
+       }),
+       do: true
+
+  defp client_retry_dispatch?(_context), do: false
 
   # No attempt started and no upstream was contacted, so the circuit
   # acquisition (including a claimed half-open probe slot) must complete

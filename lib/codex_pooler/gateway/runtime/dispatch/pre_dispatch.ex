@@ -18,6 +18,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
+  alias CodexPooler.Gateway.Transports.Streaming.PreparedWebsocketFrame.ValidationClaim
+  alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
   alias CodexPooler.Pools
   alias CodexPooler.Pools.ModelServingMode
   alias CodexPooler.Pools.ModelServingOverride
@@ -31,6 +33,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
           required(:candidates) => [candidate()],
           required(:route_state) => RouteState.t()
         }
+  @type validation_authority ::
+          :validate
+          | {:prepared_websocket, ValidationClaim.t() | term()}
+          | {:prepared_websocket, ValidationClaim.t() | term(), term()}
 
   @spec prepare(
           CodexPooler.Access.auth_context(),
@@ -54,7 +60,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
         visible_model: model,
         visible_models: [model],
         candidate_snapshots: Map.get(hydration.candidates_by_model_id, model.id, [])
-      })
+      }),
+      :validate
     )
   end
 
@@ -72,8 +79,30 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
         payload,
         %RequestOptions{} = request_options,
         %Model{} = model,
+        %{visible_model: %Model{}, visible_models: visible_models} = visible_model_context
+      )
+      when is_list(visible_models) do
+    prepare(auth, endpoint, payload, request_options, model, visible_model_context, :validate)
+  end
+
+  @spec prepare(
+          CodexPooler.Access.auth_context(),
+          String.t(),
+          map(),
+          RequestOptions.t(),
+          Model.t(),
+          visible_model_context(),
+          validation_authority()
+        ) :: {:ok, prepared()} | {:error, GatewayContracts.gateway_error()}
+  def prepare(
+        auth,
+        endpoint,
+        payload,
+        %RequestOptions{} = request_options,
+        %Model{} = model,
         %{visible_model: %Model{} = visible_model, visible_models: visible_models} =
-          visible_model_context
+          visible_model_context,
+        validation_authority
       )
       when is_list(visible_models) do
     visible_models = visible_models(visible_models)
@@ -91,8 +120,8 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
          {:ok, request_options} <-
            SessionContinuity.attach_file_affinity(auth, endpoint, payload, request_options),
          :ok <- ensure_model_supports(model, endpoint, payload, request_options, has_input_image?),
-         :ok <- validate_strict_schema(payload, request_options),
-         :ok <- InputShape.validate(payload),
+         :ok <- validate_strict_schema_once(payload, request_options, validation_authority),
+         :ok <- validate_input_shape_once(payload, request_options, validation_authority),
          {:ok, request_options, effective_model_serving_modes} <-
            resolve_model_serving_modes(
              auth,
@@ -101,11 +130,11 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
              visible_models,
              request_options
            ),
-         :ok <- PayloadNormalizer.validate(payload, request_options),
+         :ok <- validate_payload_once(payload, request_options, validation_authority),
          {:ok, candidate_snapshots} <-
            CandidateEligibility.routable_candidates(visible_model_context, model),
-         {quota_window_snapshots, quota_snapshot_at} =
-           RouteState.load_quota_window_snapshots(
+         quota_snapshots =
+           RouteState.load_quota_snapshots(
              quota_snapshot_candidates(
                visible_model_context,
                candidate_snapshots,
@@ -117,8 +146,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
            put_selected_partition_assignment_ids(
              visible_model_context,
              model,
-             quota_window_snapshots,
-             quota_snapshot_at
+             quota_snapshots
            ),
          request_options =
            put_canonical_partition_metadata(request_options, visible_model_context),
@@ -130,8 +158,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
              effective_model_serving_modes: effective_model_serving_modes,
              candidate_snapshots: candidate_snapshots,
              candidates: candidate_snapshots,
-             quota_window_snapshots: quota_window_snapshots,
-             quota_snapshot_at: quota_snapshot_at,
+             quota_snapshots: quota_snapshots,
              routing_settings: PoolRouting.routing_settings_with_defaults(auth.pool)
            })
            |> maybe_put_codex_models_etag(endpoint, request_options),
@@ -162,7 +189,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
                visible_model_context.valid_canonical_assignment_ids
              )
            ),
-         {:ok, candidates} <-
+         {:ok, candidates, request_compatible_capacity} <-
            finish_canonical_filtering(
              candidates,
              canonical_filter_input_candidates,
@@ -173,6 +200,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
            ) do
       route_state =
         route_state
+        |> RouteState.put_saved_reset_auto_capacity(request_compatible_capacity)
         |> RouteState.put_candidates(candidates)
         |> RouteState.preload_routing_snapshots(auth, model, request_options)
         |> RouteState.put_reservation_snapshot_inputs(
@@ -193,6 +221,65 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
     if OpenAICompatibility.translated_responses_surface?(compatibility),
       do: StrictSchema.validate_public(payload),
       else: StrictSchema.validate(payload)
+  end
+
+  defp validate_strict_schema_once(payload, request_options, validation_authority) do
+    validate_once(:strict_schema, payload, request_options, validation_authority, fn ->
+      validate_strict_schema(payload, request_options)
+    end)
+  end
+
+  defp validate_input_shape_once(payload, request_options, validation_authority) do
+    validate_once(:input_shape, payload, request_options, validation_authority, fn ->
+      InputShape.validate(payload)
+    end)
+  end
+
+  defp validate_payload_once(payload, request_options, validation_authority) do
+    validate_once(:payload, payload, request_options, validation_authority, fn ->
+      PayloadNormalizer.validate(payload, request_options)
+    end)
+  end
+
+  defp validate_once(family, payload, request_options, validation_authority, validation)
+       when is_function(validation, 0) do
+    if valid_prepared_authority?(family, payload, request_options, validation_authority) do
+      :ok
+    else
+      notify_validation_observer(request_options)
+      validation.()
+    end
+  end
+
+  defp valid_prepared_authority?(
+         family,
+         payload,
+         request_options,
+         {:prepared_websocket, claim}
+       ),
+       do: WebsocketCodec.prevalidated_request?(payload, request_options, claim, family)
+
+  defp valid_prepared_authority?(
+         family,
+         payload,
+         request_options,
+         {:prepared_websocket, claim, _runtime_admission_proof}
+       ),
+       do: WebsocketCodec.prevalidated_request?(payload, request_options, claim, family)
+
+  defp valid_prepared_authority?(_family, _payload, _request_options, :validate), do: false
+  defp valid_prepared_authority?(_family, _payload, _request_options, _invalid), do: false
+
+  if Mix.env() == :test do
+    defp notify_validation_observer(%RequestOptions{
+           extra: %{payload_validation_observer: observer}
+         })
+         when is_function(observer, 0),
+         do: observer.()
+
+    defp notify_validation_observer(%RequestOptions{}), do: :ok
+  else
+    defp notify_validation_observer(%RequestOptions{}), do: :ok
   end
 
   defp put_valid_canonical_assignment_ids(visible_model_context, %Model{} = model) do
@@ -246,8 +333,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
   defp put_selected_partition_assignment_ids(
          visible_model_context,
          %Model{} = model,
-         quota_window_snapshots,
-         quota_snapshot_at
+         quota_snapshots
        ) do
     candidates_by_model_id = Map.get(visible_model_context, :candidates_by_model_id, %{})
 
@@ -258,8 +344,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
           PartitionRoutability.routable_assignment_ids_by_model_id(
             [model],
             candidates_by_model_id,
-            quota_window_snapshots,
-            quota_snapshot_at
+            quota_snapshots
           )
         end
       )
@@ -358,10 +443,11 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
       with {:ok, candidates} <-
              SessionContinuity.filter_file_affinity(candidates, request_options),
            {:ok, candidates} <- CandidateEligibility.maybe_filter_compact(endpoint, candidates),
+           request_compatible_capacity = candidates,
            {:ok, candidates} <-
              SessionContinuity.apply_codex_session_assignment(candidates, request_options, model),
            :ok <- ensure_candidates_available(candidates) do
-        {:ok, candidates}
+        {:ok, candidates, request_compatible_capacity}
       end
 
     if canonical_filter_zero_work?(
@@ -455,8 +541,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.PreDispatch do
             PartitionRoutability.routable_assignment_ids_by_model_id(
               visible_models,
               candidates_by_model_id,
-              route_state.quota_window_snapshots,
-              route_state.quota_snapshot_at
+              route_state.quota_snapshots
             )
           end
         )

@@ -13,10 +13,16 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
   alias CodexPooler.Gateway.Payloads.RequestOptions.{ResetProbe, TimeoutConfig}
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, SessionContinuity}
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata
+  alias CodexPooler.Gateway.Transports.Streaming.RuntimeAdmissionProof
+  alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission
+  alias CodexPooler.Gateway.Transports.Websocket.RemoteReconnectControlV2
   alias CodexPooler.Gateway.Transports.Websocket.RolloutDrain
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequest
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV2
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV4
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
   alias CodexPooler.Gateway.Transports.WebsocketOwnerPreviousReleaseCaller
@@ -31,6 +37,150 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
   @peer_detection_timeout_ms 10_000
   @timeouts %{connect_timeout_ms: 1_000, receive_timeout_ms: 1_000}
 
+  defmodule V2FailureKindNodeClient do
+    @moduledoc false
+
+    def connected_app_nodes, do: Process.get({__MODULE__, :nodes}, [])
+    def app_node?(_node), do: true
+
+    def call_owner(node, _module, function, args, _timeout) do
+      send(self(), {:v2_failure_kind_call, node, function, length(args)})
+
+      case Process.get({__MODULE__, :action}) do
+        {:return, value} -> value
+        {:error, reason} -> :erlang.error(reason)
+        {:exit, reason} -> exit(reason)
+        {:throw, reason} -> throw(reason)
+      end
+    end
+
+    def configure(nodes, action) do
+      Process.put({__MODULE__, :nodes}, nodes)
+      Process.put({__MODULE__, :action}, action)
+    end
+
+    def reset do
+      Process.delete({__MODULE__, :nodes})
+      Process.delete({__MODULE__, :action})
+    end
+  end
+
+  defmodule ReconnectTimeoutNodeClient do
+    @moduledoc false
+
+    @remote_node :"codex_pooler@reconnect-timeout-owner-app.example"
+
+    def connected_app_nodes, do: [@remote_node]
+    def app_node?(@remote_node), do: true
+
+    def call_owner(
+          _node,
+          module,
+          :remote_reconnect_control_v1,
+          [%{action: :preflight} = control],
+          _timeout
+        ) do
+      result = module.remote_reconnect_control_v1(control)
+      send(control.downstream.pid, {:remote_reconnect_preflight_processed, result})
+      {:error, :timeout}
+    end
+
+    def call_owner(
+          _node,
+          module,
+          :remote_reconnect_control_v1,
+          [%{action: :cancel} = control],
+          _timeout
+        ) do
+      result = module.remote_reconnect_control_v1(control)
+      send(control.downstream.pid, {:remote_reconnect_cancel_processed, result})
+      result
+    end
+  end
+
+  defmodule ReplayTimeoutNodeClient do
+    @moduledoc false
+
+    def connected_app_nodes, do: Process.get({__MODULE__, :nodes}, [])
+    def app_node?(_node), do: true
+
+    def call_owner(
+          _node,
+          _module,
+          :remote_submit_request_v4,
+          [_session_id, _downstream, request],
+          _
+        ) do
+      send(self(), {:replay_v4_submit, request.native_replay_binding.owner_process_generation})
+      {:error, :owner_forward_timeout}
+    end
+
+    def call_owner(_node, _module, :remote_reconnect_control_v2, [control], _) do
+      send(self(), {:replay_v4_control, control.action, control.provisional_token})
+
+      case {Process.get({__MODULE__, :status}), control.action} do
+        {status, :provisional_query} -> {:ok, status}
+        {_status, :provisional_cancel} -> {:ok, :cancelled}
+      end
+    end
+
+    def call_owner(_node, _module, function, _args, _) do
+      send(self(), {:unexpected_replay_v4_call, function})
+      {:error, :owner_unavailable}
+    end
+
+    def configure(nodes, status) do
+      Process.put({__MODULE__, :nodes}, nodes)
+      Process.put({__MODULE__, :status}, status)
+    end
+
+    def reset do
+      Process.delete({__MODULE__, :nodes})
+      Process.delete({__MODULE__, :status})
+    end
+  end
+
+  defmodule ReplayCallerDeathNodeClient do
+    @moduledoc false
+
+    def connected_app_nodes, do: [:"codex_pooler@replay-caller-death.example"]
+    def app_node?(_node), do: true
+
+    def call_owner(
+          _node,
+          _module,
+          :remote_submit_request_v4,
+          [_session_id, _downstream, request],
+          _
+        ) do
+      notify({:replay_caller_death_submit, self()})
+
+      receive do
+        :never_release_replay_submit ->
+          {:ok, request.native_replay_binding.owner_process_generation}
+      end
+    end
+
+    def call_owner(_node, _module, :remote_reconnect_control_v2, [control], _) do
+      notify({:replay_caller_death_control, control.action, control.provisional_token})
+
+      case {control.provisional_token, control.action} do
+        {<<1::256>>, :provisional_query} -> {:ok, :started}
+        {<<2::256>>, :provisional_query} -> {:ok, :consume_reserved}
+        {<<2::256>>, :provisional_cancel} -> {:ok, :cancelled}
+      end
+    end
+
+    def call_owner(_node, _module, function, _args, _) do
+      notify({:unexpected_replay_caller_death_call, function})
+      {:error, :owner_unavailable}
+    end
+
+    defp notify(message) do
+      if pid = Process.whereis(:replay_caller_death_test), do: send(pid, message)
+    end
+  end
+
   setup_all do
     ensure_epmd_started!()
     :ok
@@ -40,8 +190,199 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
     reset_bootstrap_state_fixture!()
     auth = auth_fixture()
     Process.put({__MODULE__, :upstream_identity}, active_upstream_identity_fixture())
-    on_exit(&cleanup_local_owner_sessions/0)
+
+    on_exit(fn ->
+      cleanup_local_owner_sessions()
+      V2FailureKindNodeClient.reset()
+      ReplayTimeoutNodeClient.reset()
+    end)
+
     {:ok, auth: auth}
+  end
+
+  @tag :replay_protocol_v2
+  @tag :replay_topology
+  test "dedicated V2 control has local and simulated remote parity", %{auth: auth} do
+    %{session: session, token: token} =
+      owner_session_fixture(auth, Atom.to_string(node()), "v2-local")
+
+    assert {:ok, _owner} =
+             start_owner(session, WebsocketOwnerNodeHarness.fake_upstream_boundary(self()))
+
+    assert_receive {:websocket_owner_harness_upstream_started, _}
+    control = v2_control(auth, session, token)
+
+    assert {:ok, :fresh_dispatch, _downstream} =
+             WebsocketOwnerForwarder.reconnect_control_v2(session, token, control)
+
+    remote = :"codex_pooler@v2-owner-app.example"
+    remote_session = %{session | owner_instance_id: Atom.to_string(remote)}
+    opts = WebsocketOwnerNodeHarness.node_client_opts([remote], calls: %{remote => :success})
+
+    assert {:ok, :fresh_dispatch, _downstream} =
+             WebsocketOwnerForwarder.reconnect_control_v2(remote_session, token, control, opts)
+
+    assert_receive {:websocket_owner_harness_node_call, %{function: :remote_reconnect_control_v2}}
+  end
+
+  @tag :replay_protocol_v2
+  @tag :replay_topology
+  @tag :replay_race
+  test "remote V4 timeout preserves a started replay after factual owner query", %{auth: auth} do
+    remote = :"codex_pooler@replay-v4-timeout.example"
+
+    %{session: session, token: token} =
+      owner_session_fixture(auth, Atom.to_string(remote), "replay-v4-started")
+
+    binding = replay_binding(37)
+    request = owner_request_v4(binding)
+    ReplayTimeoutNodeClient.configure([remote], :started)
+    opts = [node_client: ReplayTimeoutNodeClient, timeout: 25]
+
+    assert {:error, :owner_forward_timeout} =
+             WebsocketOwnerForwarder.submit_request(
+               session,
+               token,
+               downstream("replay-v4-started"),
+               request,
+               opts
+             )
+
+    assert_receive {:replay_v4_submit, 37}
+    assert_receive {:replay_v4_control, :provisional_query, provisional_token}
+    assert provisional_token == request.provisional_token
+    refute_received {:replay_v4_control, :provisional_cancel, _token}
+    refute_received {:unexpected_replay_v4_call, _function}
+  end
+
+  @tag :replay_protocol_v2
+  @tag :replay_topology
+  @tag :replay_race
+  test "remote V4 timeout cancels only an owner-proven unconsumed reservation", %{auth: auth} do
+    remote = :"codex_pooler@replay-v4-unconsumed.example"
+
+    %{session: session, token: token} =
+      owner_session_fixture(auth, Atom.to_string(remote), "replay-v4-unconsumed")
+
+    request = owner_request_v4(replay_binding(41))
+    ReplayTimeoutNodeClient.configure([remote], :consume_reserved)
+    opts = [node_client: ReplayTimeoutNodeClient, timeout: 25]
+
+    assert {:error, :owner_forward_timeout} =
+             WebsocketOwnerForwarder.submit_request(
+               session,
+               token,
+               downstream("replay-v4-unconsumed"),
+               request,
+               opts
+             )
+
+    assert_receive {:replay_v4_control, :provisional_query, provisional_token}
+    assert_receive {:replay_v4_control, :provisional_cancel, ^provisional_token}
+    refute_received {:unexpected_replay_v4_call, _function}
+  end
+
+  @tag :replay_protocol_v2
+  @tag :replay_topology
+  @tag :replay_cleanup
+  test "remote V4 caller death preserves started replay after durable query", %{auth: auth} do
+    Process.register(self(), :replay_caller_death_test)
+
+    on_exit(fn ->
+      if Process.whereis(:replay_caller_death_test),
+        do: Process.unregister(:replay_caller_death_test)
+    end)
+
+    remote = :"codex_pooler@replay-caller-death.example"
+
+    %{session: session, token: token} =
+      owner_session_fixture(auth, Atom.to_string(remote), "replay-caller-death-started")
+
+    request = owner_request_v4(replay_binding(51), <<1::256>>)
+
+    caller =
+      spawn(fn ->
+        WebsocketOwnerForwarder.submit_request(
+          session,
+          token,
+          downstream("replay-caller-death-started"),
+          request,
+          node_client: ReplayCallerDeathNodeClient
+        )
+      end)
+
+    assert_receive {:replay_caller_death_submit, ^caller}
+    caller_monitor = Process.monitor(caller)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}
+    assert_receive {:replay_caller_death_control, :provisional_query, <<1::256>>}
+    refute_received {:replay_caller_death_control, :provisional_cancel, _token}
+    refute_received {:unexpected_replay_caller_death_call, _function}
+  end
+
+  @tag :replay_protocol_v2
+  @tag :replay_topology
+  @tag :replay_cleanup
+  test "remote V4 caller death cancels only a durable unconsumed reservation", %{auth: auth} do
+    Process.register(self(), :replay_caller_death_test)
+
+    on_exit(fn ->
+      if Process.whereis(:replay_caller_death_test),
+        do: Process.unregister(:replay_caller_death_test)
+    end)
+
+    remote = :"codex_pooler@replay-caller-death.example"
+
+    %{session: session, token: token} =
+      owner_session_fixture(auth, Atom.to_string(remote), "replay-caller-death-unconsumed")
+
+    request = owner_request_v4(replay_binding(53), <<2::256>>)
+
+    caller =
+      spawn(fn ->
+        WebsocketOwnerForwarder.submit_request(
+          session,
+          token,
+          downstream("replay-caller-death-unconsumed"),
+          request,
+          node_client: ReplayCallerDeathNodeClient
+        )
+      end)
+
+    assert_receive {:replay_caller_death_submit, ^caller}
+    caller_monitor = Process.monitor(caller)
+    Process.exit(caller, :kill)
+    assert_receive {:DOWN, ^caller_monitor, :process, ^caller, :killed}
+    assert_receive {:replay_caller_death_control, :provisional_query, <<2::256>>}
+    assert_receive {:replay_caller_death_control, :provisional_cancel, <<2::256>>}
+    refute_received {:unexpected_replay_caller_death_call, _function}
+  end
+
+  defp v2_control(auth, session, token) do
+    {:ok, control} =
+      RemoteReconnectControlV2.new(%{
+        version: 2,
+        action: :preflight,
+        intent: :fresh,
+        codex_session_id: session.id,
+        downstream: %{pid: self(), epoch: 1, correlation_id: "v2-control"},
+        semantic_turn_digest: <<1::256>>,
+        replay_claim_digest: <<2::256>>,
+        provisional_token: nil,
+        replay_generation: nil,
+        owner_lease_token: token,
+        control_ref: make_ref(),
+        authorization_binding: %{
+          api_key_id: auth.api_key.id,
+          api_key_runtime_epoch: auth.api_key.runtime_revocation_epoch,
+          pool_id: auth.pool.id,
+          codex_session_id: session.id,
+          model_identifier: "gpt-test"
+        },
+        consume_binding: nil
+      })
+
+    control
   end
 
   test "local owner resolution submits to local WebsocketOwnerSession", %{auth: auth} do
@@ -776,6 +1117,88 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
                     %{node: ^remote_node, function: :remote_submit_request_v1, arity: 3}}
   end
 
+  test "exact missing v2 RPC fails closed for returned error and every caught failure kind", %{
+    auth: auth
+  } do
+    remote_node = :"codex_pooler@old-collect-owner-app.example"
+    remote_node_string = Atom.to_string(remote_node)
+
+    %{session: session, token: token} =
+      owner_session_fixture(auth, remote_node_string, "collect-protocol-mismatch")
+
+    owner_request = owner_request_v2(request("collect-protocol-mismatch"))
+    downstream = downstream("corr-collect-protocol-mismatch")
+    args = [session.id, downstream, owner_request]
+
+    exact_undef =
+      {:exception, :undef, [{WebsocketOwnerForwarder, :remote_submit_request_v2, args, []}]}
+
+    original_session = Repo.get!(CodexSession, session.id)
+    original_lease = Repo.get_by!(BridgeOwnerLease, lease_token: token)
+
+    for action <- [
+          {:return, {:error, exact_undef}},
+          {:error, exact_undef},
+          {:exit, exact_undef},
+          {:throw, exact_undef}
+        ] do
+      V2FailureKindNodeClient.configure([remote_node], action)
+
+      assert {:error, :owner_unavailable} =
+               WebsocketOwnerForwarder.submit_request(
+                 session,
+                 token,
+                 downstream,
+                 owner_request,
+                 node_client: V2FailureKindNodeClient,
+                 app_node_names: [remote_node_string]
+               )
+
+      assert_receive {:v2_failure_kind_call, ^remote_node, :remote_submit_request_v2, 3}
+      refute_received {:v2_failure_kind_call, ^remote_node, :remote_submit_request_v1, _arity}
+      assert {:error, :owner_unavailable} = WebsocketOwnerSession.lookup(session.id)
+
+      assert Repo.get!(CodexSession, session.id).owner_lease_token ==
+               original_session.owner_lease_token
+
+      assert Repo.get!(BridgeOwnerLease, original_lease.id).status == "active"
+    end
+
+    for unrelated <- [
+          {:exception, :undef,
+           [
+             {WebsocketOwnerRequestV2, :nested_missing, [], []},
+             {WebsocketOwnerForwarder, :remote_submit_request_v2, args, []}
+           ]},
+          {:exception, :undef,
+           [
+             {WebsocketOwnerForwarder, :remote_submit_request_v2,
+              [session.id, downstream, %{version: 2}], []}
+           ]}
+        ] do
+      V2FailureKindNodeClient.configure([remote_node], {:exit, unrelated})
+
+      assert {:error, :owner_crashed} =
+               WebsocketOwnerForwarder.submit_request(
+                 session,
+                 token,
+                 downstream,
+                 owner_request,
+                 node_client: V2FailureKindNodeClient,
+                 app_node_names: [remote_node_string]
+               )
+
+      assert_receive {:v2_failure_kind_call, ^remote_node, :remote_submit_request_v2, 3}
+      refute_received {:v2_failure_kind_call, ^remote_node, :remote_submit_request_v1, _arity}
+      assert {:error, :owner_unavailable} = WebsocketOwnerSession.lookup(session.id)
+
+      assert Repo.get!(CodexSession, session.id).owner_lease_token ==
+               original_session.owner_lease_token
+
+      assert Repo.get!(BridgeOwnerLease, original_lease.id).status == "active"
+    end
+  end
+
   test "legacy remote request rejects before owner submission", %{auth: auth} do
     local_node_string = Atom.to_string(node())
     %{session: session} = owner_session_fixture(auth, local_node_string, "legacy-reject")
@@ -853,6 +1276,325 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
       end)
 
     refute inner_log =~ "event=owner_protocol_incompatible"
+  end
+
+  test "reconnect control maps only exact outer undef to old-owner unavailable", %{auth: auth} do
+    remote_node = :"codex_pooler@control-mismatch-owner-app.example"
+    remote_node_string = Atom.to_string(remote_node)
+    %{session: session, token: token} = owner_session_fixture(auth, remote_node_string, "control")
+    downstream = downstream("corr-control")
+    semantic_turn_key = :crypto.hash(:sha256, "opaque-control-key")
+    control_ref = make_ref()
+
+    control =
+      WebsocketOwnerForwarder.reconnect_control(
+        :preflight,
+        session.id,
+        downstream,
+        semantic_turn_key,
+        control_ref
+      )
+
+    args = [control]
+
+    exact_undef =
+      {:exception, :undef, [{WebsocketOwnerForwarder, :remote_reconnect_control_v1, args, []}]}
+
+    exact_opts =
+      WebsocketOwnerNodeHarness.node_client_opts([remote_node],
+        calls: %{remote_node => {:return, {:error, exact_undef}}}
+      )
+
+    assert {:error, :owner_unavailable} =
+             WebsocketOwnerForwarder.preflight_reconnect(
+               session,
+               token,
+               downstream,
+               semantic_turn_key,
+               control_ref,
+               exact_opts
+             )
+
+    inner_undef =
+      {:exception, :undef,
+       [
+         {WebsocketOwnerSession, :nested_missing_function, [], []},
+         {WebsocketOwnerForwarder, :remote_reconnect_control_v1, args, []}
+       ]}
+
+    inner_opts =
+      WebsocketOwnerNodeHarness.node_client_opts([remote_node],
+        calls: %{remote_node => {:return, {:error, inner_undef}}}
+      )
+
+    assert {:error, :owner_crashed} =
+             WebsocketOwnerForwarder.preflight_reconnect(
+               session,
+               token,
+               downstream,
+               semantic_turn_key,
+               control_ref,
+               inner_opts
+             )
+  end
+
+  test "local and simulated remote reconnect controls return the same idle decision", %{
+    auth: auth
+  } do
+    local_node = Atom.to_string(node())
+
+    %{session: local_session, token: local_token} =
+      owner_session_fixture(auth, local_node, "local-control-parity")
+
+    assert {:ok, _local_owner} =
+             start_owner(local_session, WebsocketOwnerNodeHarness.fake_upstream_boundary(self()))
+
+    assert_receive {:websocket_owner_harness_upstream_started, _local_upstream_pid}
+    local_downstream = attach_downstream(local_session.id, "local-control-parity")
+    local_key = :crypto.hash(:sha256, "local-control-parity")
+
+    assert {:ok, :dispatch} =
+             WebsocketOwnerForwarder.preflight_reconnect(
+               local_session,
+               local_token,
+               local_downstream,
+               local_key,
+               make_ref()
+             )
+
+    remote_node = :"codex_pooler@remote-control-parity-owner-app.example"
+
+    %{session: remote_session, token: remote_token} =
+      owner_session_fixture(auth, Atom.to_string(remote_node), "remote-control-parity")
+
+    assert {:ok, _remote_owner} =
+             start_owner(remote_session, WebsocketOwnerNodeHarness.fake_upstream_boundary(self()))
+
+    assert_receive {:websocket_owner_harness_upstream_started, _remote_upstream_pid}
+    remote_downstream = attach_downstream(remote_session.id, "remote-control-parity")
+    remote_key = :crypto.hash(:sha256, "remote-control-parity")
+
+    opts =
+      WebsocketOwnerNodeHarness.node_client_opts([remote_node],
+        calls: %{remote_node => :success}
+      )
+
+    assert {:ok, :dispatch} =
+             WebsocketOwnerForwarder.preflight_reconnect(
+               remote_session,
+               remote_token,
+               remote_downstream,
+               remote_key,
+               make_ref(),
+               opts
+             )
+  end
+
+  test "remote reconnect timeout cancels the exact pending owner handoff", %{auth: auth} do
+    remote_node = :"codex_pooler@reconnect-timeout-owner-app.example"
+
+    %{session: session, token: token} =
+      owner_session_fixture(auth, Atom.to_string(remote_node), "reconnect-timeout")
+
+    parent = self()
+    release_ref = make_ref()
+
+    upstream = %{
+      start: fn -> Agent.start_link(fn -> :ready end) end,
+      send: fn _upstream_pid, _request, _writer ->
+        Process.flag(:trap_exit, true)
+        send(parent, {:reconnect_timeout_turn_started, self()})
+
+        await_reconnect_timeout_release(release_ref)
+      end,
+      close: fn upstream_pid ->
+        if Process.alive?(upstream_pid), do: Agent.stop(upstream_pid)
+      end
+    }
+
+    assert {:ok, owner_pid} = start_owner(session, upstream)
+
+    {:ok, first_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner_pid, downstream("reconnect-timeout-a"))
+
+    payload =
+      Jason.encode!(%{
+        "type" => "response.create",
+        "model" => "gpt-example",
+        "input" => [],
+        "turn_id" => "turn-a"
+      })
+
+    native_request = %{
+      request(payload)
+      | message_mapper: &StreamProtocol.canonicalize_native_codex_responses_json_message/1
+    }
+
+    submitter =
+      spawn(fn ->
+        result = WebsocketOwnerSession.submit_request(owner_pid, first_downstream, native_request)
+
+        send(parent, {:reconnect_timeout_old_result, result})
+
+        receive do
+          :release_reconnect_timeout_submitter -> :ok
+        end
+      end)
+
+    assert_receive {:reconnect_timeout_turn_started, old_turn_pid}
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner_pid, first_downstream)
+
+    assert %{
+             active_turn: %{
+               canceled_result: {:error, :client_disconnected},
+               descriptor: %{kind: :native, semantic_turn_key: active_turn_key}
+             }
+           } = :sys.get_state(owner_pid)
+
+    assert {:ok, replacement_downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner_pid,
+               downstream("reconnect-timeout-b")
+             )
+
+    semantic_turn_key =
+      :crypto.hash(:sha256, session.id <> <<0>> <> "turn-b")
+
+    refute semantic_turn_key == active_turn_key
+
+    control_ref = make_ref()
+
+    assert {:error, :owner_forward_timeout} =
+             WebsocketOwnerForwarder.preflight_reconnect(
+               session,
+               token,
+               replacement_downstream,
+               semantic_turn_key,
+               control_ref,
+               node_client: ReconnectTimeoutNodeClient,
+               app_node_names: [Atom.to_string(remote_node)],
+               timeout: 25
+             )
+
+    assert_receive {:remote_reconnect_preflight_processed,
+                    {:ok, :replacement_handoff, ^control_ref}}
+
+    assert_receive {:remote_reconnect_cancel_processed, :ok}
+    assert_receive {:reconnect_timeout_old_result, {:error, :client_disconnected}}
+    assert %{pending_handoff: nil, active_turn: nil} = :sys.get_state(owner_pid)
+    refute_received {:websocket_owner_handoff_ready, _, _, _, _, _}
+    refute_received {:websocket_owner_handoff_failed, _, _, _, _, _, _}
+
+    send(submitter, :release_reconnect_timeout_submitter)
+    send(old_turn_pid, {:release_reconnect_timeout_turn, release_ref})
+  end
+
+  test "simulated remote reconnect becomes ready only after predecessor caller exits and consumes once",
+       %{auth: auth} do
+    remote_node = :"codex_pooler@remote-control-parity-owner-app.example"
+
+    %{session: session, token: token} =
+      owner_session_fixture(auth, Atom.to_string(remote_node), "reconnect-ready")
+
+    parent = self()
+    counter = :counters.new(1, [:atomics])
+
+    upstream = %{
+      start: fn -> Agent.start_link(fn -> :ready end) end,
+      send: fn _upstream_pid, _request, _writer ->
+        :counters.add(counter, 1, 1)
+        count = :counters.get(counter, 1)
+        Process.flag(:trap_exit, true)
+        send(parent, {:remote_reconnect_send, count, self()})
+
+        if count == 1 do
+          receive do
+            {:EXIT, _from, :shutdown} ->
+              receive do
+                :never_release -> :ok
+              end
+          end
+        end
+
+        :ok
+      end,
+      invalidate: fn _upstream_pid -> send(parent, :remote_reconnect_invalidated) end,
+      close: fn upstream_pid ->
+        if Process.alive?(upstream_pid), do: Agent.stop(upstream_pid)
+      end
+    }
+
+    assert {:ok, owner_pid} =
+             start_owner(session, upstream,
+               handoff_soft_timeout_ms: 25,
+               handoff_absolute_timeout_ms: 2_000
+             )
+
+    {:ok, first_downstream} =
+      WebsocketOwnerSession.attach_downstream(owner_pid, downstream("reconnect-ready-a"))
+
+    first_request = native_request("turn-a")
+
+    submitter =
+      spawn(fn ->
+        result = WebsocketOwnerSession.submit_request(owner_pid, first_downstream, first_request)
+        send(parent, {:remote_reconnect_predecessor_result, result})
+
+        receive do
+          :release_remote_reconnect_submitter -> :ok
+        end
+      end)
+
+    assert_receive {:remote_reconnect_send, 1, _old_turn_pid}
+    assert :ok = WebsocketOwnerSession.detach_downstream(owner_pid, first_downstream)
+
+    assert {:ok, replacement_downstream} =
+             WebsocketOwnerSession.attach_downstream(
+               owner_pid,
+               downstream("reconnect-ready-b")
+             )
+
+    control_ref = make_ref()
+    replacement_key = :crypto.hash(:sha256, session.id <> <<0>> <> "turn-b")
+
+    opts =
+      WebsocketOwnerNodeHarness.node_client_opts([remote_node],
+        calls: %{remote_node => :success}
+      )
+
+    assert {:ok, :replacement_handoff, ^control_ref} =
+             WebsocketOwnerForwarder.preflight_reconnect(
+               session,
+               token,
+               replacement_downstream,
+               replacement_key,
+               control_ref,
+               opts
+             )
+
+    assert_receive :remote_reconnect_invalidated
+    assert_receive {:remote_reconnect_predecessor_result, {:error, :client_disconnected}}
+    refute_received {:websocket_owner_handoff_ready, _, _, _, _, ^control_ref}
+
+    send(submitter, :release_remote_reconnect_submitter)
+
+    assert_receive {:websocket_owner_handoff_ready, "reconnect-ready-b", 2, owner_turn_id,
+                    downstream_pid, ^control_ref}
+
+    assert is_pid(owner_turn_id)
+    assert downstream_pid == self()
+
+    assert :ok =
+             WebsocketOwnerSession.submit_request(
+               owner_pid,
+               replacement_downstream,
+               native_request("turn-b")
+             )
+
+    assert_receive {:remote_reconnect_send, 2, _replacement_turn_pid}
+    assert_receive {:websocket_owner_frame, "reconnect-ready-b", 2, :complete}
+    assert %{pending_handoff: nil, active_turn: nil} = :sys.get_state(owner_pid)
+    refute_received {:remote_reconnect_send, 3, _unexpected_turn_pid}
   end
 
   test "legacy remote owner success remains causally marked as an accepted submission", %{
@@ -2573,6 +3315,20 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
     %{session: session, token: session.owner_lease_token}
   end
 
+  defp await_reconnect_timeout_release(release_ref) do
+    receive do
+      {:EXIT, _from, :shutdown} -> await_reconnect_timeout_release(release_ref)
+      {:release_reconnect_timeout_turn, ^release_ref} -> :ok
+    end
+  end
+
+  defp native_request(turn_id) do
+    %{
+      request(Jason.encode!(%{"type" => "response.create", "turn_id" => turn_id}))
+      | message_mapper: &StreamProtocol.canonicalize_native_codex_responses_json_message/1
+    }
+  end
+
   defp start_owner(session, upstream, opts \\ []) do
     owner_opts =
       [
@@ -2639,6 +3395,57 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
       })
 
     owner_request
+  end
+
+  defp owner_request_v2(%UpstreamWebsocketSession.Request{} = request) do
+    attrs = owner_request(request) |> Map.from_struct()
+
+    {:ok, owner_request} =
+      WebsocketOwnerRequestV2.new(
+        attrs
+        |> Map.put(:version, 2)
+        |> Map.put(:websocket_delivery_mode, :collect_compaction)
+        |> Map.put(:effective_serving_mode, :full)
+      )
+
+    owner_request
+  end
+
+  defp owner_request_v4(%NativeReplayAdmission.Binding{} = binding, token \\ <<9::256>>) do
+    attrs = owner_request(request("replay-v4")) |> Map.from_struct()
+    {:ok, binding_digest} = NativeReplayAdmission.binding_digest(binding)
+
+    proof =
+      RuntimeAdmissionProof.new(self(), make_ref(), make_ref(), binding_digest, :native_replay)
+
+    {:ok, owner_request} =
+      WebsocketOwnerRequestV4.new(
+        attrs
+        |> Map.put(:version, 4)
+        |> Map.put(:websocket_delivery_mode, :relay)
+        |> Map.put(:effective_serving_mode, :full)
+        |> Map.put(:native_replay_binding, binding)
+        |> Map.put(:native_replay_proof, proof)
+        |> Map.put(:provisional_token, token)
+      )
+
+    owner_request
+  end
+
+  defp replay_binding(owner_process_generation) do
+    %NativeReplayAdmission.Binding{
+      request_id: Ecto.UUID.generate(),
+      codex_turn_id: Ecto.UUID.generate(),
+      eligible_attempt_id: Ecto.UUID.generate(),
+      replay_attempt_id: Ecto.UUID.generate(),
+      replay_generation: 1,
+      semantic_turn_digest: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      provisional_binding_digest: <<3::256>>,
+      owner_lease_digest: <<4::256>>,
+      downstream_epoch: 1,
+      owner_process_generation: owner_process_generation
+    }
   end
 
   defp normalize_timeouts(%TimeoutConfig{} = timeouts), do: timeouts
@@ -2897,17 +3704,30 @@ defmodule CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarderTest d
     capture_log(fn ->
       WebsocketOwnerSession.Registry
       |> Registry.select([{{:"$1", :_, :_}, [], [:"$1"]}])
-      |> Enum.each(fn codex_session_id ->
-        try do
-          with {:ok, owner_pid} <- WebsocketOwnerSession.lookup(codex_session_id) do
-            _result = GenServer.stop(owner_pid, :shutdown, 1_000)
-          end
-        catch
-          :exit, _reason -> :ok
-        end
-      end)
+      |> Enum.each(&stop_local_owner_session/1)
     end)
 
     :ok
+  end
+
+  defp stop_local_owner_session(codex_session_id) do
+    case WebsocketOwnerSession.lookup(codex_session_id) do
+      {:ok, owner_pid} ->
+        monitor = Process.monitor(owner_pid)
+
+        try do
+          GenServer.stop(owner_pid, :shutdown, @peer_detection_timeout_ms)
+        catch
+          :exit, {:noproc, _details} -> :ok
+        end
+
+        assert_receive {:DOWN, ^monitor, :process, ^owner_pid, _reason},
+                       @peer_detection_timeout_ms
+
+      {:error, :owner_unavailable} ->
+        :ok
+    end
+
+    assert {:error, :owner_unavailable} = WebsocketOwnerSession.lookup(codex_session_id)
   end
 end

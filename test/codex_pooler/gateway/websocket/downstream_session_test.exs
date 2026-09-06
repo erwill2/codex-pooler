@@ -9,6 +9,7 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSessionTest do
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{BridgeOwnerLease, CodexSession, CodexTurn}
   alias CodexPooler.Gateway.Persistence.SessionContinuity
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
   alias CodexPooler.Gateway.Websocket, as: Gateway
@@ -47,7 +48,16 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSessionTest do
              })
 
     on_exit(fn ->
-      if Process.alive?(owner_pid), do: GenServer.stop(owner_pid)
+      if Process.alive?(owner_pid) do
+        current = Repo.reload!(session)
+
+        reason =
+          if current.owner_lease_token == session.owner_lease_token,
+            do: :normal,
+            else: {:shutdown, :stale_owner}
+
+        GenServer.stop(owner_pid, reason)
+      end
     end)
 
     {:ok,
@@ -61,7 +71,7 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSessionTest do
   test "successful detach interrupts a genuinely in-progress websocket turn", fixture do
     turn = active_turn_fixture(fixture, "websocket")
 
-    assert :ok = DownstreamSession.cleanup(fixture.state)
+    assert :ok = DownstreamSession.cleanup(turn.state)
 
     assert %Request{
              status: "failed",
@@ -86,13 +96,96 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSessionTest do
     assert_lease_preserved!(fixture)
   end
 
+  test "explicit cancellation with no matching request leaves the active request and session untouched",
+       fixture do
+    turn = active_turn_fixture(fixture, "websocket")
+
+    before =
+      {Repo.reload!(fixture.session), Repo.reload!(turn.request), Repo.reload!(turn.attempt),
+       Repo.reload!(turn.turn),
+       Repo.all(
+         from entry in LedgerEntry,
+           where: entry.request_id == ^turn.request.id,
+           order_by: entry.id
+       )}
+
+    assert {:ok, %{interrupted_turn_count: 0}} =
+             Gateway.interrupt_codex_turn(fixture.session, %{request_id: "no-matching-request"})
+
+    after_cancel =
+      {Repo.reload!(fixture.session), Repo.reload!(turn.request), Repo.reload!(turn.attempt),
+       Repo.reload!(turn.turn),
+       Repo.all(
+         from entry in LedgerEntry,
+           where: entry.request_id == ^turn.request.id,
+           order_by: entry.id
+       )}
+
+    assert after_cancel == before
+  end
+
+  test "typed runtime old-owner monitor cannot interrupt the replacement owner's request",
+       fixture do
+    state =
+      DownstreamSession.put_runtime(fixture.state, %{
+        codex_session: fixture.session,
+        websocket_owner_lease_token: fixture.session.owner_lease_token,
+        websocket_owner_downstream: fixture.state.websocket_owner_downstream
+      })
+
+    assert is_nil(state.opts.transport.websocket_owner.lease_token)
+    replacement_token = Ecto.UUID.generate()
+
+    fixture.session
+    |> Ecto.Changeset.change(owner_lease_token: replacement_token)
+    |> Repo.update!()
+
+    turn = active_turn_fixture(fixture, "websocket")
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:stop, {1011, "websocket owner crashed"}, _state} =
+                 DownstreamSession.handle_monitor_down(state, fixture.owner_pid, :crashed)
+      end)
+
+    assert log =~ "websocket owner monitor lease release failed"
+    assert log =~ "failure_reason=stale_owner_cleanup"
+
+    assert Repo.get!(Request, turn.request.id).status == "in_progress"
+    assert Repo.get!(Attempt, turn.attempt.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, turn.turn.id).status == "in_progress"
+    assert Repo.get!(CodexSession, fixture.session.id).owner_lease_token == replacement_token
+  end
+
+  test "owner monitor recovery failure preserves the lease and unfinished turn", fixture do
+    turn = active_turn_fixture(fixture, "websocket")
+
+    state =
+      turn.state
+      |> Map.put(:codex_session, fixture.session)
+      |> Map.put(:websocket_owner_pid, fixture.owner_pid)
+      |> Map.put(:websocket_owner_lease_token, Ecto.UUID.generate())
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:stop, {1011, "websocket owner crashed"}, _state} =
+                 DownstreamSession.handle_monitor_down(state, fixture.owner_pid, :crashed)
+      end)
+
+    assert log =~ "websocket owner monitor recovery failed"
+    assert log =~ "failure_reason=stale_owner_cleanup"
+    assert Repo.get!(Request, turn.request.id).status == "in_progress"
+    assert Repo.get!(CodexTurn, turn.turn.id).status == "in_progress"
+    assert_lease_preserved!(fixture)
+  end
+
   test "successful detach preserves accounting success that wins before turn completion",
        fixture do
     turn = active_turn_fixture(fixture, "websocket")
     finalize_turn(turn, "succeeded", nil, complete_turn?: false)
     assert Repo.get!(CodexTurn, turn.turn.id).status == "in_progress"
 
-    assert :ok = DownstreamSession.cleanup(fixture.state)
+    assert :ok = DownstreamSession.cleanup(turn.state)
 
     assert Repo.get!(CodexSession, fixture.session.id).status == "active"
     assert Repo.get!(Request, turn.request.id).status == "succeeded"
@@ -110,7 +203,13 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSessionTest do
     finalize_turn(websocket_turn, "succeeded", nil)
     http_turn = active_turn_fixture(fixture, "http_sse")
 
-    assert :ok = DownstreamSession.cleanup(fixture.state)
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = DownstreamSession.cleanup(websocket_turn.state)
+      end)
+
+    assert log =~ "websocket interrupt cleanup failed"
+    assert log =~ "failure_reason=stale_owner_cleanup"
 
     assert Repo.get!(CodexSession, fixture.session.id).status == "active"
     assert Repo.get!(CodexTurn, websocket_turn.turn.id).status == "succeeded"
@@ -125,7 +224,7 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSessionTest do
     turn = active_turn_fixture(fixture, "websocket")
     finalize_turn(turn, "failed", "upstream_error")
 
-    assert :ok = DownstreamSession.cleanup(fixture.state)
+    assert :ok = DownstreamSession.cleanup(turn.state)
 
     assert Repo.get!(CodexSession, fixture.session.id).status == "interrupted"
     assert Repo.get!(Request, turn.request.id).status == "failed"
@@ -157,7 +256,14 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSessionTest do
                  endpoint: "/backend-api/codex/responses",
                  transport: transport,
                  correlation_id: correlation_id,
-                 request_metadata: %{"codex_session_id" => fixture.session.id}
+                 request_metadata: %{
+                   "codex_session_id" => fixture.session.id,
+                   "websocket_owner_forwarding" => %{
+                     "enabled" => true,
+                     "owner_instance_id" => fixture.session.owner_instance_id,
+                     "downstream_epoch" => fixture.state.websocket_owner_downstream.epoch
+                   }
+                 }
                }
              )
 
@@ -165,7 +271,47 @@ defmodule CodexPooler.Gateway.Websocket.DownstreamSessionTest do
              Accounting.create_attempt(reserved.request, fixture.setup.assignment)
 
     assert {:ok, turn} = Gateway.start_codex_turn(fixture.session, reserved.request)
-    %{request: reserved.request, attempt: attempt, turn: turn}
+
+    on_exit(fn ->
+      current_request = Repo.reload!(reserved.request)
+      current_attempt = Repo.reload!(attempt)
+
+      if current_request.status == "in_progress" do
+        assert {:ok, result} =
+                 Accounting.finalize_request(current_request, current_attempt, %{
+                   request_status: "failed",
+                   attempt_status: "failed",
+                   response_status_code: 499,
+                   last_error_code: "client_disconnected",
+                   usage: %{status: "usage_unknown", source: "fixture_cleanup"}
+                 })
+
+        SessionContinuity.complete_codex_turn({:ok, result}, "failed", "client_disconnected")
+      end
+    end)
+
+    downstream = Map.put(fixture.state.websocket_owner_downstream, :owner_turn_id, self())
+
+    assert :ok =
+             WebsocketOwnerSession.submit_request(
+               fixture.owner_pid,
+               downstream,
+               %UpstreamWebsocketSession.Request{
+                 request_id: reserved.request.id,
+                 attempt_id: attempt.id
+               }
+             )
+
+    assert_receive {:websocket_owner_cleanup_witness, _, _, _, _} = message, 15_000
+
+    state =
+      fixture.state
+      |> Map.put(:codex_session, fixture.session)
+      |> Map.put(:tasks, MapSet.new([self()]))
+      |> then(&DownstreamSession.accept_cleanup_witness(message, &1))
+
+    assert state.websocket_owner_cleanup_witness.request_id == reserved.request.id
+    %{request: reserved.request, attempt: attempt, turn: turn, state: state}
   end
 
   defp finalize_turn(turn, status, error_code, opts \\ []) do

@@ -1,9 +1,27 @@
+defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ReceiveState.Delivery do
+  @moduledoc false
+
+  defstruct mode: :relay, effective_serving_mode: nil
+
+  @type t :: %__MODULE__{
+          mode:
+            CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request.delivery_mode(),
+          effective_serving_mode:
+            CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request.effective_serving_mode()
+        }
+end
+
 defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ReceiveState do
   @moduledoc false
 
+  alias __MODULE__.Delivery
+  alias CodexPooler.Gateway.Runtime.Finalization.ResponseUsage
   alias CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot
   alias CodexPooler.Gateway.Transports.Streaming.RetainedBody
 
+  # The receive state mirrors the finite websocket protocol phases; adding the
+  # client-retry observation keeps one request-local accumulator and avoids SQL.
+  # credo:disable-for-next-line Credo.Check.Warning.StructFieldAmount
   defstruct [
     :writer,
     :timeouts,
@@ -11,6 +29,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Rece
     :frame_observer,
     :native_codex_response_control,
     :response_id,
+    :response_usage,
     :terminal_upstream_error_code,
     :terminal_upstream_error_param,
     :termination_source,
@@ -21,6 +40,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Rece
     :connection_idle_bucket,
     :request_caller_pid,
     :request_caller_monitor,
+    :native_client_retry_observation,
+    delivery: %Delivery{},
     assignment_advertised?: false,
     native_metadata_emitted?: false,
     downstream_output_started?: false,
@@ -46,7 +67,9 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Rece
           frame_observer:
             CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request.frame_observer(),
           native_codex_response_control: TurnSnapshot.t() | nil,
+          delivery: Delivery.t(),
           response_id: String.t() | nil,
+          response_usage: ResponseUsage.usage() | nil,
           terminal_upstream_error_code: String.t() | nil,
           terminal_upstream_error_param: String.t() | nil,
           termination_source: atom() | nil,
@@ -57,6 +80,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Rece
           connection_idle_bucket: atom() | nil,
           request_caller_pid: pid() | nil,
           request_caller_monitor: reference() | nil,
+          native_client_retry_observation:
+            CodexPooler.Accounting.ClientRetry.Observation.t() | nil,
           assignment_advertised?: boolean(),
           native_metadata_emitted?: boolean(),
           downstream_output_started?: boolean(),

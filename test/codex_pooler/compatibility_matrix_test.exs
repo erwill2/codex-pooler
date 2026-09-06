@@ -5,6 +5,42 @@ defmodule CodexPooler.CompatibilityMatrixTest do
   alias CodexPooler.Pools.RoutingSettings
 
   describe "catalog and Responses runtime contract" do
+    test "pins provider-attested windowless routing below reset-bearing quota evidence" do
+      feature = CompatibilityMatrix.by_slug!(:degraded_routing)
+      fixture = CompatibilityMatrix.fixture!(:degraded_routing)
+
+      assert feature.quota_evidence == %{
+               normal_authority: "fresh_reset_bearing_windows",
+               lower_priority_fallback: "provider_attested_windowless_availability",
+               operator_or_sku_gate: false,
+               synthetic_window_or_reset: false
+             }
+
+      assert fixture.windowless_provider_availability == %{
+               routing_state: "windowless_provider_available",
+               required_metadata: ["version", "state", "observed_at", "credential_epoch"],
+               requires_current_credential_epoch: true,
+               requires_fresh_observation: true,
+               requires_no_account_window_evidence: true,
+               precedence: "below_reset_bearing_windows",
+               fabricated_window_or_reset: false
+             }
+
+      assert fixture.fail_closed == %{
+               status: 503,
+               blocked_error_code: "quota_exhausted",
+               unavailable_error_code: "quota_evidence_unavailable",
+               states: [
+                 "provider_blocked",
+                 "provider_unknown",
+                 "stale_provider_availability",
+                 "credential_epoch_mismatch",
+                 "malformed_provider_availability",
+                 "applicable_model_or_additional_blocker"
+               ]
+             }
+    end
+
     test "distinguishes public terminal compaction triggers from the unsupported compact route" do
       fixture = CompatibilityMatrix.fixture!(:responses_chat)
 
@@ -21,7 +57,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                  timing: "after_coercion_before_compact_execution",
                  completion: "local_websocket_completion"
                },
-               transport: "http_compact_json",
+               transport_contracts: public_compaction_transport_contracts(),
                closed_item: %{"type" => "compaction_trigger"},
                valid_trigger: "exactly_one_final_after_visible_input",
                malformed_trigger: %{status: 400, param: "input", upstream_dispatch: false},
@@ -98,7 +134,12 @@ defmodule CodexPooler.CompatibilityMatrixTest do
 
       assert boundary.harness_applicability == %{
                codex: %{
-                 version: "rust-v0.150.0",
+                 version: "rust-v0.153.3",
+                 peeled_commit: "b1a547b1f73ce86205d9222ac19cff334b3b7a2e",
+                 sanitized_fixtures: [
+                   "test/fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_request.json",
+                   "test/fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_incremental_request.json"
+                 ],
                  applicability: "native_v2",
                  classifier_authority: true,
                  verification: "commit_blocking"
@@ -168,14 +209,25 @@ defmodule CodexPooler.CompatibilityMatrixTest do
              }
     end
 
-    test "keeps the issue-75 policy exception narrow and generic redaction intact" do
+    test "keeps the issue-101 private-native detail projections narrow and generic redaction intact" do
       fixture = CompatibilityMatrix.fixture!(:misalignment_policy_violation)
 
       assert fixture.eligibility == %{
-               direct_http_statuses: [400, 403],
-               terminal_transports: ["sse", "websocket"],
-               route_scope: "eligible_direct_or_translated_responses_and_chat_routes_only",
-               exact_error_envelope: true
+               immediate_pre_stream_http_json: %{
+                 routes: ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"],
+                 statuses: [400, 403],
+                 exact_error_code: "misalignment_policy_violation",
+                 stream_true_rejected_before_sse_starts: true,
+                 optional_fields: ["error_type", "detailed_explanation", "steer.message"]
+               },
+               private_native_app_server_response_failed_sse: %{
+                 routes: ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"],
+                 statuses: [400, 403],
+                 exact_error_code: "misalignment_policy_violation",
+                 stream_true: true,
+                 terminal_event: "response.failed",
+                 optional_fields: ["error_type", "detailed_explanation", "steer.message"]
+               }
              }
 
       assert fixture.lifecycle == %{
@@ -201,6 +253,20 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                bounded_facts_only: true,
                raw_provider_message: false,
                raw_provider_body: false
+             }
+
+      assert fixture.redaction == %{
+               native_websocket: false,
+               native_compact: false,
+               public_v1_responses_chat_sse_websocket: false,
+               generic_errors: false,
+               logs: false,
+               request_or_attempt_metadata: false,
+               audit: false,
+               telemetry: false,
+               receipts: false,
+               stored_errors: false,
+               durable_event_history: false
              }
 
       assert fixture.generic_provider_errors == %{
@@ -791,6 +857,12 @@ defmodule CodexPooler.CompatibilityMatrixTest do
       assert feature.contract =~ "fail-open"
       assert feature.contract =~ "metadata-only"
       assert feature.contract =~ "payload_compression"
+      assert feature.contract =~ "command-backed file reads"
+
+      assert feature.contract =~
+               "remain byte-exact before output range lookup or content detection"
+
+      assert feature.contract =~ "malformed or unrecognized commands retain existing behavior"
       assert feature.contract =~ "valid JSON object or array spans embedded in ordinary prose"
 
       assert Map.fetch!(fixture, :pool_gate) == %{
@@ -801,6 +873,35 @@ defmodule CodexPooler.CompatibilityMatrixTest do
 
       assert Map.fetch!(fixture, :direction) == "request_side_only"
       assert Map.fetch!(fixture, :failure_mode) == "fail_open_original_request"
+
+      assert get_in(fixture, [:protected_tool_outputs, :command_backed_reads]) == %{
+               arguments: ["cmd", "command"],
+               native_action: %{type: "exec", command: "argv"},
+               direct_commands: ["cat", "nl", "head", "tail", "sed_print_only"],
+               pipeline: "nl_to_sed_print_only",
+               producer_aliases: %{
+                 function_call: ["call_id"],
+                 local_shell_call: ["call_id", "id"]
+               },
+               output_aliases: %{
+                 function_call_output: ["call_id"],
+                 local_shell_call_output: ["call_id", "id"]
+               },
+               output_compatibility: %{
+                 function_call_output: ["function_call", "local_shell_call"],
+                 local_shell_call_output: ["local_shell_call"]
+               },
+               owner_identity: "positional_producer_path",
+               unresolved_function_output: "protected_legacy",
+               unresolved_local_shell_output: "existing_behavior",
+               duplicate_aliases: "protected_original_output_preserved",
+               cross_kind_collisions: "protected_original_output_preserved",
+               conflicting_output_aliases: "protected_original_output_preserved",
+               recognized_owner_stage: "before_output_range_lookup_and_content_detection",
+               malformed_or_unrecognized: "existing_behavior",
+               output_behavior: "byte_exact",
+               metadata: "aggregate_counts_only"
+             }
 
       assert get_in(fixture, [:supported_input_shapes, :embedded_json]) == %{
                container_kinds: ["object", "array"],
@@ -1078,6 +1179,122 @@ defmodule CodexPooler.CompatibilityMatrixTest do
                }
              }
     end
+
+    test "pins owner-authorized native compaction accounting and public exclusion" do
+      feature = CompatibilityMatrix.by_slug!(:websocket_continuity)
+      fixture = CompatibilityMatrix.fixture!(:websocket_turn)
+
+      assert feature.contract =~ "share one semantic client turn"
+      assert feature.contract =~ "three distinct accounting lifecycles"
+      assert feature.contract =~ "first full-history compact uses the ordinary durable turn claim"
+      assert feature.contract =~ "owner capability plus sealed runtime proof"
+      assert feature.contract =~ "saved-reset probe or redeem activity"
+      assert feature.contract =~ "public /v1 never inherits the native owner capability or proof"
+
+      assert fixture.native_compaction_admission == %{
+               semantic_sequence: ["anchor", "compact", "final"],
+               first_compact: %{
+                 authority: "ordinary_durable_turn_claim",
+                 capability_required: false,
+                 replay: "duplicate_turn_without_new_side_effects"
+               },
+               mid_turn_transitions: %{
+                 compact: "owner_capability_plus_sealed_runtime_proof",
+                 final: "owner_capability_plus_sealed_runtime_proof",
+                 payload_shape_or_client_metadata_alone: "never_authoritative"
+               },
+               binding: [
+                 "phase",
+                 "semantic_turn",
+                 "prepared_frame_control",
+                 "owner_epoch_and_lease",
+                 "serving_mode",
+                 "physical_websocket_lifecycle_and_generation"
+               ],
+               legitimate_accounting: %{
+                 distinct_correlations: 3,
+                 requests: 3,
+                 attempts: 3,
+                 codex_turns: 3,
+                 reservations: 3,
+                 settlements: 3,
+                 semantic_client_turns: 1,
+                 websocket_lifecycles: 1,
+                 websocket_generations: 1,
+                 http_fallbacks: 0
+               },
+               rejected_frames: %{
+                 new_rows: 0,
+                 upstream_calls: 0,
+                 saved_reset_probe_or_redeem: false,
+                 hidden_replay_retry_or_fallback: false
+               },
+               public_v1: %{
+                 inherits_owner_capability_or_proof: false,
+                 replay_and_bridge_semantics: "unchanged",
+                 relayed_bytes_and_terminal_shape: "unchanged"
+               }
+             }
+    end
+
+    test "pins native tool continuations as distinct request lifecycles inside one logical turn" do
+      fixture = CompatibilityMatrix.fixture!(:websocket_turn)
+
+      assert fixture.native_tool_continuation == %{
+               logical_turn: %{
+                 identity: "semantic_turn_key_and_turn_claim_key",
+                 client_turns: 1
+               },
+               request_claim: %{
+                 kind: "deterministic_continuation_claim",
+                 separate_from_logical_turn_identity: true
+               },
+               accepted_semantic_continuation: %{
+                 requests: 2,
+                 attempts: 2,
+                 codex_turns: 2,
+                 settlements: 2,
+                 sequences: [1, 2]
+               },
+               exact_replay: %{
+                 status: 409,
+                 new_request_attempt_codex_turn_or_settlement: false,
+                 upstream_dispatch: false
+               }
+             }
+    end
+
+    test "pins released native metadata admission and metadata-only rejection boundaries" do
+      fixture = CompatibilityMatrix.fixture!(:websocket_turn)
+
+      assert fixture.released_native_metadata == %{
+               request_kinds: [:turn, :prewarm, :compaction, :memory],
+               canonical_envelope: %{
+                 accepted_encodings: [:map, :json_string],
+                 ordinary_and_prewarm: %{
+                   optional: [:window_id, :context_window_id, :window_number],
+                   explicit_null: "rejected",
+                   compaction: "omitted_only"
+                 },
+                 compaction: %{
+                   authority: "strict_complete_enum_map",
+                   malformed: "pre_dispatch_rejected"
+                 },
+                 memory: %{
+                   semantic_turn_identity: false,
+                   ordinary_websocket_accounting_continuity_owner_or_compaction_lifecycle: false
+                 }
+               },
+               prewarm: %{
+                 admitted_without_compaction_authority: true
+               },
+               rejection_diagnostics: %{
+                 vocabulary: :fixed,
+                 metadata_only: true,
+                 raw_metadata_values: false
+               }
+             }
+    end
   end
 
   describe "image generation compatibility contract" do
@@ -1167,8 +1384,21 @@ defmodule CodexPooler.CompatibilityMatrixTest do
       canonical_identity: %{
         upstream_endpoint: "/backend-api/codex/responses",
         accounting_endpoint: "/backend-api/codex/responses/compact",
-        request_transport: "http_compact_json",
-        attempt_transport: "http_compact_json"
+        transport_contracts: %{
+          incremental_websocket: %{
+            input_mode: "nonblank_top_level_previous_response_id",
+            request_transport: "websocket",
+            attempt_transport: "websocket",
+            connection: "current_live_matching_generation_reused_only",
+            delivery: "collect_compaction_before_validation_settlement_and_adapter",
+            retry_or_fallback: false
+          },
+          full_history_http: %{
+            input_mode: "no_top_level_previous_response_id",
+            request_transport: "http_compact_json",
+            attempt_transport: "http_compact_json"
+          }
+        }
       },
       result_transports: %{
         buffered: "responses_json",
@@ -1193,6 +1423,26 @@ defmodule CodexPooler.CompatibilityMatrixTest do
         applied: true,
         result_transport: ["buffered", "sse"],
         raw_payload_or_frame: false
+      }
+    }
+  end
+
+  defp public_compaction_transport_contracts do
+    %{
+      incremental_websocket: %{
+        surface: "responses_websocket",
+        input_mode: "nonblank_top_level_previous_response_id",
+        request_transport: "websocket",
+        attempt_transport: "websocket",
+        connection: "current_live_matching_generation_reused_only",
+        delivery: "collect_compaction_before_validation_settlement_and_adapter",
+        retry_or_fallback: false
+      },
+      full_history_http: %{
+        surfaces: ["http_json", "http_sse", "responses_websocket"],
+        input_mode: "no_top_level_previous_response_id",
+        request_transport: "http_compact_json",
+        attempt_transport: "http_compact_json"
       }
     }
   end

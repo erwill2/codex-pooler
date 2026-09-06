@@ -66,10 +66,18 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
              response
              |> Metadata.response_metadata(nil, request_options)
              |> Metadata.merge_stream_state_metadata(stream_state)
+             |> merge_usage_observation(stream_state)
              |> merge_upstream_websocket_connection(upstream_websocket_connection),
-             started: started
+             started: started,
+             before_finalize: fn ->
+               SideEffects.observe_stream_response(context, response, body, stream_state)
+               SideEffects.before_finalize_success(context, request_options)
+             end
            )
          ) do
+      {:stale_generation, finalized} ->
+        {:ok, finalized}
+
       {:ok, _finalized} = result ->
         emit_stream_finalization(
           usage,
@@ -105,45 +113,82 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     health_code = stream_health_code(failure, code)
     failure = %{failure | code: code}
 
-    health_result =
-      cond do
-        compact_assignment_model_miss?(failure, context) ->
-          :ok
+    websocket_attempt_metadata = upstream_websocket_attempt_metadata(response_context)
 
-        Keyword.get(opts, :record_health?, true) ->
-          record_health_failure(health_code, health_code, context)
+    attrs = %{
+      response_status_code: response.status,
+      last_error_code: code,
+      error_message: "upstream stream returned retryable first event #{code}",
+      latency_ms: elapsed_ms(context.started),
+      usage_status: ResponseUsage.from_sse(body)[:status] || "usage_unknown",
+      attempt_metadata:
+        first_event_attempt_metadata(
+          response_context,
+          websocket_attempt_metadata,
+          failure,
+          "retryable_first_event"
+        ),
+      retry_count: context.retry_count
+    }
+
+    record_health? =
+      not compact_assignment_model_miss?(failure, context) and
+        Keyword.get(opts, :record_health?, true)
+
+    attrs =
+      cond do
+        record_health? and not is_nil(context.attempt) ->
+          Map.put(attrs, :before_finalize, fn ->
+            SideEffects.observe_stream_response(context, response, body, nil)
+            record_health_failure(health_code, health_code, context)
+          end)
+
+        is_nil(context.attempt) ->
+          attrs
 
         true ->
-          :ok
+          Map.put(attrs, :before_finalize, fn ->
+            SideEffects.observe_stream_response(context, response, body, nil)
+          end)
       end
 
-    with :ok <- health_result do
-      websocket_attempt_metadata = upstream_websocket_attempt_metadata(response_context)
-
-      AttemptSettlement.record_retryable_failure(
-        context.reserved.request,
-        context.attempt,
-        %{
-          response_status_code: response.status,
-          last_error_code: code,
-          error_message: "upstream stream returned retryable first event #{code}",
-          latency_ms: elapsed_ms(context.started),
-          usage_status: ResponseUsage.from_sse(body)[:status] || "usage_unknown",
-          attempt_metadata:
-            first_event_attempt_metadata(
-              response_context,
-              websocket_attempt_metadata,
-              failure,
-              "retryable_first_event"
-            ),
-          retry_count: context.retry_count
-        }
-      )
+    with :ok <- maybe_record_retryable_health(context, health_code, record_health?) do
+      AttemptSettlement.record_retryable_failure(context.reserved.request, context.attempt, attrs)
     end
   end
 
+  defp maybe_record_retryable_health(
+         %SelectedCandidateContext{attempt: nil} = context,
+         code,
+         true
+       ),
+       do: record_health_failure(code, code, context)
+
+  defp maybe_record_retryable_health(%SelectedCandidateContext{}, _code, _record_health?), do: :ok
+
   @spec finalize_first_event_failure(binary(), stream_failure(), ResponseContext.t()) ::
           finalization_result()
+  def finalize_first_event_failure(
+        _body,
+        failure,
+        %ResponseContext{context: %SelectedCandidateContext{attempt: nil} = context}
+      ) do
+    code = stream_failure_code(failure, context)
+
+    case record_terminal_health_failure(code, [], context) do
+      {:error, _gateway_error} = error ->
+        error
+
+      :ok ->
+        {:error,
+         %{
+           status: 500,
+           code: "gateway_accounting_failed",
+           message: terminal_failure_message(code, "gateway accounting finalization failed")
+         }}
+    end
+  end
+
   def finalize_first_event_failure(
         body,
         failure,
@@ -153,42 +198,38 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     health_code = stream_health_code(failure, code)
     failure = %{failure | code: code}
 
-    health_result =
-      if compact_assignment_model_miss?(failure, context),
-        do: :ok,
-        else: record_terminal_health_failure(health_code, response.headers, context)
+    websocket_attempt_metadata = upstream_websocket_attempt_metadata(response_context)
+    transports = resolved_transports(response_context, websocket_attempt_metadata)
 
-    case health_result do
-      :ok ->
-        websocket_attempt_metadata = upstream_websocket_attempt_metadata(response_context)
-        transports = resolved_transports(response_context, websocket_attempt_metadata)
-
-        result =
-          AttemptSettlement.finalize_partial_stream_failure(
-            context.reserved.request,
-            context.attempt,
-            stream_usage(body, nil),
-            SettlementAttrs.partial_stream_failure(
-              context,
-              response.status,
-              code,
-              terminal_failure_message(code, "upstream stream returned first event #{code}"),
-              first_event_attempt_metadata(
-                response_context,
-                websocket_attempt_metadata,
-                failure,
-                "first_event_stream_failure"
-              )
-              |> terminal_failure_attempt_metadata(code)
-            )
+    result =
+      AttemptSettlement.finalize_partial_stream_failure(
+        context.reserved.request,
+        context.attempt,
+        stream_usage(body, nil),
+        SettlementAttrs.partial_stream_failure(
+          context,
+          response.status,
+          code,
+          terminal_failure_message(code, "upstream stream returned first event #{code}"),
+          first_event_attempt_metadata(
+            response_context,
+            websocket_attempt_metadata,
+            failure,
+            "first_event_stream_failure"
           )
+          |> terminal_failure_attempt_metadata(code)
+        )
+        |> maybe_put_before_finalize(context, fn ->
+          SideEffects.observe_stream_response(context, response, body, nil)
 
-        emit_terminal_outcome(result, code, transports)
-        result
+          if compact_assignment_model_miss?(failure, context),
+            do: :ok,
+            else: record_terminal_health_failure(health_code, response.headers, context)
+        end)
+      )
 
-      {:error, _gateway_error} = error ->
-        error
-    end
+    emit_terminal_outcome(result, code, transports)
+    normalize_stale_generation(result)
   end
 
   @spec first_event_attempt_metadata(ResponseContext.t(), map(), map(), String.t()) :: map()
@@ -218,55 +259,57 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     websocket_attempt_metadata = upstream_websocket_attempt_metadata(response_context)
     transports = resolved_transports(response_context, websocket_attempt_metadata)
 
-    case record_stream_failure_health(
-           reason,
-           code,
-           terminal_failure,
-           response.headers,
-           context
-         ) do
-      :ok ->
-        attempt_metadata =
-          response
-          |> Metadata.response_metadata("stream_interrupted", context.request_options)
-          |> Metadata.merge_stream_state_metadata(stream_state)
-          |> merge_upstream_websocket_connection(
-            websocket_attempt_metadata.upstream_websocket_connection
-          )
-          |> Metadata.maybe_put_masked_error_metadata(
-            terminal_failure && terminal_failure.upstream_code,
-            code
-          )
-          |> non_first_event_terminal_attempt_metadata(terminal_failure, code)
-          |> TransportFailureReason.maybe_put_upstream_stream_interrupted_metadata(reason, body)
-          |> merge_websocket_transport_failure(
-            websocket_attempt_metadata.transport_failure,
-            stream_state
-          )
+    attempt_metadata =
+      response
+      |> Metadata.response_metadata("stream_interrupted", context.request_options)
+      |> Metadata.merge_stream_state_metadata(stream_state)
+      |> merge_usage_observation(stream_state)
+      |> merge_upstream_websocket_connection(
+        websocket_attempt_metadata.upstream_websocket_connection
+      )
+      |> Metadata.maybe_put_masked_error_metadata(
+        terminal_failure && terminal_failure.upstream_code,
+        code
+      )
+      |> non_first_event_terminal_attempt_metadata(terminal_failure, code)
+      |> TransportFailureReason.maybe_put_upstream_stream_interrupted_metadata(reason, body)
+      |> merge_websocket_transport_failure(
+        websocket_attempt_metadata.transport_failure,
+        stream_state
+      )
 
-        result =
-          AttemptSettlement.finalize_partial_stream_failure(
-            context.reserved.request,
-            context.attempt,
-            stream_usage(body, stream_state),
-            SettlementAttrs.partial_stream_failure(
-              context,
-              response.status,
-              code,
-              terminal_failure_message(code, Metadata.safe_reason(reason)),
-              attempt_metadata
-            )
-          )
+    result =
+      AttemptSettlement.finalize_partial_stream_failure(
+        context.reserved.request,
+        context.attempt,
+        stream_usage(body, stream_state),
+        SettlementAttrs.partial_stream_failure(
+          context,
+          failure_response_status(reason, response.status),
+          code,
+          terminal_failure_message(code, Metadata.safe_reason(reason)),
+          attempt_metadata
+        )
+        |> Map.put(:upstream_status_code, response.status)
+        |> maybe_put_before_finalize(context, fn ->
+          SideEffects.observe_stream_response(context, response, body, stream_state)
+          record_stream_failure_health(reason, code, terminal_failure, response.headers, context)
+        end)
+      )
 
-        emit_terminal_outcome(result, code, transports)
-        result
-
-      {:error, _gateway_error} = error ->
-        error
-    end
+    emit_terminal_outcome(result, code, transports)
+    normalize_stale_generation(result)
   end
 
   defp emit_terminal_outcome(result, code, transports) do
+    if AttemptSettlement.stale_generation?(result) do
+      :ok
+    else
+      emit_current_terminal_outcome(result, code, transports)
+    end
+  end
+
+  defp emit_current_terminal_outcome(result, code, transports) do
     outcome = if code == "client_disconnected", do: "interrupted", else: "failed"
 
     case result do
@@ -274,6 +317,15 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
       {:error, _gateway_error} -> emit_settlement_failure(result, transports)
     end
   end
+
+  defp normalize_stale_generation({:stale_generation, finalized}), do: {:ok, finalized}
+  defp normalize_stale_generation(result), do: result
+
+  defp maybe_put_before_finalize(attrs, %SelectedCandidateContext{attempt: nil}, _callback),
+    do: attrs
+
+  defp maybe_put_before_finalize(attrs, %SelectedCandidateContext{}, callback),
+    do: Map.put(attrs, :before_finalize, callback)
 
   defp emit_settlement_outcome({:ok, finalized}, outcome, transports) do
     if AttemptSettlement.first_settlement?(finalized) do
@@ -376,6 +428,10 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
   def error_code({:chunk, _reason}), do: "downstream_stream_error"
   def error_code({:upstream_idle_timeout, _reason}), do: "stream_idle_timeout"
   def error_code({:upstream_stream_interrupted, _reason}), do: "upstream_stream_error"
+
+  def error_code({:collected_response_invalid, _status, code}),
+    do: DiagnosticTaxonomy.identifier(code) || "upstream_response_missing"
+
   def error_code(:upstream_websocket_receive_timeout), do: "stream_idle_timeout"
   def error_code({:terminal_stream_failure, %{code: code}}) when is_binary(code), do: code
   def error_code(:upstream_unauthorized), do: "upstream_unauthorized"
@@ -412,6 +468,11 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     record_health_failure(code, code, context)
   end
 
+  @doc false
+  @spec health_neutral_terminal_failure?(term(), term()) :: boolean()
+  def health_neutral_terminal_failure?(code, headers),
+    do: do_health_neutral_terminal_failure?(code, headers)
+
   defp record_stream_failure_health(
          :upstream_stream_interrupted,
          "upstream_stream_error",
@@ -424,6 +485,15 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
   defp record_stream_failure_health(
          {:upstream_stream_interrupted, _reason},
          "upstream_stream_error",
+         nil,
+         _headers,
+         context
+       ),
+       do: DispatchLifecycle.neutral_completion(context)
+
+  defp record_stream_failure_health(
+         {:collected_response_invalid, _status, _code},
+         _error_code,
          nil,
          _headers,
          context
@@ -477,7 +547,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
     ]
   end
 
-  defp health_neutral_terminal_failure?(code, headers) do
+  defp do_health_neutral_terminal_failure?(code, headers) do
     health_neutral_error_code?(code) or
       workspace_quota_depleted?(code) or
       workspace_quota_depleted?(RateLimitReachedType.parse_header(headers))
@@ -542,6 +612,11 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
   defp terminal_failure_reason({:terminal_stream_failure, %{} = failure}), do: failure
   defp terminal_failure_reason(_reason), do: nil
 
+  defp failure_response_status({:collected_response_invalid, status, _code}, _upstream_status),
+    do: status
+
+  defp failure_response_status(_reason, upstream_status), do: upstream_status
+
   defp stream_failure_code(nil, _context), do: nil
 
   defp stream_failure_code(failure, context) do
@@ -574,12 +649,23 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Streaming do
 
   defp elapsed_ms(started), do: max(System.monotonic_time(:millisecond) - started, 0)
 
-  defp stream_usage(body, stream_state) do
-    StreamUsageObserver.usage(stream_state_usage(stream_state)) || ResponseUsage.from_sse(body)
+  defp stream_usage(_body, %{response_usage: %{} = usage}), do: usage
+
+  defp stream_usage(_body, %{usage_observer: %{} = usage_state}),
+    do: StreamUsageObserver.result(usage_state)
+
+  defp stream_usage(body, _stream_state), do: ResponseUsage.from_sse(body)
+
+  defp merge_usage_observation(metadata, %{usage_observer: %{} = observer}) do
+    observation =
+      observer
+      |> StreamUsageObserver.diagnostics()
+      |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
+
+    Map.put(metadata, "usage_observation", observation)
   end
 
-  defp stream_state_usage(%{usage_observer: %{} = usage_state}), do: usage_state
-  defp stream_state_usage(_stream_state), do: StreamUsageObserver.new()
+  defp merge_usage_observation(metadata, _stream_state), do: metadata
 
   @doc false
   @spec emit_stream_finalization(map(), String.t(), String.t()) :: :ok

@@ -6,6 +6,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   alias CodexPooler.Quotas.ModelWeeklyResetSemantics
   alias CodexPooler.Upstreams.Quota
   alias CodexPooler.Upstreams.Quota.Charts.Measurements
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Quota.WindowSelector
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.SavedResetConfirmationProjection
@@ -85,6 +86,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
     UpstreamQuotaReadiness.from_windows(windows, snapshot_at)
   end
 
+  @spec readiness(RoutingQuotaSnapshot.t(), DateTime.t()) :: UpstreamQuotaReadiness.t()
+  def readiness(%RoutingQuotaSnapshot{as_of: snapshot_at} = snapshot, %DateTime{} = snapshot_at) do
+    UpstreamQuotaReadiness.from_snapshot(snapshot)
+  end
+
   @spec assignment_priming_status(map()) :: String.t()
   def assignment_priming_status(%{metadata: %{"quota_priming" => %{"status" => status}}})
       when is_binary(status),
@@ -123,6 +129,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
 
   defp put_derived_quota_priming(assignment, %{state: "weekly_only_probe"}) do
     put_quota_priming(assignment, "weekly_only_probe")
+  end
+
+  defp put_derived_quota_priming(assignment, %{state: "provider_available_no_windows"}) do
+    put_quota_priming(assignment, "known")
   end
 
   defp put_derived_quota_priming(assignment, _quota_readiness), do: assignment
@@ -191,6 +201,57 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
         snapshot_at
       )
     ] ++ additional_limits
+  end
+
+  @spec quota_limit_rows(
+          [Quota.AccountQuotaWindow.t()],
+          DateTimeDisplay.preferences(),
+          DateTime.t(),
+          CodexPooler.Upstreams.Quota.CreditBalanceStore.snapshot() | nil
+        ) :: [quota_limit_row()]
+  def quota_limit_rows(windows, datetime_preferences, snapshot_at, credit_balance) do
+    windows
+    |> quota_limit_rows(datetime_preferences, snapshot_at)
+    |> Enum.map(&put_account_credit_balance(&1, windows, snapshot_at, credit_balance))
+  end
+
+  defp put_account_credit_balance(%{key: key} = row, windows, snapshot_at, credit_balance)
+       when key in [:primary_5h, :primary_30d, :weekly] do
+    descriptor =
+      case key do
+        :weekly -> "secondary"
+        :primary_30d -> :monthly_primary
+        :primary_5h -> :primary_5h
+      end
+
+    case quota_account_window(windows, descriptor, snapshot_at) do
+      nil -> row
+      window -> put_credit_balance(row, credit_balance, window)
+    end
+  end
+
+  defp put_account_credit_balance(row, _windows, _snapshot_at, _credit_balance), do: row
+
+  defp put_credit_balance(row, %{balance: balance}, window) do
+    count_label = "#{Formatting.format_integer(balance)} credits"
+    credit_window = %{window | source: "codex_usage_api", credits: balance}
+    burning = burning_credits?(credit_window)
+
+    %{
+      row
+      | count_label: count_label,
+        count_title: quota_count_title(credit_window, count_label, burning),
+        burning_credits: burning
+    }
+  end
+
+  defp put_credit_balance(row, nil, _window) do
+    %{
+      row
+      | count_label: nil,
+        count_title: nil,
+        burning_credits: false
+    }
   end
 
   defp put_quota_priming(assignment, status) do
@@ -561,7 +622,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
          source: "codex_usage_api",
          credits: nil
        }),
-       do: "credits not reported"
+       do: nil
 
   defp quota_count_label(%Quota.AccountQuotaWindow{credits: credits, active_limit: active_limit})
        when is_integer(credits) and is_integer(active_limit) and active_limit > 0 do
@@ -593,18 +654,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection do
   defp quota_count_label(%Quota.AccountQuotaWindow{used_percent: %Decimal{}}), do: nil
 
   defp quota_count_label(%Quota.AccountQuotaWindow{}), do: nil
-
-  defp quota_count_title(
-         %Quota.AccountQuotaWindow{
-           quota_key: "account",
-           quota_scope: "account",
-           source: "codex_usage_api",
-           credits: nil
-         },
-         "credits not reported",
-         false
-       ),
-       do: "Credit balance was not reported for this quota sample."
 
   defp quota_count_title(
          %Quota.AccountQuotaWindow{

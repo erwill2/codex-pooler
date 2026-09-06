@@ -8,20 +8,36 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.RuntimeContext do
     :now,
     :api_key_runtime_epoch,
     :interrupt_reason,
+    :owner_cleanup,
+    :direct_cleanup,
     :gateway_debug_payload,
     :payload_compression,
     :reasoning_effort_snapshot,
-    :prompt_cache_controls_downgraded
+    :prompt_cache_controls_downgraded,
+    :replay_authorization_binding,
+    :replay_lifecycle_binding,
+    :replay_generation,
+    :native_replay_binding,
+    :native_replay_proof,
+    :replay_provisional_token
   ]
 
   @type t :: %__MODULE__{
           now: DateTime.t() | nil,
           api_key_runtime_epoch: non_neg_integer() | nil,
           interrupt_reason: String.t() | nil,
+          owner_cleanup: CodexPooler.Gateway.Websocket.OwnerCleanup.t() | nil,
+          direct_cleanup: CodexPooler.Gateway.Websocket.DirectCleanup.t() | nil,
           gateway_debug_payload: map() | nil,
           payload_compression: map() | nil,
           reasoning_effort_snapshot: map() | nil,
-          prompt_cache_controls_downgraded: boolean()
+          prompt_cache_controls_downgraded: boolean(),
+          replay_authorization_binding: map() | nil,
+          replay_lifecycle_binding: map() | nil,
+          replay_generation: non_neg_integer() | nil,
+          native_replay_binding: term(),
+          native_replay_proof: term(),
+          replay_provisional_token: binary() | nil
         }
 
   @spec build(map() | keyword()) :: t()
@@ -37,7 +53,13 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions.RuntimeContext do
       payload_compression:
         RequestCompressionMetadata.runtime_metadata(Map.get(opts, :payload_compression)),
       reasoning_effort_snapshot: Map.get(opts, :reasoning_effort_snapshot),
-      prompt_cache_controls_downgraded: false
+      prompt_cache_controls_downgraded: false,
+      replay_authorization_binding: Map.get(opts, :replay_authorization_binding),
+      replay_lifecycle_binding: Map.get(opts, :replay_lifecycle_binding),
+      replay_generation: Map.get(opts, :replay_generation),
+      native_replay_binding: Map.get(opts, :native_replay_binding),
+      native_replay_proof: Map.get(opts, :native_replay_proof),
+      replay_provisional_token: Map.get(opts, :replay_provisional_token)
     }
   end
 

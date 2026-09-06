@@ -3,7 +3,12 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerRequestTest do
 
   alias CodexPooler.Gateway.Payloads.RequestOptions.{ResetProbe, TimeoutConfig}
   alias CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot
+  alias CodexPooler.Gateway.Transports.Streaming.RuntimeAdmissionProof
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequest
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV2
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV3
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV4
 
   @allowed_keys MapSet.new([
                   :__struct__,
@@ -160,6 +165,106 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerRequestTest do
     refute inspected =~ attrs.upstream_identity_id
   end
 
+  test "constructs a strict function-free v2 collect envelope" do
+    attrs =
+      valid_attrs()
+      |> Map.put(:version, 2)
+      |> Map.put(:websocket_delivery_mode, :collect_compaction)
+      |> Map.put(:effective_serving_mode, :full)
+
+    assert {:ok, request} = WebsocketOwnerRequestV2.new(attrs)
+    assert request.version == 2
+    assert request.websocket_delivery_mode == :collect_compaction
+    assert request.effective_serving_mode == :full
+    refute contains_function?(request)
+    assert inspect(request) == "#WebsocketOwnerRequestV2<version: 2>"
+
+    for {field, value} <- [
+          {:version, 1},
+          {:websocket_delivery_mode, :relay},
+          {:effective_serving_mode, :auto},
+          {:effective_serving_mode, "full"}
+        ] do
+      assert {:error, {:invalid_field, ^field}} =
+               attrs |> Map.put(field, value) |> WebsocketOwnerRequestV2.new()
+    end
+
+    assert {:error, {:unknown_fields, [:unexpected]}} =
+             attrs |> Map.put(:unexpected, true) |> WebsocketOwnerRequestV2.new()
+
+    assert {:error, {:invalid_field, :effective_serving_mode}} =
+             attrs |> Map.delete(:effective_serving_mode) |> WebsocketOwnerRequestV2.new()
+
+    assert {:error, {:invalid_field, :envelope}} = WebsocketOwnerRequestV2.new(request)
+  end
+
+  test "keeps v1 and v2 closed while accepting a separate capability-bearing v3 envelope" do
+    v2_attrs =
+      valid_attrs()
+      |> Map.put(:version, 2)
+      |> Map.put(:websocket_delivery_mode, :collect_compaction)
+      |> Map.put(:effective_serving_mode, :full)
+
+    capability = capability()
+
+    v3_attrs =
+      Map.merge(v2_attrs, %{
+        version: 3,
+        owner_admission_capability: capability,
+        first_compact_collection: nil
+      })
+
+    assert {:ok, request} = WebsocketOwnerRequestV3.new(v3_attrs)
+    assert request.owner_admission_capability == capability
+    assert inspect(request) == "#WebsocketOwnerRequestV3<version: 3, capability: redacted>"
+
+    assert {:ok, relay_request} =
+             v3_attrs
+             |> Map.put(:websocket_delivery_mode, :relay)
+             |> WebsocketOwnerRequestV3.new()
+
+    assert relay_request.websocket_delivery_mode == :relay
+    assert relay_request.owner_admission_capability == capability
+
+    assert {:error, {:unknown_fields, [:owner_admission_capability]}} =
+             v2_attrs
+             |> Map.put(:owner_admission_capability, capability)
+             |> WebsocketOwnerRequestV2.new()
+
+    assert {:error, {:unknown_fields, [:owner_admission_capability]}} =
+             valid_attrs()
+             |> Map.put(:owner_admission_capability, capability)
+             |> WebsocketOwnerRequest.new()
+
+    assert {:error, {:invalid_field, :owner_admission_capability}} =
+             v3_attrs
+             |> Map.put(:owner_admission_capability, nil)
+             |> WebsocketOwnerRequestV3.new()
+  end
+
+  @tag :replay_protocol_v2
+  test "V4 is a closed redacted replay-only data plane envelope" do
+    attrs =
+      valid_attrs()
+      |> Map.merge(%{
+        version: 4,
+        websocket_delivery_mode: :relay,
+        effective_serving_mode: :full,
+        native_replay_binding: replay_binding(),
+        native_replay_proof: replay_proof(),
+        provisional_token: <<9::256>>
+      })
+
+    assert {:ok, request} = WebsocketOwnerRequestV4.new(attrs)
+    assert inspect(request) == "#WebsocketOwnerRequestV4<version: 4, replay: redacted>"
+    refute inspect(request) =~ Base.encode16(attrs.provisional_token)
+
+    assert {:error, {:unknown_fields, [:owner_admission_capability]}} =
+             attrs
+             |> Map.put(:owner_admission_capability, capability())
+             |> WebsocketOwnerRequestV4.new()
+  end
+
   defp valid_attrs do
     upstream_identity_id = Ecto.UUID.generate()
 
@@ -199,6 +304,58 @@ defmodule CodexPooler.Gateway.Transports.WebsocketOwnerRequestTest do
       attempt_id: Ecto.UUID.generate(),
       mode: "full"
     }
+  end
+
+  defp capability do
+    binding = %NativeCompactionAdmission.Binding{
+      semantic_turn_key: <<1::256>>,
+      window_digest: <<2::256>>,
+      context_digest: <<3::256>>,
+      window_number: nil,
+      previous_response_digest: nil,
+      serving_mode: :full,
+      topology: %NativeCompactionAdmission.Topology.Forwarded{
+        owner_instance_digest: <<4::256>>,
+        downstream_epoch: 1,
+        owner_lease_digest: <<5::256>>
+      },
+      lifecycle_id: Ecto.UUID.generate(),
+      generation: 1
+    }
+
+    {:ok, ordinary} = NativeCompactionAdmission.ordinary_success(binding)
+    {:ok, pending} = NativeCompactionAdmission.arm_compact(ordinary, 100)
+
+    {:ok, _reserved, capability} =
+      NativeCompactionAdmission.reserve(pending, :compact, binding, make_ref(), 0)
+
+    capability
+  end
+
+  defp replay_binding do
+    %CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission.Binding{
+      request_id: Ecto.UUID.generate(),
+      codex_turn_id: Ecto.UUID.generate(),
+      eligible_attempt_id: Ecto.UUID.generate(),
+      replay_attempt_id: Ecto.UUID.generate(),
+      replay_generation: 1,
+      semantic_turn_digest: <<1::256>>,
+      replay_claim_digest: <<2::256>>,
+      provisional_binding_digest: <<3::256>>,
+      owner_lease_digest: <<4::256>>,
+      downstream_epoch: 2,
+      owner_process_generation: 1
+    }
+  end
+
+  defp replay_proof do
+    RuntimeAdmissionProof.new(
+      self(),
+      make_ref(),
+      make_ref(),
+      <<7::256>>,
+      :native_replay
+    )
   end
 
   defp contains_function?(value) when is_function(value), do: true

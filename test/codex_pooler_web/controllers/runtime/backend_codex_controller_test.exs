@@ -50,6 +50,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
   alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Gateway.Transports.BoundedResponseBody
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser
+  alias CodexPooler.Gateway.Usage
 
   alias CodexPooler.Gateway.Persistence.{
     BridgeDemotion,
@@ -67,7 +68,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments.PoolAssignments
   alias CodexPooler.Upstreams.CodexClientIdentity
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.Lifecycle.IdentityLifecycle
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
+  alias CodexPooler.Upstreams.Reconciliation.PoolReconciliation
 
   @supported_compression_model "gpt-4o"
   @reasoning_denial_message "reasoning effort is not available for this API key"
@@ -593,7 +597,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute unauthorized.resp_body =~ hidden_model.exposed_model_id
     refute unauthorized.resp_body =~ "gpt-stale-serving-mode"
 
-    requests = Repo.all(from request in Request, where: request.pool_id == ^setup.pool.id)
+    requests = Repo.all(from(request in Request, where: request.pool_id == ^setup.pool.id))
     assert length(requests) == 5
     assert Enum.all?(requests, &(&1.upstream_account_label == setup.identity.account_label))
     assert FakeUpstream.count(upstream) == 0
@@ -1481,11 +1485,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     requests =
       Repo.all(
-        from request in Request,
+        from(request in Request,
           where:
             request.pool_id == ^setup.pool.id and
               request.endpoint == "/backend-api/codex/models",
           order_by: [asc: request.admitted_at]
+        )
       )
 
     assert length(requests) == 2
@@ -1532,11 +1537,12 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     requests =
       Repo.all(
-        from request in Request,
+        from(request in Request,
           where:
             request.pool_id == ^setup.pool.id and
               request.endpoint == "/backend-api/codex/responses",
           order_by: [asc: request.admitted_at]
+        )
       )
 
     assert length(requests) == 2
@@ -1582,6 +1588,55 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
     assert request.endpoint == "/backend-api/codex/models"
     assert request.status == "succeeded"
+  end
+
+  test "metadata and usage accounting distinguish request claims within one logical turn" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    semantic_turn_key = :crypto.strong_rand_bytes(32)
+    turn_claim_key = "codex-turn:" <> Base.url_encode64(semantic_turn_key, padding: false)
+
+    request_claims =
+      for label <- ["metadata", "usage"] do
+        "codex-request:" <>
+          (:crypto.hash(:sha256, label <> turn_claim_key)
+           |> Base.url_encode64(padding: false))
+      end
+
+    [metadata_claim, usage_claim] = request_claims
+
+    request_options = fn request_claim_key ->
+      RequestOptions.build(
+        %{
+          transport: "websocket",
+          semantic_turn_key: semantic_turn_key,
+          turn_claim_key: turn_claim_key,
+          request_claim_key: request_claim_key
+        },
+        "/backend-api/codex/responses",
+        %{}
+      )
+    end
+
+    assert {:ok, %{status: 200}} =
+             Metadata.serve_codex_models(auth, request_options.(metadata_claim))
+
+    assert {:ok, %{status: 200}} =
+             Usage.codex_usage(auth, "/api/codex/usage", request_options.(usage_claim))
+
+    assert request_claims ==
+             Repo.all(
+               from request in Request,
+                 where: request.pool_id == ^setup.pool.id,
+                 order_by: [asc: request.admitted_at],
+                 select: request.correlation_id
+             )
+
+    refute metadata_claim == usage_claim
+    refute metadata_claim == turn_claim_key
+    refute usage_claim == turn_claim_key
   end
 
   test "GET /backend-api/codex/models keeps generic backend API-key auth semantics", %{
@@ -2939,6 +2994,83 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
     assert attempt.status == "succeeded"
+  end
+
+  @tag :command_read_protection
+  test "POST /backend-api/codex/responses forwards id-keyed native file-read JSON byte-exact",
+       %{conn: conn} do
+    upstream =
+      start_upstream(
+        FakeUpstream.json_response(%{
+          "id" => "resp_backend_command_read_protection",
+          "object" => "response",
+          "status" => "completed",
+          "output" => [],
+          "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+        })
+      )
+
+    setup = gateway_setup(upstream, supported_compression_model_opts())
+    enable_request_compression!(setup.pool)
+    native_id = "shell_backend_private_json_read"
+    private_path = "src/private-example.json"
+
+    original_output =
+      %{
+        "private_marker" => "backend private json output sentinel",
+        "rows" => Enum.map(1..64, &%{"id" => &1, "state" => "synthetic"})
+      }
+      |> Jason.encode!(pretty: true)
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "type" => "local_shell_call",
+            "id" => native_id,
+            "action" => %{"type" => "exec", "command" => ["cat", private_path]}
+          },
+          %{
+            "type" => "local_shell_call_output",
+            "id" => native_id,
+            "output" => original_output
+          }
+        ]
+      })
+
+    assert %{"id" => "resp_backend_command_read_protection"} = json_response(conn, 200)
+    assert [captured] = FakeUpstream.requests(upstream)
+    assert captured.path == "/backend-api/codex/responses"
+
+    forwarded_output =
+      captured.json["input"]
+      |> Enum.find(&(&1["type"] == "local_shell_call_output"))
+      |> Map.fetch!("output")
+
+    assert forwarded_output == original_output
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+
+    assert %{
+             "status" => "skipped",
+             "reason" => "protected_tool_outputs",
+             "route_class" => "proxy_http",
+             "transport" => "http_json",
+             "candidate_count" => 0,
+             "compressed_count" => 0,
+             "skipped_count" => 0,
+             "protected_tool_output_skipped_count" => 1
+           } = metadata = attempt.response_metadata["payload_compression"]
+
+    metadata_text = inspect(metadata)
+    refute metadata_text =~ native_id
+    refute metadata_text =~ private_path
+    refute metadata_text =~ "backend private json output sentinel"
+    refute Map.has_key?(metadata, "strategies")
   end
 
   test "POST /backend-api/codex/responses keeps disabled request compression as passthrough",
@@ -4981,9 +5113,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     requests =
       Repo.all(
-        from r in Request,
+        from(r in Request,
           where: r.pool_id == ^setup.pool.id,
           order_by: [asc: r.admitted_at]
+        )
       )
 
     assert length(requests) == 2
@@ -5043,9 +5176,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     requests =
       Repo.all(
-        from r in Request,
+        from(r in Request,
           where: r.pool_id == ^setup.pool.id,
           order_by: [asc: r.admitted_at]
+        )
       )
 
     assert length(requests) == 2
@@ -5103,9 +5237,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     requests =
       Repo.all(
-        from r in Request,
+        from(r in Request,
           where: r.pool_id == ^setup.pool.id,
           order_by: [asc: r.admitted_at]
+        )
       )
 
     assert length(requests) == 2
@@ -7260,12 +7395,13 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     assert %Request{} =
              request =
              Repo.one!(
-               from request in Request,
+               from(request in Request,
                  where:
                    request.pool_id == ^setup.pool.id and
                      request.endpoint == "/backend-api/codex/responses",
                  order_by: [desc: request.admitted_at],
                  limit: 1
+               )
              )
 
     assert request.request_metadata["pricing"]["status"] == "priced"
@@ -7338,9 +7474,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     [first_request] =
       Repo.all(
-        from request in Request,
+        from(request in Request,
           where: request.pool_id == ^setup.pool.id,
           order_by: [asc: request.admitted_at, asc: request.id]
+        )
       )
 
     assert first_request.request_metadata["routing"]["strategy"] == "bridge_ring"
@@ -7381,9 +7518,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     [first_request, second_request] =
       Repo.all(
-        from request in Request,
+        from(request in Request,
           where: request.pool_id == ^setup.pool.id,
           order_by: [asc: request.admitted_at, asc: request.id]
+        )
       )
 
     assert first_request.request_metadata["routing"]["strategy"] == "bridge_ring"
@@ -10575,7 +10713,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         {setup, first_state, second_state}
       end)
 
-    register_unboxed_pool_cleanup!(setup.pool)
+    register_unboxed_pool_cleanup!(setup)
     first_lock = lock_circuit_probe!(first_state)
     second_lock = lock_circuit_probe!(second_state)
 
@@ -10783,9 +10921,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     assert [models_request, inference_request] =
              Repo.all(
-               from request in Request,
+               from(request in Request,
                  where: request.pool_id == ^setup.pool.id,
                  order_by: [asc: request.admitted_at, asc: request.id]
+               )
              )
 
     assert models_request.status == "succeeded"
@@ -10842,7 +10981,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         {setup, second, first_state}
       end)
 
-    register_unboxed_pool_cleanup!(setup.pool)
+    register_unboxed_pool_cleanup!(setup)
     first_lock = lock_circuit_probe!(first_state)
 
     :ok = CodexPooler.Events.subscribe_pool(setup.pool)
@@ -11759,9 +11898,10 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     requests =
       Repo.all(
-        from r in Request,
+        from(r in Request,
           where: r.pool_id == ^setup.pool.id,
           order_by: [asc: r.admitted_at]
+        )
       )
 
     assert Enum.map(requests, & &1.request_metadata["codex_session_id"]) == [
@@ -12205,6 +12345,537 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
     refute inspect(request.request_metadata) =~ "quota_account_primary_missing"
   end
 
+  test "POST /backend-api/codex/responses reconciles affirmative flags into a settled windowless route",
+       %{conn: conn} do
+    payload = %{
+      "plan_type" => "sample_flags_plan",
+      "rate_limit" => %{
+        "allowed" => true,
+        "limit_reached" => false,
+        "primary_window" => nil,
+        "secondary_window" => nil
+      }
+    }
+
+    assert_windowless_backend_lifecycle!(conn, payload,
+      response_id: "resp_windowless_flags",
+      forbidden_values: ["sample_flags_plan", "limit_reached"]
+    )
+  end
+
+  test "POST /backend-api/codex/responses reconciles affirmative credits into a settled windowless route",
+       %{conn: conn} do
+    payload = %{
+      "plan_type" => "sample_credits_plan",
+      "credits" => %{"has_credits" => true, "unlimited" => false}
+    }
+
+    assert_windowless_backend_lifecycle!(conn, payload,
+      response_id: "resp_windowless_credits",
+      forbidden_values: ["sample_credits_plan", "has_credits", "unlimited"]
+    )
+  end
+
+  test "POST /backend-api/codex/responses rejects blocked and unknown no-window observations before dispatch",
+       %{conn: conn} do
+    cases = [
+      {%{
+         "plan_type" => "sample_blocked_plan",
+         "rate_limit" => %{"allowed" => false, "limit_reached" => true}
+       }, "quota_exhausted", "upstream quota is exhausted until its reset time"},
+      {%{
+         "plan_type" => "sample_unknown_plan",
+         "rate_limit" => %{"allowed" => true, "limit_reached" => true}
+       }, "quota_evidence_unavailable",
+       "no upstream account has fresh reset-bearing quota evidence for this model"},
+      {%{
+         "plan_type" => "sample_malformed_additional_plan",
+         "rate_limit" => %{"allowed" => true, "limit_reached" => false},
+         "additional_rate_limits" => [
+           %{
+             "limit_name" => "Sample model",
+             "metered_feature" => "sample_model",
+             "rate_limit" => %{
+               "allowed" => true,
+               "limit_reached" => false,
+               "primary_window" => "malformed"
+             }
+           }
+         ]
+       }, "quota_evidence_unavailable",
+       "no upstream account has fresh reset-bearing quota evidence for this model"},
+      {%{
+         "plan_type" => "sample_blocked_additional_plan",
+         "rate_limit" => %{"allowed" => true, "limit_reached" => false},
+         "additional_rate_limits" => [
+           %{
+             "limit_name" => "Sample model",
+             "metered_feature" => "sample_model",
+             "rate_limit" => %{"allowed" => false, "limit_reached" => true}
+           }
+         ]
+       }, "quota_evidence_unavailable",
+       "no upstream account has fresh reset-bearing quota evidence for this model"}
+    ]
+
+    Enum.each(cases, fn {usage_payload, code, message} ->
+      upstream = start_windowless_lifecycle_upstream(usage_payload, "resp_must_not_dispatch")
+      setup = gateway_setup(upstream, quota?: false)
+
+      assert {:ok, _identity} =
+               PoolReconciliation.refresh_quota_from_usage(setup.identity, setup.assignment)
+
+      conn =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/backend-api/codex/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => native_text_input("negative windowless routing fixture")
+        })
+
+      assert %{"error" => %{"code" => ^code, "message" => ^message}} =
+               json_response(conn, 503)
+
+      assert model_dispatch_count(upstream) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+
+      assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+      assert request.status == "rejected"
+      assert request.last_error_code == code
+
+      metadata_text = inspect(request.request_metadata)
+      refute metadata_text =~ usage_payload["plan_type"]
+      refute metadata_text =~ "limit_reached"
+      refute metadata_text =~ setup.identity.chatgpt_account_id
+      refute metadata_text =~ "negative windowless routing fixture"
+    end)
+  end
+
+  test "POST /backend-api/codex/responses rejects scalar additional collections without dispatch",
+       %{conn: conn} do
+    Enum.each(["account", 42, %{"unexpected" => "map"}], fn malformed ->
+      usage_payload = %{
+        "plan_type" => "sample_scalar_additional_plan",
+        "rate_limit" => %{"allowed" => true, "limit_reached" => false},
+        "additional_rate_limits" => malformed
+      }
+
+      upstream = start_windowless_lifecycle_upstream(usage_payload, "resp_must_not_dispatch")
+      setup = gateway_setup(upstream, quota?: false)
+
+      assert {:ok, _identity} =
+               PoolReconciliation.refresh_quota_from_usage(setup.identity, setup.assignment)
+
+      snapshot =
+        setup.identity
+        |> Repo.reload!()
+        |> Map.fetch!(:metadata)
+        |> Map.fetch!(AccountAvailabilityStore.metadata_key())
+
+      assert snapshot["state"] == "unknown"
+      assert QuotaWindows.list_quota_windows(setup.identity) == []
+
+      conn =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/backend-api/codex/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => native_text_input("malformed additional collection")
+        })
+
+      assert %{"error" => %{"code" => "quota_evidence_unavailable"}} =
+               json_response(conn, 503)
+
+      assert model_dispatch_count(upstream) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+    end)
+  end
+
+  test "POST /backend-api/codex/responses rejects incomplete selected account and additional windows before dispatch",
+       %{conn: conn} do
+    valid_window = %{
+      "used_percent" => 25,
+      "limit_window_seconds" => 18_000,
+      "reset_after_seconds" => 3_600,
+      "reset_at" => DateTime.utc_now() |> DateTime.add(3_600, :second) |> DateTime.to_unix()
+    }
+
+    invalid_windows =
+      for field <- ~w(limit_window_seconds reset_after_seconds reset_at),
+          mutation <- [:missing, :wrong_type] do
+        case mutation do
+          :missing -> Map.delete(valid_window, field)
+          :wrong_type -> Map.put(valid_window, field, "invalid")
+        end
+      end
+
+    cases =
+      Enum.flat_map(invalid_windows, fn window ->
+        [
+          %{
+            "plan_type" => "sample_malformed_account_window",
+            "rate_limit" => %{
+              "allowed" => true,
+              "limit_reached" => false,
+              "primary_window" => window
+            }
+          },
+          %{
+            "plan_type" => "sample_malformed_additional_window",
+            "rate_limit" => %{"allowed" => true, "limit_reached" => false},
+            "additional_rate_limits" => [
+              %{
+                "limit_name" => "Sample model",
+                "metered_feature" => "sample_model",
+                "rate_limit" => %{
+                  "allowed" => true,
+                  "limit_reached" => false,
+                  "primary_window" => window
+                }
+              }
+            ]
+          }
+        ]
+      end)
+
+    Enum.each(cases, fn usage_payload ->
+      upstream = start_windowless_lifecycle_upstream(usage_payload, "resp_must_not_dispatch")
+      setup = gateway_setup(upstream, quota?: false)
+
+      assert {:ok, _identity} =
+               PoolReconciliation.refresh_quota_from_usage(setup.identity, setup.assignment)
+
+      conn =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/backend-api/codex/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => native_text_input("malformed selected window")
+        })
+
+      assert %{"error" => %{"code" => "quota_evidence_unavailable"}} =
+               json_response(conn, 503)
+
+      assert model_dispatch_count(upstream) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
+      assert QuotaWindows.list_quota_windows(setup.identity) == []
+    end)
+  end
+
+  test "POST /backend-api/codex/responses invalidates a positive snapshot after credential rotation",
+       %{conn: conn} do
+    usage_payload = %{
+      "plan_type" => "sample_rotation_plan",
+      "rate_limit" => %{"allowed" => true, "limit_reached" => false}
+    }
+
+    upstream = start_windowless_lifecycle_upstream(usage_payload, "resp_rotation_must_not_run")
+    setup = gateway_setup(upstream, quota?: false)
+
+    assert {:ok, refreshed_identity} =
+             PoolReconciliation.refresh_quota_from_usage(setup.identity, setup.assignment)
+
+    rotated_identity =
+      refreshed_identity
+      |> Ecto.Changeset.change(
+        metadata: CredentialFencing.advance_credential_epoch(refreshed_identity)
+      )
+      |> Repo.update!()
+
+    assert get_in(rotated_identity.metadata, ["credential_epoch"]) == 2
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => native_text_input("rotated credential must not use stale availability")
+      })
+
+    assert %{
+             "error" => %{
+               "code" => "quota_evidence_unavailable",
+               "message" =>
+                 "no upstream account has fresh reset-bearing quota evidence for this model"
+             }
+           } = json_response(conn, 503)
+
+    assert model_dispatch_count(upstream) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  test "POST /backend-api/codex/responses persists false credits as unknown after availability",
+       %{conn: conn} do
+    available = %{
+      "plan_type" => "sample_available_plan",
+      "rate_limit" => %{"allowed" => true, "limit_reached" => false}
+    }
+
+    no_proof = %{
+      "plan_type" => "sample_no_proof_plan",
+      "credits" => %{"has_credits" => false, "unlimited" => false}
+    }
+
+    upstream = start_windowless_lifecycle_upstream(available, "resp_no_proof_must_not_run")
+    setup = gateway_setup(upstream, quota?: false)
+
+    assert {:ok, available_identity} =
+             PoolReconciliation.refresh_quota_from_usage(setup.identity, setup.assignment)
+
+    FakeUpstream.set_mode(
+      upstream,
+      windowless_lifecycle_mode(no_proof, "resp_no_proof_must_not_run")
+    )
+
+    assert {:ok, unknown_identity} =
+             PoolReconciliation.refresh_quota_from_usage(available_identity, setup.assignment)
+
+    assert get_in(Repo.reload!(unknown_identity).metadata, [
+             AccountAvailabilityStore.metadata_key(),
+             "state"
+           ]) == "unknown"
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => native_text_input("no proof must fail closed")
+      })
+
+    assert %{"error" => %{"code" => "quota_evidence_unavailable"}} =
+             json_response(conn, 503)
+
+    assert model_dispatch_count(upstream) == 0
+    assert Repo.aggregate(Attempt, :count) == 0
+  end
+
+  test "POST /backend-api/codex/responses scopes exhausted model aliases before dispatch",
+       %{conn: conn} do
+    cases = [
+      {:model, "gpt-test-model", "provider-gpt-test-model", 503, 0},
+      {:upstream_model, nil, "provider-gpt-test-model", 503, 0},
+      {:model, "unrelated-model", "unrelated-upstream", 200, 1}
+    ]
+
+    Enum.each(cases, fn {scope, model, upstream_model, status, dispatch_count} ->
+      usage_payload = %{
+        "plan_type" => "sample_model_scope_plan",
+        "rate_limit" => %{"allowed" => true, "limit_reached" => false}
+      }
+
+      upstream =
+        start_windowless_lifecycle_upstream(usage_payload, "resp_model_scope_windowless")
+
+      setup = gateway_setup(upstream, quota?: false)
+
+      assert {:ok, identity} =
+               PoolReconciliation.refresh_quota_from_usage(setup.identity, setup.assignment)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 model_quota_window_attrs(setup.model, "primary", %{
+                   quota_scope: Atom.to_string(scope),
+                   model: model,
+                   upstream_model: upstream_model,
+                   used_percent: Decimal.new("100")
+                 })
+               ])
+
+      conn =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/backend-api/codex/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => native_text_input("model alias scope fixture")
+        })
+
+      if status == 200 do
+        assert %{"id" => "resp_model_scope_windowless"} = json_response(conn, 200)
+      else
+        assert %{"error" => %{"code" => "quota_exhausted"}} = json_response(conn, 503)
+      end
+
+      assert model_dispatch_count(upstream) == dispatch_count
+
+      attempts =
+        Repo.aggregate(
+          from(a in Attempt,
+            join: r in Request,
+            on: r.id == a.request_id,
+            where: r.pool_id == ^setup.pool.id
+          ),
+          :count
+        )
+
+      assert attempts == dispatch_count
+    end)
+  end
+
+  test "POST /backend-api/codex/responses ignores future raw rows and rejects retained resetless sources",
+       %{conn: conn} do
+    scenarios = [
+      {"codex_response_headers", DateTime.utc_now() |> DateTime.add(1, :hour), 200},
+      {"codex_response_headers", DateTime.utc_now(), 503},
+      {"codex_rate_limit_event", DateTime.utc_now(), 503},
+      {"codex_rate_limit_error", DateTime.utc_now(), 503},
+      {"local_reconciliation", DateTime.utc_now(), 503}
+    ]
+
+    Enum.each(scenarios, fn {source, observed_at, status} ->
+      usage_payload = %{
+        "plan_type" => "sample_source_plan",
+        "rate_limit" => %{"allowed" => true, "limit_reached" => false}
+      }
+
+      upstream = start_windowless_lifecycle_upstream(usage_payload, "resp_source_windowless")
+      setup = gateway_setup(upstream, quota?: false)
+
+      assert {:ok, identity} =
+               PoolReconciliation.refresh_quota_from_usage(setup.identity, setup.assignment)
+
+      assert {:ok, [_window]} =
+               QuotaWindows.upsert_quota_windows(identity, [
+                 primary_quota_window_attrs(%{
+                   source: source,
+                   reset_at: nil,
+                   observed_at: DateTime.truncate(observed_at, :microsecond),
+                   last_sync_at: DateTime.truncate(observed_at, :microsecond)
+                 })
+               ])
+
+      conn =
+        conn
+        |> recycle()
+        |> auth(setup)
+        |> post("/backend-api/codex/responses", %{
+          "model" => setup.model.exposed_model_id,
+          "input" => native_text_input("retained source fixture")
+        })
+
+      if status == 200 do
+        assert %{"id" => "resp_source_windowless"} = json_response(conn, 200)
+        assert model_dispatch_count(upstream) == 1
+      else
+        assert %{"error" => %{"code" => "quota_evidence_unavailable"}} =
+                 json_response(conn, 503)
+
+        assert model_dispatch_count(upstream) == 0
+      end
+    end)
+  end
+
+  test "POST /backend-api/codex/responses reverses ordinary and windowless provider evidence",
+       %{conn: conn} do
+    available_payload = %{
+      "plan_type" => "sample_transition_plan",
+      "rate_limit" => %{"allowed" => true, "limit_reached" => false}
+    }
+
+    upstream =
+      start_windowless_lifecycle_upstream(available_payload, "resp_windowless_transition")
+
+    setup = gateway_setup(upstream, quota?: false)
+    usage_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:ok, [_usage_window]} =
+             QuotaWindows.upsert_quota_windows(setup.identity, [
+               primary_quota_window_attrs(%{
+                 source: "codex_usage_api",
+                 observed_at: DateTime.add(usage_at, -60, :second),
+                 last_sync_at: DateTime.add(usage_at, -60, :second)
+               })
+             ])
+
+    assert {:ok, _identity} =
+             PoolReconciliation.refresh_quota_from_usage(setup.identity, setup.assignment,
+               observed_at: usage_at
+             )
+
+    assert QuotaWindows.list_quota_windows(setup.identity) == []
+
+    assert get_in(Repo.reload!(setup.identity).metadata, [
+             AccountAvailabilityStore.metadata_key(),
+             "state"
+           ]) == "available"
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => native_text_input("windowless transition request")
+      })
+
+    assert %{"id" => "resp_windowless_transition"} = json_response(conn, 200)
+
+    ordinary_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    reset_at = DateTime.add(ordinary_at, 1, :hour)
+
+    ordinary_payload = %{
+      "plan_type" => "sample_transition_plan",
+      "rate_limit" => %{
+        "primary_window" => %{
+          "used_percent" => 4,
+          "limit_window_seconds" => 18_000,
+          "reset_after_seconds" => DateTime.diff(reset_at, ordinary_at, :second),
+          "reset_at" => DateTime.to_unix(reset_at)
+        }
+      }
+    }
+
+    FakeUpstream.set_mode(
+      upstream,
+      windowless_lifecycle_mode(ordinary_payload, "resp_ordinary_transition")
+    )
+
+    assert {:ok, ordinary_identity} =
+             PoolReconciliation.refresh_quota_from_usage(
+               Repo.reload!(setup.identity),
+               setup.assignment,
+               observed_at: ordinary_at
+             )
+
+    refute Map.has_key?(
+             Repo.reload!(ordinary_identity).metadata,
+             AccountAvailabilityStore.metadata_key()
+           )
+
+    assert [%{source: "codex_usage_api"} = window] =
+             QuotaWindows.list_quota_windows(ordinary_identity)
+
+    assert QuotaWindows.usable_window?(window)
+
+    conn =
+      conn
+      |> recycle()
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => native_text_input("ordinary transition request")
+      })
+
+    assert %{"id" => "resp_ordinary_transition"} = json_response(conn, 200)
+
+    assert [first_request, second_request] =
+             Repo.all(
+               from(r in Request,
+                 where: r.pool_id == ^setup.pool.id,
+                 order_by: [asc: r.admitted_at]
+               )
+             )
+
+    assert get_in(first_request.request_metadata, ["quota_decision", "routing_state"]) ==
+             "windowless_provider_available"
+
+    assert get_in(second_request.request_metadata, ["quota_decision", "routing_state"]) ==
+             "precise"
+  end
+
   test "POST /backend-api/codex/responses refreshes stale reset-bearing quota before rejecting",
        %{conn: conn} do
     reset_at = DateTime.add(DateTime.utc_now(), 900, :second) |> DateTime.truncate(:second)
@@ -12220,7 +12891,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
                   "primary_window" => %{
                     "used_percent" => 12,
                     "limit_window_seconds" => 18_000,
-                    "reset_at" => DateTime.to_iso8601(reset_at)
+                    "reset_after_seconds" => 900,
+                    "reset_at" => DateTime.to_unix(reset_at)
                   }
                 }
               }},
@@ -12273,7 +12945,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
                   "primary_window" => %{
                     "used_percent" => 12,
                     "limit_window_seconds" => 18_000,
-                    "reset_at" => DateTime.to_iso8601(reset_at)
+                    "reset_after_seconds" => 900,
+                    "reset_at" => DateTime.to_unix(reset_at)
                   }
                 }
               }}
@@ -12333,7 +13006,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
                   "primary_window" => %{
                     "used_percent" => 12,
                     "limit_window_seconds" => 18_000,
-                    "reset_at" => DateTime.to_iso8601(reset_at)
+                    "reset_after_seconds" => 900,
+                    "reset_at" => DateTime.to_unix(reset_at)
                   }
                 }
               }},
@@ -12388,12 +13062,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
                   "primary_window" => %{
                     "used_percent" => 12,
                     "limit_window_seconds" => 18_000,
-                    "reset_at" => DateTime.to_iso8601(reset_at)
+                    "reset_after_seconds" => 900,
+                    "reset_at" => DateTime.to_unix(reset_at)
                   },
                   "secondary_window" => %{
                     "used_percent" => 24,
                     "limit_window_seconds" => 604_800,
-                    "reset_at" => DateTime.to_iso8601(secondary_reset_at)
+                    "reset_after_seconds" => 604_800,
+                    "reset_at" => DateTime.to_unix(secondary_reset_at)
                   }
                 },
                 "additional_rate_limits" => [
@@ -12403,12 +13079,14 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
                       "primary_window" => %{
                         "used_percent" => 8,
                         "limit_window_seconds" => 18_000,
-                        "reset_at" => DateTime.to_iso8601(reset_at)
+                        "reset_after_seconds" => 900,
+                        "reset_at" => DateTime.to_unix(reset_at)
                       },
                       "secondary_window" => %{
                         "used_percent" => 16,
                         "limit_window_seconds" => 604_800,
-                        "reset_at" => DateTime.to_iso8601(secondary_reset_at)
+                        "reset_after_seconds" => 604_800,
+                        "reset_at" => DateTime.to_unix(secondary_reset_at)
                       }
                     }
                   }
@@ -12885,7 +13563,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         "primary_window" => %{
           "used_percent" => 100,
           "limit_window_seconds" => 18_000,
-          "reset_at" => DateTime.to_iso8601(reset_at)
+          "reset_after_seconds" => 900,
+          "reset_at" => DateTime.to_unix(reset_at)
         }
       }
     }
@@ -12947,7 +13626,7 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
       pinned.assignment,
       pinned.identity,
       "previous_response_id",
-      "quota_evidence_unavailable"
+      "quota_exhausted"
     )
   end
 
@@ -12960,7 +13639,8 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
         "primary_window" => %{
           "used_percent" => 12,
           "limit_window_seconds" => 18_000,
-          "reset_at" => DateTime.to_iso8601(reset_at)
+          "reset_after_seconds" => 900,
+          "reset_at" => DateTime.to_unix(reset_at)
         }
       }
     }
@@ -14250,6 +14930,122 @@ defmodule CodexPoolerWeb.Runtime.BackendCodexControllerTest do
 
     assert usage_request.path == "/backend-api/wham/usage"
     usage_request
+  end
+
+  defp assert_windowless_backend_lifecycle!(conn, usage_payload, opts) do
+    response_id = Keyword.fetch!(opts, :response_id)
+    upstream = start_windowless_lifecycle_upstream(usage_payload, response_id)
+    setup = gateway_setup(upstream, quota?: false)
+
+    assert {:ok, refreshed_identity} =
+             PoolReconciliation.refresh_quota_from_usage(setup.identity, setup.assignment)
+
+    snapshot =
+      refreshed_identity
+      |> Repo.reload!()
+      |> Map.fetch!(:metadata)
+      |> Map.fetch!(AccountAvailabilityStore.metadata_key())
+
+    assert Map.keys(snapshot) |> Enum.sort() ==
+             ~w(credential_epoch observed_at state version)
+
+    assert snapshot["version"] == 1
+    assert snapshot["state"] == "available"
+    assert snapshot["credential_epoch"] == 1
+    assert {:ok, _observed_at, 0} = DateTime.from_iso8601(snapshot["observed_at"])
+    assert QuotaWindows.list_quota_windows(refreshed_identity) == []
+
+    conn =
+      conn
+      |> auth(setup)
+      |> post("/backend-api/codex/responses", %{
+        "model" => setup.model.exposed_model_id,
+        "input" => native_text_input("windowless lifecycle request")
+      })
+
+    assert %{"id" => ^response_id, "object" => "response"} = json_response(conn, 200)
+    assert model_dispatch_count(upstream) == 1
+
+    assert [request] = Repo.all(from(r in Request, where: r.pool_id == ^setup.pool.id))
+    assert request.status == "succeeded"
+    assert request.response_status_code == 200
+
+    assert get_in(request.request_metadata, ["quota_decision", "routing_state"]) ==
+             "windowless_provider_available"
+
+    assert get_in(request.request_metadata, [
+             "quota_decision",
+             "windowless_provider_available_candidate_count"
+           ]) == 1
+
+    assert Map.keys(request.request_metadata["quota_decision"]) |> Enum.sort() ==
+             ~w(
+               allowed
+               credit_backed_probe_candidate_count
+               eligible_candidate_count
+               precise_candidate_count
+               reset_probe_candidate_count
+               routing_state
+               summary
+               weekly_probe_candidate_count
+               windowless_provider_available_candidate_count
+             )
+
+    assert [attempt] = Repo.all(from(a in Attempt, where: a.request_id == ^request.id))
+    assert attempt.attempt_number == 1
+    assert attempt.status == "succeeded"
+    assert attempt.upstream_status_code == 200
+    assert attempt.pool_upstream_assignment_id == setup.assignment.id
+    assert attempt.upstream_identity_id == setup.identity.id
+
+    assert [_settlement] =
+             Repo.all(
+               from(entry in LedgerEntry,
+                 where: entry.request_id == ^request.id and entry.entry_kind == "settlement"
+               )
+             )
+
+    metadata_text = inspect({request.request_metadata, attempt.response_metadata})
+
+    Enum.each(
+      Keyword.fetch!(opts, :forbidden_values) ++
+        [
+          setup.identity.chatgpt_account_id,
+          setup.authorization,
+          setup.raw_key,
+          "windowless lifecycle request",
+          response_id,
+          "upstream-token"
+        ],
+      fn forbidden_value -> refute metadata_text =~ forbidden_value end
+    )
+
+    setup
+  end
+
+  defp start_windowless_lifecycle_upstream(usage_payload, response_id) do
+    start_upstream(windowless_lifecycle_mode(usage_payload, response_id))
+  end
+
+  defp windowless_lifecycle_mode(usage_payload, response_id) do
+    {:path_json,
+     %{
+       "/backend-api/wham/usage" => {200, usage_payload},
+       "/backend-api/codex/usage" => {200, usage_payload},
+       "/backend-api/codex/responses" =>
+         {200,
+          %{
+            "id" => response_id,
+            "object" => "response",
+            "status" => "completed",
+            "output" => [],
+            "usage" => %{"input_tokens" => 4, "output_tokens" => 3, "total_tokens" => 7}
+          }}
+     }}
+  end
+
+  defp model_dispatch_count(upstream) do
+    Enum.count(FakeUpstream.requests(upstream), &(&1.path == "/backend-api/codex/responses"))
   end
 
   defp mark_pinned_assignment_reauth_required!(setup) do

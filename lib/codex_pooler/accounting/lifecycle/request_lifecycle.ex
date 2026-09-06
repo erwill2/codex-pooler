@@ -10,11 +10,13 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
 
   alias CodexPooler.Accounting.{
     Attempt,
+    ClientRetry,
     LedgerEntry,
     Metadata,
     PricingResolution,
     Request,
     RequestLogFacts,
+    RequestReplayEntitlement,
     Rollups
   }
 
@@ -93,6 +95,25 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
       {:error,
        Metadata.accounting_error(:invalid_request, "authenticated pool and api key are required")}
 
+  @spec claim_client_retry_successor(auth(), model_ref(), map(), map()) ::
+          {:ok, CodexPooler.Accounting.ClientRetry.SuccessorClaim.t()} | {:error, atom() | map()}
+  def claim_client_retry_successor(
+        %{pool: _pool, api_key: _api_key} = auth,
+        model_or_id,
+        payload,
+        opts
+      )
+      when is_map(payload) and is_map(opts) do
+    case normalize_model(model_or_id) do
+      %Model{} = model -> Reservation.claim_client_retry_successor(auth, model, payload, opts)
+      nil -> {:error, :authorization_changed}
+      {:error, _reason} -> {:error, :authorization_changed}
+    end
+  end
+
+  def claim_client_retry_successor(_auth, _model_or_id, _payload, _opts),
+    do: {:error, :authorization_changed}
+
   @spec record_denied_request(auth(), model_ref(), map()) :: request_result()
   def record_denied_request(auth, model_or_id, opts \\ %{})
 
@@ -127,49 +148,74 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         )
 
       ensure_request_dispatchable!(request)
-
-      model = attempt_model(request, attrs)
-      pricing_snapshot = attempt_pricing_snapshot(request, model, attrs)
-
-      attempt_number =
-        Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count, :id) + 1
-
-      attempt_changes =
-        %Attempt{
-          id: Map.get(attrs, :id),
-          request_id: request.id,
-          attempt_number: attempt_number,
-          pool_upstream_assignment_id: assignment.id,
-          upstream_identity_id: assignment.upstream_identity_id,
-          pricing_snapshot_id: pricing_snapshot && pricing_snapshot.id,
-          model_id: request.model_id,
-          upstream_model_id: (model && model.upstream_model_id) || request.requested_model,
-          transport: request.transport,
-          status: Map.get(attrs, :status, "in_progress"),
-          started_at: timestamp,
-          retryable: Map.get(attrs, :retryable, false),
-          usage_status: Map.get(attrs, :usage_status, @usage_pending),
-          response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :response_metadata, %{}))
-        }
-
-      ReferenceLocks.lock_and_validate!(assignment.upstream_identity_id, assignment.id)
-
-      case Repo.insert(attempt_changes,
-             on_conflict: {:replace, [:id]},
-             conflict_target: :id,
-             returning: true
-           ) do
-        {:ok, attempt} ->
-          IdentitySnapshot.persist_request_identity_snapshot(request, assignment, attrs)
-          RequestLogFacts.record_attempt_written!(attempt)
-          attempt
-
-        {:error, changeset} ->
-          Repo.rollback(changeset)
-      end
+      ensure_no_request_replay!(request.id)
+      insert_attempt!(request, assignment, attrs, timestamp)
     end)
     |> unwrap_transaction()
   end
+
+  @spec create_client_retry_dispatch_attempt(
+          Request.t(),
+          PoolUpstreamAssignment.t(),
+          ClientRetry.DispatchAuthority.t(),
+          map()
+        ) :: {:ok, Attempt.t()} | {:error, Ecto.Changeset.t() | accounting_error()}
+  def create_client_retry_dispatch_attempt(request, assignment, authority, attrs \\ %{})
+
+  def create_client_retry_dispatch_attempt(
+        %Request{} = request,
+        %PoolUpstreamAssignment{} = assignment,
+        %ClientRetry.DispatchAuthority{} = authority,
+        attrs
+      ) do
+    timestamp = now(attrs)
+
+    Repo.transaction(fn ->
+      request =
+        Repo.one!(
+          from locked_request in Request,
+            where: locked_request.id == ^request.id,
+            lock: "FOR UPDATE"
+        )
+
+      ensure_request_dispatchable!(request)
+
+      case ClientRetry.validate_dispatch_authority(request, authority) do
+        :ok ->
+          :ok
+
+        {:error, :invalid_client_retry_dispatch_authority} ->
+          Repo.rollback(
+            Metadata.accounting_error(
+              :invalid_client_retry_dispatch_authority,
+              "client retry dispatch authority is invalid"
+            )
+          )
+      end
+
+      ensure_no_request_replay!(request.id)
+
+      if Repo.exists?(from attempt in Attempt, where: attempt.request_id == ^request.id) do
+        Repo.rollback(
+          Metadata.accounting_error(
+            :client_retry_dispatch_claimed,
+            "client retry dispatch attempt was already claimed"
+          )
+        )
+      end
+
+      insert_attempt!(request, assignment, Map.put(attrs, :replay_generation, 0), timestamp)
+    end)
+    |> unwrap_transaction()
+  end
+
+  def create_client_retry_dispatch_attempt(_request, _assignment, _authority, _attrs),
+    do:
+      {:error,
+       Metadata.accounting_error(
+         :invalid_client_retry_dispatch_authority,
+         "client retry dispatch authority is invalid"
+       )}
 
   @spec record_retryable_attempt_failure(Attempt.t(), map()) ::
           {:ok, Attempt.t()} | {:error, Ecto.Changeset.t() | accounting_error()}
@@ -191,6 +237,9 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
     timestamp = now(attrs)
 
     Repo.transaction(fn ->
+      request_snapshot = Repo.get!(Request, attempt.request_id)
+      :ok = lock_replay_prefix(request_snapshot)
+
       request =
         Repo.one!(
           from locked_request in Request,
@@ -207,27 +256,69 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
             lock: "FOR UPDATE"
         )
 
-      ensure_attempt_retryable!(attempt)
+      replay_entitlement =
+        Repo.one(
+          from replay in RequestReplayEntitlement,
+            where: replay.request_id == ^request.id,
+            lock: "FOR UPDATE"
+        )
 
-      case attempt
-           |> Ecto.Changeset.change(%{
-             status: Map.get(attrs, :attempt_status, "retryable_failed"),
-             completed_at: timestamp,
-             upstream_status_code: Map.get(attrs, :response_status_code),
-             retryable: true,
-             network_error_code: blank_to_nil(Map.get(attrs, :last_error_code)),
-             error_message: blank_to_nil(Map.get(attrs, :error_message)),
-             latency_ms: Map.get(attrs, :latency_ms),
-             usage_status: Map.get(attrs, :usage_status, @usage_unknown),
-             response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :attempt_metadata, %{}))
-           })
-           |> Repo.update() do
-        {:ok, attempt} ->
-          RequestLogFacts.record_attempt_written!(attempt)
-          attempt
+      if replay_finalization_authority(attempt, replay_entitlement, attrs) == :stale_generation do
+        %{
+          request: Repo.reload!(request),
+          attempt: Repo.reload!(attempt),
+          finalization_disposition: :reused,
+          stale_generation?: true
+        }
+      else
+        ensure_attempt_retryable!(attempt)
+        run_before_finalize!(attrs)
+        persist_retryable_attempt_failure(attempt, attrs, timestamp)
+      end
+    end)
+    |> unwrap_transaction()
+  end
 
-        {:error, changeset} ->
-          Repo.rollback(changeset)
+  defp persist_retryable_attempt_failure(attempt, attrs, timestamp) do
+    attempt
+    |> Ecto.Changeset.change(%{
+      status: Map.get(attrs, :attempt_status, "retryable_failed"),
+      completed_at: timestamp,
+      upstream_status_code: Map.get(attrs, :response_status_code),
+      retryable: true,
+      network_error_code: blank_to_nil(Map.get(attrs, :last_error_code)),
+      error_message: blank_to_nil(Map.get(attrs, :error_message)),
+      latency_ms: Map.get(attrs, :latency_ms),
+      usage_status: Map.get(attrs, :usage_status, @usage_unknown),
+      response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :attempt_metadata, %{}))
+    })
+    |> Repo.update()
+    |> case do
+      {:ok, attempt} ->
+        RequestLogFacts.record_attempt_written!(attempt)
+        attempt
+
+      {:error, changeset} ->
+        Repo.rollback(changeset)
+    end
+  end
+
+  @doc false
+  @spec with_current_replay_generation(Request.t(), Attempt.t(), (-> result)) ::
+          {:ok, result} | {:error, :stale_generation}
+        when result: term()
+  def with_current_replay_generation(%Request{} = request, %Attempt{} = attempt, callback)
+      when is_function(callback, 0) do
+    Repo.transaction(fn ->
+      request = Repo.get!(Request, request.id)
+
+      {_request, attempt, _reservation, _settlement, entitlement} =
+        lock_finalization_rows(request, attempt)
+
+      if replay_finalization_authority(attempt, entitlement, %{}) == :stale_generation do
+        Repo.rollback(:stale_generation)
+      else
+        callback.()
       end
     end)
     |> unwrap_transaction()
@@ -244,6 +335,21 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         "request lifecycle completed before another upstream attempt could start"
       )
     )
+  end
+
+  defp ensure_no_request_replay!(request_id) do
+    if Repo.exists?(
+         from replay in RequestReplayEntitlement, where: replay.request_id == ^request_id
+       ) do
+      Repo.rollback(
+        Metadata.accounting_error(
+          :request_replay_required,
+          "request replay attempt requires one-shot replay authorization"
+        )
+      )
+    end
+
+    :ok
   end
 
   defp ensure_attempt_retryable!(%Attempt{status: status, completed_at: nil})
@@ -304,8 +410,13 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
       %{request: request, attempt: nil, release: release}
     end)
     |> unwrap_transaction()
-    |> tap_request_finalized_events()
+    |> tap_request_finalized_events_unless_stale()
   end
+
+  defp tap_request_finalized_events_unless_stale({:ok, %{stale_generation?: true}} = result),
+    do: result
+
+  defp tap_request_finalized_events_unless_stale(result), do: tap_request_finalized_events(result)
 
   @spec finalize_request(Request.t(), Attempt.t(), map()) :: request_result()
   def finalize_request(%Request{} = request, %Attempt{} = attempt, attrs \\ %{}) do
@@ -322,7 +433,6 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         %Attempt{} = attempt,
         attrs \\ %{}
       ) do
-    timestamp = now(attrs)
     request_status = Map.get(attrs, :request_status, Map.get(attrs, :status, "succeeded"))
 
     attempt_status =
@@ -341,75 +451,227 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
       retry_count: retry_count,
       last_error_code: last_error_code,
       error_message: error_message,
-      timestamp: timestamp
+      timestamp: nil
     }
 
     Repo.transaction(fn ->
-      {request, attempt, reservation, existing_settlement} =
+      {request, attempt, reservation, existing_settlement, replay_entitlement} =
         lock_finalization_rows(request, attempt)
 
-      case finalization_action(existing_settlement, usage) do
-        {:reuse, settlement} ->
-          release =
-            Repo.get_by!(
-              LedgerEntry,
-              source_event_id: LedgerEntries.release_source_event_id(request.id)
-            )
+      timestamp = if replay_entitlement, do: replay_db_now(), else: now(attrs)
+      finalization = %{finalization | timestamp: timestamp}
 
-          %{
-            request: request,
-            attempt: attempt,
-            settlement: settlement,
-            release: release,
-            finalization_disposition: :reused
-          }
+      replay_entitlement =
+        replay_finalization_authority(attempt, replay_entitlement, attrs)
 
-        action ->
-          previous_request = request
-          attempt = persist_final_attempt(attempt, usage, attrs, finalization)
-          RequestLogFacts.record_attempt_written!(attempt)
-
-          pricing =
-            PricingResolution.lookup_for_settlement(
-              request,
-              attempt,
-              reservation,
-              usage,
-              attrs,
-              timestamp
-            )
-
-          request = persist_final_request(request, usage, pricing, finalization)
-
-          settlement_state =
-            build_settlement_context(request, attempt, reservation, usage, pricing, finalization)
-
-          %{settlement: settlement, release: release, status: settlement_status} =
-            persist_settlement_entries(
-              request,
-              attempt,
-              reservation,
-              settlement_state,
-              previous_request,
-              settlement_to_replace(action)
-            )
-
-          record_settlement_fact!(settlement, settlement_status)
-
-          %{
-            request: request,
-            attempt: attempt,
-            settlement: settlement,
-            release: release,
-            finalization_disposition: finalization_disposition(settlement_status)
-          }
+      if replay_entitlement == :stale_generation do
+        %{
+          request: Repo.reload!(request),
+          attempt: Repo.reload!(attempt),
+          finalization_disposition: :reused,
+          stale_generation?: true
+        }
+      else
+        finalize_current_generation(
+          request,
+          attempt,
+          reservation,
+          existing_settlement,
+          replay_entitlement,
+          usage,
+          attrs,
+          finalization
+        )
       end
     end)
     |> unwrap_transaction()
-    |> tap_request_finalized_events()
+    |> tap_request_finalized_events_unless_stale()
+  end
+
+  defp finalize_current_generation(
+         request,
+         attempt,
+         reservation,
+         existing_settlement,
+         replay_entitlement,
+         usage,
+         attrs,
+         finalization
+       ) do
+    timestamp = finalization.timestamp
+
+    case finalization_action(existing_settlement, usage) do
+      {:reuse, settlement} ->
+        release =
+          Repo.get_by!(
+            LedgerEntry,
+            source_event_id: LedgerEntries.release_source_event_id(request.id)
+          )
+
+        close_replay_entitlement(replay_entitlement, timestamp, attrs)
+
+        %{
+          request: request,
+          attempt: attempt,
+          settlement: settlement,
+          release: release,
+          finalization_disposition: :reused
+        }
+
+      action ->
+        run_before_finalize!(attrs)
+        previous_request = request
+        attempt = persist_final_attempt(attempt, usage, attrs, finalization)
+        RequestLogFacts.record_attempt_written!(attempt)
+
+        pricing =
+          PricingResolution.lookup_for_settlement(
+            request,
+            attempt,
+            reservation,
+            usage,
+            attrs,
+            timestamp
+          )
+
+        request = persist_final_request(request, usage, pricing, finalization, replay_entitlement)
+
+        settlement_state =
+          build_settlement_context(request, attempt, reservation, usage, pricing, finalization)
+
+        %{settlement: settlement, release: release, status: settlement_status} =
+          persist_settlement_entries(
+            request,
+            attempt,
+            reservation,
+            settlement_state,
+            previous_request,
+            settlement_to_replace(action)
+          )
+
+        record_settlement_fact!(settlement, settlement_status)
+        close_replay_entitlement(replay_entitlement, timestamp, attrs)
+
+        %{
+          request: request,
+          attempt: attempt,
+          settlement: settlement,
+          release: release,
+          finalization_disposition: finalization_disposition(settlement_status)
+        }
+    end
+  end
+
+  defp replay_finalization_authority(attempt, nil, _attrs) do
+    if attempt.replay_generation == 0, do: nil, else: :stale_generation
+  end
+
+  defp replay_finalization_authority(attempt, entitlement, attrs) do
+    cond do
+      consumed_replay_attempt?(attempt, entitlement) ->
+        entitlement
+
+      closing_armed_replay_attempt?(attempt, entitlement, attrs) ->
+        entitlement
+
+      true ->
+        :stale_generation
+    end
+  end
+
+  defp consumed_replay_attempt?(attempt, entitlement) do
+    attempt.replay_generation == entitlement.replay_generation and
+      entitlement.status == "consumed" and entitlement.replay_attempt_id == attempt.id and
+      is_nil(entitlement.closed_at)
+  end
+
+  defp closing_armed_replay_attempt?(attempt, entitlement, attrs) do
+    Map.get(attrs, :replay_entitlement_close_status) in ["expired", "revoked"] and
+      attempt.replay_generation == 0 and entitlement.status == "armed" and
+      entitlement.eligible_attempt_id == attempt.id and is_nil(entitlement.closed_at)
+  end
+
+  defp lock_replay_prefix(request) do
+    session_id =
+      Repo.one(
+        from turn in CodexPooler.Gateway.Persistence.CodexTurn,
+          where: turn.request_id == ^request.id,
+          select: turn.codex_session_id
+      )
+
+    if is_nil(session_id), do: :ok, else: lock_replay_session_prefix(request, session_id)
+  end
+
+  defp lock_replay_session_prefix(request, session_id) do
+    _session =
+      Repo.one!(
+        from session in CodexPooler.Gateway.Persistence.CodexSession,
+          where: session.id == ^session_id,
+          lock: "FOR UPDATE"
+      )
+
+    _api_key =
+      Repo.one!(
+        from api_key in CodexPooler.Access.APIKey,
+          where: api_key.id == ^request.api_key_id,
+          lock: "FOR UPDATE"
+      )
+
+    _turn =
+      Repo.one!(
+        from turn in CodexPooler.Gateway.Persistence.CodexTurn,
+          where: turn.request_id == ^request.id,
+          lock: "FOR UPDATE"
+      )
+
+    :ok
+  end
+
+  defp replay_db_now do
+    Repo.one!(
+      from request in Request,
+        limit: 1,
+        select: type(fragment("request_replay_db_now()"), :utc_datetime_usec)
+    )
+  end
+
+  defp close_replay_entitlement(nil, _timestamp, _attrs), do: :ok
+
+  defp close_replay_entitlement(%RequestReplayEntitlement{} = entitlement, timestamp, attrs) do
+    closed_at =
+      case entitlement.last_liveness_at || entitlement.started_at || entitlement.consumed_at do
+        %DateTime{} = state_at ->
+          if DateTime.compare(timestamp, state_at) == :gt,
+            do: timestamp,
+            else: DateTime.add(state_at, 1, :microsecond)
+
+        _state_at ->
+          timestamp
+      end
+
+    close_attrs =
+      case Map.get(attrs, :replay_entitlement_close_status) do
+        status when status in ["expired", "revoked"] ->
+          %{
+            status: status,
+            terminal_at: timestamp,
+            closed_at: DateTime.add(timestamp, 1, :microsecond)
+          }
+
+        _status ->
+          %{closed_at: closed_at}
+      end
+
+    entitlement
+    |> RequestReplayEntitlement.changeset(close_attrs)
+    |> Repo.update!()
+
+    :ok
   end
 
   defp lock_finalization_rows(%Request{} = request, %Attempt{} = attempt) do
+    :ok = lock_replay_prefix(request)
+
     request =
       Repo.one!(
         from locked_request in Request,
@@ -421,6 +683,22 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
       Repo.one!(
         from locked_attempt in Attempt,
           where: locked_attempt.id == ^attempt.id,
+          lock: "FOR UPDATE"
+      )
+
+    latest_attempt =
+      Repo.one!(
+        from row in Attempt,
+          where: row.request_id == ^request.id,
+          order_by: [desc: row.attempt_number],
+          limit: 1,
+          lock: "FOR UPDATE"
+      )
+
+    entitlement =
+      Repo.one(
+        from replay in RequestReplayEntitlement,
+          where: replay.request_id == ^request.id,
           lock: "FOR UPDATE"
       )
 
@@ -450,7 +728,8 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         &(&1.entry_kind == "settlement" and &1.amount_status == "recorded")
       )
 
-    {request, attempt, reservation, existing_settlement}
+    attempt = if latest_attempt.id == attempt.id, do: latest_attempt, else: attempt
+    {request, attempt, reservation, existing_settlement, entitlement}
   end
 
   defp finalization_action(nil, _usage), do: :insert
@@ -463,29 +742,51 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
 
   defp finalization_action(%LedgerEntry{} = settlement, _usage), do: {:reuse, settlement}
 
+  defp run_before_finalize!(attrs) do
+    case Map.get(attrs, :before_finalize) do
+      nil ->
+        :ok
+
+      callback when is_function(callback, 0) ->
+        case callback.() do
+          :ok -> :ok
+          {:ok, _value} -> :ok
+          {:error, reason} -> Repo.rollback(reason)
+        end
+    end
+  end
+
   defp settlement_to_replace({:replace, settlement}), do: settlement
   defp settlement_to_replace(:insert), do: nil
 
   defp persist_final_attempt(attempt, usage, attrs, finalization) do
+    attempt_attrs =
+      if Map.get(attrs, :preserve_replay_attempt, false) do
+        %{}
+      else
+        %{
+          status: finalization.attempt_status,
+          completed_at: finalization.timestamp,
+          upstream_status_code:
+            Map.get(attrs, :upstream_status_code, finalization.response_status_code),
+          retryable: Map.get(attrs, :retryable, false),
+          network_error_code: finalization.last_error_code,
+          error_message: finalization.error_message,
+          latency_ms: Map.get(attrs, :latency_ms),
+          usage_status: usage.status,
+          response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :attempt_metadata, %{}))
+        }
+      end
+
     attempt =
       attempt
-      |> Ecto.Changeset.change(%{
-        status: finalization.attempt_status,
-        completed_at: finalization.timestamp,
-        upstream_status_code: finalization.response_status_code,
-        retryable: Map.get(attrs, :retryable, false),
-        network_error_code: finalization.last_error_code,
-        error_message: finalization.error_message,
-        latency_ms: Map.get(attrs, :latency_ms),
-        usage_status: usage.status,
-        response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :attempt_metadata, %{}))
-      })
+      |> Ecto.Changeset.change(attempt_attrs)
       |> Repo.update!()
 
     attempt
   end
 
-  defp persist_final_request(request, usage, pricing, finalization) do
+  defp persist_final_request(request, usage, pricing, finalization, replay_entitlement) do
     request_attrs =
       %{
         status: finalization.request_status,
@@ -495,12 +796,23 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
         retry_count: finalization.retry_count,
         last_error_code: finalization.last_error_code
       }
-      |> Map.merge(IdentitySnapshot.finalized_request_snapshot_attrs(request, pricing))
+      |> maybe_merge_finalized_identity_snapshot(request, pricing, replay_entitlement)
 
     request
     |> Ecto.Changeset.change(request_attrs)
     |> Repo.update!()
   end
+
+  defp maybe_merge_finalized_identity_snapshot(
+         attrs,
+         _request,
+         _pricing,
+         %RequestReplayEntitlement{}
+       ),
+       do: attrs
+
+  defp maybe_merge_finalized_identity_snapshot(attrs, request, pricing, nil),
+    do: Map.merge(attrs, IdentitySnapshot.finalized_request_snapshot_attrs(request, pricing))
 
   defp build_settlement_context(_request, _attempt, reservation, usage, pricing, finalization) do
     usage = fill_unknown_usage_from_reservation(usage, reservation, finalization.timestamp)
@@ -738,6 +1050,49 @@ defmodule CodexPooler.Accounting.RequestLifecycle do
     do: Repo.get(Model, model_id)
 
   defp attempt_model(_request, _attrs), do: nil
+
+  defp insert_attempt!(request, assignment, attrs, timestamp) do
+    model = attempt_model(request, attrs)
+    pricing_snapshot = attempt_pricing_snapshot(request, model, attrs)
+
+    attempt_number =
+      Repo.aggregate(from(a in Attempt, where: a.request_id == ^request.id), :count, :id) + 1
+
+    attempt_changes = %Attempt{
+      id: Map.get(attrs, :id),
+      request_id: request.id,
+      attempt_number: attempt_number,
+      pool_upstream_assignment_id: assignment.id,
+      upstream_identity_id: assignment.upstream_identity_id,
+      pricing_snapshot_id: pricing_snapshot && pricing_snapshot.id,
+      model_id: request.model_id,
+      upstream_model_id: (model && model.upstream_model_id) || request.requested_model,
+      transport: request.transport,
+      status: Map.get(attrs, :status, "in_progress"),
+      started_at: timestamp,
+      retryable: Map.get(attrs, :retryable, false),
+      usage_status: Map.get(attrs, :usage_status, @usage_pending),
+      response_metadata: Metadata.sanitize_metadata(Map.get(attrs, :response_metadata, %{})),
+      replay_generation: Map.get(attrs, :replay_generation, 0)
+    }
+
+    ReferenceLocks.lock_and_validate!(assignment.upstream_identity_id, assignment.id)
+
+    case Repo.insert(attempt_changes,
+           on_conflict: {:replace, [:id]},
+           conflict_target: :id,
+           returning: true
+         ) do
+      {:ok, attempt} ->
+        if callback = Map.get(attrs, :admitted_attempt_bind), do: callback.(attempt)
+        IdentitySnapshot.persist_request_identity_snapshot(request, assignment, attrs)
+        RequestLogFacts.record_attempt_written!(attempt)
+        attempt
+
+      {:error, changeset} ->
+        Repo.rollback(changeset)
+    end
+  end
 
   defp attempt_pricing_snapshot(_request, _model, %{pricing_snapshot: pricing_snapshot}),
     do: pricing_snapshot

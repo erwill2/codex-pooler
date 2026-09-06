@@ -13,6 +13,8 @@ defmodule CodexPooler.Dev.Seeds.Full do
   alias CodexPooler.InstanceSettings
   alias CodexPooler.Pools.{OperatorPoolAssignment, Pool}
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
 
@@ -55,6 +57,8 @@ defmodule CodexPooler.Dev.Seeds.Full do
     api_keys = seed_api_keys!(owner, pool_active)
     seed_operator_pool_assignments!(owner, operators, pool_active)
     identities = seed_identities!(owner)
+    expiry_fixtures = Enum.take(identities, -4)
+    seed_expiry_fixture_secrets!(expiry_fixtures)
     assignments = seed_assignments!(owner, pool_active, identities)
 
     [active | _rest] = identities
@@ -90,6 +94,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
       pools: [pool_active, pool_secondary, pool_disabled],
       api_keys: api_keys,
       upstream_identities: identities,
+      expiry_fixtures: expiry_fixtures,
       assignments:
         Enum.take(assignments, 6) ++ [secondary_assignment] ++ Enum.drop(assignments, 6),
       models: models ++ secondary_models,
@@ -244,6 +249,48 @@ defmodule CodexPooler.Dev.Seeds.Full do
         "active",
         "pro",
         "Pro"
+      ),
+      windowless_identity_attrs(
+        owner,
+        "dev-acct-provider-available-no-windows",
+        "Sample Provider Available",
+        :available
+      ),
+      windowless_identity_attrs(
+        owner,
+        "dev-acct-provider-blocked-no-windows",
+        "Sample Provider Blocked",
+        :blocked
+      ),
+      windowless_identity_attrs(
+        owner,
+        "dev-acct-provider-unknown-no-windows",
+        "Sample Provider Unknown",
+        :unknown
+      ),
+      expiry_fixture_identity_attrs(
+        owner,
+        "dev-acct-expiry-known-future",
+        "Expiry Known Future",
+        :known_future
+      ),
+      expiry_fixture_identity_attrs(
+        owner,
+        "dev-acct-expiry-known-past",
+        "Expiry Known Past",
+        :known_past
+      ),
+      expiry_fixture_identity_attrs(
+        owner,
+        "dev-acct-expiry-unknown-current",
+        "Expiry Unknown Current",
+        :unknown_current
+      ),
+      expiry_fixture_identity_attrs(
+        owner,
+        "dev-acct-expiry-markerless-legacy-writer",
+        "Markerless Legacy Writer",
+        :markerless_legacy_writer
       )
     ]
     |> Enum.map(fn attrs ->
@@ -259,87 +306,132 @@ defmodule CodexPooler.Dev.Seeds.Full do
          reauth,
          paused,
          clear,
-         absent
+         absent,
+         available_no_windows,
+         blocked_no_windows,
+         unknown_no_windows
+         | expiry_fixtures
        ]) do
-    [
-      assignment_attrs(
-        owner,
-        pool,
-        active,
-        "Dev Active Assignment",
-        "active",
-        "active",
-        "eligible",
-        metadata: %{"quota_priming" => %{"status" => "known"}}
-      ),
-      assignment_attrs(
-        owner,
-        pool,
-        ready,
-        "Dev Ready Assignment",
-        "active",
-        "active",
-        "eligible",
-        metadata: %{"quota_priming" => %{"status" => "known"}}
-      ),
-      assignment_attrs(
-        owner,
-        pool,
-        exhausted,
-        "Dev Exhausted Assignment",
-        "active",
-        "active",
-        "eligible"
-      ),
-      assignment_attrs(
-        owner,
-        pool,
-        plus,
-        "Dev Cooldown Assignment",
-        "active",
-        "cooldown",
-        "ineligible",
-        cooldown_until: minutes_from_now(35)
-      ),
-      assignment_attrs(
-        owner,
-        pool,
-        reauth,
-        "Dev Reauth Assignment",
-        "reauth_required",
-        "errored",
-        "ineligible"
-      ),
-      assignment_attrs(
-        owner,
-        pool,
-        paused,
-        "Dev Paused Assignment",
-        "paused",
-        "disabled",
-        "ineligible"
-      ),
-      assignment_attrs(
-        owner,
-        pool,
-        clear,
-        "Dev Circuit Clear Assignment",
-        "active",
-        "active",
-        "eligible",
-        metadata: %{"quota_priming" => %{"status" => "known"}}
-      ),
-      assignment_attrs(
-        owner,
-        pool,
-        absent,
-        "Dev Circuit Absent Assignment",
-        "active",
-        "active",
-        "eligible",
-        metadata: %{"quota_priming" => %{"status" => "known"}}
-      )
-    ]
+    ([
+       assignment_attrs(
+         owner,
+         pool,
+         active,
+         "Dev Active Assignment",
+         "active",
+         "active",
+         "eligible",
+         metadata: %{"quota_priming" => %{"status" => "known"}}
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         ready,
+         "Dev Ready Assignment",
+         "active",
+         "active",
+         "eligible",
+         metadata: %{"quota_priming" => %{"status" => "known"}}
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         exhausted,
+         "Dev Exhausted Assignment",
+         "active",
+         "active",
+         "eligible"
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         plus,
+         "Dev Cooldown Assignment",
+         "active",
+         "cooldown",
+         "ineligible",
+         cooldown_until: minutes_from_now(35)
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         reauth,
+         "Dev Reauth Assignment",
+         "reauth_required",
+         "errored",
+         "ineligible"
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         paused,
+         "Dev Paused Assignment",
+         "paused",
+         "disabled",
+         "ineligible"
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         clear,
+         "Dev Circuit Clear Assignment",
+         "active",
+         "active",
+         "eligible",
+         metadata: %{"quota_priming" => %{"status" => "known"}}
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         absent,
+         "Dev Circuit Absent Assignment",
+         "active",
+         "active",
+         "eligible",
+         metadata: %{"quota_priming" => %{"status" => "known"}}
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         available_no_windows,
+         "Sample Available Assignment",
+         "active",
+         "active",
+         "eligible",
+         metadata: %{"quota_priming" => %{"status" => "known"}}
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         blocked_no_windows,
+         "Sample Blocked Assignment",
+         "active",
+         "active",
+         "eligible",
+         metadata: %{"quota_priming" => %{"status" => "blocked"}}
+       ),
+       assignment_attrs(
+         owner,
+         pool,
+         unknown_no_windows,
+         "Sample Unknown Assignment",
+         "active",
+         "active",
+         "eligible"
+       )
+     ] ++
+       Enum.map(expiry_fixtures, fn identity ->
+         assignment_attrs(
+           owner,
+           pool,
+           identity,
+           "#{identity.account_label} Assignment",
+           "active",
+           "active",
+           "eligible",
+           metadata: %{"quota_priming" => %{"status" => "known"}}
+         )
+       end))
     |> Enum.map(&seed_assignment!/1)
   end
 
@@ -357,7 +449,11 @@ defmodule CodexPooler.Dev.Seeds.Full do
            _reauth_assignment,
            _paused_assignment,
            clear_assignment,
-           absent_assignment
+           absent_assignment,
+           _available_no_windows_assignment,
+           _blocked_no_windows_assignment,
+           _unknown_no_windows_assignment
+           | _expiry_fixture_assignments
          ],
          _secondary_assignment
        ) do
@@ -421,7 +517,11 @@ defmodule CodexPooler.Dev.Seeds.Full do
            _reauth_assignment,
            _paused_assignment,
            clear_assignment,
-           _absent_assignment
+           _absent_assignment,
+           _available_no_windows_assignment,
+           _blocked_no_windows_assignment,
+           _unknown_no_windows_assignment
+           | _expiry_fixture_assignments
          ],
          [
            active_identity,
@@ -431,7 +531,11 @@ defmodule CodexPooler.Dev.Seeds.Full do
            _reauth_identity,
            _paused_identity,
            clear_identity,
-           _absent_identity
+           _absent_identity,
+           _available_no_windows_identity,
+           _blocked_no_windows_identity,
+           _unknown_no_windows_identity
+           | _expiry_fixture_identities
          ]
        ) do
     [
@@ -489,7 +593,7 @@ defmodule CodexPooler.Dev.Seeds.Full do
     }
   end
 
-  defp seed_quota_windows!([active, ready, exhausted, plus, reauth, paused, clear, absent]) do
+  defp seed_quota_windows!([active, ready, exhausted, plus, reauth, paused, clear, absent | _]) do
     windows = [
       quota_attrs(active, quota_window_spec("primary", 300, "account", 1000, 640, "36", "fresh")),
       quota_attrs(
@@ -964,6 +1068,102 @@ defmodule CodexPooler.Dev.Seeds.Full do
       updated_at: timestamp,
       metadata: %{"dev_seed" => @seed_key, "state" => status}
     }
+  end
+
+  defp windowless_identity_attrs(owner, account_id, label, availability_state) do
+    observed_at = now()
+
+    owner
+    |> identity_attrs(account_id, label, "active", "sample", "Sample")
+    |> Map.update!(:metadata, fn metadata ->
+      metadata
+      |> Map.put("credential_epoch", 1)
+      |> Map.put(
+        AccountAvailabilityStore.metadata_key(),
+        AccountAvailabilityStore.encode!(availability_state, observed_at, 1)
+      )
+    end)
+  end
+
+  defp expiry_fixture_identity_attrs(owner, account_id, label, fixture) do
+    owner
+    |> identity_attrs(account_id, label, "active", "sample", "Sample")
+    |> Map.update!(:metadata, fn metadata ->
+      metadata
+      |> Map.merge(%{
+        "dev_seed_fixture" => "expiry",
+        "expiry_fixture" => Atom.to_string(fixture),
+        "saved_resets" => comparable_saved_reset_state()
+      })
+      |> Map.merge(expiry_fixture_metadata(fixture))
+    end)
+  end
+
+  defp expiry_fixture_metadata(:known_future) do
+    canonical_expiry_metadata(minutes_from_now(60))
+  end
+
+  defp expiry_fixture_metadata(:known_past) do
+    canonical_expiry_metadata(minutes_ago(60))
+  end
+
+  defp expiry_fixture_metadata(:unknown_current) do
+    %{
+      "credential_epoch" => 2,
+      "token_refresh" => %{
+        "access_token_expiry" => %{
+          "version" => 1,
+          "credential_epoch" => 2,
+          "state" => "unknown",
+          "source" => "unavailable"
+        }
+      }
+    }
+  end
+
+  defp expiry_fixture_metadata(:markerless_legacy_writer) do
+    %{"access_token_expires_at" => DateTime.to_iso8601(minutes_ago(60))}
+  end
+
+  defp canonical_expiry_metadata(%DateTime{} = deadline) do
+    %{
+      "credential_epoch" => 2,
+      "access_token_expires_at" => DateTime.to_iso8601(deadline),
+      "token_refresh" => %{
+        "access_token_expiry" => %{
+          "version" => 1,
+          "credential_epoch" => 2,
+          "state" => "known",
+          "source" => "explicit"
+        }
+      }
+    }
+  end
+
+  defp comparable_saved_reset_state do
+    %{
+      "status" => "reported",
+      "available_count" => 1,
+      "source" => "codex_usage_api",
+      "path_style" => "codex_api",
+      "observed_at" => DateTime.to_iso8601(now()),
+      "usage_path" => "/api/codex/usage",
+      "reason" => nil
+    }
+  end
+
+  defp seed_expiry_fixture_secrets!(identities) do
+    Enum.each(identities, fn identity ->
+      fixture = identity.metadata["expiry_fixture"]
+
+      for {kind, plaintext} <- [
+            {"access_token", "synthetic-expiry-access-#{fixture}"},
+            {"refresh_token", "synthetic-expiry-refresh-#{fixture}"}
+          ] do
+        {:ok, _secret} =
+          Upstreams.store_encrypted_secret(identity, %{secret_kind: kind, plaintext: plaintext})
+      end
+    end)
   end
 
   defp assignment_attrs(owner, pool, identity, label, status, health, eligibility, extras \\ []) do

@@ -6,10 +6,10 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
   import ExUnit.CaptureLog
   import Ecto.Query
 
-  alias CodexPooler.Accounting.Attempt
+  alias CodexPooler.Accounting.{Attempt, RequestReplay}
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.OperationalSettings
-  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Payloads.{NativeCodexTurnMetadata, RequestOptions}
   alias CodexPooler.Gateway.Persistence.{BridgeSessionAlias, CodexSession}
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata
   alias CodexPooler.Gateway.Transports.MisalignmentPolicyViolation
@@ -21,12 +21,15 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerContract
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequest
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV2
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerRequestV3
   alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerSession
   alias CodexPooler.Gateway.Transports.WebsocketOwnerNodeHarness
   alias CodexPooler.Gateway.Websocket, as: Gateway
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.CloudflareCookies
   alias CodexPooler.Upstreams.CodexClientIdentity
+  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
   @receive_timeout_ms 25
@@ -119,6 +122,178 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
     end
   end
 
+  @tag :collect_compaction
+  test "direct collect compaction materializes a nil writer from anchored Full options regardless of output item names" do
+    compact_frames = fn suffix ->
+      [
+        Jason.encode!(%{
+          "type" => "response.output_item.done",
+          "item" => %{"type" => "compaction", "encrypted_content" => "opaque-#{suffix}"}
+        }),
+        Jason.encode!(%{
+          "type" => "response.completed",
+          "response" => %{"id" => "resp_collect_#{suffix}", "status" => "completed"}
+        })
+      ]
+    end
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        {:sequence,
+         [
+           websocket_success("collect-warmup"),
+           FakeUpstream.websocket_text_frames(compact_frames.("custom")),
+           FakeUpstream.websocket_text_frames(compact_frames.("future"))
+         ]}
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    full_snapshot = %{configured_mode: "full", effective_mode: "full", source: "override"}
+
+    warmup_options =
+      session
+      |> websocket_request_options()
+      |> RequestOptions.put_model_serving_mode(full_snapshot)
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             upstream
+             |> websocket_dispatch_request(warmup_options)
+             |> UpstreamDispatch.websocket_request()
+
+    for {suffix, output_type} <- [
+          {"custom", "custom_tool_call_output"},
+          {"future", "future_tool_output"}
+        ] do
+      payload = %{
+        "previous_response_id" => "resp_synthetic_anchor",
+        "input" => [
+          %{"type" => output_type, "output" => "opaque-output"},
+          %{"type" => "compaction_trigger"}
+        ]
+      }
+
+      options =
+        %{
+          receive_timeout_ms: 1_000,
+          upstream_websocket_session: session,
+          model_serving_mode_configured: "full",
+          model_serving_mode: "full",
+          model_serving_mode_source: "override"
+        }
+        |> RequestOptions.build("/backend-api/codex/responses", payload)
+        |> RequestOptions.for_websocket(payload)
+        |> RequestOptions.put_payload_context(compaction_trigger_bridge?: true)
+        |> RequestOptions.put_transport(websocket_delivery_mode: :collect_compaction)
+
+      assert RequestOptions.connection_bound_compaction?(options)
+
+      request = %{
+        websocket_dispatch_request(upstream, options)
+        | writer: nil,
+          upstream_payload: Jason.encode!(payload),
+          original_payload: payload
+      }
+
+      assert {:ok, %{terminal: "response.completed", body: body}} =
+               UpstreamDispatch.websocket_request(request)
+
+      assert body =~ "opaque-#{suffix}"
+    end
+
+    assert [warmup, custom_collect, future_collect] = FakeUpstream.requests(upstream)
+    assert warmup.websocket_connection_id == custom_collect.websocket_connection_id
+    assert custom_collect.websocket_connection_id == future_collect.websocket_connection_id
+
+    assert Enum.map(Jason.decode!(custom_collect.body)["input"], & &1["type"]) == [
+             "custom_tool_call_output",
+             "compaction_trigger"
+           ]
+
+    assert Enum.map(Jason.decode!(future_collect.body)["input"], & &1["type"]) == [
+             "future_tool_output",
+             "compaction_trigger"
+           ]
+  end
+
+  @tag :collect_compaction
+  test "direct collect compaction reuses a matching Lite connection for function output" do
+    compact_item =
+      Jason.encode!(%{
+        "type" => "response.output_item.done",
+        "item" => %{"type" => "compaction", "encrypted_content" => "opaque-lite"}
+      })
+
+    terminal =
+      Jason.encode!(%{
+        "type" => "response.completed",
+        "response" => %{"id" => "resp_collect_lite", "status" => "completed"}
+      })
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        {:sequence,
+         [
+           websocket_success("lite-warmup"),
+           FakeUpstream.websocket_text_frames([compact_item, terminal])
+         ]}
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    payload = %{
+      "previous_response_id" => "resp_synthetic_lite_anchor",
+      "input" => [
+        %{"type" => "function_call_output", "call_id" => "call_fixture", "output" => "ok"},
+        %{"type" => "compaction_trigger"}
+      ]
+    }
+
+    base = %{
+      receive_timeout_ms: 1_000,
+      upstream_websocket_session: session,
+      model_serving_mode_configured: "lite",
+      model_serving_mode: "lite",
+      model_serving_mode_source: "override"
+    }
+
+    warmup_options = RequestOptions.for_websocket(base, %{"model" => "example-model"})
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             upstream
+             |> websocket_dispatch_request(warmup_options)
+             |> UpstreamDispatch.websocket_request()
+
+    options =
+      base
+      |> RequestOptions.build("/backend-api/codex/responses", payload)
+      |> RequestOptions.for_websocket(payload)
+      |> RequestOptions.put_payload_context(compaction_trigger_bridge?: true)
+      |> RequestOptions.put_transport(websocket_delivery_mode: :collect_compaction)
+
+    request = %{
+      websocket_dispatch_request(upstream, options)
+      | writer: nil,
+        upstream_payload: Jason.encode!(payload),
+        original_payload: payload
+    }
+
+    assert RequestOptions.connection_bound_compaction?(options)
+    assert {:ok, %{terminal: "response.completed"}} = UpstreamDispatch.websocket_request(request)
+
+    assert [warmup, collect] = FakeUpstream.requests(upstream)
+    assert warmup.websocket_connection_id == collect.websocket_connection_id
+
+    assert Enum.map(Jason.decode!(collect.body)["input"], & &1["type"]) == [
+             "function_call_output",
+             "compaction_trigger"
+           ]
+  end
+
   test "remote owner dispatch sends only a validated v1 envelope and keeps submission observer local",
        %{auth: auth} do
     remote_node = :"codex_pooler@data-only-owner.example"
@@ -177,6 +352,183 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
     assert WebsocketOwnerRequest.validate(envelope) == :ok
     refute contains_function?(envelope)
     assert is_function(observer, 0)
+  end
+
+  test "connection-bound collect dispatch selects only the v2 owner RPC", %{auth: auth} do
+    remote_node = :"codex_pooler@collect-owner.example"
+
+    %{session: session, lease_token: lease_token} =
+      owner_session_fixture(auth, Atom.to_string(remote_node))
+
+    OwnerEnvelopeNodeClient.configure(
+      [remote_node],
+      {:websocket_owner_submission_accepted, {:error, :owner_drained}}
+    )
+
+    downstream = %{pid: self(), epoch: 1, correlation_id: "corr-collect-owner"}
+
+    payload = %{
+      "previous_response_id" => "resp_synthetic_anchor",
+      "input" => [
+        %{"type" => "function_call_output", "call_id" => "synthetic", "output" => "opaque"},
+        %{"type" => "compaction_trigger"}
+      ]
+    }
+
+    request_options =
+      RequestOptions.for_websocket(
+        %{
+          codex_session: session,
+          receive_timeout_ms: @receive_timeout_ms,
+          websocket_owner_forwarding_enabled?: true,
+          websocket_owner_session: session,
+          websocket_owner_lease_token: lease_token,
+          websocket_owner_downstream: downstream,
+          websocket_owner_downstream_epoch: downstream.epoch,
+          websocket_owner_proxy_instance_id: Atom.to_string(node()),
+          websocket_owner_instance_id: session.owner_instance_id,
+          websocket_owner_forwarder_opts: [
+            node_client: OwnerEnvelopeNodeClient,
+            app_node_names: [Atom.to_string(remote_node)]
+          ],
+          compaction_trigger_bridge?: true
+        },
+        payload
+      )
+      |> RequestOptions.put_payload_context(
+        compaction_result_mode: :native_websocket,
+        native_codex_turn_metadata: native_turn_metadata(:compaction)
+      )
+      |> RequestOptions.put_transport(websocket_delivery_mode: :collect_compaction)
+      |> RequestOptions.put_model_serving_mode(%{
+        configured_mode: "full",
+        effective_mode: "full",
+        source: "override"
+      })
+
+    assert RequestOptions.connection_bound_compaction?(request_options)
+    identity = active_upstream_identity_fixture()
+
+    request = %UpstreamDispatch.Request{
+      url: "https://upstream.example.test/backend-api/codex/responses",
+      token: "redacted",
+      upstream_payload: Jason.encode!(payload),
+      original_payload: payload,
+      identity: identity,
+      accounting_request: nil,
+      accounting_attempt: nil,
+      writer: nil,
+      assignment_advertised?: true,
+      request_options: request_options
+    }
+
+    assert {:error, %{reason: :owner_drained}} = UpstreamDispatch.websocket_request(request)
+
+    assert_received {:owner_envelope_call, ^remote_node, _module, :remote_submit_request_v2,
+                     [session_id, _downstream, %WebsocketOwnerRequestV2{} = envelope], _timeout}
+
+    assert session_id == session.id
+    assert envelope.version == 2
+    assert envelope.websocket_delivery_mode == :collect_compaction
+    assert envelope.effective_serving_mode == :full
+    assert WebsocketOwnerRequestV2.validate(envelope) == :ok
+    refute contains_function?(envelope)
+    refute_received {:owner_envelope_call, ^remote_node, _module, :remote_submit_request_v1, _, _}
+  end
+
+  test "connection-bound final turn keeps capability authorization and relay delivery through v3",
+       %{auth: auth} do
+    remote_node = :"codex_pooler@relay-owner.example"
+
+    %{session: session, lease_token: lease_token} =
+      owner_session_fixture(auth, Atom.to_string(remote_node))
+
+    OwnerEnvelopeNodeClient.configure(
+      [remote_node],
+      {:websocket_owner_submission_accepted, {:error, :owner_drained}}
+    )
+
+    downstream = %{pid: self(), epoch: 1, correlation_id: "corr-relay-owner"}
+
+    payload = %{
+      "previous_response_id" => "resp_synthetic_compaction_anchor",
+      "input" => [%{"type" => "message", "role" => "user", "content" => []}]
+    }
+
+    request_options =
+      RequestOptions.for_websocket(
+        %{
+          codex_session: session,
+          receive_timeout_ms: @receive_timeout_ms,
+          websocket_owner_forwarding_enabled?: true,
+          websocket_owner_session: session,
+          websocket_owner_lease_token: lease_token,
+          websocket_owner_downstream: downstream,
+          websocket_owner_downstream_epoch: downstream.epoch,
+          websocket_owner_proxy_instance_id: Atom.to_string(node()),
+          websocket_owner_instance_id: session.owner_instance_id,
+          websocket_owner_forwarder_opts: [
+            node_client: OwnerEnvelopeNodeClient,
+            app_node_names: [Atom.to_string(remote_node)]
+          ],
+          compaction_trigger_bridge?: true
+        },
+        payload
+      )
+      |> RequestOptions.put_payload_context(
+        native_codex_turn_metadata: native_turn_metadata(:turn)
+      )
+      |> RequestOptions.put_transport(websocket_delivery_mode: :collect_compaction)
+      |> RequestOptions.put_model_serving_mode(%{
+        configured_mode: "full",
+        effective_mode: "full",
+        source: "override"
+      })
+
+    capability = forwarded_native_compaction_capability(session, lease_token, downstream, :final)
+
+    request_options =
+      RequestOptions.put_native_compaction_admission(
+        request_options,
+        capability,
+        {:forwarded, session, lease_token, downstream,
+         [
+           node_client: OwnerEnvelopeNodeClient,
+           app_node_names: [Atom.to_string(remote_node)]
+         ]},
+        %{
+          lifecycle_id: capability.binding.lifecycle_id,
+          generation: capability.binding.generation
+        }
+      )
+
+    assert RequestOptions.connection_bound_compaction?(request_options)
+    identity = active_upstream_identity_fixture()
+
+    request = %UpstreamDispatch.Request{
+      url: "https://upstream.example.test/backend-api/codex/responses",
+      token: "redacted",
+      upstream_payload: Jason.encode!(payload),
+      original_payload: payload,
+      identity: identity,
+      accounting_request: nil,
+      accounting_attempt: nil,
+      writer: fn _message -> :ok end,
+      assignment_advertised?: true,
+      request_options: request_options
+    }
+
+    assert {:error, %{reason: :owner_drained}} = UpstreamDispatch.websocket_request(request)
+
+    assert_received {:owner_envelope_call, ^remote_node, _module, :remote_submit_request_v3,
+                     [session_id, _downstream, %WebsocketOwnerRequestV3{} = envelope], _timeout}
+
+    assert session_id == session.id
+    assert envelope.version == 3
+    assert envelope.websocket_delivery_mode == :relay
+    assert envelope.owner_admission_capability != nil
+    assert WebsocketOwnerRequestV3.validate(envelope) == :ok
+    refute_received {:owner_envelope_call, ^remote_node, _module, :remote_submit_request_v2, _, _}
   end
 
   test "invalid owner request data fails before remote submission" do
@@ -1226,6 +1578,216 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
            }
   end
 
+  @tag :replay_generation_race
+  test "direct websocket visible result cannot mark a stale generation zero turn after arm", %{
+    auth: auth
+  } do
+    model = model_fixture(auth.pool, %{exposed_model_id: "gpt-replay-visible-cas"})
+    %{assignment: assignment, identity: identity} = upstream_assignment_fixture(auth.pool)
+
+    assert {:ok, session} =
+             Gateway.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    request =
+      request_fixture(auth, %{
+        model_id: model.id,
+        requested_model: model.exposed_model_id,
+        transport: "websocket",
+        status: "in_progress",
+        usage_status: "usage_pending",
+        completed_at: nil,
+        response_status_code: nil
+      })
+
+    options =
+      RequestOptions.for_websocket(%{})
+      |> RequestOptions.put_continuity(semantic_turn_key: <<1::256>>)
+
+    assert {:ok, turn} = Gateway.start_codex_turn(session, request, options)
+
+    attempt =
+      attempt_fixture(request, assignment, %{
+        status: "in_progress",
+        completed_at: nil,
+        upstream_status_code: nil,
+        usage_status: "usage_pending"
+      })
+
+    attempt = attempt |> Ecto.Changeset.change(%{model_id: model.id}) |> Repo.update!()
+    session = Repo.reload!(session)
+
+    reservation =
+      ledger_entry_fixture(request, %{
+        entry_kind: "reservation",
+        amount_status: "recorded",
+        usage_status: "usage_pending",
+        attempt_id: nil,
+        pool_upstream_assignment_id: assignment.id,
+        upstream_identity_id: identity.id,
+        model_id: model.id
+      })
+
+    reservation
+    |> Ecto.Changeset.change(%{source_event_id: "request:#{request.id}:reservation"})
+    |> Repo.update!()
+
+    assert {:ok, _armed} =
+             RequestReplay.arm(%{
+               api_key_id: auth.api_key.id,
+               pool_id: auth.pool.id,
+               codex_session_id: session.id,
+               request_id: request.id,
+               codex_turn_id: turn.id,
+               eligible_attempt_id: attempt.id,
+               api_key_runtime_epoch: auth.api_key.runtime_revocation_epoch,
+               model_id: model.id,
+               model_identifier: model.exposed_model_id,
+               endpoint: request.endpoint,
+               semantic_turn_digest: <<1::256>>,
+               replay_claim_digest: <<2::256>>,
+               owner_instance_id: session.owner_instance_id,
+               owner_lease_token: session.owner_lease_token,
+               predecessor_epoch: 1,
+               failure_reason: :client_disconnected,
+               pre_visible_output: true
+             })
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        FakeUpstream.websocket_text_frames([
+          Jason.encode!(%{"type" => "response.completed", "response" => %{"id" => "resp_stale"}})
+        ])
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+
+    dispatch_request = %{
+      websocket_dispatch_request(upstream, websocket_request_options())
+      | identity: identity,
+        accounting_request: request,
+        accounting_attempt: attempt
+    }
+
+    assert {:ok, _result} = UpstreamDispatch.websocket_request(dispatch_request)
+    assert Repo.reload!(turn).first_visible_output_at == nil
+  end
+
+  @tag :replay_generation_race
+  test "direct websocket stale rate-limit frame cannot mutate quota or reach its writer", %{
+    auth: auth
+  } do
+    model = model_fixture(auth.pool, %{exposed_model_id: "gpt-replay-rate-limit-frame"})
+    %{assignment: assignment, identity: identity} = upstream_assignment_fixture(auth.pool)
+
+    model
+    |> Ecto.Changeset.change(%{metadata: %{"source_assignment_ids" => [assignment.id]}})
+    |> Repo.update!()
+
+    assert {:ok, session} =
+             Gateway.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    request =
+      request_fixture(auth, %{
+        model_id: model.id,
+        requested_model: model.exposed_model_id,
+        transport: "websocket",
+        status: "in_progress",
+        usage_status: "usage_pending",
+        completed_at: nil,
+        response_status_code: nil
+      })
+
+    options =
+      RequestOptions.for_websocket(%{})
+      |> RequestOptions.put_continuity(semantic_turn_key: <<1::256>>)
+
+    assert {:ok, turn} = Gateway.start_codex_turn(session, request, options)
+
+    attempt =
+      attempt_fixture(request, assignment, %{
+        status: "in_progress",
+        completed_at: nil,
+        upstream_status_code: nil,
+        usage_status: "usage_pending"
+      })
+      |> Ecto.Changeset.change(%{model_id: model.id})
+      |> Repo.update!()
+
+    reservation =
+      ledger_entry_fixture(request, %{
+        entry_kind: "reservation",
+        amount_status: "recorded",
+        usage_status: "usage_pending",
+        attempt_id: nil,
+        pool_upstream_assignment_id: assignment.id,
+        upstream_identity_id: identity.id,
+        model_id: model.id
+      })
+
+    reservation
+    |> Ecto.Changeset.change(%{source_event_id: "request:#{request.id}:reservation"})
+    |> Repo.update!()
+
+    session = Repo.reload!(session)
+
+    assert {:ok, _armed} =
+             RequestReplay.arm(%{
+               api_key_id: auth.api_key.id,
+               pool_id: auth.pool.id,
+               codex_session_id: session.id,
+               request_id: request.id,
+               codex_turn_id: turn.id,
+               eligible_attempt_id: attempt.id,
+               api_key_runtime_epoch: auth.api_key.runtime_revocation_epoch,
+               model_id: model.id,
+               model_identifier: model.exposed_model_id,
+               endpoint: request.endpoint,
+               semantic_turn_digest: <<1::256>>,
+               replay_claim_digest: <<2::256>>,
+               owner_instance_id: session.owner_instance_id,
+               owner_lease_token: session.owner_lease_token,
+               predecessor_epoch: 1,
+               failure_reason: :client_disconnected,
+               pre_visible_output: true
+             })
+
+    rate_limit_event = websocket_rate_limit_event("96")
+
+    {:ok, upstream} =
+      FakeUpstream.start_link(
+        FakeUpstream.websocket_text_frames([
+          rate_limit_event,
+          Jason.encode!(%{
+            "type" => "response.completed",
+            "response" => %{"id" => "resp_stale_rate_limit_frame"}
+          })
+        ])
+      )
+
+    on_exit(fn -> FakeUpstream.stop(upstream) end)
+    parent = self()
+
+    request_options =
+      websocket_request_options()
+      |> RequestOptions.put_transport(
+        websocket_writer: fn frame -> send(parent, {:frame, frame}) end
+      )
+
+    dispatch_request = %{
+      websocket_dispatch_request(upstream, request_options)
+      | identity: identity,
+        accounting_request: request,
+        accounting_attempt: attempt,
+        writer: fn frame -> send(parent, {:frame, frame}) end
+    }
+
+    observations_before = QuotaWindows.list_quota_windows(identity)
+    assert {:ok, _result} = UpstreamDispatch.websocket_request(dispatch_request)
+    refute_received {:frame, ^rate_limit_event}
+    assert QuotaWindows.list_quota_windows(identity) == observations_before
+    assert Repo.reload!(turn).first_visible_output_at == nil
+  end
+
   test "one-shot websocket request preserves its structured response identity" do
     response_id = "one-shot-response-identity"
     {:ok, success_upstream} = FakeUpstream.start_link(websocket_success(response_id))
@@ -1501,6 +2063,45 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
     RequestOptions.for_websocket(opts, %{"model" => "example-model"})
   end
 
+  defp native_turn_metadata(request_kind) when request_kind in [:turn, :compaction] do
+    %NativeCodexTurnMetadata{
+      semantic_turn_key: :crypto.strong_rand_bytes(32),
+      window_id_digest: :crypto.strong_rand_bytes(32),
+      context_window_id_digest: :crypto.strong_rand_bytes(32),
+      window_number: 1,
+      request_kind: request_kind,
+      compaction: nil
+    }
+  end
+
+  defp forwarded_native_compaction_capability(session, lease_token, downstream, phase) do
+    binding = %CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Binding{
+      semantic_turn_key: :crypto.strong_rand_bytes(32),
+      window_digest: :crypto.strong_rand_bytes(32),
+      context_digest: :crypto.strong_rand_bytes(32),
+      window_number: 2,
+      compaction_item_digest: :crypto.strong_rand_bytes(32),
+      previous_response_digest: nil,
+      serving_mode: :full,
+      topology:
+        %CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Topology.Forwarded{
+          owner_instance_digest: :crypto.hash(:sha256, session.owner_instance_id),
+          downstream_epoch: downstream.epoch,
+          owner_lease_digest: :crypto.hash(:sha256, lease_token)
+        },
+      lifecycle_id: Ecto.UUID.generate(),
+      generation: 1
+    }
+
+    %CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Capability{
+      phase: phase,
+      binding: binding,
+      control_ref: make_ref(),
+      token: :crypto.strong_rand_bytes(32),
+      expires_at_ms: System.system_time(:millisecond) + 30_000
+    }
+  end
+
   defp collect_multi_agent_round_observations(observations) do
     receive do
       {:multi_agent_round_product_observation, observation} ->
@@ -1584,6 +2185,21 @@ defmodule CodexPooler.Gateway.Transports.UpstreamDispatchTest do
         "response" => %{"id" => id}
       })
     ])
+  end
+
+  defp websocket_rate_limit_event(used_percent) do
+    reset_at = DateTime.utc_now() |> DateTime.add(900, :second) |> DateTime.truncate(:second)
+
+    Jason.encode!(%{
+      "type" => "codex.rate_limits",
+      "rate_limits" => %{
+        "primary" => %{
+          "used_percent" => used_percent,
+          "window_minutes" => 300,
+          "reset_at" => DateTime.to_unix(reset_at)
+        }
+      }
+    })
   end
 
   defp websocket_owner_request_options(session, lease_token, downstream, forwarder_opts) do

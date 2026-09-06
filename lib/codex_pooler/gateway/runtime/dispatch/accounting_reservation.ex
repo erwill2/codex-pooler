@@ -17,6 +17,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
   alias CodexPooler.Gateway.Transports.Websocket.DiagnosticTaxonomy
+  alias CodexPooler.Gateway.Websocket.DirectCleanup
   alias CodexPooler.RouteClass
 
   @type auth :: Access.auth_context()
@@ -69,6 +70,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
       " failure_code=gateway_reservation_failed",
       " status=#{status}",
       " request_id=#{DiagnosticTaxonomy.safe_correlator(request_options.request_metadata.request_id)}",
+      native_lifecycle_log_metadata(request_options),
       " failure_reason=#{failure_reason}",
       " retryable=#{retryable}"
     ])
@@ -81,13 +83,42 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
     }
   end
 
-  @spec attrs(auth(), map(), String.t(), RequestOptions.t()) :: map()
-  def attrs(auth, payload, endpoint, %RequestOptions{} = request_options) when is_map(payload) do
-    attrs(auth, payload, endpoint, request_options, nil)
+  defp native_lifecycle_log_metadata(request_options) do
+    case RequestOptions.native_compaction_admission(request_options) do
+      {:ok, _capability, _owner, %{lifecycle_id: lifecycle_id}} ->
+        " native_lifecycle_id=#{DiagnosticTaxonomy.safe_correlator(lifecycle_id)}"
+
+      _no_valid_admission ->
+        ""
+    end
   end
+
+  @spec attrs(auth(), map(), String.t(), RequestOptions.t()) :: map()
+  def attrs(auth, payload, endpoint, %RequestOptions{} = request_options) when is_map(payload),
+    do: attrs(auth, payload, endpoint, request_options, nil, nil)
 
   @spec attrs(auth(), map(), String.t(), RequestOptions.t(), RouteState.t() | nil) :: map()
   def attrs(auth, payload, endpoint, %RequestOptions{} = request_options, route_state)
+      when is_map(payload) do
+    attrs(auth, payload, endpoint, request_options, route_state, nil)
+  end
+
+  @spec attrs(
+          auth(),
+          map(),
+          String.t(),
+          RequestOptions.t(),
+          RouteState.t() | nil,
+          Ecto.UUID.t() | nil
+        ) :: map()
+  def attrs(
+        auth,
+        payload,
+        endpoint,
+        %RequestOptions{} = request_options,
+        route_state,
+        authorized_correlation_id
+      )
       when is_map(payload) do
     %RequestOptions{
       request_metadata: request_metadata,
@@ -98,17 +129,39 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation do
 
     %{
       endpoint: accounting_endpoint,
+      direct_cleanup_bind: direct_cleanup_bind(request_options.runtime.direct_cleanup),
       transport: transport.transport,
-      correlation_id: RequestOptions.server_correlation_id(request_options),
+      correlation_id:
+        authorized_correlation_id ||
+          durable_request_correlation_id(request_options, payload),
       idempotency_key: request_metadata.idempotency_key,
       client_ip: request_metadata.client_ip,
       user_agent: request_metadata.user_agent,
       runtime_revocation_epoch: request_options.runtime.api_key_runtime_epoch,
+      native_client_retry_witness: request_options.native_client_retry_witness,
       api_key_policy: request_options.routing.api_key_policy,
       request_metadata:
         request_metadata_attrs(auth, payload, accounting_endpoint, request_options, route_state)
     }
   end
+
+  defp durable_request_correlation_id(
+         %RequestOptions{
+           transport: %{transport: "websocket"},
+           continuity: %{request_claim_key: request_claim_key}
+         },
+         _payload
+       )
+       when is_binary(request_claim_key),
+       do: request_claim_key
+
+  defp durable_request_correlation_id(%RequestOptions{} = request_options, payload),
+    do: RequestOptions.server_correlation_id(request_options, payload)
+
+  defp direct_cleanup_bind(nil), do: nil
+
+  defp direct_cleanup_bind(context),
+    do: fn request -> DirectCleanup.bind(context, request) end
 
   @spec reservation_snapshot_inputs(auth(), Model.t(), map(), String.t(), RequestOptions.t()) ::
           RouteState.reservation_snapshot_inputs()

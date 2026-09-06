@@ -61,6 +61,9 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity do
     end
   end
 
+  @spec previous_response_session_id(auth(), String.t(), DateTime.t()) :: Ecto.UUID.t() | nil
+  defdelegate previous_response_session_id(auth, previous_response_id, now), to: Aliases
+
   @spec previous_response_assignment_id(auth(), String.t(), DateTime.t()) ::
           Ecto.UUID.t() | nil
   defdelegate previous_response_assignment_id(auth, previous_response_id, now), to: Aliases
@@ -226,10 +229,30 @@ defmodule CodexPooler.Gateway.Persistence.SessionContinuity do
 
   @spec start_codex_turn(CodexSession.t(), Request.t(), opts()) :: turn_result()
   defdelegate start_codex_turn(session, request, opts), to: TurnLifecycle
+  @spec lock_codex_session_for_turn(CodexSession.t()) :: CodexSession.t()
+  defdelegate lock_codex_session_for_turn(session), to: TurnLifecycle
   @spec complete_codex_turn(complete_turn_result(), String.t(), term()) :: term()
   defdelegate complete_codex_turn(result, status, error_code), to: TurnLifecycle
+
+  @spec complete_codex_turn(
+          complete_turn_result(),
+          String.t(),
+          term(),
+          CodexPooler.Accounting.Attempt.t()
+        ) ::
+          term()
+  defdelegate complete_codex_turn(result, status, error_code, attempt), to: TurnLifecycle
   @spec mark_codex_turn_visible(request_ref()) :: :ok
   defdelegate mark_codex_turn_visible(request_ref), to: TurnLifecycle
+
+  @spec mark_codex_turn_visible(request_ref(), CodexPooler.Accounting.Attempt.t()) ::
+          :ok | {:error, :stale_generation}
+  defdelegate mark_codex_turn_visible(request_ref, attempt), to: TurnLifecycle
+
+  @doc false
+  @spec authorize_codex_turn_visibility(request_ref(), map()) ::
+          {:ok, TurnLifecycle.visibility_witness()} | {:error, :stale_generation}
+  defdelegate authorize_codex_turn_visibility(request_ref, attempt), to: TurnLifecycle
 
   @spec release_owner_lease(session_ref(), Ecto.UUID.t() | String.t(), String.t()) ::
           :ok | {:error, :stale_owner | :owner_unavailable}

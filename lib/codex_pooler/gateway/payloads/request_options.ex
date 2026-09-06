@@ -5,6 +5,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   alias __MODULE__.Continuity
   alias __MODULE__.FileBridgeContext
+  alias __MODULE__.NativeCompactionAdmission, as: NativeCompactionAdmissionContext
   alias __MODULE__.Normalization
   alias __MODULE__.OpenAICompatibility
   alias __MODULE__.PayloadContext
@@ -15,7 +16,14 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   alias __MODULE__.TimeoutConfig
   alias __MODULE__.Transport
   alias __MODULE__.UsageAuthentication
+  alias CodexPooler.Accounting.ClientRetry.OriginalWitness
+  alias CodexPooler.Gateway.Payloads.CompactionTrigger
+  alias CodexPooler.Gateway.Persistence.CodexSession
   alias CodexPooler.Gateway.RequestCompression.Metadata, as: RequestCompressionMetadata
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
+  alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerAdmissionControlV1
+  alias CodexPooler.Gateway.Transports.Websocket.WebsocketOwnerForwarder
 
   @enforce_keys [
     :request_metadata,
@@ -39,6 +47,10 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
             openai_compatibility: nil,
             usage_authentication: nil,
             file_bridge: nil,
+            native_compaction_admission: nil,
+            native_compaction_reservation: nil,
+            native_client_retry_witness: nil,
+            first_compact_collection: nil,
             extra: %{}
 
   @type t :: %__MODULE__{
@@ -52,6 +64,10 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
           openai_compatibility: OpenAICompatibility.t(),
           usage_authentication: UsageAuthentication.t(),
           file_bridge: FileBridgeContext.t(),
+          native_compaction_admission: NativeCompactionAdmissionContext.t() | nil,
+          native_compaction_reservation: map() | nil,
+          native_client_retry_witness: OriginalWitness.t() | nil,
+          first_compact_collection: NativeCompactionAdmission.FirstCompactCollection.t() | nil,
           extra: map()
         }
 
@@ -76,10 +92,15 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :client_ip,
     :codex_session,
     :codex_turn_id,
+    :semantic_turn_key,
+    :turn_claim_key,
+    :request_claim_key,
+    :replay_claim_digest,
     :collect_openai_image_stream,
     :collect_openai_response_stream,
     :chatgpt_account_id,
     :compaction_trigger_bridge?,
+    :compaction_input_mode,
     :compaction_projection_context,
     :compaction_result_mode,
     :compaction_result_transport,
@@ -116,6 +137,11 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :pool_timeout,
     :pool_timeout_ms,
     :reasoning_effort_snapshot,
+    :replay_authorization_binding,
+    :replay_lifecycle_binding,
+    :replay_generation,
+    :native_replay_binding,
+    :replay_provisional_token,
     :pool_upstream_assignment_id,
     :previous_response_id,
     :prompt_cache_controls_downgraded,
@@ -159,14 +185,17 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     :websocket_owner_lease_token,
     :websocket_owner_proxy_instance_id,
     :websocket_owner_session,
+    :websocket_delivery_mode,
     :user_agent,
     :websocket_writer,
     "authorization_header",
     "chatgpt_account_id",
+    "compaction_input_mode",
     "prompt_cache_controls_downgraded",
     "prompt_cache_key",
     "request_method",
-    "transport"
+    "transport",
+    "websocket_delivery_mode"
   ]
 
   @spec build(t() | map() | keyword(), String.t(), map()) :: t()
@@ -183,7 +212,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
       continuity: Continuity.build(opts),
       routing: routing(opts, endpoint, payload),
       timeout_config: TimeoutConfig.build(opts),
-      payload_context: payload_context(opts),
+      payload_context: payload_context(opts, payload),
       runtime: RuntimeContext.build(opts),
       openai_compatibility: OpenAICompatibility.build(opts),
       usage_authentication: usage_authentication(opts),
@@ -251,12 +280,19 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     %{options | request_metadata: struct!(options.request_metadata, updates)}
   end
 
-  @spec server_correlation_id(t()) :: Ecto.UUID.t()
+  @spec server_correlation_id(t()) :: String.t()
+  @spec server_correlation_id(t(), map()) :: String.t()
+  def server_correlation_id(%__MODULE__{} = options, payload) when is_map(payload),
+    do: server_correlation_id(options)
+
   def server_correlation_id(%__MODULE__{
         transport: %{transport: "websocket"},
-        continuity: %{codex_turn_id: turn_id}
+        continuity: %{
+          request_claim_key: request_claim_key,
+          turn_claim_key: turn_claim_key
+        }
       }) do
-    turn_id || Ecto.UUID.generate()
+    request_claim_key || turn_claim_key || Ecto.UUID.generate()
   end
 
   def server_correlation_id(%__MODULE__{}), do: Ecto.UUID.generate()
@@ -265,13 +301,402 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
   def websocket_request_correlation_id(%__MODULE__{
         request_metadata: %{request_id: request_id},
         transport: %{transport: "websocket"},
-        continuity: %{codex_turn_id: turn_id}
+        continuity: %{
+          request_claim_key: request_claim_key,
+          turn_claim_key: turn_claim_key
+        }
       }) do
-    turn_id || request_id || Ecto.UUID.generate()
+    request_claim_key || turn_claim_key || request_id || Ecto.UUID.generate()
   end
 
   def websocket_request_correlation_id(%__MODULE__{} = options),
     do: server_correlation_id(options)
+
+  @spec websocket_denial_correlation_id(t(), CodexPooler.Accounting.Request.t() | nil) ::
+          Ecto.UUID.t() | String.t()
+  def websocket_denial_correlation_id(
+        %__MODULE__{},
+        %CodexPooler.Accounting.Request{correlation_id: correlation_id}
+      )
+      when is_binary(correlation_id) and correlation_id != "",
+      do: correlation_id
+
+  def websocket_denial_correlation_id(
+        %__MODULE__{} = options,
+        %CodexPooler.Accounting.Request{}
+      ),
+      do: websocket_request_correlation_id(options)
+
+  def websocket_denial_correlation_id(
+        %__MODULE__{
+          transport: %{transport: "websocket"},
+          continuity: %{
+            request_claim_key: request_claim_key,
+            turn_claim_key: turn_claim_key
+          }
+        },
+        nil
+      )
+      when is_binary(request_claim_key) and request_claim_key != turn_claim_key,
+      do: request_claim_key
+
+  def websocket_denial_correlation_id(
+        %__MODULE__{
+          request_metadata: %{request_id: request_id},
+          transport: %{transport: "websocket"}
+        },
+        nil
+      )
+      when is_binary(request_id),
+      do: request_id
+
+  def websocket_denial_correlation_id(%__MODULE__{} = options, nil),
+    do: websocket_request_correlation_id(options)
+
+  @spec put_native_compaction_admission(
+          t(),
+          CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Capability.t(),
+          NativeCompactionAdmissionContext.owner(),
+          NativeCompactionAdmissionContext.lifecycle()
+        ) :: t()
+  def put_native_compaction_admission(%__MODULE__{} = options, capability, owner, lifecycle) do
+    case NativeCompactionAdmissionContext.new(capability, owner, lifecycle) do
+      {:ok, admission} -> %{options | native_compaction_admission: admission}
+      {:error, :invalid_input} -> options
+    end
+  end
+
+  @spec native_compaction_admission(t()) ::
+          {:ok, CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Capability.t(),
+           NativeCompactionAdmissionContext.owner(), NativeCompactionAdmissionContext.lifecycle()}
+          | :none
+  def native_compaction_admission(%__MODULE__{
+        native_compaction_admission: %NativeCompactionAdmissionContext{} = admission
+      }),
+      do: NativeCompactionAdmissionContext.unwrap(admission)
+
+  def native_compaction_admission(%__MODULE__{}), do: :none
+
+  @spec put_first_compact_collection(t(), NativeCompactionAdmission.FirstCompactCollection.t()) ::
+          t()
+  def put_first_compact_collection(
+        %__MODULE__{} = options,
+        %NativeCompactionAdmission.FirstCompactCollection{} = provenance
+      ),
+      do: %{options | first_compact_collection: provenance}
+
+  @spec acknowledge_native_compact_finalization(
+          t(),
+          <<_::256>>,
+          NativeCompactionAdmission.Binding.t(),
+          non_neg_integer()
+        ) :: :ok | {:error, atom()}
+  def acknowledge_native_compact_finalization(
+        %__MODULE__{} = options,
+        digest,
+        %NativeCompactionAdmission.Binding{} = binding,
+        expires_at_ms
+      ) do
+    with {:ok, source_phase, control_ref, owner} <- compact_confirmation_source(options),
+         :ok <- record_first_compact_collection_if_needed(options, owner) do
+      confirmation = %NativeCompactionAdmission.Confirmation{
+        source_phase: source_phase,
+        source_control_ref: control_ref,
+        binding: binding
+      }
+
+      acknowledge_compact_owner(owner, digest, confirmation, expires_at_ms)
+    end
+  end
+
+  defp record_first_compact_collection_if_needed(
+         %__MODULE__{
+           first_compact_collection:
+             %NativeCompactionAdmission.FirstCompactCollection{} =
+               provenance
+         },
+         {:direct, owner}
+       ),
+       do: UpstreamWebsocketSession.record_first_compact_collected(owner, provenance)
+
+  defp record_first_compact_collection_if_needed(
+         %__MODULE__{
+           first_compact_collection:
+             %NativeCompactionAdmission.FirstCompactCollection{} =
+               provenance
+         },
+         {:forwarded, session, lease_token, downstream, opts}
+       ) do
+    attrs = %{
+      version: 1,
+      action: :record_first_compact_collected,
+      downstream: Map.take(downstream, [:pid, :epoch, :correlation_id]),
+      binding: nil,
+      phase: nil,
+      control_ref: nil,
+      capability: nil,
+      disposition: nil,
+      success?: nil,
+      compaction_item_digest: nil,
+      confirmation: nil,
+      first_compact_collection: provenance,
+      expires_at_ms: nil,
+      now_ms: nil
+    }
+
+    with {:ok, control} <- WebsocketOwnerAdmissionControlV1.new(attrs),
+         {:ok, _result} <-
+           WebsocketOwnerForwarder.admission_control(session, lease_token, control, opts) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp record_first_compact_collection_if_needed(%__MODULE__{}, _owner), do: :ok
+
+  defp compact_confirmation_source(%__MODULE__{
+         native_compaction_admission: %NativeCompactionAdmissionContext{} = admission
+       }) do
+    with {:ok, capability, owner, _lifecycle} <-
+           NativeCompactionAdmissionContext.unwrap(admission) do
+      {:ok, :compact, NativeCompactionAdmission.control_ref(capability), owner}
+    end
+  end
+
+  defp compact_confirmation_source(
+         %__MODULE__{
+           first_compact_collection:
+             %NativeCompactionAdmission.FirstCompactCollection{} = provenance
+         } = options
+       ) do
+    {:ok, :first_full_history_compact, provenance.control_ref, first_compact_owner(options)}
+  end
+
+  defp compact_confirmation_source(%__MODULE__{}), do: {:error, :owner_unavailable}
+
+  defp first_compact_owner(%__MODULE__{
+         transport: %{upstream_websocket_session: owner, websocket_owner: %{enabled?: false}}
+       })
+       when is_pid(owner),
+       do: {:direct, owner}
+
+  defp first_compact_owner(%__MODULE__{transport: %{websocket_owner: owner}})
+       when is_map(owner) and owner.enabled? == true,
+       do: {:forwarded, owner.session, owner.lease_token, owner.downstream, owner.forwarder_opts}
+
+  defp acknowledge_compact_owner({:direct, owner}, digest, confirmation, expires_at_ms),
+    do:
+      UpstreamWebsocketSession.acknowledge_compact_finalization(
+        owner,
+        {:success, digest, confirmation, expires_at_ms}
+      )
+
+  defp acknowledge_compact_owner(
+         {:forwarded, session, lease_token, downstream, opts},
+         digest,
+         confirmation,
+         expires_at_ms
+       ) do
+    attrs = %{
+      version: 1,
+      action: :finalization_ack,
+      downstream: Map.take(downstream, [:pid, :epoch, :correlation_id]),
+      binding: nil,
+      phase: nil,
+      control_ref: nil,
+      capability: nil,
+      disposition: nil,
+      success?: true,
+      compaction_item_digest: digest,
+      confirmation: confirmation,
+      first_compact_collection: nil,
+      expires_at_ms: expires_at_ms,
+      now_ms: nil
+    }
+
+    with {:ok, control} <- WebsocketOwnerAdmissionControlV1.new(attrs),
+         {:ok, _result} <-
+           WebsocketOwnerForwarder.admission_control(session, lease_token, control, opts) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec native_compaction_admission_digest(t(), atom()) ::
+          {:ok, <<_::256>>} | :none | {:error, :invalid_input}
+  def native_compaction_admission_digest(
+        %__MODULE__{
+          native_compaction_admission: %NativeCompactionAdmissionContext{} = admission,
+          continuity: %{semantic_turn_key: semantic_turn_key, turn_claim_key: turn_claim_key}
+        } = options,
+        variant
+      ) do
+    with {:ok, serving_mode} <- admission_serving_mode(options),
+         {:ok, topology} <- admission_topology(options) do
+      NativeCompactionAdmissionContext.binding_digest(
+        admission,
+        semantic_turn_key,
+        turn_claim_key,
+        variant,
+        serving_mode,
+        topology
+      )
+    end
+  end
+
+  def native_compaction_admission_digest(%__MODULE__{}, _variant), do: :none
+
+  defp admission_serving_mode(%__MODULE__{
+         routing: %{model_serving_mode: nil},
+         native_compaction_admission: %NativeCompactionAdmissionContext{} = admission
+       }) do
+    with {:ok, capability, _owner, _lifecycle} <-
+           NativeCompactionAdmissionContext.unwrap(admission) do
+      {:ok, capability.binding.serving_mode}
+    end
+  end
+
+  defp admission_serving_mode(%__MODULE__{} = options) do
+    case model_serving_mode(options) do
+      "full" -> {:ok, :full}
+      "lite" -> {:ok, :lite}
+      _other -> {:error, :invalid_input}
+    end
+  end
+
+  defp admission_topology(%__MODULE__{
+         transport: %{
+           upstream_websocket_session: pid,
+           websocket_owner: %{enabled?: false}
+         }
+       })
+       when is_pid(pid),
+       do: {:ok, :direct}
+
+  defp admission_topology(%__MODULE__{
+         transport: %{
+           upstream_websocket_session: nil,
+           websocket_owner: %{
+             enabled?: true,
+             session: %CodexSession{},
+             lease_token: lease_token,
+             downstream: downstream,
+             downstream_epoch: epoch,
+             owner_instance_id: owner_instance_id
+           }
+         }
+       })
+       when is_binary(lease_token) and is_map(downstream) and is_integer(epoch) and epoch > 0 and
+              is_binary(owner_instance_id),
+       do: {:ok, :forwarded}
+
+  defp admission_topology(%__MODULE__{}), do: {:error, :invalid_input}
+
+  @spec mark_native_compaction_accounting_started(t(), non_neg_integer()) ::
+          :ok | {:error, atom()}
+  def mark_native_compaction_accounting_started(%__MODULE__{} = options, now_ms) do
+    case native_compaction_admission(options) do
+      {:ok, capability, owner, _lifecycle} ->
+        owner_admission_action(owner, :mark_accounting_started, capability, now_ms)
+
+      :none ->
+        :ok
+    end
+  end
+
+  @spec cancel_native_compaction_reservation(t(), non_neg_integer()) ::
+          :ok | {:error, atom()}
+  def cancel_native_compaction_reservation(%__MODULE__{} = options, now_ms) do
+    case native_compaction_admission(options) do
+      {:ok, capability, owner, _lifecycle} ->
+        owner_admission_action(owner, :cancel, capability, now_ms)
+
+      :none ->
+        :ok
+    end
+  end
+
+  @spec clear_native_compaction_admission(t()) :: :ok | {:error, atom()}
+  def clear_native_compaction_admission(%__MODULE__{} = options) do
+    case native_compaction_admission(options) do
+      {:ok, capability, {:direct, owner}, _lifecycle} ->
+        UpstreamWebsocketSession.clear_compaction_admission(owner, capability)
+
+      {:ok, capability, {:forwarded, session, lease_token, downstream, opts}, _lifecycle} ->
+        forwarded_admission_action(
+          session,
+          lease_token,
+          downstream,
+          opts,
+          :clear,
+          capability,
+          nil
+        )
+
+      :none ->
+        :ok
+    end
+  end
+
+  defp owner_admission_action({:direct, owner}, :mark_accounting_started, capability, now_ms),
+    do: UpstreamWebsocketSession.mark_compaction_accounting_started(owner, capability, now_ms)
+
+  defp owner_admission_action({:direct, owner}, :cancel, capability, now_ms),
+    do: UpstreamWebsocketSession.cancel_compaction_reservation(owner, capability, now_ms)
+
+  defp owner_admission_action(
+         {:forwarded, session, lease_token, downstream, opts},
+         action,
+         capability,
+         now_ms
+       ),
+       do:
+         forwarded_admission_action(
+           session,
+           lease_token,
+           downstream,
+           opts,
+           action,
+           capability,
+           now_ms
+         )
+
+  defp forwarded_admission_action(
+         session,
+         lease_token,
+         downstream,
+         opts,
+         action,
+         capability,
+         now_ms
+       ) do
+    attrs = %{
+      version: 1,
+      action: action,
+      downstream: Map.take(downstream, [:pid, :epoch, :correlation_id]),
+      binding: nil,
+      phase: nil,
+      control_ref: nil,
+      capability: capability,
+      disposition: if(action == :cancel, do: :pre_accounting),
+      success?: nil,
+      compaction_item_digest: nil,
+      confirmation: nil,
+      first_compact_collection: nil,
+      expires_at_ms: nil,
+      now_ms: now_ms
+    }
+
+    with {:ok, control} <- WebsocketOwnerAdmissionControlV1.new(attrs),
+         {:ok, _result} <-
+           WebsocketOwnerForwarder.admission_control(session, lease_token, control, opts) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   @spec client_request_metadata(t()) :: map()
   def client_request_metadata(%__MODULE__{} = options) do
@@ -322,6 +747,21 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     %{options | transport: Transport.update(options.transport, updates)}
   end
 
+  @spec connection_bound_compaction?(t()) :: boolean()
+  def connection_bound_compaction?(%__MODULE__{
+        payload_context: %{
+          compaction_trigger_bridge?: true
+        },
+        transport: %{
+          transport: "websocket",
+          websocket_delivery_mode: mode
+        }
+      })
+      when mode in [:collect_compaction, :collect_full_history],
+      do: true
+
+  def connection_bound_compaction?(%__MODULE__{}), do: false
+
   @spec put_continuity(t(), keyword()) :: t()
   def put_continuity(%__MODULE__{} = options, updates) when is_list(updates) do
     %{options | continuity: Continuity.update(options.continuity, updates)}
@@ -337,6 +777,10 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     %{options | runtime: RuntimeContext.update(options.runtime, updates)}
   end
 
+  @spec put_native_client_retry_witness(t(), OriginalWitness.t()) :: t()
+  def put_native_client_retry_witness(%__MODULE__{} = options, %OriginalWitness{} = witness),
+    do: %{options | native_client_retry_witness: witness}
+
   @spec capture_api_key_runtime_epoch(t(), CodexPooler.Access.auth_context()) :: t()
   def capture_api_key_runtime_epoch(
         %__MODULE__{runtime: %{api_key_runtime_epoch: nil}} = options,
@@ -350,7 +794,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
 
   @spec put_payload_context(t(), keyword()) :: t()
   def put_payload_context(%__MODULE__{} = options, updates) when is_list(updates) do
-    %{options | payload_context: struct!(options.payload_context, updates)}
+    %{options | payload_context: PayloadContext.update(options.payload_context, updates)}
   end
 
   @spec put_openai_compatibility(t(), keyword()) :: t()
@@ -518,8 +962,8 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptions do
     end
   end
 
-  defp payload_context(opts) do
-    PayloadContext.build(opts)
+  defp payload_context(opts, payload) do
+    PayloadContext.build(opts, CompactionTrigger.compaction_input_mode(payload))
   end
 
   defp usage_authentication(opts) do

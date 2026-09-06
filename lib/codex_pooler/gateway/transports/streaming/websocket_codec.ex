@@ -3,17 +3,25 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   Conversion helpers for Codex public websocket frames and upstream stream data.
   """
 
+  alias CodexPooler.Accounting.ClientRetry
   alias CodexPooler.Gateway.Contracts
   alias CodexPooler.Gateway.OpenAICompatibility.Error
   alias CodexPooler.Gateway.OpenAICompatibility.Responses
   alias CodexPooler.Gateway.Payloads.CompactionTrigger
+  alias CodexPooler.Gateway.Payloads.InputShape
   alias CodexPooler.Gateway.Payloads.PayloadNormalizer
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.RequestOptions.CompactionProjectionContext
+  alias CodexPooler.Gateway.Payloads.StrictSchema
   alias CodexPooler.Gateway.Payloads.ToolResultShape
-  alias CodexPooler.Gateway.Routing.SessionContinuity
+  alias CodexPooler.Gateway.Payloads.WebsocketTurnIdentity
   alias CodexPooler.Gateway.Runtime.Streaming.BufferTelemetry
+  alias CodexPooler.Gateway.Transports.Streaming.PreparedWebsocketFrame
+  alias CodexPooler.Gateway.Transports.Streaming.PreparedWebsocketFrame.Capability
+  alias CodexPooler.Gateway.Transports.Streaming.PreparedWebsocketFrame.ValidationClaim
+  alias CodexPooler.Gateway.Transports.Streaming.RuntimeAdmissionProof
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
+  alias CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission
   alias CodexPooler.RouteClass
 
   @type decode_error :: :invalid_json | :not_object
@@ -27,8 +35,14 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
           required(:request_options) => RequestOptions.t(),
           optional(:result_adapter) => (gateway_call_result() -> gateway_call_result())
         }
+  @type prepared_result :: {:ok, PreparedWebsocketFrame.t()} | {:error, gateway_error()}
 
   @stream_id_pattern ~r/\A[A-Za-z0-9_.-]+\z/
+  @prepared_frame_salt "gateway websocket prepared frame v1"
+  @prepared_validation_salt "gateway websocket payload validation v1"
+  @validation_claim_version 1
+  @native_validation_families [:strict_schema, :input_shape, :payload]
+  @canonical_metadata_key "x-codex-turn-metadata"
 
   @spec decode_payload(binary()) :: {:ok, map()} | {:error, decode_error()}
   def decode_payload(payload) when is_binary(payload) do
@@ -43,6 +57,682 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
         {:error, :invalid_json}
     end
   end
+
+  @spec prepare_frame(binary(), RequestOptions.t(), (binary() -> any())) :: prepared_result()
+  def prepare_frame(raw_payload, %RequestOptions{} = opts, push_frame)
+      when is_binary(raw_payload) and is_function(push_frame, 1) do
+    with {:ok, payload} <- decode_prepared_payload(raw_payload),
+         {:ok, prepared} <- prepare_decoded_frame(payload, opts, push_frame),
+         {:ok, completed_validations} <- validate_before_seal(prepared),
+         {:ok, prepared} <- put_native_request_claim(prepared) do
+      prepared = seal_prepared_frame(prepared, completed_validations)
+      notify_preparation_observer(prepared.request_options)
+      {:ok, prepared}
+    end
+  end
+
+  def prepare_frame(_raw_payload, _opts, _push_frame) do
+    {:error, Error.invalid_request("websocket message must be a text JSON frame")}
+  end
+
+  defp prepare_decoded_frame(%{"type" => "response.processed"} = payload, opts, _push_frame) do
+    with :ok <- validate_response_processed(payload) do
+      {:ok,
+       %PreparedWebsocketFrame{
+         variant: :response_processed,
+         endpoint: "/backend-api/codex/responses",
+         payload: payload,
+         request_options: websocket_request_options(opts, payload)
+       }}
+    end
+  end
+
+  defp prepare_decoded_frame(%{"type" => type}, _opts, _push_frame)
+       when type != "response.create" do
+    {:error, Error.invalid_request("websocket message type is not supported", "type")}
+  end
+
+  defp prepare_decoded_frame(%{"generate" => false} = payload, opts, _push_frame) do
+    with :ok <- validate_optional_model(payload) do
+      {:ok,
+       %PreparedWebsocketFrame{
+         variant: :prewarm,
+         endpoint: "/backend-api/codex/responses",
+         payload: payload,
+         request_options: websocket_request_options(opts, payload),
+         semantic_turn_key: nil,
+         turn_claim_key: nil
+       }}
+    end
+  end
+
+  defp prepare_decoded_frame(%{"type" => "response.create"} = payload, opts, push_frame) do
+    with :ok <- validate_native_response_model(payload, opts),
+         :ok <- validate_native_compaction_placement(payload, opts),
+         {:ok, coerced} <- coerce_request(payload, opts, push_frame) do
+      request_options = coerced.request_options
+
+      {:ok,
+       %PreparedWebsocketFrame{
+         variant: response_create_variant(opts),
+         endpoint: coerced.endpoint,
+         payload: prepared_payload(coerced.payload, opts),
+         request_options: request_options,
+         semantic_turn_key: request_options.continuity.semantic_turn_key,
+         turn_claim_key: request_options.continuity.turn_claim_key,
+         result_adapter: Map.get(coerced, :result_adapter)
+       }}
+    end
+  end
+
+  defp prepare_decoded_frame(
+         payload,
+         %RequestOptions{openai_compatibility: %{public_openai_responses_stream: false}} = opts,
+         push_frame
+       )
+       when not is_map_key(payload, "type") do
+    prepare_decoded_frame(Map.put(payload, "type", "response.create"), opts, push_frame)
+  end
+
+  defp prepare_decoded_frame(_payload, _opts, _push_frame) do
+    {:error, Error.invalid_request("websocket message type is not supported", "type")}
+  end
+
+  defp decode_prepared_payload(raw_payload) do
+    case decode_payload(raw_payload) do
+      {:ok, payload} ->
+        {:ok, payload}
+
+      {:error, :not_object} ->
+        {:error, Error.invalid_request("websocket message must be a JSON object")}
+
+      {:error, :invalid_json} ->
+        {:error, Error.invalid_request("websocket message must be valid JSON")}
+    end
+  end
+
+  defp validate_response_processed(%{"response_id" => response_id})
+       when is_binary(response_id) do
+    if String.trim(response_id) == "" do
+      {:error, Error.invalid_request("response.processed requires response_id")}
+    else
+      :ok
+    end
+  end
+
+  defp validate_response_processed(_payload),
+    do: {:error, Error.invalid_request("response.processed requires response_id")}
+
+  defp validate_native_response_model(
+         _payload,
+         %RequestOptions{openai_compatibility: %{public_openai_responses_stream: true}}
+       ),
+       do: :ok
+
+  defp validate_native_response_model(%{"model" => model}, %RequestOptions{})
+       when is_binary(model) do
+    if String.trim(model) == "" do
+      {:error, Error.invalid_request("model is required", "model")}
+    else
+      :ok
+    end
+  end
+
+  defp validate_native_response_model(_payload, %RequestOptions{}),
+    do: {:error, Error.invalid_request("model is required", "model")}
+
+  defp validate_optional_model(payload) do
+    case Map.fetch(payload, "model") do
+      :error ->
+        :ok
+
+      {:ok, model} when is_binary(model) ->
+        if String.trim(model) == "",
+          do: {:error, Error.invalid_request("model is required", "model")},
+          else: :ok
+
+      {:ok, _invalid} ->
+        {:error, Error.invalid_request("model is required", "model")}
+    end
+  end
+
+  defp validate_native_compaction_placement(
+         _payload,
+         %RequestOptions{openai_compatibility: %{public_openai_responses_stream: true}}
+       ),
+       do: :ok
+
+  defp validate_native_compaction_placement(%{"input" => input} = payload, %RequestOptions{})
+       when is_list(input) do
+    if Enum.any?(input, &match?(%{"type" => "compaction_trigger"}, &1)) do
+      case CompactionTrigger.prepare_bridge(
+             "/backend-api/codex/responses",
+             Map.put(payload, "stream", true)
+           ) do
+        {:error, reason} -> {:error, reason}
+        _valid -> :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp validate_native_compaction_placement(_payload, %RequestOptions{}), do: :ok
+
+  defp validate_before_seal(%PreparedWebsocketFrame{
+         variant: :native_response_create,
+         payload: payload,
+         request_options: request_options
+       }) do
+    with :ok <- StrictSchema.validate(payload),
+         :ok <- InputShape.validate(payload),
+         :ok <- PayloadNormalizer.validate(payload, request_options) do
+      {:ok, @native_validation_families}
+    end
+  end
+
+  defp validate_before_seal(%PreparedWebsocketFrame{}), do: {:ok, []}
+
+  @spec valid_prepared_frame?(PreparedWebsocketFrame.t()) :: boolean()
+  def valid_prepared_frame?(
+        %PreparedWebsocketFrame{
+          provenance: %{
+            frame: token,
+            validation: %ValidationClaim{} = validation_claim,
+            capability:
+              %Capability{server: capability_server, reference: capability_reference} = capability
+          }
+        } = prepared
+      )
+      when is_binary(token) and is_pid(capability_server) and is_reference(capability_reference) do
+    valid_signed_digest?(
+      @prepared_frame_salt,
+      token,
+      prepared_frame_digest(prepared, validation_claim, capability)
+    )
+  end
+
+  def valid_prepared_frame?(_prepared), do: false
+
+  @spec validate_prepared_frame(PreparedWebsocketFrame.t()) ::
+          :ok | {:error, :consumed | :invalid}
+  def validate_prepared_frame(
+        %PreparedWebsocketFrame{provenance: %{frame: frame_token, capability: capability}} =
+          prepared
+      ) do
+    if valid_prepared_frame?(prepared) do
+      Capability.validate(capability, frame_token)
+    else
+      {:error, :invalid}
+    end
+  end
+
+  def validate_prepared_frame(_prepared), do: {:error, :invalid}
+
+  @spec consume_prepared_frame(PreparedWebsocketFrame.t()) ::
+          {:ok, RuntimeAdmissionProof.t() | nil} | {:error, :consumed | :invalid}
+  def consume_prepared_frame(
+        %PreparedWebsocketFrame{
+          provenance: %{frame: frame_token, capability: capability}
+        } = prepared
+      ) do
+    if valid_prepared_frame?(prepared) do
+      Capability.consume_for_dispatch(capability, frame_token)
+    else
+      {:error, :invalid}
+    end
+  end
+
+  def consume_prepared_frame(_prepared), do: {:error, :invalid}
+
+  @doc false
+  @spec attach_native_compaction_admission(
+          PreparedWebsocketFrame.t(),
+          RequestOptions.NativeCompactionAdmission.t()
+        ) ::
+          {:ok, PreparedWebsocketFrame.t()}
+          | {:error, :already_attached | :consumed | :invalid | :binding_mismatch}
+  def attach_native_compaction_admission(
+        %PreparedWebsocketFrame{
+          native_replay_binding: nil,
+          request_options: %RequestOptions{native_compaction_admission: nil}
+        } = prepared,
+        %RequestOptions.NativeCompactionAdmission{} = admission
+      ) do
+    request_options =
+      prepared.request_options
+      |> RequestOptions.put_continuity(request_claim_key: prepared.turn_claim_key)
+      |> then(&%{&1 | native_compaction_admission: admission})
+
+    with true <- valid_prepared_frame?(prepared),
+         {:ok, _digest} <-
+           RequestOptions.native_compaction_admission_digest(request_options, prepared.variant),
+         :ok <- Capability.consume(prepared.provenance.capability, prepared.provenance.frame) do
+      {:ok,
+       seal_prepared_frame(
+         %{prepared | request_options: request_options},
+         prepared.provenance.validation.completed
+       )}
+    else
+      {:error, :invalid_input} ->
+        _consumed = Capability.consume(prepared.provenance.capability, prepared.provenance.frame)
+        {:error, :binding_mismatch}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      false ->
+        {:error, :invalid}
+    end
+  end
+
+  def attach_native_compaction_admission(
+        %PreparedWebsocketFrame{request_options: %RequestOptions{}},
+        %RequestOptions.NativeCompactionAdmission{}
+      ),
+      do: {:error, :already_attached}
+
+  def attach_native_compaction_admission(_prepared, _admission), do: {:error, :invalid}
+
+  @spec attach_native_replay_admission(
+          PreparedWebsocketFrame.t(),
+          NativeReplayAdmission.Binding.t()
+        ) ::
+          {:ok, PreparedWebsocketFrame.t()}
+          | {:error, :already_attached | :consumed | :invalid | :binding_mismatch}
+  def attach_native_replay_admission(
+        %PreparedWebsocketFrame{
+          variant: :native_response_create,
+          native_replay_binding: nil,
+          request_options: %RequestOptions{native_compaction_admission: nil}
+        } = prepared,
+        %NativeReplayAdmission.Binding{} = binding
+      ) do
+    with true <- valid_prepared_frame?(prepared),
+         true <- replay_binding_matches?(prepared, binding),
+         {:ok, _digest} <- NativeReplayAdmission.binding_digest(binding),
+         :ok <- Capability.consume(prepared.provenance.capability, prepared.provenance.frame) do
+      {:ok,
+       seal_prepared_frame(
+         %{prepared | native_replay_binding: binding},
+         prepared.provenance.validation.completed
+       )}
+    else
+      false -> {:error, :binding_mismatch}
+      {:error, :invalid_binding} -> {:error, :binding_mismatch}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  def attach_native_replay_admission(%PreparedWebsocketFrame{}, %NativeReplayAdmission.Binding{}),
+    do: {:error, :already_attached}
+
+  def attach_native_replay_admission(_prepared, _binding), do: {:error, :invalid}
+
+  @spec attach_replay_intent(PreparedWebsocketFrame.t(), map(), non_neg_integer()) ::
+          {:ok, PreparedWebsocketFrame.t()} | {:error, :consumed | :invalid}
+  def attach_replay_intent(%PreparedWebsocketFrame{} = prepared, authorization, generation)
+      when is_map(authorization) and is_integer(generation) and generation >= 0 do
+    request_options =
+      RequestOptions.put_runtime_context(prepared.request_options,
+        replay_authorization_binding: authorization,
+        replay_generation: generation
+      )
+
+    with true <- valid_prepared_frame?(prepared),
+         :ok <- Capability.consume(prepared.provenance.capability, prepared.provenance.frame) do
+      {:ok,
+       seal_prepared_frame(
+         %{prepared | request_options: request_options},
+         prepared.provenance.validation.completed
+       )}
+    else
+      false -> {:error, :invalid}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec attach_replay_intent(PreparedWebsocketFrame.t(), map(), map()) ::
+          {:ok, PreparedWebsocketFrame.t()} | {:error, :consumed | :invalid}
+  def attach_replay_intent(%PreparedWebsocketFrame{} = prepared, authorization, lifecycle)
+      when is_map(authorization) and is_map(lifecycle) do
+    generation = Map.get(lifecycle, :replay_generation)
+
+    if is_integer(generation) and generation >= 0 do
+      request_options =
+        RequestOptions.put_runtime_context(prepared.request_options,
+          replay_authorization_binding: authorization,
+          replay_lifecycle_binding: lifecycle,
+          replay_generation: generation
+        )
+
+      with true <- valid_prepared_frame?(prepared),
+           :ok <- Capability.consume(prepared.provenance.capability, prepared.provenance.frame) do
+        {:ok,
+         seal_prepared_frame(
+           %{prepared | request_options: request_options},
+           prepared.provenance.validation.completed
+         )}
+      else
+        false -> {:error, :invalid}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, :invalid}
+    end
+  end
+
+  def attach_replay_intent(_prepared, _authorization, _generation), do: {:error, :invalid}
+
+  @spec reseal_runtime_frame(PreparedWebsocketFrame.t(), RequestOptions.t()) ::
+          {:ok, PreparedWebsocketFrame.t()} | {:error, :consumed | :invalid}
+  def reseal_runtime_frame(%PreparedWebsocketFrame{} = prepared, %RequestOptions{} = options) do
+    with true <- valid_prepared_frame?(prepared),
+         :ok <- Capability.consume(prepared.provenance.capability, prepared.provenance.frame) do
+      {:ok,
+       seal_prepared_frame(
+         %{prepared | request_options: options},
+         prepared.provenance.validation.completed
+       )}
+    else
+      false -> {:error, :invalid}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec replay_eligible?(PreparedWebsocketFrame.t()) :: boolean()
+  def replay_eligible?(%PreparedWebsocketFrame{
+        variant: :native_response_create,
+        semantic_turn_key: semantic,
+        replay_claim_digest: replay,
+        payload: payload,
+        request_options:
+          %RequestOptions{
+            transport: %{websocket_owner: %{enabled?: true}, upstream_websocket_bridge?: false},
+            openai_compatibility: %{public_openai_responses_stream: false}
+          } = options
+      })
+      when is_binary(semantic) and byte_size(semantic) == 32 and
+             is_binary(replay) and byte_size(replay) == 32 do
+    ordinary_native_tool_continuation?(payload, options) or replay_request_kind?(payload, options)
+  end
+
+  def replay_eligible?(%PreparedWebsocketFrame{}), do: false
+
+  @spec prevalidated_request?(
+          map(),
+          RequestOptions.t(),
+          ValidationClaim.t() | term(),
+          ValidationClaim.family()
+        ) :: boolean()
+  def prevalidated_request?(
+        payload,
+        %RequestOptions{} = request_options,
+        %ValidationClaim{
+          version: @validation_claim_version,
+          completed: completed,
+          token: token
+        },
+        family
+      )
+      when is_map(payload) and is_list(completed) and is_binary(token) and
+             family in @native_validation_families do
+    completed == @native_validation_families and family in completed and
+      valid_signed_digest?(
+        @prepared_validation_salt,
+        token,
+        validation_claim_digest(payload, request_options, completed)
+      )
+  end
+
+  def prevalidated_request?(_payload, %RequestOptions{}, _claim, _family), do: false
+
+  defp seal_prepared_frame(%PreparedWebsocketFrame{} = prepared, completed_validations)
+       when completed_validations in [[], @native_validation_families] do
+    validation_claim = %ValidationClaim{
+      version: @validation_claim_version,
+      completed: completed_validations,
+      token:
+        sign_digest(
+          @prepared_validation_salt,
+          validation_claim_digest(
+            prepared.payload,
+            prepared.request_options,
+            completed_validations
+          )
+        )
+    }
+
+    capability = Capability.issue()
+
+    frame_token =
+      sign_digest(
+        @prepared_frame_salt,
+        prepared_frame_digest(prepared, validation_claim, capability)
+      )
+
+    binding_digest = runtime_admission_binding_digest(prepared)
+
+    :ok =
+      Capability.seal(capability, frame_token, binding_digest, runtime_admission_kind(prepared))
+
+    %{
+      prepared
+      | provenance: %{frame: frame_token, validation: validation_claim, capability: capability}
+    }
+  end
+
+  defp prepared_frame_digest(
+         %PreparedWebsocketFrame{} = prepared,
+         validation_claim,
+         capability
+       ) do
+    {capability_server, capability_reference} = Capability.digest_identity(capability)
+
+    digest_term({
+      prepared.variant,
+      prepared.endpoint,
+      prepared.payload,
+      prepared.semantic_turn_key,
+      prepared.turn_claim_key,
+      prepared.replay_claim_digest,
+      prepared.native_replay_binding,
+      prepared.native_client_retry_witness,
+      prepared.request_options.continuity.request_claim_key,
+      prepared.request_options.continuity.replay_claim_digest,
+      prepared_session_authorization(prepared.request_options),
+      prepared.request_options.runtime.api_key_runtime_epoch,
+      prepared.request_options.native_client_retry_witness,
+      prepared.request_options.runtime.replay_authorization_binding,
+      prepared.request_options.runtime.replay_lifecycle_binding,
+      prepared.request_options.runtime.replay_generation,
+      prepared.request_options.native_compaction_admission,
+      prepared.request_options.native_compaction_reservation,
+      prepared.request_options.transport.websocket_delivery_mode,
+      validation_claim,
+      capability_server,
+      capability_reference,
+      is_function(prepared.result_adapter, 1)
+    })
+  end
+
+  defp prepared_session_authorization(%RequestOptions{
+         continuity: %{
+           codex_session: %{
+             id: session_id,
+             pool_id: pool_id,
+             api_key_id: api_key_id,
+             status: status
+           }
+         }
+       }) do
+    {session_id, pool_id, api_key_id, status}
+  end
+
+  defp prepared_session_authorization(%RequestOptions{continuity: %{codex_session: nil}}),
+    do: nil
+
+  defp prepared_session_authorization(%RequestOptions{continuity: %{codex_session: session}}),
+    do: session
+
+  defp validation_claim_digest(payload, %RequestOptions{} = request_options, completed) do
+    digest_term({
+      @validation_claim_version,
+      completed,
+      payload,
+      request_options.transport.transport,
+      request_options.transport.upstream_endpoint,
+      request_options.transport.websocket_delivery_mode,
+      request_options.payload_context,
+      request_options.native_compaction_admission,
+      request_options.native_compaction_reservation,
+      RequestOptions.use_responses_lite?(request_options),
+      RequestOptions.OpenAICompatibility.translated_responses_surface?(
+        request_options.openai_compatibility
+      )
+    })
+  end
+
+  @spec runtime_admission_binding_digest(PreparedWebsocketFrame.t()) :: <<_::256>> | nil
+  def runtime_admission_binding_digest(%PreparedWebsocketFrame{} = prepared) do
+    case prepared.native_replay_binding do
+      %NativeReplayAdmission.Binding{} = binding ->
+        case NativeReplayAdmission.binding_digest(binding) do
+          {:ok, digest} -> digest
+          {:error, :invalid_binding} -> :crypto.hash(:sha256, "invalid_native_replay_admission")
+        end
+
+      nil ->
+        case RequestOptions.native_compaction_admission_digest(
+               prepared.request_options,
+               prepared.variant
+             ) do
+          {:ok, digest} -> digest
+          :none -> nil
+          {:error, :invalid_input} -> :crypto.hash(:sha256, "invalid_native_compaction_admission")
+        end
+    end
+  end
+
+  defp runtime_admission_kind(%PreparedWebsocketFrame{
+         native_replay_binding: %NativeReplayAdmission.Binding{}
+       }),
+       do: :native_replay
+
+  defp runtime_admission_kind(%PreparedWebsocketFrame{
+         request_options: %{native_compaction_admission: admission}
+       })
+       when not is_nil(admission), do: :native_compaction
+
+  defp runtime_admission_kind(%PreparedWebsocketFrame{}), do: nil
+
+  defp replay_binding_matches?(prepared, binding),
+    do:
+      digest_match?(prepared.semantic_turn_key, binding.semantic_turn_digest) and
+        digest_match?(prepared.replay_claim_digest, binding.replay_claim_digest)
+
+  defp digest_match?(left, right)
+       when is_binary(left) and is_binary(right) and byte_size(left) == 32 and
+              byte_size(right) == 32,
+       do: Plug.Crypto.secure_compare(left, right)
+
+  defp digest_match?(_left, _right), do: false
+
+  defp digest_term(term) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(term, [:deterministic]))
+  end
+
+  defp sign_digest(salt, digest) do
+    :crypto.mac(:hmac, :sha256, provenance_key(salt), digest)
+  end
+
+  defp valid_signed_digest?(salt, token, expected_digest) do
+    expected_token = sign_digest(salt, expected_digest)
+
+    byte_size(token) == byte_size(expected_token) and
+      Plug.Crypto.secure_compare(token, expected_token)
+  end
+
+  defp provenance_key(salt) do
+    :crypto.hash(:sha256, secret_key_base() <> <<0>> <> salt)
+  end
+
+  defp secret_key_base do
+    :codex_pooler
+    |> Application.fetch_env!(CodexPoolerWeb.Endpoint)
+    |> Keyword.fetch!(:secret_key_base)
+  end
+
+  defp response_create_variant(%RequestOptions{
+         openai_compatibility: %{public_openai_responses_stream: true}
+       }),
+       do: :public_response_create
+
+  defp response_create_variant(%RequestOptions{}), do: :native_response_create
+
+  defp prepared_payload(
+         payload,
+         %RequestOptions{openai_compatibility: %{public_openai_responses_stream: true}}
+       ),
+       do: payload
+
+  defp prepared_payload(payload, %RequestOptions{}) do
+    payload
+    |> Map.drop(["turn_id", "request_id"])
+    |> scrub_client_metadata_turn_id()
+  end
+
+  defp scrub_client_metadata_turn_id(%{"client_metadata" => client_metadata} = payload)
+       when is_map(client_metadata) do
+    client_metadata =
+      client_metadata
+      |> Map.delete("turn_id")
+      |> scrub_canonical_metadata_turn_id()
+
+    Map.put(payload, "client_metadata", client_metadata)
+  end
+
+  defp scrub_client_metadata_turn_id(payload), do: payload
+
+  defp scrub_canonical_metadata_turn_id(%{"x-codex-turn-metadata" => metadata} = client_metadata)
+       when is_map(metadata) do
+    Map.put(client_metadata, "x-codex-turn-metadata", Map.delete(metadata, "turn_id"))
+  end
+
+  defp scrub_canonical_metadata_turn_id(%{"x-codex-turn-metadata" => encoded} = client_metadata)
+       when is_binary(encoded) do
+    case Jason.decode(encoded) do
+      {:ok, metadata} when is_map(metadata) ->
+        Map.put(
+          client_metadata,
+          "x-codex-turn-metadata",
+          metadata |> Map.delete("turn_id") |> Jason.encode!()
+        )
+
+      _validated_earlier ->
+        client_metadata
+    end
+  end
+
+  defp scrub_canonical_metadata_turn_id(client_metadata), do: client_metadata
+
+  defp websocket_request_options(%RequestOptions{} = opts, payload) do
+    opts
+    |> RequestOptions.for_payload("/backend-api/codex/responses", payload)
+    |> RequestOptions.put_transport(
+      transport: "websocket",
+      upstream_endpoint: "/backend-api/codex/responses",
+      route_class: RouteClass.proxy_websocket()
+    )
+  end
+
+  defp notify_preparation_observer(%RequestOptions{
+         extra: %{websocket_preparation_observer: observer}
+       })
+       when is_function(observer, 0),
+       do: observer.()
+
+  defp notify_preparation_observer(%RequestOptions{}), do: :ok
 
   @spec stream_id(term()) :: stream_id_result()
   def stream_id(payload) when is_binary(payload) do
@@ -62,6 +752,8 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   def stream_id(_payload), do: :omitted
 
   @spec deliver_result(map(), (binary() -> any())) :: deliver_result()
+  def deliver_result(%{stale_generation?: true}, _push_frame), do: :ok
+
   def deliver_result(%{websocket_stream: stream}, _push_frame) do
     stream.()
     |> normalize_websocket_stream_result()
@@ -116,22 +808,189 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   @spec ack_result() :: map()
   def ack_result, do: %{websocket_messages: []}
 
+  @spec response_writer(RequestOptions.t(), (binary() -> any())) ::
+          nil | (binary() -> any())
+  def response_writer(
+        %RequestOptions{transport: %{websocket_writer: nil}},
+        _push_frame
+      ),
+      do: nil
+
+  def response_writer(%RequestOptions{} = request_options, push_frame)
+      when is_function(push_frame, 1),
+      do: namespace_restoring_writer(push_frame, request_options)
+
   @spec coerce_request(map(), RequestOptions.t(), (binary() -> any())) ::
           {:ok, coerced_request()} | {:error, gateway_error()}
   def coerce_request(payload, %RequestOptions{} = opts, push_frame)
       when is_map(payload) and is_function(push_frame, 1) do
-    with {:ok, coerced} <- coerce_response_payload(payload, opts) do
+    with {:ok, coerced} <- coerce_response_payload(payload, opts),
+         {:ok, turn_identity} <- native_turn_identity(payload, opts) do
       request_options =
         coerced
         |> request_options(push_frame)
         |> maybe_put_backend_turn_state(coerced.endpoint, coerced.payload)
-        |> RequestOptions.put_continuity(
-          codex_turn_id: SessionContinuity.websocket_turn_id(coerced.payload)
-        )
+        |> put_native_turn_identity(turn_identity)
 
       {:ok, %{coerced | request_options: request_options}}
     end
   end
+
+  defp native_turn_identity(
+         _payload,
+         %RequestOptions{openai_compatibility: %{public_openai_responses_stream: true}}
+       ),
+       do: {:ok, :missing}
+
+  defp native_turn_identity(%{"type" => "response.create"} = payload, %RequestOptions{} = opts) do
+    case WebsocketTurnIdentity.resolve(payload, codex_session_id(opts)) do
+      {:ok, identity} -> {:ok, identity}
+      :missing -> {:ok, :missing}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp native_turn_identity(_payload, %RequestOptions{}), do: {:ok, :missing}
+
+  defp codex_session_id(%RequestOptions{continuity: %{codex_session: %{id: id}}})
+       when is_binary(id),
+       do: id
+
+  defp codex_session_id(%RequestOptions{}), do: nil
+
+  defp put_native_turn_identity(%RequestOptions{} = request_options, :missing),
+    do: request_options
+
+  defp put_native_turn_identity(%RequestOptions{} = request_options, identity) do
+    RequestOptions.put_continuity(request_options,
+      semantic_turn_key: identity.semantic_turn_key,
+      turn_claim_key: identity.turn_claim_key
+    )
+  end
+
+  defp put_native_request_claim(
+         %PreparedWebsocketFrame{
+           variant: :native_response_create,
+           payload: payload,
+           request_options: %RequestOptions{} = request_options,
+           semantic_turn_key: semantic_turn_key,
+           turn_claim_key: turn_claim_key
+         } = prepared
+       )
+       when is_binary(semantic_turn_key) and is_binary(turn_claim_key) do
+    request_claim_key =
+      if ordinary_native_tool_continuation?(payload, request_options) do
+        WebsocketTurnIdentity.request_claim_key(semantic_turn_key, payload)
+      else
+        turn_claim_key
+      end
+
+    case WebsocketTurnIdentity.replay_claim_digest(semantic_turn_key, payload) do
+      {:ok, replay_claim_digest} ->
+        request_options =
+          RequestOptions.put_continuity(request_options,
+            request_claim_key: request_claim_key,
+            replay_claim_digest: replay_claim_digest
+          )
+
+        {request_options, witness} =
+          case ClientRetry.original_witness(
+                 replay_claim_digest,
+                 request_options.runtime.api_key_runtime_epoch
+               ) do
+            {:ok, witness} ->
+              {RequestOptions.put_native_client_retry_witness(request_options, witness), witness}
+
+            {:error, :invalid_witness} ->
+              {request_options, nil}
+          end
+
+        {:ok,
+         %{
+           prepared
+           | request_options: request_options,
+             replay_claim_digest: replay_claim_digest,
+             native_client_retry_witness: witness
+         }}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp put_native_request_claim(%PreparedWebsocketFrame{} = prepared), do: {:ok, prepared}
+
+  defp ordinary_native_tool_continuation?(
+         %{"input" => input} = payload,
+         %RequestOptions{
+           native_compaction_admission: nil,
+           payload_context: %{compaction_trigger_bridge?: false},
+           openai_compatibility: %{public_openai_responses_stream: false}
+         }
+       )
+       when is_list(input) do
+    ordinary_native_turn_continuation?(payload) and ToolResultShape.any?(input) and
+      not native_final_compaction?(input)
+  end
+
+  defp ordinary_native_tool_continuation?(_payload, %RequestOptions{}), do: false
+
+  defp ordinary_native_turn_continuation?(
+         %{
+           "client_metadata" => %{"x-codex-turn-metadata" => metadata}
+         } = payload
+       ),
+       do:
+         match?(%{"request_kind" => "turn"}, canonical_metadata_map(metadata)) or
+           previous_response_present?(payload)
+
+  defp ordinary_native_turn_continuation?(payload), do: previous_response_present?(payload)
+
+  defp native_final_compaction?(input) do
+    Enum.any?(
+      input,
+      &match?(%{"type" => type} when type in ["compaction", "compaction_summary"], &1)
+    )
+  end
+
+  defp previous_response_present?(%{"previous_response_id" => value}) when is_binary(value),
+    do: String.trim(value) != ""
+
+  defp previous_response_present?(_payload), do: false
+
+  defp canonical_metadata_map(metadata) when is_map(metadata), do: metadata
+
+  defp canonical_metadata_map(metadata) when is_binary(metadata) do
+    case Jason.decode(metadata) do
+      {:ok, decoded} when is_map(decoded) -> decoded
+      _invalid -> %{}
+    end
+  end
+
+  defp canonical_metadata_map(_metadata), do: %{}
+
+  defp replay_request_kind?(
+         %{"client_metadata" => %{@canonical_metadata_key => metadata}},
+         %RequestOptions{} = options
+       ) do
+    case canonical_metadata_map(metadata) do
+      %{"request_kind" => kind} when kind in ["turn", "compaction"] ->
+        not valid_final_compaction_admission?(options)
+
+      _other ->
+        false
+    end
+  end
+
+  defp replay_request_kind?(_payload, %RequestOptions{}), do: false
+
+  defp valid_final_compaction_admission?(%RequestOptions{
+         native_compaction_admission:
+           %RequestOptions.NativeCompactionAdmission{capability: %{phase: :final}} = admission
+       }),
+       do: RequestOptions.NativeCompactionAdmission.valid?(admission)
+
+  defp valid_final_compaction_admission?(%RequestOptions{}), do: false
 
   defp namespace_restoring_writer(
          push_frame,
@@ -319,10 +1178,28 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
 
   defp prepare_native_compaction_bridge(%{payload: payload} = coerced) do
     result_transport = CompactionTrigger.compaction_result_transport(payload)
+    coerced = put_native_compaction_input_mode(coerced)
 
     with {:ok, turn_state} <- validated_native_compaction_turn_state(payload) do
       prepare_native_compaction_bridge(coerced, result_transport, turn_state)
     end
+  end
+
+  defp put_native_compaction_input_mode(
+         %{
+           payload: payload,
+           request_options: %RequestOptions{payload_context: payload_context} = request_options
+         } = coerced
+       ) do
+    request_options = %{
+      request_options
+      | payload_context: %{
+          payload_context
+          | compaction_input_mode: CompactionTrigger.compaction_input_mode(payload)
+        }
+    }
+
+    %{coerced | request_options: request_options}
   end
 
   defp prepare_native_compaction_bridge(coerced, result_transport, turn_state) do
@@ -339,12 +1216,7 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
         request_options =
           coerced.request_options
           |> RequestOptions.retarget("/backend-api/codex/responses/compact", compact_payload)
-          |> RequestOptions.put_transport(
-            transport: "http_compact_json",
-            upstream_endpoint: "/backend-api/codex/responses",
-            route_class: RouteClass.proxy_compact(),
-            websocket_writer: nil
-          )
+          |> put_native_compaction_transport(result_transport)
           |> RequestOptions.put_payload_context(
             compaction_trigger_bridge?: true,
             compaction_result_transport: result_transport,
@@ -371,6 +1243,40 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
     end
   end
 
+  defp put_native_compaction_transport(
+         %RequestOptions{
+           payload_context: %{compaction_input_mode: :incremental}
+         } = request_options,
+         _result_transport
+       ) do
+    RequestOptions.put_transport(request_options,
+      transport: "websocket",
+      upstream_endpoint: "/backend-api/codex/responses",
+      route_class: RouteClass.proxy_compact(),
+      websocket_writer: nil,
+      websocket_delivery_mode: :collect_compaction
+    )
+  end
+
+  defp put_native_compaction_transport(%RequestOptions{} = request_options, result_transport) do
+    if result_transport == :sse do
+      RequestOptions.put_transport(request_options,
+        transport: "websocket",
+        upstream_endpoint: "/backend-api/codex/responses",
+        route_class: RouteClass.proxy_compact(),
+        websocket_writer: nil,
+        websocket_delivery_mode: :collect_full_history
+      )
+    else
+      RequestOptions.put_transport(request_options,
+        transport: "http_compact_json",
+        upstream_endpoint: "/backend-api/codex/responses",
+        route_class: RouteClass.proxy_compact(),
+        websocket_writer: nil
+      )
+    end
+  end
+
   defp validated_native_compaction_turn_state(payload) do
     case PayloadNormalizer.validate_backend_compaction_turn_state(payload) do
       :passthrough -> {:ok, nil}
@@ -393,26 +1299,24 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
   end
 
   defp prepare_public_compaction_bridge(%{payload: payload} = coerced) do
+    coerced = put_public_compaction_input_mode(coerced)
+
     case CompactionTrigger.prepare_bridge("/v1/responses", payload) do
       :passthrough ->
         {:ok, coerced}
 
       {:ok, compact_payload} ->
         downstream_payload = coerced.payload
-        result_transport = CompactionTrigger.compaction_result_transport(payload)
+        compact_payload = project_public_compaction_payload(coerced, compact_payload)
 
         request_options =
           coerced.request_options
           |> RequestOptions.retarget("/backend-api/codex/responses/compact", compact_payload)
-          |> RequestOptions.put_transport(
-            transport: "http_compact_json",
-            upstream_endpoint: "/backend-api/codex/responses",
-            route_class: RouteClass.proxy_compact(),
-            websocket_writer: nil
-          )
+          |> put_public_compaction_transport()
           |> RequestOptions.put_payload_context(
             compaction_trigger_bridge?: true,
-            compaction_result_transport: result_transport,
+            compaction_result_transport: public_compaction_result_transport(coerced),
+            compaction_result_mode: :public_websocket,
             compaction_projection_context:
               CompactionProjectionContext.new(downstream_payload, compact_payload)
           )
@@ -429,6 +1333,65 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  defp put_public_compaction_input_mode(
+         %{
+           payload: payload,
+           request_options: %RequestOptions{payload_context: payload_context} = request_options
+         } = coerced
+       ) do
+    request_options = %{
+      request_options
+      | payload_context: %{
+          payload_context
+          | compaction_input_mode: CompactionTrigger.compaction_input_mode(payload)
+        }
+    }
+
+    %{coerced | request_options: request_options}
+  end
+
+  defp project_public_compaction_payload(
+         %{
+           request_options: %RequestOptions{
+             payload_context: %{compaction_input_mode: :incremental}
+           }
+         },
+         compact_payload
+       ) do
+    CompactionTrigger.project_responses_payload(compact_payload, :sse)
+  end
+
+  defp project_public_compaction_payload(_coerced, compact_payload), do: compact_payload
+
+  defp public_compaction_result_transport(%{
+         request_options: %RequestOptions{payload_context: %{compaction_input_mode: :incremental}}
+       }),
+       do: :sse
+
+  defp public_compaction_result_transport(_coerced), do: :buffered
+
+  defp put_public_compaction_transport(
+         %RequestOptions{payload_context: %{compaction_input_mode: :incremental}} =
+           request_options
+       ) do
+    RequestOptions.put_transport(request_options,
+      transport: "websocket",
+      upstream_endpoint: "/backend-api/codex/responses",
+      route_class: RouteClass.proxy_compact(),
+      websocket_writer: nil,
+      websocket_delivery_mode: :collect_compaction
+    )
+  end
+
+  defp put_public_compaction_transport(%RequestOptions{} = request_options) do
+    RequestOptions.put_transport(request_options,
+      transport: "http_compact_json",
+      upstream_endpoint: "/backend-api/codex/responses",
+      route_class: RouteClass.proxy_compact(),
+      websocket_writer: nil
+    )
   end
 
   defp maybe_put_backend_turn_state(
@@ -473,10 +1436,23 @@ defmodule CodexPooler.Gateway.Transports.Streaming.WebsocketCodec do
            payload
        )
        when is_binary(previous_response_id) do
-    payload
-    |> Map.get("input")
-    |> ToolResultShape.items()
-    |> Enum.any?()
+    if String.trim(previous_response_id) == "" do
+      false
+    else
+      case CompactionTrigger.prepare_bridge("/backend-api/codex/responses", payload) do
+        {:ok, _compact_payload} ->
+          true
+
+        :passthrough ->
+          payload
+          |> Map.get("input")
+          |> ToolResultShape.items()
+          |> Enum.any?()
+
+        {:error, _reason} ->
+          false
+      end
+    end
   end
 
   defp continuity_ordered_payload(_payload), do: false

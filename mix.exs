@@ -5,7 +5,7 @@ defmodule CodexPooler.MixProject do
     [
       app: :codex_pooler,
       # x-release-please-start-version
-      version: "0.6.11",
+      version: "0.7.0",
       # x-release-please-end
       elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
@@ -63,10 +63,10 @@ defmodule CodexPooler.MixProject do
       {:postgrex, "== 0.22.4"},
       {:phoenix_html, "== 4.3.0"},
       {:phoenix_live_reload, "== 1.7.0", only: :dev},
-      {:phoenix_live_view, "== 1.2.10"},
+      {:phoenix_live_view, "== 1.2.11"},
       {:lazy_html, "== 0.1.12", only: :test},
-      {:oban, "== 2.24.0"},
-      {:phoenix_live_dashboard, "== 0.9.0", only: :dev},
+      {:oban, "== 2.24.1"},
+      {:phoenix_live_dashboard, "== 0.9.1", only: :dev},
       {:esbuild, "== 0.10.0", runtime: Mix.env() == :dev},
       {:tailwind, "== 0.5.1", runtime: Mix.env() == :dev},
       {:heroicons,
@@ -80,7 +80,7 @@ defmodule CodexPooler.MixProject do
       {:gen_smtp, "== 1.3.0"},
       {:req, "== 0.7.4"},
       {:finch, "== 0.23.0"},
-      {:mint, "== 1.9.3"},
+      {:mint, "== 1.10.0"},
       {:mint_web_socket, "== 1.0.6"},
       {:telemetry_metrics, "== 1.2.0"},
       {:telemetry_metrics_prometheus_core, "== 1.2.1"},

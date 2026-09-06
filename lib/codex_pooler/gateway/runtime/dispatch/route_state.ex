@@ -8,6 +8,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
   alias CodexPooler.Gateway.Routing.CircuitState
   alias CodexPooler.Pools.RoutingSettings
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
 
@@ -19,10 +20,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
     effective_model_serving_modes: %{},
     candidate_snapshots: [],
     saved_reset_auto_cohort: [],
+    saved_reset_auto_capacity: [],
     candidates: [],
     routing_settings: nil,
-    quota_window_snapshots: %{},
-    quota_snapshot_at: nil,
+    quota_snapshots: %{},
     circuit_snapshots: %{},
     circuit_eligibility_snapshots: %{},
     reservation_snapshot_inputs: nil,
@@ -33,7 +34,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
   @type candidate :: CandidateEligibility.candidate()
   @type auth :: CodexPooler.Access.auth_context()
   @type visible_model_context :: %{optional(atom()) => term()}
-  @type quota_window_snapshots :: %{optional(Ecto.UUID.t()) => [AccountQuotaWindow.t()]}
+  @type quota_snapshots :: RoutingQuotaSnapshot.snapshot_map()
   @type circuit_snapshot :: CircuitState.eligibility_snapshot() | boolean()
   @type circuit_snapshots :: %{optional(Ecto.UUID.t()) => circuit_snapshot()}
   @type reservation_snapshot_inputs :: %{
@@ -59,10 +60,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
           effective_model_serving_modes: effective_model_serving_modes(),
           candidate_snapshots: [candidate()],
           saved_reset_auto_cohort: [candidate()],
+          saved_reset_auto_capacity: [candidate()],
           candidates: [candidate()],
           routing_settings: RoutingSettings.t() | nil,
-          quota_window_snapshots: quota_window_snapshots(),
-          quota_snapshot_at: DateTime.t() | nil,
+          quota_snapshots: quota_snapshots(),
           circuit_snapshots: circuit_snapshots(),
           circuit_eligibility_snapshots: circuit_snapshots(),
           reservation_snapshot_inputs: reservation_snapshot_inputs() | nil,
@@ -78,9 +79,9 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
           optional(:effective_model_serving_modes) => effective_model_serving_modes(),
           optional(:candidate_snapshots) => [candidate()],
           optional(:saved_reset_auto_cohort) => [candidate()],
+          optional(:saved_reset_auto_capacity) => [candidate()],
           optional(:routing_settings) => RoutingSettings.t() | nil,
-          optional(:quota_window_snapshots) => quota_window_snapshots(),
-          optional(:quota_snapshot_at) => DateTime.t() | nil,
+          optional(:quota_snapshots) => quota_snapshots(),
           optional(:circuit_snapshots) => circuit_snapshots(),
           optional(:circuit_eligibility_snapshots) => circuit_snapshots(),
           optional(:reservation_snapshot_inputs) => reservation_snapshot_inputs() | nil,
@@ -99,6 +100,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
       effective_model_serving_modes: Map.get(attrs, :effective_model_serving_modes, %{}),
       candidate_snapshots: Map.get(attrs, :candidate_snapshots, candidates),
       saved_reset_auto_cohort: Map.get(attrs, :saved_reset_auto_cohort, candidates),
+      saved_reset_auto_capacity: Map.get(attrs, :saved_reset_auto_capacity, candidates),
       candidates: candidates,
       routing_settings: Map.get(attrs, :routing_settings),
       circuit_snapshots: circuit_snapshots(attrs),
@@ -107,10 +109,7 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
       reset_probe: Map.get(attrs, :reset_probe),
       extensions: Map.get(attrs, :extensions, %{})
     }
-    |> put_quota_window_snapshot(
-      Map.get(attrs, :quota_window_snapshots, %{}),
-      Map.get(attrs, :quota_snapshot_at)
-    )
+    |> put_quota_snapshots(Map.get(attrs, :quota_snapshots, %{}))
   end
 
   @spec put_candidates(t(), [candidate()]) :: t()
@@ -121,6 +120,11 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
   def put_saved_reset_auto_cohort(%__MODULE__{} = route_state, candidates)
       when is_list(candidates),
       do: %{route_state | saved_reset_auto_cohort: candidates}
+
+  @spec put_saved_reset_auto_capacity(t(), [candidate()]) :: t()
+  def put_saved_reset_auto_capacity(%__MODULE__{} = route_state, candidates)
+      when is_list(candidates),
+      do: %{route_state | saved_reset_auto_capacity: candidates}
 
   @spec put_reset_probe(t(), ResetProbe.t()) :: t()
   def put_reset_probe(%__MODULE__{} = route_state, %ResetProbe{} = reset_probe),
@@ -147,23 +151,10 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
       when is_map(snapshot_inputs),
       do: %{route_state | reservation_snapshot_inputs: snapshot_inputs}
 
-  @spec put_quota_window_snapshot(t(), quota_window_snapshots(), DateTime.t() | nil) :: t()
-  def put_quota_window_snapshot(%__MODULE__{} = route_state, snapshots, %DateTime{} = at)
-      when is_map(snapshots) do
-    %{route_state | quota_window_snapshots: snapshots, quota_snapshot_at: at}
-  end
-
-  def put_quota_window_snapshot(%__MODULE__{} = route_state, snapshots, nil)
-      when snapshots == %{} do
-    %{route_state | quota_window_snapshots: snapshots, quota_snapshot_at: nil}
-  end
-
-  def put_quota_window_snapshot(%__MODULE__{}, snapshots, at) when is_map(snapshots) do
-    timestamp_type = if is_nil(at), do: "nil", else: "invalid"
-
-    raise ArgumentError,
-          "quota snapshot timestamp must be a DateTime, or nil only for empty snapshots; " <>
-            "got snapshots=#{map_size(snapshots)} timestamp_type=#{timestamp_type}"
+  @spec put_quota_snapshots(t(), quota_snapshots()) :: t()
+  def put_quota_snapshots(%__MODULE__{} = route_state, snapshots) when is_map(snapshots) do
+    validate_quota_snapshots!(snapshots)
+    %{route_state | quota_snapshots: snapshots}
   end
 
   @spec put_circuit_snapshots(t(), circuit_snapshots()) :: t()
@@ -175,23 +166,25 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
       when is_map(snapshots),
       do: put_circuit_snapshots(route_state, snapshots)
 
-  @spec load_quota_window_snapshots([candidate()]) :: {quota_window_snapshots(), DateTime.t()}
-  def load_quota_window_snapshots(candidates) when is_list(candidates),
-    do: load_quota_window_snapshot(candidates)
+  @spec load_quota_snapshots([candidate()]) :: quota_snapshots()
+  def load_quota_snapshots(candidates) when is_list(candidates),
+    do: load_quota_snapshot(candidates)
 
   @spec preload_routing_snapshots(t(), auth(), Model.t(), RequestOptions.t()) :: t()
   def preload_routing_snapshots(
-        %__MODULE__{candidates: candidates} = route_state,
+        %__MODULE__{} = route_state,
         auth,
         %Model{} = model,
         %RequestOptions{} = request_options
       ) do
     route_class = RequestOptions.route_class(request_options)
 
+    routing_candidates = routing_snapshot_candidates(route_state)
+
     route_state
-    |> maybe_load_quota_window_snapshot(candidates)
+    |> maybe_load_quota_snapshot(routing_candidates)
     |> put_circuit_snapshots(
-      CircuitState.eligibility_snapshots(auth, model, candidates, route_class)
+      CircuitState.eligibility_snapshots(auth, model, routing_candidates, route_class)
     )
   end
 
@@ -199,38 +192,57 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
   # candidate list. When that snapshot already covers every remaining candidate
   # there is nothing new to learn, so reuse it instead of reading quota twice
   # per dispatch.
-  defp maybe_load_quota_window_snapshot(%__MODULE__{} = route_state, candidates) do
-    if quota_window_snapshot_covers?(route_state, candidates) do
+  defp maybe_load_quota_snapshot(%__MODULE__{} = route_state, candidates) do
+    if quota_snapshot_covers?(route_state, candidates) do
       route_state
     else
-      {quota_window_snapshots, quota_snapshot_at} = load_quota_window_snapshot(candidates)
-
-      put_quota_window_snapshot(route_state, quota_window_snapshots, quota_snapshot_at)
+      put_quota_snapshots(route_state, load_quota_snapshot(candidates))
     end
   end
 
-  defp quota_window_snapshot_covers?(
-         %__MODULE__{quota_snapshot_at: %DateTime{}, quota_window_snapshots: snapshots},
-         candidates
-       ),
-       do:
-         Enum.all?(candidates, fn {_assignment, identity} ->
-           Map.has_key?(snapshots, identity.id)
-         end)
+  defp quota_snapshot_covers?(%__MODULE__{quota_snapshots: snapshots}, candidates),
+    do:
+      snapshots != %{} and
+        Enum.all?(candidates, fn {_assignment, identity} ->
+          Map.has_key?(snapshots, identity.id)
+        end)
 
-  defp quota_window_snapshot_covers?(%__MODULE__{}, _candidates), do: false
+  @spec refresh_quota_snapshots(t()) :: t()
+  def refresh_quota_snapshots(%__MODULE__{} = route_state) do
+    put_quota_snapshots(
+      route_state,
+      load_quota_snapshot(routing_snapshot_candidates(route_state))
+    )
+  end
 
-  @spec refresh_quota_window_snapshots(t()) :: t()
-  def refresh_quota_window_snapshots(%__MODULE__{candidates: candidates} = route_state) do
-    {quota_window_snapshots, quota_snapshot_at} = load_quota_window_snapshot(candidates)
-
-    put_quota_window_snapshot(route_state, quota_window_snapshots, quota_snapshot_at)
+  @doc false
+  @spec refresh_quota_snapshots(t(), ([Ecto.UUID.t()], DateTime.t() -> quota_snapshots())) :: t()
+  def refresh_quota_snapshots(
+        %__MODULE__{} = route_state,
+        loader
+      )
+      when is_function(loader, 2) do
+    put_quota_snapshots(
+      route_state,
+      load_quota_snapshot(routing_snapshot_candidates(route_state), loader)
+    )
   end
 
   @spec quota_windows_for_identity(t(), UpstreamIdentity.t()) :: [AccountQuotaWindow.t()]
   def quota_windows_for_identity(%__MODULE__{} = route_state, %UpstreamIdentity{id: identity_id}) do
-    Map.get(route_state.quota_window_snapshots, identity_id, [])
+    route_state
+    |> quota_snapshot_for_identity!(identity_id)
+    |> Map.fetch!(:raw_windows)
   end
+
+  @spec quota_snapshot_for_identity(t(), UpstreamIdentity.t() | Ecto.UUID.t()) ::
+          RoutingQuotaSnapshot.t()
+  def quota_snapshot_for_identity(%__MODULE__{} = route_state, %UpstreamIdentity{id: identity_id}),
+      do: quota_snapshot_for_identity!(route_state, identity_id)
+
+  def quota_snapshot_for_identity(%__MODULE__{} = route_state, identity_id)
+      when is_binary(identity_id),
+      do: quota_snapshot_for_identity!(route_state, identity_id)
 
   @spec circuit_snapshot(t(), Ecto.UUID.t()) :: circuit_snapshot() | nil
   def circuit_snapshot(%__MODULE__{} = route_state, assignment_id)
@@ -252,15 +264,49 @@ defmodule CodexPooler.Gateway.Runtime.Dispatch.RouteState do
     Map.get(attrs, :circuit_snapshots, Map.get(attrs, :circuit_eligibility_snapshots, %{}))
   end
 
-  defp load_quota_window_snapshot(candidates) do
+  defp load_quota_snapshot(candidates) do
+    load_quota_snapshot(candidates, &QuotaWindows.load_routing_quota_snapshots/2)
+  end
+
+  defp load_quota_snapshot(candidates, loader) do
     snapshot_at = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
-    snapshots =
-      candidates
-      |> Enum.map(fn {_assignment, identity} -> identity.id end)
-      |> Enum.uniq()
-      |> QuotaWindows.list_quota_windows_by_identity_ids(snapshot_at)
+    candidates
+    |> Enum.map(fn {_assignment, identity} -> identity.id end)
+    |> Enum.uniq()
+    |> loader.(snapshot_at)
+  end
 
-    {snapshots, snapshot_at}
+  defp routing_snapshot_candidates(%__MODULE__{} = route_state) do
+    (route_state.saved_reset_auto_capacity ++ route_state.candidates)
+    |> Enum.uniq_by(fn {assignment, identity} -> {assignment.id, identity.id} end)
+  end
+
+  defp quota_snapshot_for_identity!(%__MODULE__{quota_snapshots: snapshots}, identity_id) do
+    Map.fetch!(snapshots, identity_id)
+  end
+
+  defp validate_quota_snapshots!(snapshots) do
+    valid_entries? =
+      Enum.all?(snapshots, fn
+        {identity_id,
+         %RoutingQuotaSnapshot{upstream_identity_id: snapshot_identity_id, as_of: %DateTime{}}}
+        when identity_id == snapshot_identity_id ->
+          true
+
+        _entry ->
+          false
+      end)
+
+    as_of_values =
+      if valid_entries? do
+        snapshots |> Map.values() |> Enum.map(& &1.as_of) |> Enum.uniq()
+      else
+        []
+      end
+
+    if not valid_entries? or length(as_of_values) > 1 do
+      raise ArgumentError, "quota snapshots must be complete identity entries from one as_of"
+    end
   end
 end

@@ -26,8 +26,11 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Auth.CodexAuth
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
   alias CodexPooler.Upstreams.OAuthFlows
+  alias CodexPooler.Upstreams.Quota.AccountAvailabilityStore
   alias CodexPooler.Upstreams.Quota.AccountQuotaWindow
+  alias CodexPooler.Upstreams.Quota.CreditBalanceStore
   alias CodexPooler.Upstreams.Quota.PrimingState
   alias CodexPooler.Upstreams.Quota.Windows.EvidenceStore
   alias CodexPooler.Upstreams.SavedResets.AutoEligibility
@@ -61,6 +64,66 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     Repo.delete_all(Oban.Job)
     :ok
+  end
+
+  test "renders windowless availability readiness through stable account selectors", %{conn: conn} do
+    as_of = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    pool = pool_fixture(%{name: "Windowless readiness Pool"})
+
+    fixtures =
+      for {state, label} <- [
+            {:available, "Sample Available Without Windows"},
+            {:blocked, "Sample Blocked Without Windows"},
+            {:unknown, "Sample Unknown Without Windows"}
+          ],
+          into: %{} do
+        %{identity: identity} =
+          upstream_assignment_fixture(pool, %{
+            account_label: label,
+            identity_metadata: %{
+              "credential_epoch" => 1,
+              AccountAvailabilityStore.metadata_key() =>
+                AccountAvailabilityStore.encode!(state, as_of, 1)
+            }
+          })
+
+        {state, identity}
+      end
+
+    {:ok, view, html} = live(conn, ~p"/admin/upstreams")
+
+    expected = %{
+      available: {"provider_available_no_windows", "Provider available", "warning", "true"},
+      blocked: {"blocked", "Quota blocked", "warning", "false"},
+      unknown: {"missing_evidence", "Quota missing", "warning", "false"}
+    }
+
+    for {state, identity} <- fixtures do
+      {readiness_state, readiness_label, tone, ready_now} = Map.fetch!(expected, state)
+      prefix = "upstream-account-#{identity.id}"
+
+      routing_state =
+        if state == :available, do: "provider_available_no_windows", else: "quota_blocked"
+
+      card_html = view |> element("##{prefix}") |> render()
+      assert card_html =~ ~s(data-routing-state="#{routing_state}")
+      assert card_html =~ ~s(data-routing-tone="#{tone}")
+      assert card_html =~ ~s(data-routing-ready-now="#{ready_now}")
+
+      assert has_element?(view, "##{prefix}-quota-readiness-contract[data-quota-tone='#{tone}']")
+
+      contract_html = view |> element("##{prefix}-quota-readiness-contract") |> render()
+      assert contract_html =~ ~s(data-routing-ready-now="#{ready_now}")
+
+      assert has_element?(view, "##{prefix}-quota-readiness-state", readiness_state)
+      assert has_element?(view, "##{prefix}-quota-readiness-label", readiness_label)
+      refute has_element?(view, "##{prefix}-limits [data-countdown-at]")
+      refute has_element?(view, "##{prefix}-limits [data-role='upstream-limit-reset']")
+    end
+
+    refute html =~ AccountAvailabilityStore.metadata_key()
+    refute html =~ "credential_epoch"
+    refute html =~ "provider_payload"
   end
 
   test "shared dropdown action item renders button and link modes" do
@@ -3312,7 +3375,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-account-#{identity.id} header[data-role='upstream-account-card-header'].flex-row.items-center.justify-between.py-3"
+             "#upstream-account-#{identity.id} header[data-role='upstream-account-card-header'].flex-col.items-stretch.justify-between.py-3[class~='sm:flex-row'][class~='sm:items-center']"
            )
 
     assert has_element?(
@@ -3322,7 +3385,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(
              view,
-             "#upstream-account-#{identity.id}-header-actions.items-center.self-center #upstream-account-#{identity.id}-plan-label.self-center",
+             "#upstream-account-#{identity.id}-header-actions.items-center.self-end[class~='sm:self-center'] #upstream-account-#{identity.id}-plan-label.self-center",
              "Team"
            )
 
@@ -3465,11 +3528,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(view, "#upstream-account-#{identity.id}-limit-primary_5h", "64%")
 
-    assert has_element?(
-             view,
-             "#upstream-account-#{identity.id}-limit-primary_5h",
-             "64 / 100 credits"
-           )
+    refute has_element?(view, "#upstream-account-#{identity.id}-limit-primary_5h-count")
 
     assert has_element?(
              view,
@@ -3538,7 +3597,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
            )
 
     refute has_element?(view, "#upstream-account-#{browser_identity.id}-limit-primary_5h")
+
     refute has_element?(view, "#upstream-account-#{browser_identity.id}-limit-weekly-count")
+
     assert has_element?(view, "#upstream-account-#{browser_identity.id}-limit-weekly-reset")
 
     assert has_element?(
@@ -3943,6 +4004,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
                }
              ])
 
+    put_credit_balance_snapshot!(identity, 601, fresh_observed_at)
     stale_window = Enum.find(windows, &(&1.quota_key == "gpt_reserve"))
     assert %AccountQuotaWindow{} = stale_window
 
@@ -4090,7 +4152,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
                    "primary_window" => %{
                      "used_percent" => 3,
                      "limit_window_seconds" => 2_592_000,
-                     "reset_after_seconds" => 950_400
+                     "reset_after_seconds" => 950_400,
+                     "reset_at" => DateTime.to_unix(DateTime.add(now, 950_400, :second))
                    }
                  }
                },
@@ -4137,12 +4200,21 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
                    "primary_window" => %{
                      "used_percent" => 12,
                      "limit_window_seconds" => 604_800,
-                     "reset_after_seconds" => 518_400
+                     "reset_after_seconds" => 518_400,
+                     "reset_at" => DateTime.to_unix(DateTime.add(now, 518_400, :second))
                    }
                  }
                },
                now
              )
+
+    for {identity, balance} <- [
+          {quota_identity, 601},
+          {credit_identity, 500},
+          {depleted_identity, 0}
+        ] do
+      put_credit_balance_snapshot!(identity, balance, now)
+    end
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
 
@@ -4189,12 +4261,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     refute render(view) =~ "0 / 601 credits"
 
-    assert has_element?(view, "#{unreported_selector}-count", "credits not reported")
-
-    assert has_element?(
-             view,
-             "#{unreported_selector}-count[title='Credit balance was not reported for this quota sample.'][aria-label='Credit balance was not reported for this quota sample.']"
-           )
+    refute has_element?(view, "#{unreported_selector}-count")
+    assert has_element?(view, "#{unreported_selector}-reset")
   end
 
   test "Spark zero-use quota stays visible while evidence sources change", %{
@@ -4608,6 +4676,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
                }
              ])
 
+    put_credit_balance_snapshot!(identity, 3817, now)
     [account] = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
     monthly = Enum.find(account.quota_limits, &(&1.key == :primary_30d))
 
@@ -5947,7 +6016,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert [_match, quota_contract] =
              Regex.run(
-               ~r/<section id="upstream-account-#{blocked_id}-quota-readiness-contract">(.*?)<\/section>/s,
+               ~r/<section[^>]+id="upstream-account-#{blocked_id}-quota-readiness-contract"[^>]*>(.*?)<\/section>/s,
                blocked_html
              )
 
@@ -6606,10 +6675,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
 
     assert has_element?(view, "#upstream-account-#{identity.id}-limit-primary_5h", "89%")
 
-    refute has_element?(
+    assert has_element?(
              view,
-             "#upstream-account-#{identity.id}-limit-primary_5h",
-             "not reported"
+             "#upstream-account-#{identity.id}-limit-primary_5h-progress[value='89']"
            )
   end
 
@@ -6804,10 +6872,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
         auth_fresh_at: auth_fresh_at,
         auth_verified_at: auth_verified_at,
         metadata: %{
+          "credential_epoch" => 1,
           "access_token_expires_at" => DateTime.to_iso8601(access_expires_at),
           "token_refresh" => %{
             "status" => "failed",
             "finished_at" => DateTime.to_iso8601(token_finished_at),
+            "access_token_expiry" => %{
+              "version" => 1,
+              "credential_epoch" => 1,
+              "state" => "known",
+              "source" => "explicit"
+            },
             "reason" => %{
               "code" => "codex_oauth_refresh_failed",
               "message" => "upstream OAuth refresh failed"
@@ -6876,19 +6951,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
   } do
     {:ok, pool} = Pools.create_pool(scope, %{slug: "auth-expiration", name: "Auth Expiration"})
 
-    future_expires_at = DateTime.add(DateTime.utc_now(), 2, :hour)
-    past_expires_at = DateTime.add(DateTime.utc_now(), -2, :hour)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    future_expires_at = DateTime.add(now, 2, :hour)
+    past_expires_at = DateTime.add(now, -2, :hour)
 
     %{identity: future_identity} =
       active_upstream_assignment_fixture(pool, %{
         account_label: "Future Auth Expiration",
-        metadata: %{"access_token_expires_at" => DateTime.to_iso8601(future_expires_at)}
+        metadata: credential_expiry_metadata(:known, future_expires_at)
       })
 
     %{identity: past_identity} =
       active_upstream_assignment_fixture(pool, %{
         account_label: "Past Auth Expiration",
-        metadata: %{"access_token_expires_at" => DateTime.to_iso8601(past_expires_at)}
+        metadata: credential_expiry_metadata(:known, past_expires_at)
       })
 
     %{identity: missing_identity} =
@@ -6897,7 +6973,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     %{identity: malformed_identity} =
       active_upstream_assignment_fixture(pool, %{
         account_label: "Malformed Auth Expiration",
-        metadata: %{"access_token_expires_at" => "not-a-timestamp"}
+        metadata: credential_expiry_metadata(:malformed, future_expires_at)
       })
 
     {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
@@ -6905,19 +6981,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     assert has_element?(
              view,
              "#upstream-account-#{future_identity.id}-auth-expiration[title]",
-             "Auth expires"
+             "Access token expires"
            )
 
     assert has_element?(
              view,
              "#upstream-account-#{past_identity.id}-auth-expiration[title]",
-             "Auth expired"
+             "Access token expired"
            )
 
     for identity <- [missing_identity, malformed_identity] do
       selector = "#upstream-account-#{identity.id}-auth-expiration"
 
-      assert has_element?(view, selector, "Expiration unavailable")
+      assert has_element?(view, selector, "Access token expiry unavailable")
       refute has_element?(view, "#{selector}[title]")
       refute has_element?(view, selector, "No expiration")
     end
@@ -6936,6 +7012,139 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
              view,
              "#upstream-account-#{future_identity.id} header #upstream-account-#{future_identity.id}-routing-readiness"
            )
+  end
+
+  @tag :credential_expiry_list
+  test "renders canonical credential expiry and preserves manual action gates", %{
+    conn: conn,
+    scope: scope
+  } do
+    {:ok, pool} =
+      Pools.create_pool(scope, %{slug: "structured-expiry", name: "Structured Expiry"})
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    future_deadline = DateTime.add(now, 2, :hour)
+    past_deadline = DateTime.add(now, -2, :hour)
+    reset_metadata = available_saved_reset_metadata(now)
+    secret_sentinel = runtime_secret("structured-expiry")
+
+    assert UpstreamAccountsReadModel.identity_observability(
+             %UpstreamIdentity{metadata: credential_expiry_metadata(:malformed, future_deadline)},
+             [],
+             [],
+             now
+           ).credential_expiry == %{state: "unavailable", expires_at: nil, age: nil}
+
+    %{identity: future} =
+      active_upstream_assignment_fixture(pool, %{
+        account_label: "Known future expiry",
+        access_token: secret_sentinel <> "-future",
+        metadata:
+          credential_expiry_metadata(:known, future_deadline)
+          |> Map.merge(reset_metadata)
+      })
+
+    %{identity: past} =
+      active_upstream_assignment_fixture(pool, %{
+        account_label: "Known past expiry",
+        access_token: secret_sentinel <> "-past",
+        metadata:
+          credential_expiry_metadata(:known, past_deadline)
+          |> Map.merge(reset_metadata)
+      })
+
+    %{identity: unknown} =
+      active_upstream_assignment_fixture(pool, %{
+        account_label: "Unknown expiry",
+        access_token: secret_sentinel <> "-unknown",
+        metadata: credential_expiry_metadata(:unknown, nil) |> Map.merge(reset_metadata)
+      })
+
+    %{identity: malformed} =
+      active_upstream_assignment_fixture(pool, %{
+        account_label: "Malformed expiry",
+        access_token: secret_sentinel <> "-malformed",
+        metadata:
+          credential_expiry_metadata(:malformed, future_deadline)
+          |> Map.merge(reset_metadata)
+      })
+
+    %{identity: missing_secret} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Missing expiry secret",
+        identity_metadata: credential_expiry_metadata(:unknown, nil) |> Map.merge(reset_metadata)
+      })
+
+    %{identity: reauth} =
+      upstream_assignment_fixture(pool, %{
+        account_label: "Reauthentication priority",
+        identity_status: "reauth_required",
+        identity_metadata:
+          credential_expiry_metadata(:known, future_deadline) |> Map.merge(reset_metadata)
+      })
+
+    assert {:ok, _secret} =
+             Upstreams.store_encrypted_secret(reauth, %{
+               secret_kind: "access_token",
+               plaintext: secret_sentinel <> "-reauth"
+             })
+
+    accounts = UpstreamAccountsReadModel.list_visible_accounts(scope, [pool])
+    accounts_by_id = Map.new(accounts, &{&1.identity.id, &1})
+
+    assert accounts_by_id[future.id].identity_observability.credential_expiry.state ==
+             "known_future"
+
+    assert accounts_by_id[past.id].identity_observability.credential_expiry.state == "known_past"
+
+    for identity <- [unknown, malformed] do
+      assert accounts_by_id[identity.id].identity_observability.credential_expiry == %{
+               state: "unavailable",
+               expires_at: nil,
+               age: nil
+             }
+    end
+
+    assert accounts_by_id[future.id].saved_reset_redemption_action.available?
+    refute accounts_by_id[past.id].saved_reset_redemption_action.available?
+    assert accounts_by_id[unknown.id].saved_reset_redemption_action.available?
+    assert accounts_by_id[malformed.id].saved_reset_redemption_action.available?
+    refute accounts_by_id[missing_secret.id].saved_reset_redemption_action.available?
+    refute accounts_by_id[reauth.id].saved_reset_redemption_action.available?
+
+    {:ok, view, _html} = live(conn, ~p"/admin/upstreams")
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{future.id}-auth-expiration",
+             "Access token expires"
+           )
+
+    assert has_element?(
+             view,
+             "#upstream-account-#{past.id}-auth-expiration",
+             "Access token expired"
+           )
+
+    for identity <- [unknown, malformed] do
+      selector = "#upstream-account-#{identity.id}-auth-expiration"
+      assert has_element?(view, selector, "Access token expiry unavailable")
+      refute has_element?(view, "#{selector}[title]")
+    end
+
+    assert has_element?(view, "#replace-auth-json-upstream-account-#{reauth.id}")
+    assert has_element?(view, "#oauth-relink-upstream-account-#{reauth.id}")
+
+    for identity <- [future, past, unknown, malformed] do
+      assert has_element?(view, "#pause-upstream-account-#{identity.id}")
+      assert has_element?(view, "#reactivate-upstream-account-#{identity.id}[disabled]")
+    end
+
+    assert has_element?(view, "#pause-upstream-account-#{reauth.id}[disabled]")
+    assert has_element?(view, "#reactivate-upstream-account-#{reauth.id}[disabled]")
+
+    html = render(view)
+    refute html =~ secret_sentinel
   end
 
   @tag :relative_countdown_contract
@@ -8174,7 +8383,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
               recovery_component_assignment(pool.id, "Recovery Edge")
             ],
             refresh_status: "succeeded",
-            access_token_label: "access token expires 2026-05-04 12:00 UTC"
+            secret_status: :present
           ),
         account_index: 0
       )
@@ -8299,6 +8508,65 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
     }
   end
 
+  defp credential_expiry_metadata(:known, %DateTime{} = deadline) do
+    %{
+      "credential_epoch" => 1,
+      "access_token_expires_at" => DateTime.to_iso8601(deadline),
+      "token_refresh" => %{
+        "status" => "succeeded",
+        "access_token_expiry" => %{
+          "version" => 1,
+          "credential_epoch" => 1,
+          "state" => "known",
+          "source" => "explicit"
+        }
+      }
+    }
+  end
+
+  defp credential_expiry_metadata(:unknown, nil) do
+    %{
+      "credential_epoch" => 1,
+      "token_refresh" => %{
+        "status" => "succeeded",
+        "access_token_expiry" => %{
+          "version" => 1,
+          "credential_epoch" => 1,
+          "state" => "unknown",
+          "source" => "unavailable"
+        }
+      }
+    }
+  end
+
+  defp credential_expiry_metadata(:malformed, %DateTime{} = deadline) do
+    %{
+      "credential_epoch" => 1,
+      "access_token_expires_at" => DateTime.to_iso8601(deadline),
+      "token_refresh" => %{
+        "status" => "succeeded",
+        "access_token_expiry" => %{
+          "version" => 1,
+          "credential_epoch" => 1,
+          "state" => "known",
+          "source" => "explicit",
+          "untrusted" => true
+        }
+      }
+    }
+  end
+
+  defp available_saved_reset_metadata(%DateTime{} = now) do
+    %{
+      "saved_resets" => %{
+        "status" => "reported",
+        "available_count" => 1,
+        "source" => "codex_usage_api",
+        "observed_at" => DateTime.to_iso8601(now)
+      }
+    }
+  end
+
   defp recovery_component_assignment(pool_id, pool_label) do
     %{
       id: Ecto.UUID.generate(),
@@ -8344,7 +8612,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
         credential_expiry: %{state: "unavailable", expires_at: nil, age: nil}
       },
       access_token_label:
-        Keyword.get(opts, :access_token_label, "access token expired 2026-05-04 12:00 UTC"),
+        Keyword.get(opts, :access_token_label, "access token expiry unavailable"),
+      secret_status: Keyword.get(opts, :secret_status, :expired),
       reauth_required?: status == "reauth_required",
       reauth_reason_code: nil,
       reauth_reason_message: nil,
@@ -8924,7 +9193,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
               "used_percent" => used_percent,
               "limit_window_seconds" => 604_800,
               "reset_after_seconds" => reset_after_seconds,
-              "reset_at" => DateTime.to_iso8601(reset_at)
+              "reset_at" => DateTime.to_unix(reset_at)
             }
           }
         }
@@ -8991,6 +9260,20 @@ defmodule CodexPoolerWeb.Admin.UpstreamsLiveTest do
       )
 
     window
+  end
+
+  defp put_credit_balance_snapshot!(identity, balance, observed_at) do
+    identity = Repo.reload!(identity)
+
+    metadata =
+      CreditBalanceStore.transition(
+        identity.metadata,
+        %{"credits" => %{"balance" => balance}},
+        observed_at,
+        CredentialFencing.credential_epoch(identity)
+      )
+
+    identity |> Ecto.Changeset.change(metadata: metadata) |> Repo.update!()
   end
 
   defp worker_name(worker), do: worker |> Atom.to_string() |> String.replace_prefix("Elixir.", "")

@@ -17,6 +17,14 @@ config :codex_pooler,
   ecto_repos: [CodexPooler.Repo],
   generators: [timestamp_type: :utc_datetime]
 
+config :codex_pooler,
+       CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace,
+       mode: :off
+
+config :codex_pooler, CodexPooler.Upstreams.CodexClientIdentity,
+  # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.+)$
+  default_client_version: "0.153.4"
+
 jobs_schedule = [
   %{
     key: :catalog_sync,
@@ -102,6 +110,16 @@ jobs_schedule = [
     workers: [CodexPooler.Jobs.RuntimeStateCleanupWorker],
     scheduled_worker: CodexPooler.Jobs.RuntimeStateCleanupWorker,
     cadence: %{label: "Every 15 min", cron: "*/15 * * * *"}
+  },
+  %{
+    key: :request_replay_cleanup,
+    id: "request-replay-cleanup",
+    title: "Request replay cleanup",
+    description: "Expired replay cleanup",
+    icon: "hero-sparkles",
+    workers: [CodexPooler.Jobs.RequestReplayCleanupWorker],
+    scheduled_worker: CodexPooler.Jobs.RequestReplayCleanupWorker,
+    cadence: %{label: "Every minute", cron: "* * * * *"}
   }
 ]
 

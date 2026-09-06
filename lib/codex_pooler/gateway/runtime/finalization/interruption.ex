@@ -3,14 +3,19 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
 
   import Ecto.Query
 
+  alias CodexPooler.Access.APIKey
   alias CodexPooler.Accounting
-  alias CodexPooler.Accounting.{Attempt, Request}
+  alias CodexPooler.Accounting.{Attempt, Request, RequestReplayEntitlement}
+  alias CodexPooler.Accounting.RequestLogFacts
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Persistence.SessionContinuity
   alias CodexPooler.Gateway.Persistence.StatusVocabulary.Session, as: SessionStatus
   alias CodexPooler.Gateway.Persistence.StatusVocabulary.Turn, as: TurnStatus
   alias CodexPooler.Gateway.Runtime.Finalization.Metadata
   alias CodexPooler.Gateway.Runtime.Finalization.Streaming
+  alias CodexPooler.Gateway.Transports.Websocket.NativeReplayAdmission.Binding
+  alias CodexPooler.Gateway.Websocket.OwnerCleanup
   alias CodexPooler.Repo
 
   require Logger
@@ -27,11 +32,150 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
   @turn_failed TurnStatus.failed_status()
   @turn_interrupted TurnStatus.interrupted_status()
 
+  @spec interrupt_direct_request(
+          CodexPooler.Gateway.Websocket.DirectCleanup.receipt(),
+          String.t()
+        ) :: :ok | {:error, term()}
+  def interrupt_direct_request(receipt, reason) do
+    Repo.transaction(fn ->
+      session = codex_session_for_update(receipt.session_id)
+      _key = Repo.one(from k in APIKey, where: k.id == ^receipt.api_key_id, lock: "FOR UPDATE")
+
+      _turn =
+        Repo.one(
+          from t in CodexTurn,
+            where:
+              t.codex_session_id == ^receipt.session_id and t.request_id == ^receipt.request_id,
+            lock: "FOR UPDATE"
+        )
+
+      request = request_for_update(receipt.request_id)
+
+      if direct_receipt_matches?(session, request, receipt) and
+           request.status in ["accepted", "in_progress"] and
+           not replacement_turn_active?(receipt.session_id, receipt.request_id) and
+           pre_attempt_owner_receipt_matches?(session, request, receipt) do
+        request = mark_pre_attempt_owner_drain(request, receipt, reason)
+        interrupt_direct_locked(session, request, reason)
+      end
+    end)
+    |> case do
+      {:ok, _} -> :ok
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp direct_receipt_matches?(%CodexSession{} = session, %Request{} = request, receipt),
+    do:
+      request.correlation_id == receipt.correlation_id and
+        request.api_key_id == receipt.api_key_id and request.pool_id == session.pool_id
+
+  defp direct_receipt_matches?(_session, _request, _receipt), do: false
+
+  defp pre_attempt_owner_receipt_matches?(
+         session,
+         request,
+         %{
+           owner_binding: %{
+             owner_instance_id: owner,
+             owner_lease_token: token,
+             downstream_epoch: epoch
+           }
+         } = receipt
+       )
+       when is_binary(owner) and is_binary(token) and is_integer(epoch) and epoch > 0 do
+    metadata = Map.get(request.request_metadata, "websocket_owner_forwarding", %{})
+
+    session.owner_lease_token == token and
+      session.owner_instance_id == owner and
+      current_owner_lease?(session.owner_lease_expires_at) and
+      metadata["owner_instance_id"] == owner and
+      metadata["downstream_epoch"] == epoch and
+      admitted_attempt_matches?(latest_attempt_for_update(request.id), receipt)
+  end
+
+  defp pre_attempt_owner_receipt_matches?(_session, request, receipt),
+    do:
+      is_nil(Map.get(receipt, :owner_binding)) and
+        not Map.has_key?(request.request_metadata, "websocket_owner_forwarding")
+
+  defp current_owner_lease?(%DateTime{} = expiry), do: DateTime.compare(expiry, now()) == :gt
+  defp current_owner_lease?(_expiry), do: false
+
+  defp admitted_attempt_matches?(nil, _receipt), do: true
+
+  defp admitted_attempt_matches?(%Attempt{} = attempt, receipt),
+    do:
+      attempt.id == Map.get(receipt, :attempt_id) and
+        attempt.replay_generation == Map.get(receipt, :replay_generation) and
+        attempt.transport == "websocket"
+
+  defp mark_pre_attempt_owner_drain(
+         %{status: status} = request,
+         %{owner_binding: binding},
+         "owner_drained"
+       )
+       when is_map(binding) and status in ["accepted", "in_progress"] do
+    if is_nil(latest_attempt_for_update(request.id)) do
+      request
+      |> Ecto.Changeset.change(
+        request_metadata: Map.put(request.request_metadata, "websocket_pre_attempt_drain", true)
+      )
+      |> Repo.update!()
+    else
+      request
+    end
+  end
+
+  defp mark_pre_attempt_owner_drain(request, _receipt, _reason), do: request
+
+  defp interrupt_direct_locked(session, request, reason) do
+    turn = Repo.get_by(CodexTurn, request_id: request.id)
+    attempt = latest_attempt_for_update(request.id)
+
+    case {request.status, turn, attempt} do
+      {"accepted", nil, _} ->
+        request
+        |> Ecto.Changeset.change(
+          status: "failed",
+          completed_at: now(),
+          response_status_code: 499,
+          last_error_code: reason,
+          usage_status: "usage_unknown"
+        )
+        |> Repo.update!()
+
+        RequestLogFacts.record_request_created!(request)
+
+      {"in_progress", %CodexTurn{} = turn, nil} ->
+        case Accounting.finalize_reservation_failure(request, %{
+               last_error_code: reason,
+               response_status_code: 499,
+               usage_status: "usage_unknown"
+             }) do
+          {:ok, _} -> complete_interrupted_turn!(turn, nil, @turn_interrupted, reason, now())
+          {:error, error} -> Repo.rollback(error)
+        end
+
+      _ ->
+        opts = RequestOptions.for_websocket(%{request_id: request.correlation_id, reason: reason})
+
+        case interrupt_codex_turn(session, opts) do
+          {:ok, _} -> :ok
+          {:error, error} -> Repo.rollback(error)
+        end
+    end
+  end
+
   @spec interrupt_codex_session(session_ref(), opts()) :: {:ok, term()} | {:error, term()}
   def interrupt_codex_session(%CodexSession{id: id}, opts), do: interrupt_codex_session(id, opts)
 
   def interrupt_codex_session(session_id, %RequestOptions{} = opts) when is_binary(session_id) do
-    interrupt_session(session_id, opts, interrupt_reason(opts))
+    if opts.transport.websocket_owner.lease_token do
+      interrupt_owner_request(session_id, opts, interrupt_reason(opts))
+    else
+      interrupt_codex_turn(session_id, opts)
+    end
   end
 
   def interrupt_codex_session(_session_id, _opts), do: {:ok, :ok}
@@ -63,7 +207,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
 
   def interrupt_detached_codex_turn(session_id, %RequestOptions{} = opts)
       when is_binary(session_id) do
-    interrupt_session_turn(session_id, :latest, opts, interrupt_reason(opts))
+    interrupt_owner_request(session_id, opts, interrupt_reason(opts))
   end
 
   def interrupt_detached_codex_turn(_session_id, _opts),
@@ -78,7 +222,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
       when is_binary(session_id) do
     reason = owner_recovery_reason(owner_reason)
 
-    case interrupt_session(session_id, opts, reason) do
+    case interrupt_owner_request(session_id, opts, reason) do
       {:ok, _result} = ok ->
         ok
 
@@ -89,6 +233,196 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
   end
 
   def recover_owner_lifecycle_leftovers(_session_id, _owner_reason, _opts), do: {:ok, :ok}
+
+  @spec release_owner_cleanup_lease(map(), String.t(), :idle_expiry | :drain_cut | nil) ::
+          :ok | {:error, term()}
+  def release_owner_cleanup_lease(state, reason, cause) do
+    case Repo.transaction(fn -> release_owner_cleanup_lease_locked(state, reason, cause) end) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp release_owner_cleanup_lease_locked(state, reason, cause) do
+    session = codex_session_for_update(state.codex_session_id)
+    witness = OwnerCleanup.from_owner_state(state)
+    request_id = if witness, do: witness.request_id
+
+    with %CodexSession{} <- session,
+         true <- session.owner_lease_token == state.owner_lease_token,
+         true <- session.owner_instance_id == state.owner_instance_id,
+         true <- cleanup_release_attempt_matches?(witness),
+         false <- other_active_turn?(session.id, request_id),
+         :ok <-
+           SessionContinuity.release_owner_lease(session, state.owner_lease_token, reason, cause) do
+      :ok
+    else
+      _stale -> Repo.rollback(:stale_owner_cleanup)
+    end
+  end
+
+  defp other_active_turn?(session_id, nil) do
+    Repo.exists?(
+      from turn in CodexTurn,
+        where: turn.codex_session_id == ^session_id and turn.status == ^@turn_in_progress
+    )
+  end
+
+  defp other_active_turn?(session_id, request_id),
+    do: replacement_turn_active?(session_id, request_id)
+
+  defp cleanup_release_attempt_matches?(nil), do: true
+
+  defp cleanup_release_attempt_matches?(%OwnerCleanup{} = witness) do
+    case latest_attempt_for_update(witness.request_id) do
+      %Attempt{id: id, replay_generation: generation} ->
+        id == witness.attempt_id and generation == witness.replay_generation
+
+      _missing ->
+        false
+    end
+  end
+
+  @spec recover_expired_owner_lifecycle(map(), opts()) :: {:ok, term()} | {:error, term()}
+  def recover_expired_owner_lifecycle(candidate, %RequestOptions{} = opts) do
+    Repo.transaction(fn -> recover_expired_owner_locked(candidate, opts) end)
+  end
+
+  defp recover_expired_owner_locked(candidate, opts) do
+    session = codex_session_for_update(candidate.session_id)
+
+    if (session && session.owner_instance_id == candidate.owner_instance_id) and
+         session.owner_lease_token == candidate.owner_lease_token and
+         session.owner_lease_expires_at == candidate.owner_lease_expires_at and
+         DateTime.compare(candidate.owner_lease_expires_at, now()) != :gt do
+      case interrupt_session(candidate.session_id, opts, "owner_unavailable") do
+        {:ok, result} -> result
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    else
+      Repo.rollback(:stale_owner_cleanup)
+    end
+  end
+
+  defp interrupt_owner_request(session_id, %RequestOptions{} = opts, reason) do
+    caller_owned_transaction? = Repo.in_transaction?()
+
+    Repo.transaction(fn ->
+      session = codex_session_for_update(session_id)
+      witness = opts.runtime.owner_cleanup
+
+      with %OwnerCleanup{session_id: ^session_id} <- witness,
+           %CodexSession{} <- session,
+           true <- session.owner_lease_token == witness.owner_lease_token,
+           true <- session.owner_instance_id == witness.owner_instance_id,
+           true <- opts.transport.websocket_owner.lease_token == witness.owner_lease_token,
+           %DateTime{} = expiry <- session.owner_lease_expires_at,
+           true <- DateTime.compare(expiry, now()) == :gt,
+           false <- replacement_turn_active?(session_id, witness.request_id),
+           %Request{} = snapshot <- Repo.get(Request, witness.request_id),
+           %APIKey{} <-
+             Repo.one(
+               from key in APIKey, where: key.id == ^snapshot.api_key_id, lock: "FOR UPDATE"
+             ),
+           %CodexTurn{} = turn <- exact_owner_turn(session_id, witness),
+           %Request{} = request <- request_for_update(witness.request_id),
+           %Attempt{} = attempt <- latest_attempt_for_update(witness.request_id),
+           true <- attempt.id == witness.attempt_id,
+           true <- attempt.replay_generation == witness.replay_generation,
+           true <- attempt.transport == "websocket",
+           true <- request_owner_matches?(request, witness) do
+        close_owner_replay!(witness.request_id)
+
+        now = now()
+
+        interrupt_selected_session_turn(session, %{
+          turn: turn,
+          opts: opts,
+          reason: reason,
+          now: now,
+          next_status: @session_interrupted,
+          lease_expires_at: DateTime.add(now, reconnect_window_seconds(opts), :second),
+          caller_owned_transaction?: caller_owned_transaction?
+        })
+      else
+        _missing_or_stale -> Repo.rollback(:stale_owner_cleanup)
+      end
+    end)
+    |> finalize_transaction(caller_owned_transaction?)
+  end
+
+  defp close_owner_replay!(request_id) do
+    case Accounting.close_request_replay(request_id, :owner_shutdown) do
+      {:ok, _disposition} -> :ok
+      {:error, failure} -> Repo.rollback({:request_replay_close_failed, failure})
+    end
+  end
+
+  defp replacement_turn_active?(session_id, request_id) do
+    Repo.exists?(
+      from turn in CodexTurn,
+        where:
+          turn.codex_session_id == ^session_id and turn.request_id != ^request_id and
+            turn.status == ^@turn_in_progress
+    )
+  end
+
+  defp exact_owner_turn(session_id, witness) do
+    Repo.one(
+      from turn in CodexTurn,
+        where: turn.codex_session_id == ^session_id and turn.request_id == ^witness.request_id,
+        lock: "FOR UPDATE"
+    )
+  end
+
+  defp request_owner_matches?(
+         request,
+         %OwnerCleanup{replay_generation: 1, native_replay_binding: %Binding{} = binding} =
+           witness
+       ) do
+    entitlement =
+      Repo.one(
+        from row in RequestReplayEntitlement,
+          where: row.request_id == ^request.id,
+          lock: "FOR UPDATE"
+      )
+
+    match?(%RequestReplayEntitlement{status: "consumed"}, entitlement) and
+      entitlement.replay_attempt_id == witness.attempt_id and
+      {binding.request_id, binding.replay_attempt_id} == {witness.request_id, witness.attempt_id} and
+      replay_binding_identity_matches?(binding, entitlement) and
+      binding.downstream_epoch == witness.downstream_epoch and
+      binding.replay_generation == witness.replay_generation and
+      binding.provisional_binding_digest == entitlement.provisional_binding_digest and
+      binding.owner_lease_digest == entitlement.owner_lease_digest and
+      RequestReplayEntitlement.verify_owner_lease_digest(
+        witness.owner_lease_token,
+        entitlement.owner_lease_key_version,
+        entitlement.owner_lease_digest
+      )
+  end
+
+  defp request_owner_matches?(_request, %OwnerCleanup{replay_generation: 1}), do: false
+
+  defp request_owner_matches?(request, witness) do
+    case request.request_metadata do
+      %{
+        "websocket_owner_forwarding" => %{
+          "owner_instance_id" => owner,
+          "downstream_epoch" => epoch
+        }
+      } ->
+        owner == witness.owner_instance_id and epoch == witness.downstream_epoch
+
+      _missing ->
+        false
+    end
+  end
+
+  defp replay_binding_identity_matches?(binding, entitlement) do
+    fields = [:codex_turn_id, :eligible_attempt_id, :semantic_turn_digest, :replay_claim_digest]
+    Map.take(binding, fields) == Map.take(entitlement, fields)
+  end
 
   defp interrupt_session(session_id, %RequestOptions{} = opts, reason) do
     caller_owned_transaction? = Repo.in_transaction?()
@@ -179,6 +513,9 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
   end
 
   defp interrupt_selected_session_turn(nil, _interruption_context),
+    do: interruption_result(0, [])
+
+  defp interrupt_selected_session_turn(_session, %{turn: nil}),
     do: interruption_result(0, [])
 
   defp interrupt_selected_session_turn(%CodexSession{} = session, interruption_context) do
@@ -376,21 +713,6 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
     )
   end
 
-  defp turn_for_selector(session_id, :latest) do
-    Repo.one(
-      from turn in CodexTurn,
-        where:
-          turn.codex_session_id == ^session_id and
-            fragment(
-              "COALESCE((SELECT a.transport FROM attempts AS a WHERE a.request_id = ? ORDER BY a.attempt_number DESC LIMIT 1), 'websocket') = 'websocket'",
-              turn.request_id
-            ),
-        order_by: [desc: turn.started_at],
-        limit: 1,
-        lock: "FOR UPDATE"
-    )
-  end
-
   defp latest_attempt_for_update(request_id) do
     Repo.one(
       from attempt in Attempt,
@@ -482,7 +804,7 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.Interruption do
        when is_binary(terminating_lease_token),
        do: current_lease_token == terminating_lease_token
 
-  defp terminating_owner_still_owns_session?(%CodexSession{}, %RequestOptions{}), do: true
+  defp terminating_owner_still_owns_session?(%CodexSession{}, %RequestOptions{}), do: false
 
   defp owner_recovery_reason(:owner_drained), do: "owner_drained"
   defp owner_recovery_reason("owner_drained"), do: "owner_drained"

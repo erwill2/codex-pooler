@@ -1,5 +1,19 @@
 import Config
 
+native_compaction_trace_mode =
+  if config_env() in [:dev, :test] do
+    CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace.runtime_mode(
+      System.get_env("CODEX_POOLER_NATIVE_COMPACTION_TRACE", "off"),
+      config_env()
+    )
+  else
+    :off
+  end
+
+config :codex_pooler,
+       CodexPooler.Gateway.Transports.Websocket.NativeCompactionTrace,
+       mode: native_compaction_trace_mode
+
 if System.get_env("PHX_SERVER") in ~w(true 1) do
   config :codex_pooler, CodexPoolerWeb.Endpoint, server: true
 end
@@ -71,7 +85,7 @@ if config_env() == :prod do
         Keyword.merge(base_oban_runtime_config, queues: oban_queues, plugins: false)
 
       "scheduler" ->
-        Keyword.merge(base_oban_runtime_config, [queues: false, stager: false] ++ oban_services)
+        Keyword.merge(base_oban_runtime_config, [queues: false] ++ oban_services)
 
       "all" ->
         Keyword.merge(base_oban_runtime_config, [queues: oban_queues] ++ oban_services)

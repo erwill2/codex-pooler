@@ -5,9 +5,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   alias CodexPooler.Admin.{UpstreamCircuitReadiness, UpstreamCockpitMetrics}
   alias CodexPooler.Audit
   alias CodexPooler.Pools
+  alias CodexPooler.Upstreams.Auth.{AccessTokenExpiry, TokenRefreshMetadata}
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.UpstreamIdentity
+  alias CodexPooler.Upstreams.Secrets
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel
+  alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.Formatting
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.QuotaProjection
   alias CodexPoolerWeb.DateTimeDisplay
 
@@ -46,6 +49,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:auth_fresh_label) => String.t(),
           required(:auth_verified_label) => String.t(),
           required(:access_token_label) => String.t(),
+          required(:credential_expiry) =>
+            UpstreamAccountsReadModel.credential_expiry_projection(),
+          required(:secret_status) =>
+            :present | :missing | :expired | :refresh_due | :reauth_required,
           required(:token_refresh_label) => String.t(),
           required(:refresh_job_state) => String.t() | nil,
           required(:reauth_required?) => boolean(),
@@ -150,6 +157,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
           required(:saved_reset_policy) => SavedResets.auto_policy_projection(),
           required(:saved_reset_confirmation) => QuotaProjection.saved_reset_confirmation() | nil,
           required(:quota_limits) => [UpstreamAccountsReadModel.quota_limit_row()],
+          required(:quota_readiness) => UpstreamAccountsReadModel.quota_readiness(),
           required(:flags) => flags()
         }
 
@@ -174,6 +182,24 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
 
     pool_contribution =
       UpstreamCockpitMetrics.pool_contribution(scope, identity_id, assignments)
+
+    %{request_health: request_health, pool_contribution: pool_contribution}
+  end
+
+  @spec request_metrics(Scope.t(), t()) :: %{
+          request_health: request_health(),
+          pool_contribution: pool_contribution()
+        }
+  def request_metrics(%Scope{} = scope, %{identity: %{id: identity_id}} = cockpit) do
+    request_health = UpstreamCockpitMetrics.request_health(scope, identity_id)
+
+    pool_contribution =
+      UpstreamCockpitMetrics.pool_contribution_from_readiness(
+        scope,
+        identity_id,
+        cockpit.assignments.items,
+        cockpit.quota_readiness
+      )
 
     %{request_health: request_health, pool_contribution: pool_contribution}
   end
@@ -227,19 +253,24 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   end
 
   defp from_account_snapshot(%{identity: %UpstreamIdentity{}} = account, scope, options) do
+    quota_readiness =
+      Map.get(account, :quota_readiness) ||
+        get_in(account, [:routing_readiness, :quota_readiness]) ||
+        %{routing_ready_now?: false}
+
     safe_identity = safe_identity(account)
     header = header(account, safe_identity)
     assignments = assignments(account)
-    quota_health = quota_health(account.identity, assignments, scope)
+    quota_health = quota_health(account, assignments, scope)
 
     {request_health, pool_contribution} =
-      request_metrics(account.identity, assignments, scope, options)
+      request_metrics(account.identity, assignments, quota_readiness, scope, options)
 
     flags = flags(account, assignments, quota_health, request_health)
     charts = charts(flags, quota_health, request_health, pool_contribution)
     oauth_flows = oauth_flows(account, scope)
     recent_events = recent_events(account.identity, scope, oauth_flows)
-    actions = actions(account)
+    actions = actions(account, header)
     saved_resets = saved_resets(account)
     saved_reset_policy = saved_reset_policy(account)
     saved_reset_confirmation = Map.get(account, :saved_reset_confirmation)
@@ -256,21 +287,48 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       saved_reset_policy: saved_reset_policy,
       saved_reset_confirmation: saved_reset_confirmation,
       quota_limits: quota_limits(account),
+      quota_readiness: quota_readiness,
       oauth_flows: oauth_flows,
       sections: sections,
       flags: flags
     }
   end
 
-  defp request_metrics(identity, assignments, scope, options) do
+  defp request_metrics(identity, assignments, quota_readiness, scope, options) do
     if Keyword.get(options, :request_metrics?, true) do
-      {request_health(identity, scope), pool_contribution(identity, assignments, scope)}
+      {
+        request_health(identity, scope),
+        pool_contribution_from_readiness(identity, assignments, quota_readiness, scope)
+      }
     else
       {
         UpstreamCockpitMetrics.request_health_without_request_data(),
         UpstreamCockpitMetrics.pool_contribution_without_request_data(assignments.items)
       }
     end
+  end
+
+  defp pool_contribution_from_readiness(
+         %UpstreamIdentity{} = identity,
+         %{items: assignments},
+         quota_readiness,
+         %Scope{} = scope
+       ) do
+    UpstreamCockpitMetrics.pool_contribution_from_readiness(
+      scope,
+      identity,
+      assignments,
+      quota_readiness
+    )
+  end
+
+  defp pool_contribution_from_readiness(
+         %UpstreamIdentity{},
+         %{items: assignments},
+         _quota_readiness,
+         _scope
+       ) do
+    UpstreamCockpitMetrics.pool_contribution_without_request_data(assignments)
   end
 
   defp oauth_flows(_account, nil), do: UpstreamAccountsReadModel.empty_oauth_flow_state()
@@ -331,6 +389,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       auth_fresh_label: account.auth_fresh_label,
       auth_verified_label: account.auth_verified_label,
       access_token_label: account.access_token_label,
+      credential_expiry: credential_expiry(account.identity),
+      secret_status: Secrets.secret_status(account.identity),
       token_refresh_label: account.token_refresh_label,
       refresh_job_state: account.refresh_job_state,
       reauth_required?: account.reauth_required?,
@@ -394,16 +454,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     }
   end
 
-  @spec pool_contribution(UpstreamIdentity.t(), assignments(), Scope.t() | term()) ::
-          pool_contribution()
-  defp pool_contribution(%UpstreamIdentity{} = identity, %{items: assignments}, %Scope{} = scope) do
-    UpstreamCockpitMetrics.pool_contribution(scope, identity, assignments)
-  end
-
-  defp pool_contribution(%UpstreamIdentity{}, %{items: assignments}, _scope) do
-    UpstreamCockpitMetrics.pool_contribution_without_request_data(assignments)
-  end
-
   @spec request_health(UpstreamIdentity.t(), Scope.t() | term()) :: request_health()
   defp request_health(%UpstreamIdentity{} = identity, %Scope{} = scope) do
     UpstreamCockpitMetrics.request_health(scope, identity)
@@ -413,12 +463,15 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     UpstreamCockpitMetrics.request_health_without_request_data()
   end
 
-  @spec quota_health(UpstreamIdentity.t(), assignments(), Scope.t() | term()) :: quota_health()
-  defp quota_health(%UpstreamIdentity{} = identity, %{items: assignments}, %Scope{} = scope) do
-    UpstreamCockpitMetrics.quota_health(scope, identity, assignments)
+  defp quota_health(
+         %{identity: %UpstreamIdentity{} = identity, quota_readiness: readiness},
+         %{items: assignments},
+         %Scope{} = scope
+       ) do
+    UpstreamCockpitMetrics.quota_health_from_readiness(scope, identity, assignments, readiness)
   end
 
-  defp quota_health(%UpstreamIdentity{}, %{items: assignments}, _scope) do
+  defp quota_health(%{identity: %UpstreamIdentity{}}, %{items: assignments}, _scope) do
     UpstreamCockpitMetrics.quota_health_without_quota_data(assignments)
   end
 
@@ -675,10 +728,10 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
   defp blank?(nil), do: true
   defp blank?(value), do: String.trim(to_string(value)) == ""
 
-  defp actions(account) do
+  defp actions(account, header) do
     status = account.identity.status
-    recovery_eligible? = recovery_eligible?(account)
-    redeem_saved_reset = redeem_saved_reset_action(account)
+    recovery_eligible? = recovery_eligible?(account, header)
+    redeem_saved_reset = redeem_saved_reset_action(account, header)
 
     %{
       rename: action(status != "deleted", "deleted accounts cannot be renamed"),
@@ -708,7 +761,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     }
   end
 
-  defp redeem_saved_reset_action(account) do
+  defp redeem_saved_reset_action(account, header) do
     cond do
       account.identity.status == "deleted" ->
         action(false, "deleted accounts cannot redeem saved resets")
@@ -716,7 +769,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
       account.identity.status == "disabled" ->
         action(false, "disabled accounts cannot redeem saved resets")
 
-      not auth_clearly_usable?(account) ->
+      not auth_clearly_usable?(header) ->
         action(false, "saved reset redemption requires usable credentials")
 
       account.assignments == [] ->
@@ -749,25 +802,46 @@ defmodule CodexPoolerWeb.Admin.UpstreamCockpitReadModel do
     }
   end
 
-  defp recovery_eligible?(%{identity: %{status: status}} = account) do
-    status in @recovery_statuses and status != "deleted" and not auth_clearly_usable?(account)
+  defp recovery_eligible?(%{identity: %{status: status}}, header) do
+    status in @recovery_statuses and status != "deleted" and not auth_clearly_usable?(header)
   end
 
   defp auth_clearly_usable?(%{
          reauth_required?: false,
          refresh_status: refresh_status,
-         access_token_label: access_token_label
+         secret_status: :present,
+         credential_expiry: %{state: expiry_state}
        }) do
     refresh_status in @usable_refresh_statuses and
-      not expired_access_token_label?(access_token_label)
+      expiry_state != "known_past"
   end
 
   defp auth_clearly_usable?(_account), do: false
 
-  defp expired_access_token_label?(label) when is_binary(label),
-    do: String.starts_with?(label, "access token expired")
+  defp credential_expiry(%UpstreamIdentity{} = identity) do
+    now = DateTime.utc_now()
 
-  defp expired_access_token_label?(_label), do: false
+    case identity.metadata
+         |> TokenRefreshMetadata.project_access_token_expiry()
+         |> AccessTokenExpiry.evaluate(now) do
+      %{state: :known, deadline: %DateTime{} = deadline} ->
+        %{
+          state: "known_future",
+          expires_at: deadline,
+          age: Formatting.relative_time_label(deadline, now)
+        }
+
+      %{state: :expired, deadline: %DateTime{} = deadline} ->
+        %{
+          state: "known_past",
+          expires_at: deadline,
+          age: Formatting.relative_time_label(deadline, now)
+        }
+
+      _unknown ->
+        %{state: "unavailable", expires_at: nil, age: nil}
+    end
+  end
 
   defp safe_account_id_label(value) when is_binary(value) and value != "" do
     fingerprint =

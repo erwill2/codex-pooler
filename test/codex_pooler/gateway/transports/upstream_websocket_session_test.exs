@@ -3,12 +3,22 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   @moduletag capture_log: true
 
+  alias CodexPooler.Accounting.ClientRetry
   alias CodexPooler.AgentV2ContractFixture
   alias CodexPooler.FakeUpstream
+  alias CodexPooler.Gateway.Payloads.RequestOptions
+  alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
   alias CodexPooler.Gateway.Transports.NativeCodexResponseControl.TurnSnapshot
   alias CodexPooler.Gateway.Transports.Streaming.StreamProtocol
   alias CodexPooler.Gateway.Transports.TransportFailureReason
   alias CodexPooler.Gateway.Transports.UpstreamDispatch
+  alias CodexPooler.Gateway.Transports.Websocket.ForwardedOwnerRequestHandoff
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Binding
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Capability
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Confirmation
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission.Topology.Direct
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAuthorizationObservation
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.ConnectionUpgrade
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request
@@ -23,6 +33,53 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
   # @timeouts. It has to stay above those scenario timeouts, or a loaded run
   # gives up on a request that was still allowed to be in flight.
   @detection_timeout_ms 5_000
+
+  defmodule ForwardedHandoffProbe do
+    use GenServer
+
+    def start_link({expected_lifecycle, expected_mode, observer}) do
+      GenServer.start_link(__MODULE__, {expected_lifecycle, expected_mode, observer})
+    end
+
+    @impl GenServer
+    def init({expected_lifecycle, expected_mode, observer}) do
+      {:ok,
+       %{
+         expected_lifecycle: expected_lifecycle,
+         expected_mode: expected_mode,
+         observer: observer,
+         redeemed?: false
+       }}
+    end
+
+    @impl GenServer
+    def handle_call(
+          {:redeem_forwarded_send_v1, _witness, lifecycle, mode},
+          _from,
+          %{redeemed?: true, observer: observer} = state
+        ) do
+      send(observer, {:forwarded_handoff_replay, lifecycle, mode})
+      {:reply, {:error, :forwarded_send_witness_rejected}, state}
+    end
+
+    def handle_call(
+          {:redeem_forwarded_send_v1, _witness, lifecycle, mode},
+          _from,
+          %{expected_lifecycle: lifecycle, expected_mode: mode, observer: observer} = state
+        ) do
+      send(observer, {:forwarded_handoff_redeemed, lifecycle, mode})
+      {:reply, :ok, %{state | redeemed?: true}}
+    end
+
+    def handle_call(
+          {:redeem_forwarded_send_v1, _witness, lifecycle, mode},
+          _from,
+          %{observer: observer} = state
+        ) do
+      send(observer, {:forwarded_handoff_stale, lifecycle, mode})
+      {:reply, {:error, :forwarded_send_witness_rejected}, state}
+    end
+  end
 
   test "characterization exposes the initial websocket lifecycle through OTP status" do
     {:ok, session} = UpstreamWebsocketSession.start_link([])
@@ -70,7 +127,8 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
              reconnect_pending?: false,
              request_active?: false,
              keepalive_pending?: true,
-             pong_pending?: false
+             pong_pending?: false,
+             admission_phase: :cleared
            }
 
     assert status_logged_events(status) == []
@@ -115,6 +173,666 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       refute inspect(dispatch_request) =~ marker
       refute inspect(formatted) =~ marker
     end
+  end
+
+  test "direct accounting rejection logs the admission state before clearing it" do
+    upstream = start_upstream(websocket_success("resp_ws_admission_diagnostics"))
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(websocket_request(FakeUpstream.url(upstream)))
+             )
+
+    binding = direct_admission_binding(lifecycle_state(session), ordinary_receipt)
+    now_ms = System.system_time(:millisecond)
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               binding,
+               now_ms + 30_000,
+               ordinary_receipt
+             )
+
+    assert {:ok, capability} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :compact,
+               binding,
+               make_ref(),
+               now_ms
+             )
+
+    assert :ok =
+             UpstreamWebsocketSession.mark_compaction_accounting_started(
+               session,
+               capability,
+               now_ms
+             )
+
+    payload = %{"model" => "gpt-test"}
+
+    request_options =
+      %{request_id: "admission-diagnostic-request"}
+      |> RequestOptions.build("/backend-api/codex/responses", payload)
+      |> RequestOptions.put_native_compaction_admission(
+        capability,
+        {:direct, session},
+        lifecycle_state(session)
+      )
+
+    for current_state <- [:accounting_started_compact, :cleared] do
+      log =
+        capture_log(fn ->
+          assert {:error, :invalid_transition} =
+                   UpstreamWebsocketSession.mark_compaction_accounting_started(
+                     session,
+                     capability,
+                     now_ms
+                   )
+
+          assert AccountingReservation.pre_attempt_failure(:invalid_transition, request_options) ==
+                   %{
+                     status: 500,
+                     code: "gateway_reservation_failed",
+                     message: "gateway request reservation failed",
+                     retryable: false
+                   }
+        end)
+
+      assert [line, reservation_line] = String.split(log, "\n", trim: true)
+      assert line =~ "native compaction admission rejected"
+      assert line =~ "step=mark_accounting_started"
+      assert line =~ "phase=compact"
+      assert line =~ "current_state=#{current_state}"
+      assert line =~ "expected_state=reserved_compact"
+      assert line =~ "topology=direct"
+      assert line =~ "reason=invalid_transition"
+      assert line =~ "native_lifecycle_id=#{binding.lifecycle_id}"
+      assert reservation_line =~ "native_lifecycle_id=#{binding.lifecycle_id}"
+      assert reservation_line =~ "request_id=admission-diagnostic-request"
+      refute log =~ Base.encode16(capability.token)
+    end
+
+    malformed_capability = %{capability | phase: :private_phase_sentinel, binding: nil}
+
+    malformed_log =
+      capture_log(fn ->
+        assert {:error, :invalid_transition} =
+                 UpstreamWebsocketSession.mark_compaction_accounting_started(
+                   session,
+                   malformed_capability,
+                   now_ms
+                 )
+      end)
+
+    assert malformed_log =~ "phase=unknown"
+    assert malformed_log =~ "native_lifecycle_id=none"
+    refute malformed_log =~ "private_phase_sentinel"
+  end
+
+  test "direct admission reserves once, consumes immediately before send, and acknowledges compact collection" do
+    observer = attach_native_compaction_observer()
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert %{generation: 0} = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(raw_websocket_request(peer.url, self()))
+             )
+
+    assert_receive {:upstream_websocket_frame, _warmup_frame}, @detection_timeout_ms
+
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    binding = direct_admission_binding(lifecycle, ordinary_receipt)
+    expires_at_ms = System.system_time(:millisecond) + 30_000
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               binding,
+               expires_at_ms,
+               ordinary_receipt
+             )
+
+    control_ref = make_ref()
+
+    assert {:ok, %Capability{} = capability} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :compact,
+               binding,
+               control_ref,
+               System.system_time(:millisecond)
+             )
+
+    assert :ok =
+             UpstreamWebsocketSession.mark_compaction_accounting_started(
+               session,
+               capability,
+               System.system_time(:millisecond)
+             )
+
+    request = %{
+      raw_websocket_request(peer.url, self())
+      | native_compaction_capability: capability,
+        expected_connection_lifecycle: lifecycle
+    }
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert :collected_unconfirmed = UpstreamWebsocketSession.compaction_admission_phase(session)
+
+    digest = :crypto.hash(:sha256, "synthetic-compaction-item")
+
+    confirmation = %Confirmation{
+      source_phase: :compact,
+      source_control_ref: control_ref,
+      binding: %{binding | compaction_item_digest: digest}
+    }
+
+    assert :ok =
+             UpstreamWebsocketSession.acknowledge_compact_finalization(
+               session,
+               {:success, digest, confirmation, expires_at_ms}
+             )
+
+    assert :pending_final = UpstreamWebsocketSession.compaction_admission_phase(session)
+
+    final_binding = %{
+      binding
+      | window_digest: :crypto.hash(:sha256, "next-window"),
+        context_digest: :crypto.hash(:sha256, "next-context"),
+        window_number: binding.window_number + 1,
+        compaction_item_digest: digest
+    }
+
+    assert {:ok, final_capability} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :final,
+               final_binding,
+               make_ref(),
+               System.system_time(:millisecond)
+             )
+
+    assert :ok =
+             UpstreamWebsocketSession.mark_compaction_accounting_started(
+               session,
+               final_capability,
+               System.system_time(:millisecond)
+             )
+
+    final_request = %{
+      raw_websocket_request(peer.url, self())
+      | native_compaction_capability: final_capability,
+        expected_connection_lifecycle: lifecycle
+    }
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, final_request)
+
+    assert :consumed_final = UpstreamWebsocketSession.compaction_admission_phase(session)
+    assert :ok = UpstreamWebsocketSession.acknowledge_final_response(session, :success)
+    assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+
+    assert observer.() ==
+             expected_native_compaction_counts()
+             |> Map.drop([:compact_runtime_proof_redeemed, :final_runtime_proof_redeemed])
+  end
+
+  test "direct admission failures and replay emit no successful transition facts" do
+    observer = attach_native_compaction_observer()
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(raw_websocket_request(peer.url, self()))
+             )
+
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    binding = direct_admission_binding(lifecycle, ordinary_receipt)
+    assert :ok = UpstreamWebsocketSession.arm_compact(session, binding, 30_000, ordinary_receipt)
+
+    assert {:error, :expired} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :compact,
+               binding,
+               make_ref(),
+               30_001
+             )
+
+    assert observer.() == %{}
+  end
+
+  test "direct admission rejects stale capability without bytes and releases only pre-accounting cancellation" do
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(raw_websocket_request(peer.url, self()))
+             )
+
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    binding = direct_admission_binding(lifecycle, ordinary_receipt)
+    expires_at_ms = System.system_time(:millisecond) + 30_000
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               binding,
+               expires_at_ms,
+               ordinary_receipt
+             )
+
+    assert {:ok, capability} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :compact,
+               binding,
+               make_ref(),
+               System.system_time(:millisecond)
+             )
+
+    assert :ok =
+             UpstreamWebsocketSession.cancel_compaction_reservation(
+               session,
+               capability,
+               System.system_time(:millisecond)
+             )
+
+    assert :pending_compact = UpstreamWebsocketSession.compaction_admission_phase(session)
+
+    assert {:ok, capability} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :compact,
+               binding,
+               make_ref(),
+               System.system_time(:millisecond)
+             )
+
+    assert :ok =
+             UpstreamWebsocketSession.mark_compaction_accounting_started(
+               session,
+               capability,
+               System.system_time(:millisecond)
+             )
+
+    stale_capability =
+      NativeCompactionAdmission.Capability.replace_token(
+        capability,
+        :crypto.strong_rand_bytes(32)
+      )
+
+    request = %{
+      raw_websocket_request(peer.url, self())
+      | native_compaction_capability: stale_capability,
+        expected_connection_lifecycle: lifecycle
+    }
+
+    assert {:error, %{reason: :native_compaction_capability_rejected}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    refute_received {:raw_upstream_websocket_request, 1, 2}
+    assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+  end
+
+  test "direct admission clears on finalization failure, invalidation, reconnect, and caller death" do
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(raw_websocket_request(peer.url, self()))
+             )
+
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    binding = direct_admission_binding(lifecycle, ordinary_receipt)
+    expires_at_ms = System.system_time(:millisecond) + 30_000
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               binding,
+               expires_at_ms,
+               ordinary_receipt
+             )
+
+    assert :ok = UpstreamWebsocketSession.acknowledge_compact_finalization(session, :failure)
+    assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(raw_websocket_request(peer.url, self()))
+             )
+
+    binding = direct_admission_binding(lifecycle, ordinary_receipt)
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               binding,
+               expires_at_ms,
+               ordinary_receipt
+             )
+
+    assert :ok = UpstreamWebsocketSession.invalidate_connection(session)
+    assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(raw_websocket_request(peer.url, self()))
+             )
+
+    replacement_lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    assert replacement_lifecycle.generation == lifecycle.generation + 1
+    refute replacement_lifecycle == lifecycle
+
+    replacement_binding = direct_admission_binding(replacement_lifecycle, ordinary_receipt)
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               replacement_binding,
+               expires_at_ms,
+               ordinary_receipt
+             )
+
+    Agent.update(peer.state, &%{&1 | response_mode: :hold})
+
+    owner = self()
+
+    request_pid =
+      spawn(fn ->
+        UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, owner))
+      end)
+
+    request_monitor = Process.monitor(request_pid)
+
+    assert_receive {:raw_upstream_websocket_request, 2, 2}, @detection_timeout_ms
+    Process.exit(request_pid, :kill)
+
+    assert_receive {:DOWN, ^request_monitor, :process, ^request_pid, :killed},
+                   @detection_timeout_ms
+
+    _ = :sys.get_state(session)
+    assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+  end
+
+  test "direct admission rejects malformed controls and stale lifecycle before upstream send" do
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:error, :invalid_input} = UpstreamWebsocketSession.arm_compact(session, %{}, -1)
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.reserve_compaction(session, :unknown, %{}, nil, -1)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(raw_websocket_request(peer.url, self()))
+             )
+
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    binding = direct_admission_binding(lifecycle, ordinary_receipt)
+    expires_at_ms = System.system_time(:millisecond) + 30_000
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               binding,
+               expires_at_ms,
+               ordinary_receipt
+             )
+
+    assert {:ok, capability} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :compact,
+               binding,
+               make_ref(),
+               System.system_time(:millisecond)
+             )
+
+    assert :ok =
+             UpstreamWebsocketSession.mark_compaction_accounting_started(
+               session,
+               capability,
+               System.system_time(:millisecond)
+             )
+
+    stale_lifecycle = %{lifecycle | generation: lifecycle.generation + 1}
+
+    request = %{
+      raw_websocket_request(peer.url, self())
+      | native_compaction_capability: capability,
+        expected_connection_lifecycle: stale_lifecycle
+    }
+
+    assert {:error, %{reason: :native_compaction_capability_rejected}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert Agent.get(peer.state, & &1.connection_count) == 1
+    assert :cleared = UpstreamWebsocketSession.compaction_admission_phase(session)
+  end
+
+  test "direct admission preserves the current capability after a stale reserve attempt" do
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, %{terminal: "response.completed", ordinary_success_result: ordinary_receipt}} =
+             UpstreamWebsocketSession.request(
+               session,
+               ordinary_request(raw_websocket_request(peer.url, self()))
+             )
+
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    binding = direct_admission_binding(lifecycle, ordinary_receipt)
+    now_ms = System.system_time(:millisecond)
+
+    assert :ok =
+             UpstreamWebsocketSession.arm_compact(
+               session,
+               binding,
+               now_ms + 30_000,
+               ordinary_receipt
+             )
+
+    assert {:ok, capability} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :compact,
+               binding,
+               make_ref(),
+               now_ms
+             )
+
+    stale_binding = %{binding | generation: binding.generation + 1}
+
+    assert {:error, :binding_mismatch} =
+             UpstreamWebsocketSession.reserve_compaction(
+               session,
+               :compact,
+               stale_binding,
+               make_ref(),
+               now_ms
+             )
+
+    assert :reserved_compact = UpstreamWebsocketSession.compaction_admission_phase(session)
+    refute_received {:raw_upstream_websocket_request, 1, 2}
+
+    assert :ok =
+             UpstreamWebsocketSession.mark_compaction_accounting_started(
+               session,
+               capability,
+               now_ms
+             )
+
+    request = %{
+      raw_websocket_request(peer.url, self())
+      | native_compaction_capability: capability,
+        expected_connection_lifecycle: lifecycle
+    }
+
+    assert {:ok, %{terminal: "response.completed", response_id: "resp_raw_ws_1_2"}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert :collected_unconfirmed = UpstreamWebsocketSession.compaction_admission_phase(session)
+  end
+
+  test "public admission APIs return bounded errors for every malformed call shape" do
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:error, :invalid_input} = UpstreamWebsocketSession.connection_lifecycle_snapshot(:bad)
+    assert {:error, :invalid_input} = UpstreamWebsocketSession.arm_compact(:bad, %{}, -1)
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.authorize_first_compact_collection(:bad, %{}, nil)
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.record_first_compact_collected(:bad, %{})
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.reserve_compaction(:bad, :unknown, %{}, nil, -1)
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.mark_compaction_accounting_started(:bad, %{}, -1)
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.cancel_compaction_reservation(:bad, %{}, -1)
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.acknowledge_compact_finalization(:bad, :failure)
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.acknowledge_compact_finalization(session, :invalid)
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.acknowledge_final_response(session, :invalid)
+
+    assert {:error, :invalid_input} =
+             UpstreamWebsocketSession.acknowledge_final_response(:bad, :success)
+
+    assert {:error, :invalid_input} = UpstreamWebsocketSession.clear_compaction_admission(:bad)
+    assert {:error, :invalid_input} = UpstreamWebsocketSession.compaction_admission_phase(:bad)
+  end
+
+  test "forwarded handoff redeems on the live generation immediately before one physical send" do
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, self()))
+
+    assert_receive {:upstream_websocket_frame, _warmup_frame}, @detection_timeout_ms
+
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    handoff = forwarded_handoff_probe(lifecycle, :full, self())
+
+    request = %{
+      raw_websocket_request(peer.url, self())
+      | forwarded_owner_send_handoff: handoff,
+        effective_serving_mode: "full"
+    }
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert_receive {:forwarded_handoff_redeemed, ^lifecycle, :full}, @detection_timeout_ms
+    assert_receive {:upstream_websocket_frame, _accepted_frame}, @detection_timeout_ms
+
+    assert {:error, %{reason: :native_compaction_capability_rejected}} =
+             UpstreamWebsocketSession.request(session, request)
+
+    assert_receive {:forwarded_handoff_replay, ^lifecycle, :full}, @detection_timeout_ms
+    refute_received {:upstream_websocket_frame, _extra_frame}
+  end
+
+  test "forwarded handoff rejects replacement generation and mixed direct authorization with zero bytes" do
+    peer = start_raw_websocket_peer(response_mode: :terminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, self()))
+
+    assert_receive {:upstream_websocket_frame, _warmup_frame}, @detection_timeout_ms
+
+    lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    stale_handoff = forwarded_handoff_probe(lifecycle, :full, self())
+
+    assert :ok = UpstreamWebsocketSession.invalidate_connection(session)
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, self()))
+
+    assert_receive {:upstream_websocket_frame, _replacement_frame}, @detection_timeout_ms
+
+    replacement_lifecycle = UpstreamWebsocketSession.connection_lifecycle_snapshot(session)
+    assert replacement_lifecycle.generation == lifecycle.generation + 1
+
+    stale_request = %{
+      raw_websocket_request(peer.url, self())
+      | forwarded_owner_send_handoff: stale_handoff,
+        effective_serving_mode: "full"
+    }
+
+    assert {:error, %{reason: :native_compaction_capability_rejected}} =
+             UpstreamWebsocketSession.request(session, stale_request)
+
+    assert_receive {:forwarded_handoff_stale, ^replacement_lifecycle, :full},
+                   @detection_timeout_ms
+
+    refute_received {:upstream_websocket_frame, _stale_frame}
+
+    mixed_handoff = forwarded_handoff_probe(replacement_lifecycle, :full, self())
+    mixed_binding = direct_admission_binding(replacement_lifecycle)
+
+    mixed_capability = %Capability{
+      phase: :compact,
+      binding: mixed_binding,
+      control_ref: make_ref(),
+      token: :crypto.strong_rand_bytes(32),
+      expires_at_ms: System.system_time(:millisecond) + 30_000
+    }
+
+    mixed_request = %{
+      stale_request
+      | forwarded_owner_send_handoff: mixed_handoff,
+        native_compaction_capability: mixed_capability,
+        expected_connection_lifecycle: replacement_lifecycle
+    }
+
+    assert {:error, %{reason: :native_compaction_capability_rejected}} =
+             UpstreamWebsocketSession.request(session, mixed_request)
+
+    refute_received {:forwarded_handoff_redeemed, _lifecycle, _mode}
+    refute_received {:upstream_websocket_frame, _mixed_frame}
   end
 
   test "OTP termination report redacts installed request state and crashing transport message" do
@@ -915,6 +1633,58 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert FakeUpstream.http_request_count(upstream) == 0
   end
 
+  test "close after partial reasoning returns a complete metadata-only client retry observation" do
+    upstream =
+      start_upstream(
+        FakeUpstream.websocket_sse_then_close([
+          %{
+            "type" => "response.reasoning_summary_text.delta",
+            "delta" => "private reasoning fragment"
+          }
+        ])
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    handler_id = "t7-frame-query-count-#{System.unique_integer([:positive, :monotonic])}"
+    parent = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, _metadata, %{parent: parent, session: session} ->
+          if self() == session, do: send(parent, :t7_frame_sql_query)
+        end,
+        %{parent: parent, session: session}
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    request = %{
+      websocket_request(FakeUpstream.url(upstream))
+      | native_client_retry_observation: ClientRetry.new_observation()
+    }
+
+    assert {:error,
+            %{
+              reason: :upstream_websocket_closed_before_terminal,
+              native_client_retry_observation: observation
+            }} = UpstreamWebsocketSession.request(session, request)
+
+    assert {:ok, metadata} =
+             ClientRetry.final_observation_metadata(observation)
+
+    assert metadata["authority_complete"] == true
+    assert metadata["partial_reasoning_seen"] == true
+    assert metadata["output_item_done_count"] == 0
+    assert metadata["terminal_seen"] == false
+    assert metadata["terminal_candidate_seen"] == false
+    refute inspect(metadata) =~ "private reasoning fragment"
+    refute_received :t7_frame_sql_query
+  end
+
   test "peer close after an arbitrary nonterminal event records only bounded protocol buckets" do
     raw_event_type = "response.private_event_sentinel_deadbeef"
     raw_payload = "private-frame-sentinel-cafefeed"
@@ -1492,6 +2262,279 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     cleanup = stop_raw_websocket_peer(peer)
     assert cleanup.alive_tasks == []
     assert cleanup.client_socket_count == 0
+  end
+
+  @tag :fragmented_upgrade_boundary
+  test "Mint rejects upgrade headers without a status line before response completion" do
+    peer = start_raw_websocket_peer(upgrade_mode: :missing_status)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    initial_lifecycle = lifecycle_state(session)
+
+    assert {:error, %{body: "", reason: %Mint.HTTPError{reason: :invalid_status_line}}} =
+             UpstreamWebsocketSession.request(session, websocket_request(peer.url))
+
+    assert_disconnected_lifecycle(session, initial_lifecycle)
+
+    cleanup = stop_raw_websocket_peer(peer)
+    assert cleanup.alive_tasks == []
+    assert cleanup.client_socket_count == 0
+  end
+
+  @tag :fragmented_upgrade_boundary
+  test "Mint emits a split upgrade status before the terminal headers and done batch" do
+    peer = start_raw_websocket_peer(upgrade_mode: :split_status)
+    uri = URI.parse(peer.url)
+
+    {:ok, conn} =
+      Mint.HTTP.connect(:http, uri.host, uri.port, protocols: [:http1], mode: :passive)
+
+    on_exit(fn -> Mint.HTTP.close(conn) end)
+    {:ok, conn, ref} = Mint.WebSocket.upgrade(:ws, conn, uri.path, [])
+
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :status, peer_pid},
+                   @detection_timeout_ms
+
+    assert {:ok, conn, [{:status, ^ref, 101}]} =
+             Mint.WebSocket.recv(conn, 0, @detection_timeout_ms)
+
+    send(peer_pid, :release_raw_upstream_websocket_upgrade)
+
+    deadline = System.monotonic_time(:millisecond) + @detection_timeout_ms
+    {conn, responses} = receive_mint_upgrade_until_done(conn, ref, deadline, [])
+    assert [{:headers, ^ref, headers}, {:done, ^ref}] = responses
+    assert {"upgrade", "websocket"} in headers
+
+    {:ok, _conn} = Mint.HTTP.close(conn)
+    cleanup = stop_raw_websocket_peer(peer)
+    assert cleanup.alive_tasks == []
+    assert cleanup.client_socket_count == 0
+  end
+
+  test "an intact raw HTTP websocket upgrade establishes generation one" do
+    peer = start_raw_websocket_peer(upgrade_mode: :valid)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    initial_lifecycle = lifecycle_state(session)
+
+    assert {:ok, result} =
+             UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, self()))
+
+    assert_connection_metadata(result, %{initial_lifecycle | generation: 1}, false, false)
+    assert_receive {:upstream_websocket_frame, _frame}, @detection_timeout_ms
+
+    cleanup = stop_raw_websocket_peer(peer)
+    assert cleanup.alive_tasks == []
+    assert cleanup.client_socket_count == 0
+  end
+
+  @tag :fragmented_upgrade_boundary
+  test "retains a status 101 emitted in a Mint batch before the terminal headers batch" do
+    peer = start_raw_websocket_peer(upgrade_mode: :split_status)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    initial_lifecycle = lifecycle_state(session)
+    owner = self()
+
+    request_task =
+      Task.async(fn ->
+        UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, owner))
+      end)
+
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :status, peer_pid},
+                   @detection_timeout_ms
+
+    assert_stack_eventually_in(session, ConnectionUpgrade, :await_upgrade, 5)
+    send(peer_pid, :release_raw_upstream_websocket_upgrade)
+
+    assert {:ok, result} = Task.await(request_task, @detection_timeout_ms)
+    assert_connection_metadata(result, %{initial_lifecycle | generation: 1}, false, false)
+    assert_receive {:upstream_websocket_frame, _frame}, @detection_timeout_ms
+
+    cleanup = stop_raw_websocket_peer(peer)
+    assert cleanup.alive_tasks == []
+    assert cleanup.client_socket_count == 0
+  end
+
+  test "retains status across a partial header line before final upgrade headers" do
+    peer = start_raw_websocket_peer(upgrade_mode: :split_partial_headers)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    owner = self()
+
+    task =
+      Task.async(fn ->
+        UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, owner))
+      end)
+
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :partial_headers, peer_pid},
+                   @detection_timeout_ms
+
+    send(peer_pid, :release_raw_upstream_websocket_upgrade)
+    assert {:ok, _result} = Task.await(task, @detection_timeout_ms)
+    assert_receive {:upstream_websocket_frame, _frame}, @detection_timeout_ms
+  end
+
+  @tag :fragmented_upgrade_boundary
+  test "uses the completed final block when informational and final responses share one Mint batch" do
+    peer =
+      start_raw_websocket_peer(
+        upgrade_mode: :informational_then_valid,
+        upgrade_headers: [{"x-final-upgrade", "present"}]
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, _result} =
+             UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, self()))
+
+    state = :sys.get_state(session)
+    assert {"x-final-upgrade", "present"} in state.headers
+    refute Enum.any?(state.headers, fn {name, _value} -> name == "x-informational-sentinel" end)
+  end
+
+  test "retains a fragmented non-101 status for the terminal upgrade failure" do
+    peer = start_raw_websocket_peer(upgrade_mode: :split_forbidden)
+    owner = self()
+
+    result_task =
+      Task.async(fn ->
+        UpstreamWebsocketSession.request_once(raw_websocket_request(peer.url, owner))
+      end)
+
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :forbidden_status, peer_pid},
+                   @detection_timeout_ms
+
+    send(peer_pid, :release_raw_upstream_websocket_upgrade)
+
+    assert {:error, %{body: "", reason: {:websocket_upgrade_failed, 403, headers}}} =
+             Task.await(result_task, @detection_timeout_ms)
+
+    assert {"content-length", "0"} in headers
+    refute_received {:raw_upstream_websocket_upgrade_payload, 1, _bytes}
+  end
+
+  test "caller death after the first upgrade fragment closes without sending payload" do
+    peer = start_raw_websocket_peer(upgrade_mode: :split_status)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    owner = self()
+
+    task =
+      Task.async(fn ->
+        UpstreamWebsocketSession.request(session, raw_websocket_request(peer.url, owner))
+      end)
+
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :status, peer_pid},
+                   @detection_timeout_ms
+
+    assert Task.shutdown(task, :brutal_kill) == nil
+    send(peer_pid, :release_raw_upstream_websocket_upgrade)
+    assert :closed = wait_for_raw_websocket_connection_closed(1, 500)
+    refute_received {:raw_upstream_websocket_upgrade_payload, 1, _bytes}
+  end
+
+  test "queued terminal upgrade data wins at an expired monotonic deadline" do
+    peer = start_raw_websocket_peer(upgrade_mode: :split_status)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = %{
+      raw_websocket_request(peer.url, self())
+      | timeouts: %{connect_timeout_ms: 80, receive_timeout_ms: 1_000}
+    }
+
+    owner = self()
+    request = %{request | writer: fn text -> send(owner, {:upstream_websocket_frame, text}) end}
+
+    task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
+
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :status, peer_pid},
+                   @detection_timeout_ms
+
+    :erlang.suspend_process(session)
+
+    try do
+      send(peer_pid, :release_raw_upstream_websocket_upgrade)
+
+      assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :terminal_queued},
+                     @detection_timeout_ms
+
+      await_test_timer(120)
+    after
+      :erlang.resume_process(session)
+    end
+
+    assert {:ok, _result} = Task.await(task, @detection_timeout_ms)
+    assert_receive {:upstream_websocket_frame, _frame}, @detection_timeout_ms
+  end
+
+  test "queued nonterminal upgrade data folds once and then respects the expired deadline" do
+    peer = start_raw_websocket_peer(upgrade_mode: :split_nonterminal_headers)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = %{
+      raw_websocket_request(peer.url, self())
+      | timeouts: %{connect_timeout_ms: 80, receive_timeout_ms: 1_000}
+    }
+
+    task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
+
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :status, peer_pid},
+                   @detection_timeout_ms
+
+    :erlang.suspend_process(session)
+
+    try do
+      send(peer_pid, :release_raw_upstream_websocket_upgrade)
+
+      assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :nonterminal_queued},
+                     @detection_timeout_ms
+
+      await_test_timer(120)
+    after
+      :erlang.resume_process(session)
+    end
+
+    assert {:error, %{reason: :upstream_websocket_upgrade_timeout}} =
+             Task.await(task, @detection_timeout_ms)
+
+    refute_received {:raw_upstream_websocket_upgrade_payload, 1, _bytes}
+  end
+
+  test "nonterminal trickle fragments cannot extend the websocket upgrade deadline" do
+    peer = start_raw_websocket_peer(upgrade_mode: :trickle_nonterminal)
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = %{
+      raw_websocket_request(peer.url, self())
+      | timeouts: %{connect_timeout_ms: 120, receive_timeout_ms: 1_000}
+    }
+
+    task = Task.async(fn -> UpstreamWebsocketSession.request(session, request) end)
+
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :trickle_status, peer_pid},
+                   @detection_timeout_ms
+
+    :erlang.suspend_process(session)
+
+    try do
+      release_raw_websocket_trickle(peer_pid, 10)
+      await_test_timer(160)
+    after
+      :erlang.resume_process(session)
+    end
+
+    assert {:error, %{reason: :upstream_websocket_upgrade_timeout}} =
+             Task.await(task, @detection_timeout_ms)
+
+    refute_received {:raw_upstream_websocket_upgrade_payload, 1, _bytes}
   end
 
   test "does not advance generation when Mint rejects websocket creation after status 101" do
@@ -2569,6 +3612,216 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     assert warmup_request.websocket_connection_id == continuation_request.websocket_connection_id
   end
 
+  @tag :collect_compaction
+  test "full-history collection rejects an anchor on a fresh connection without send" do
+    upstream = start_upstream(websocket_success_without_id())
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    request = websocket_request(FakeUpstream.url(upstream))
+
+    request = %{
+      request
+      | payload:
+          Jason.encode!(%{
+            "type" => "response.create",
+            "previous_response_id" => "resp_old",
+            "input" => [
+              %{"type" => "message", "role" => "user", "content" => "synthetic"},
+              %{"type" => "compaction_trigger"}
+            ]
+          }),
+        writer: nil,
+        websocket_delivery_mode: :collect_full_history,
+        effective_serving_mode: "full"
+    }
+
+    assert {:ok, result} = UpstreamWebsocketSession.request(session, request)
+    assert result.terminal == "error"
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  @tag :collect_compaction
+  test "fresh full-history collection opens one connection and keeps anchored collection fenced" do
+    upstream = start_upstream(websocket_success_without_id())
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+    request = websocket_request(FakeUpstream.url(upstream))
+
+    request = %{
+      request
+      | payload:
+          Jason.encode!(%{
+            "type" => "response.create",
+            "input" => [
+              %{"type" => "message", "role" => "user", "content" => "synthetic"},
+              %{"type" => "compaction_trigger"}
+            ]
+          }),
+        writer: nil,
+        websocket_delivery_mode: :collect_full_history,
+        effective_serving_mode: "full"
+    }
+
+    assert {:ok, result} = UpstreamWebsocketSession.request(session, request)
+    assert result.terminal == "response.completed"
+    assert FakeUpstream.count(upstream) == 1
+    assert result.upstream_websocket_connection.reused == false
+  end
+
+  @tag :collect_compaction
+  test "collect compaction retains frames without a writer on a reused matching-mode connection" do
+    item =
+      Jason.encode!(%{
+        "type" => "response.output_item.done",
+        "item" => %{"type" => "compaction", "encrypted_content" => "opaque-compact"}
+      })
+
+    terminal =
+      Jason.encode!(%{
+        "type" => "response.completed",
+        "response" => %{"id" => "resp_collect_matching", "status" => "completed"}
+      })
+
+    upstream =
+      start_upstream(
+        {:sequence,
+         [
+           websocket_success_without_id(),
+           FakeUpstream.websocket_text_frames([item, terminal])
+         ]}
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = websocket_request(FakeUpstream.url(upstream))
+    warmup = struct(request, effective_serving_mode: "full")
+
+    collect =
+      struct(request,
+        writer: nil,
+        websocket_delivery_mode: :collect_compaction,
+        effective_serving_mode: "full"
+      )
+
+    assert {:ok, %{terminal: "response.completed"}} =
+             UpstreamWebsocketSession.request(session, warmup)
+
+    assert {:ok, result} = UpstreamWebsocketSession.request(session, collect)
+    assert result.upstream_websocket_connection.reused
+    assert result.body == "data: #{item}\n\ndata: #{terminal}\n\n"
+
+    assert [warmup_request, collect_request] = FakeUpstream.requests(upstream)
+    assert warmup_request.websocket_connection_id == collect_request.websocket_connection_id
+    assert collect_request.body == collect.payload
+  end
+
+  @tag :collect_compaction
+  test "collect compaction rejects fresh mode-mismatched and invalidated connections without send or reconnect" do
+    upstream =
+      start_upstream(
+        {:sequence,
+         [
+           websocket_success_without_id(),
+           websocket_success_without_id()
+         ]}
+      )
+
+    request = websocket_request(FakeUpstream.url(upstream))
+
+    {:ok, fresh_session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(fresh_session) end)
+    fresh_lifecycle = lifecycle_state(fresh_session)
+
+    fresh_collect =
+      struct(request,
+        writer: nil,
+        websocket_delivery_mode: :collect_compaction,
+        effective_serving_mode: "full"
+      )
+
+    assert_collect_guard_result(
+      UpstreamWebsocketSession.request(fresh_session, fresh_collect),
+      :fresh
+    )
+
+    assert FakeUpstream.requests(upstream) == []
+    assert FakeUpstream.websocket_connection_count(upstream) == 0
+    assert_disconnected_lifecycle(fresh_session, fresh_lifecycle)
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    assert {:ok, _warmup} =
+             UpstreamWebsocketSession.request(
+               session,
+               struct(request, effective_serving_mode: "full")
+             )
+
+    lite_collect =
+      struct(request,
+        writer: nil,
+        websocket_delivery_mode: :collect_compaction,
+        effective_serving_mode: "lite"
+      )
+
+    assert_collect_guard_result(
+      UpstreamWebsocketSession.request(session, lite_collect),
+      :reused
+    )
+
+    assert [_warmup_request] = FakeUpstream.requests(upstream)
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+
+    assert :ok = UpstreamWebsocketSession.invalidate_connection(session)
+
+    assert_collect_guard_result(
+      UpstreamWebsocketSession.request(session, fresh_collect),
+      :reconnected
+    )
+
+    assert [_warmup_request] = FakeUpstream.requests(upstream)
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+  end
+
+  @tag :collect_compaction
+  test "collect compaction does not reconnect after a preterminal close" do
+    upstream =
+      start_upstream(
+        {:sequence,
+         [
+           websocket_success_without_id(),
+           FakeUpstream.websocket_sse_then_close([]),
+           websocket_success_without_id()
+         ]}
+      )
+
+    {:ok, session} = UpstreamWebsocketSession.start_link([])
+    on_exit(fn -> UpstreamWebsocketSession.close(session) end)
+
+    request = websocket_request(FakeUpstream.url(upstream))
+
+    assert {:ok, _warmup} =
+             UpstreamWebsocketSession.request(
+               session,
+               struct(request, effective_serving_mode: "full")
+             )
+
+    collect =
+      struct(request,
+        writer: nil,
+        websocket_delivery_mode: :collect_compaction,
+        effective_serving_mode: "full"
+      )
+
+    assert {:error, %{reason: :upstream_websocket_closed_before_terminal}} =
+             UpstreamWebsocketSession.request(session, collect)
+
+    assert [_warmup_request, collect_request] = FakeUpstream.requests(upstream)
+    assert collect_request.body == collect.payload
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+  end
+
   @tag :continuation_generation_boundary
   test "marked continuation on a replacement connection writes one retry terminal and keeps it reusable" do
     upstream =
@@ -2843,6 +4096,27 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     })
   end
 
+  defp assert_collect_guard_result(result, connection_use) do
+    terminal = native_retry_terminal()
+
+    assert {:ok,
+            %{
+              body: "data: " <> ^terminal <> "\n\n",
+              terminal: "error",
+              status: 200,
+              upstream_error_code: "previous_response_not_found",
+              upstream_error_param: "previous_response_id",
+              transport_failure: transport_failure,
+              upstream_websocket_connection: connection
+            }} = result
+
+    assert transport_failure ==
+             TransportFailureReason.continuation_generation_guard_metadata(connection_use)
+
+    assert connection.reused == (connection_use == :reused)
+    assert connection.reconnected == (connection_use == :reconnected)
+  end
+
   defp websocket_success_without_id do
     FakeUpstream.websocket_text_frames([
       Jason.encode!(%{
@@ -2910,6 +4184,64 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     session
     |> :sys.get_state()
     |> lifecycle_from_state()
+  end
+
+  defp ordinary_request(%Request{} = request) do
+    payload = request.payload |> Jason.decode!() |> Map.put_new("model", "upstream-test-model")
+
+    %{
+      request
+      | payload: Jason.encode!(payload),
+        request_id: Ecto.UUID.generate(),
+        attempt_id: Ecto.UUID.generate(),
+        effective_serving_mode: "full"
+    }
+  end
+
+  defp direct_admission_binding(lifecycle, ordinary_receipt) do
+    %{
+      direct_admission_binding(lifecycle)
+      | previous_response_digest: ordinary_receipt.response_digest
+    }
+  end
+
+  defp direct_admission_binding(%{lifecycle_id: lifecycle_id, generation: generation}) do
+    %Binding{
+      semantic_turn_key: :crypto.hash(:sha256, "semantic-turn"),
+      window_digest: :crypto.hash(:sha256, "window"),
+      context_digest: :crypto.hash(:sha256, "context"),
+      window_number: 1,
+      previous_response_digest: nil,
+      serving_mode: :full,
+      topology: %Direct{},
+      lifecycle_id: lifecycle_id,
+      generation: generation
+    }
+  end
+
+  defp forwarded_handoff_probe(lifecycle, mode, observer) do
+    child_spec = %{
+      id: {ForwardedHandoffProbe, make_ref()},
+      start: {ForwardedHandoffProbe, :start_link, [{lifecycle, mode, observer}]},
+      restart: :temporary
+    }
+
+    owner = start_supervised!(child_spec)
+
+    witness = %CodexPooler.Gateway.Transports.Websocket.ForwardedSendWitnessV1{
+      version: 1,
+      phase: :compact,
+      binding: direct_admission_binding(lifecycle),
+      control_ref: make_ref(),
+      capability_digest: <<0::256>>,
+      correlation_digest: <<1::256>>,
+      downstream_epoch: 1,
+      expires_at_ms: System.system_time(:millisecond) + 30_000,
+      nonce: <<2::256>>,
+      signature: <<3::256>>
+    }
+
+    ForwardedOwnerRequestHandoff.new(owner, witness)
   end
 
   defp status_state(
@@ -3288,28 +4620,190 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     end
   end
 
-  defp send_raw_websocket_upgrade(state, socket, key, mode, _connection_id, _owner)
-       when mode in [:valid, :invalid_accept] do
-    accept =
-      if mode == :valid do
-        :sha
-        |> :crypto.hash(key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
-        |> Base.encode64()
-      else
-        "invalid-websocket-accept"
-      end
+  defp send_raw_websocket_upgrade(state, socket, key, :missing_status, _connection_id, _owner) do
+    send_raw_websocket_upgrade_headers(state, socket, key)
+  end
 
-    upgrade_headers =
-      if mode == :valid do
-        state
-        |> Agent.get(& &1.upgrade_headers)
-        |> Enum.map(fn {name, value} -> [name, ": ", value, "\r\n"] end)
-      else
-        []
-      end
+  defp send_raw_websocket_upgrade(state, socket, key, :split_status, connection_id, owner) do
+    :ok = :gen_tcp.send(socket, "HTTP/1.1 101 Switching Protocols\r\n")
+    send(owner, {:raw_upstream_websocket_upgrade_fragment, connection_id, :status, self()})
+
+    receive do
+      :release_raw_upstream_websocket_upgrade ->
+        result = send_raw_websocket_upgrade_headers(state, socket, key)
+        send(owner, {:raw_upstream_websocket_upgrade_fragment, connection_id, :terminal_queued})
+        result
+    after
+      @detection_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
+    end
+  end
+
+  defp send_raw_websocket_upgrade(
+         _state,
+         socket,
+         key,
+         :split_partial_headers,
+         connection_id,
+         owner
+       ) do
+    :ok = :gen_tcp.send(socket, ["HTTP/1.1 101 Switching Protocols\r\n", "upgrade: web"])
+
+    send(
+      owner,
+      {:raw_upstream_websocket_upgrade_fragment, connection_id, :partial_headers, self()}
+    )
+
+    receive do
+      :release_raw_upstream_websocket_upgrade ->
+        accept = websocket_accept(key)
+
+        :gen_tcp.send(socket, [
+          "socket\r\nconnection: Upgrade\r\nsec-websocket-accept: ",
+          accept,
+          "\r\n\r\n"
+        ])
+    after
+      @detection_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
+    end
+  end
+
+  defp send_raw_websocket_upgrade(
+         state,
+         socket,
+         key,
+         :informational_then_valid,
+         _connection_id,
+         _owner
+       ) do
+    final_headers = raw_websocket_upgrade_headers(state, key, websocket_accept(key))
 
     :gen_tcp.send(socket, [
+      "HTTP/1.1 103 Early Hints\r\nx-informational-sentinel: excluded\r\n\r\n",
       "HTTP/1.1 101 Switching Protocols\r\n",
+      final_headers
+    ])
+  end
+
+  defp send_raw_websocket_upgrade(_state, socket, _key, :split_forbidden, connection_id, owner) do
+    :ok = :gen_tcp.send(socket, "HTTP/1.1 403 Forbidden\r\n")
+
+    send(
+      owner,
+      {:raw_upstream_websocket_upgrade_fragment, connection_id, :forbidden_status, self()}
+    )
+
+    receive do
+      :release_raw_upstream_websocket_upgrade ->
+        :gen_tcp.send(socket, "content-length: 0\r\n\r\n")
+    after
+      @detection_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
+    end
+  end
+
+  defp send_raw_websocket_upgrade(
+         _state,
+         socket,
+         _key,
+         :split_nonterminal_headers,
+         connection_id,
+         owner
+       ) do
+    :ok = :gen_tcp.send(socket, "HTTP/1.1 101 Switching Protocols\r\n")
+    send(owner, {:raw_upstream_websocket_upgrade_fragment, connection_id, :status, self()})
+
+    receive do
+      :release_raw_upstream_websocket_upgrade ->
+        result = :gen_tcp.send(socket, "upgrade: web")
+
+        send(
+          owner,
+          {:raw_upstream_websocket_upgrade_fragment, connection_id, :nonterminal_queued}
+        )
+
+        result
+    after
+      @detection_timeout_ms -> {:error, :upgrade_fragment_release_timeout}
+    end
+  end
+
+  defp send_raw_websocket_upgrade(
+         _state,
+         socket,
+         _key,
+         :trickle_nonterminal,
+         connection_id,
+         owner
+       ) do
+    :ok = :gen_tcp.send(socket, "HTTP/1.1 101 Switching Protocols\r\n")
+
+    send(
+      owner,
+      {:raw_upstream_websocket_upgrade_fragment, connection_id, :trickle_status, self()}
+    )
+
+    send_raw_websocket_trickle(socket, owner, connection_id, [
+      "x",
+      "-",
+      "t",
+      "r",
+      "i",
+      "c",
+      "k",
+      "l",
+      "e",
+      ":"
+    ])
+  end
+
+  defp send_raw_websocket_upgrade(state, socket, key, mode, _connection_id, _owner)
+       when mode in [:valid, :invalid_accept] do
+    accept = if mode == :valid, do: websocket_accept(key), else: "invalid-websocket-accept"
+
+    :ok = :gen_tcp.send(socket, "HTTP/1.1 101 Switching Protocols\r\n")
+    send_raw_websocket_upgrade_headers(state, socket, key, accept)
+  end
+
+  defp send_raw_websocket_trickle(_socket, _owner, _connection_id, []), do: :ok
+
+  defp send_raw_websocket_trickle(socket, owner, connection_id, [fragment | rest]) do
+    receive do
+      :release_raw_upstream_websocket_trickle -> :ok
+    end
+
+    case :gen_tcp.send(socket, fragment) do
+      :ok ->
+        send(owner, {:raw_upstream_websocket_upgrade_fragment, connection_id, :trickle, self()})
+        send_raw_websocket_trickle(socket, owner, connection_id, rest)
+
+      {:error, :closed} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp send_raw_websocket_upgrade_headers(state, socket, key) do
+    send_raw_websocket_upgrade_headers(state, socket, key, websocket_accept(key))
+  end
+
+  defp websocket_accept(key) do
+    :sha
+    |> :crypto.hash(key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    |> Base.encode64()
+  end
+
+  defp send_raw_websocket_upgrade_headers(state, socket, _key, accept) do
+    :gen_tcp.send(socket, raw_websocket_upgrade_headers(state, nil, accept))
+  end
+
+  defp raw_websocket_upgrade_headers(state, _key, accept) do
+    upgrade_headers =
+      state
+      |> Agent.get(& &1.upgrade_headers)
+      |> Enum.map(fn {name, value} -> [name, ": ", value, "\r\n"] end)
+
+    [
       "upgrade: websocket\r\n",
       "connection: Upgrade\r\n",
       "sec-websocket-accept: ",
@@ -3317,7 +4811,7 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
       "\r\n",
       upgrade_headers,
       "\r\n"
-    ])
+    ]
   end
 
   defp raw_websocket_peer_read_headers(socket, acc \\ "") do
@@ -3554,6 +5048,38 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
     end
   end
 
+  defp receive_mint_upgrade_until_done(conn, ref, deadline, accumulated) do
+    timeout_ms = max(deadline - System.monotonic_time(:millisecond), 0)
+    assert {:ok, conn, responses} = Mint.WebSocket.recv(conn, 0, timeout_ms)
+    accumulated = accumulated ++ responses
+
+    if Enum.any?(responses, &match?({:done, ^ref}, &1)) do
+      {conn, accumulated}
+    else
+      receive_mint_upgrade_until_done(conn, ref, deadline, accumulated)
+    end
+  end
+
+  defp await_test_timer(timeout_ms) do
+    timer_ref = make_ref()
+    Process.send_after(self(), {:test_timer_elapsed, timer_ref}, timeout_ms)
+
+    receive do
+      {:test_timer_elapsed, ^timer_ref} -> :ok
+    end
+  end
+
+  defp release_raw_websocket_trickle(_peer_pid, 0), do: :ok
+
+  defp release_raw_websocket_trickle(peer_pid, remaining) do
+    send(peer_pid, :release_raw_upstream_websocket_trickle)
+
+    assert_receive {:raw_upstream_websocket_upgrade_fragment, 1, :trickle, ^peer_pid},
+                   @detection_timeout_ms
+
+    release_raw_websocket_trickle(peer_pid, remaining - 1)
+  end
+
   defp stop_raw_websocket_peer(%{state: state}) do
     if Process.alive?(state) do
       snapshot =
@@ -3593,6 +5119,39 @@ defmodule CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSessionTest 
 
   defp safe_tcp_close(socket) when is_port(socket), do: :gen_tcp.close(socket)
   defp safe_tcp_close(_socket), do: :ok
+
+  defp attach_native_compaction_observer do
+    handler_id = "direct-native-compaction-#{System.unique_integer([:positive])}"
+    test_pid = self()
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :gateway, :native_compaction, :authorization_transition],
+        fn _event, _measurements, metadata, _config ->
+          send(test_pid, {:native_event, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+
+    fn -> drain_native_compaction_events(%{}) end
+  end
+
+  defp drain_native_compaction_events(counts) do
+    receive do
+      {:native_event, %{transition: transition, topology: :direct}} ->
+        drain_native_compaction_events(Map.update(counts, transition, 1, &(&1 + 1)))
+    after
+      0 -> counts
+    end
+  end
+
+  defp expected_native_compaction_counts do
+    NativeCompactionAuthorizationObservation.transitions()
+    |> Map.new(&{&1, 1})
+  end
 
   defp stack_has_mfa?(stacktrace, module, function, arity) do
     Enum.any?(stacktrace, fn

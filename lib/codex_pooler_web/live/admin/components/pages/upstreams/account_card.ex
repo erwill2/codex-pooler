@@ -26,8 +26,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
 
   @reactivatable_statuses ~w(paused refresh_due refresh_failed)
   @recovery_statuses ~w(paused refresh_due refresh_failed reauth_required)
-  @usable_refresh_statuses ~w(succeeded imported refreshing)
-
   attr :account, :map, required: true
   attr :account_index, :integer, required: true
   attr :panel_view, :atom, default: :usage, values: [:usage, :tokens, :pools]
@@ -68,7 +66,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     <article
       id={"upstream-account-#{@account.identity.id}"}
       data-role="upstream-account-card"
+      data-routing-state={@routing_readiness.state}
       data-routing-tone={@routing_readiness.tone}
+      data-routing-ready-now={to_string(@routing_readiness.routing_ready_now?)}
       class={[
         "upstream-account-card min-w-0 rounded-box border border-base-300 bg-base-100 transition-colors",
         token_burn_active?(@account) && "admin-token-burn-active"
@@ -77,7 +77,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     >
       <header
         data-role="upstream-account-card-header"
-        class="flex flex-row items-center justify-between gap-3 border-b border-base-300 bg-base-200/35 px-4 py-3"
+        class="flex flex-col items-stretch justify-between gap-3 border-b border-base-300 bg-base-200/35 px-4 py-3 sm:flex-row sm:items-center"
       >
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-2">
@@ -106,7 +106,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
           <p
             id={"upstream-account-#{@account.identity.id}-auth-expiration"}
             data-role="upstream-auth-expiration"
-            class="truncate text-xs leading-4 text-base-content/55"
+            class="text-xs leading-4 text-base-content/55 sm:truncate"
             title={@auth_expiration.title}
           >
             {@auth_expiration.label}
@@ -114,7 +114,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
         </div>
         <div
           id={"upstream-account-#{@account.identity.id}-header-actions"}
-          class="flex shrink-0 items-center gap-2 self-center"
+          class="flex shrink-0 items-center gap-2 self-end sm:self-center"
         >
           <SavedResetMeter.saved_reset_count_badge
             id={"upstream-account-#{@account.identity.id}-saved-reset-count"}
@@ -541,22 +541,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
     case credential_expiry do
       %{state: "known_future", expires_at: %DateTime{} = expires_at} ->
         %{
-          label: "Auth expires #{credential_expiry_label(credential_expiry)}",
+          label: "Access token expires #{credential_expiry_label(credential_expiry)}",
           title: DateTimeDisplay.format_datetime(expires_at, preferences)
         }
 
       %{state: "known_past", expires_at: %DateTime{} = expires_at} ->
         %{
-          label: "Auth expired #{credential_expiry_label(credential_expiry)}",
+          label: "Access token expired #{credential_expiry_label(credential_expiry)}",
           title: DateTimeDisplay.format_datetime(expires_at, preferences)
         }
 
       _unavailable ->
-        %{label: "Expiration unavailable", title: nil}
+        %{label: "Access token expiry unavailable", title: nil}
     end
   end
 
-  defp auth_expiration(_account, _preferences), do: %{label: "Expiration unavailable", title: nil}
+  defp auth_expiration(_account, _preferences),
+    do: %{label: "Access token expiry unavailable", title: nil}
 
   @spec credential_expiry_label(map()) :: String.t()
   defp credential_expiry_label(%{age: age}) when is_binary(age) and age != "", do: age
@@ -1080,19 +1081,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
   defp auth_clearly_usable?(%{
          reauth_required?: false,
          refresh_status: refresh_status,
-         access_token_label: access_token_label
+         secret_status: :present
        }) do
-    refresh_status in @usable_refresh_statuses and
-      not expired_access_token_label?(access_token_label)
+    refresh_status in ~w(succeeded imported refreshing)
   end
 
   defp auth_clearly_usable?(_account), do: false
-
-  @spec expired_access_token_label?(term()) :: boolean()
-  defp expired_access_token_label?(label) when is_binary(label),
-    do: String.starts_with?(label, "access token expired")
-
-  defp expired_access_token_label?(_label), do: false
 
   @spec recovery_default_pool_id(map()) :: String.t() | nil
   defp recovery_default_pool_id(%{assignments: [assignment | _assignments]}),

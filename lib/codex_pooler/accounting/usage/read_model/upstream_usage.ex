@@ -7,6 +7,7 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
 
   alias CodexPooler.Accounting.UsageResponses
   alias CodexPooler.Repo
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
   alias CodexPooler.Upstreams.StatusVocabulary.Assignment, as: AssignmentStatus
@@ -25,8 +26,8 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     pool_id = id_for(pool_or_id)
 
     case best_codex_usage_identity_for_pool(pool_id, opts) do
-      {%UpstreamIdentity{} = identity, _assignment, windows} ->
-        build_codex_usage_for_identity(identity, windows, opts)
+      {%UpstreamIdentity{} = identity, _assignment, snapshot} ->
+        build_codex_usage_for_identity(identity, snapshot, opts)
 
       nil ->
         {:error, accounting_error(:no_upstream_usage, "no upstream usage is available")}
@@ -90,7 +91,8 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
   @spec v1_upstream_limits_for_pool(term(), DateTime.t(), keyword()) :: [map()]
   def v1_upstream_limits_for_pool(pool_id, as_of, opts) when is_binary(pool_id) do
     case best_codex_usage_identity_for_pool(pool_id, Keyword.put(opts, :as_of, as_of)) do
-      {%UpstreamIdentity{}, %PoolUpstreamAssignment{}, windows} ->
+      {%UpstreamIdentity{}, %PoolUpstreamAssignment{}, snapshot} ->
+        windows = RoutingQuotaSnapshot.effective_windows(snapshot)
         {primary, secondary} = UsageResponses.account_usage_windows(windows, as_of)
 
         [primary, secondary]
@@ -106,16 +108,41 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
 
   defp build_codex_usage_for_identity(%UpstreamIdentity{} = identity, opts) do
     as_of = Keyword.get(opts, :as_of, now())
-    windows = quota_windows_for_identity(identity.id, as_of)
 
-    build_codex_usage_for_identity(identity, windows, Keyword.put(opts, :as_of, as_of))
+    snapshot =
+      [identity.id]
+      |> RoutingQuotaSnapshot.load_by_identity_ids(as_of)
+      |> Map.fetch!(identity.id)
+
+    if explicit_usage_snapshot_available?(snapshot) do
+      build_codex_usage_for_identity(identity, snapshot, Keyword.put(opts, :as_of, as_of))
+    else
+      {:error, accounting_error(:no_upstream_usage, "no upstream usage is available")}
+    end
   end
 
-  defp build_codex_usage_for_identity(%UpstreamIdentity{} = identity, windows, opts) do
+  defp build_codex_usage_for_identity(%UpstreamIdentity{} = identity, snapshot, opts) do
     as_of = Keyword.get(opts, :as_of, now())
+    windows = RoutingQuotaSnapshot.effective_windows(snapshot)
     {primary, secondary} = UsageResponses.account_usage_windows(windows, as_of)
     additional_rate_limits = UsageResponses.additional_codex_rate_limits(windows, as_of)
-    credits = UsageResponses.codex_credits(primary, secondary)
+
+    credits =
+      case {snapshot.credit_balance_reported?, snapshot.credit_balance} do
+        {false, _unreported} ->
+          UsageResponses.codex_credits(primary, secondary)
+
+        {true, %{balance: balance, has_credits: has_credits, unlimited: unlimited}}
+        when is_boolean(has_credits) and is_boolean(unlimited) ->
+          %{
+            balance: Integer.to_string(balance),
+            has_credits: has_credits,
+            unlimited: unlimited
+          }
+
+        _unavailable ->
+          nil
+      end
 
     usage =
       %{
@@ -142,15 +169,24 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
     as_of = Keyword.get(opts, :as_of, now())
     candidates = codex_usage_candidates(pool_id)
 
-    windows_by_identity_id =
-      quota_windows_by_identity_id(Enum.map(candidates, &elem(&1, 0).id), as_of)
+    snapshots_by_identity_id =
+      candidates
+      |> Enum.map(&elem(&1, 0).id)
+      |> RoutingQuotaSnapshot.load_by_identity_ids(as_of)
 
     candidates
     |> Enum.map(fn {%UpstreamIdentity{} = identity, assignment} ->
-      {identity, assignment, Map.get(windows_by_identity_id, identity.id, [])}
+      {identity, assignment, Map.get(snapshots_by_identity_id, identity.id)}
     end)
     |> Enum.filter(&codex_usage_candidate_has_quota?/1)
     |> Enum.max_by(&codex_usage_candidate_rank(&1, opts), fn -> nil end)
+    |> case do
+      {identity, assignment, snapshot} ->
+        {identity, assignment, snapshot}
+
+      nil ->
+        nil
+    end
   end
 
   defp best_codex_usage_identity_for_pool(_pool_id, _opts), do: nil
@@ -171,47 +207,45 @@ defmodule CodexPooler.Accounting.UsageReadModel.UpstreamUsage do
   end
 
   defp codex_usage_candidate_rank(
-         {%UpstreamIdentity{} = identity, %PoolUpstreamAssignment{}, windows},
+         {%UpstreamIdentity{} = identity, %PoolUpstreamAssignment{}, snapshot},
          opts
        ) do
     as_of = Keyword.get(opts, :as_of, now())
+    windows = RoutingQuotaSnapshot.effective_windows(snapshot)
     {primary, secondary} = UsageResponses.account_usage_windows(windows, as_of)
     rate_limit = UsageResponses.codex_rate_limit(primary, secondary)
 
     {
       if(rate_limit.allowed, do: 1, else: 0),
-      usage_routing_state_rank(windows, as_of),
+      usage_routing_state_rank(snapshot),
       plan_rank(identity),
       usage_remaining_score(primary, secondary),
       usage_percent_score(primary, secondary)
     }
   end
 
-  defp codex_usage_candidate_has_quota?({%UpstreamIdentity{}, %PoolUpstreamAssignment{}, windows}) do
-    Enum.any?(windows, &(&1.quota_key == "account"))
+  defp codex_usage_candidate_has_quota?(
+         {%UpstreamIdentity{}, %PoolUpstreamAssignment{}, snapshot}
+       ) do
+    Enum.any?(RoutingQuotaSnapshot.time_visible_raw_windows(snapshot), fn window ->
+      window.quota_scope == "account"
+    end) or
+      QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, account_only: true).eligible?
   end
 
-  defp quota_windows_by_identity_id([], _as_of), do: %{}
-
-  # candidate selection must reason about the effective window view: an
-  # identity whose only rows are superseded or future-dated has no usable
-  # quota knowledge, and must neither pass the has-quota filter nor outrank
-  # a genuinely exhausted identity with an empty (allowed-looking) payload
-  defp quota_windows_by_identity_id(identity_ids, as_of) do
-    QuotaWindows.list_quota_windows_by_identity_ids(identity_ids, as_of)
+  defp explicit_usage_snapshot_available?(snapshot) do
+    Enum.any?(RoutingQuotaSnapshot.time_visible_raw_windows(snapshot), fn window ->
+      window.quota_scope == "account"
+    end) or
+      QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, account_only: true).eligible?
   end
 
-  defp quota_windows_for_identity(identity_id, as_of) do
-    QuotaWindows.list_quota_windows(identity_id, as_of)
-  end
-
-  defp usage_routing_state_rank(windows, as_of) do
-    case QuotaWindows.routing_quota_eligibility_from_windows(windows,
-           at: as_of
-         ) do
+  defp usage_routing_state_rank(snapshot) do
+    case QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, account_only: true) do
       %{routing_state: :precise} -> 3
       %{routing_state: :credit_backed_probe} -> 2
       %{routing_state: :weekly_only_probe} -> 1
+      %{routing_state: :windowless_provider_available} -> 1
       _state -> 0
     end
   end

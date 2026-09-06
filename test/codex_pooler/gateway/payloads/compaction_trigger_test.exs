@@ -4,40 +4,196 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
   alias CodexPooler.Gateway.Payloads.CompactionTrigger
 
   @fixture_path Path.expand(
-                  "../../../fixtures/codex/rust-v0.150.0-3b3b4f8fb3f6403e72c2d0533ed0d2f309c59717/remote_compaction_v2_request.json",
+                  "../../../fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_request.json",
                   __DIR__
                 )
   @external_resource @fixture_path
 
   @incremental_fixture_path Path.expand(
-                              "../../../fixtures/codex/rust-v0.150.0-3b3b4f8fb3f6403e72c2d0533ed0d2f309c59717/remote_compaction_v2_incremental_request.json",
+                              "../../../fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_incremental_request.json",
                               __DIR__
                             )
   @external_resource @incremental_fixture_path
 
+  describe "prepare_bridge/2" do
+    test "accepts a final native trigger after a zero-byte function output" do
+      payload = zero_byte_compaction_payload()
+
+      assert {:ok, projected} =
+               CompactionTrigger.prepare_bridge("/backend-api/codex/responses", payload)
+
+      assert projected["input"] == payload["input"]
+      assert projected["store"] == false
+      refute Map.has_key?(projected, "stream")
+    end
+
+    test "keeps public visible-input strictness for a zero-byte function output" do
+      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+               CompactionTrigger.prepare_bridge("/v1/responses", zero_byte_compaction_payload())
+    end
+
+    test "keeps public singleton trigger rejection" do
+      assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+               CompactionTrigger.prepare_bridge("/v1/responses", %{
+                 "input" => [%{"type" => "compaction_trigger"}]
+               })
+    end
+
+    test "preserves native singleton and nonempty controls while rejecting malformed triggers" do
+      trigger = %{"type" => "compaction_trigger"}
+
+      assert {:ok, _projected} =
+               CompactionTrigger.prepare_bridge("/backend-api/codex/responses", %{
+                 "input" => [trigger],
+                 "stream" => true
+               })
+
+      nonempty = put_in(zero_byte_compaction_payload(), ["input", Access.at(0), "output"], "ok")
+
+      assert {:ok, _projected} =
+               CompactionTrigger.prepare_bridge("/backend-api/codex/responses", nonempty)
+
+      for input <- [
+            [
+              trigger,
+              %{"type" => "function_call_output", "call_id" => "call_fixture", "output" => ""}
+            ],
+            [
+              %{"type" => "function_call_output", "call_id" => "call_fixture", "output" => ""},
+              trigger,
+              trigger
+            ]
+          ] do
+        assert {:error, %{status: 400, code: "invalid_request", param: "input"}} =
+                 CompactionTrigger.prepare_bridge("/backend-api/codex/responses", %{
+                   "input" => input,
+                   "stream" => true
+                 })
+      end
+    end
+  end
+
   describe "Responses compact projection" do
+    @tag :compaction_state_baseline
+    test "characterizes anchor projection and the bounded result transport before typed state" do
+      anchored = incremental_scenario!("anchored_tool_output_and_trigger")
+      trigger_only = incremental_scenario!("anchored_trigger_only")
+
+      for payload <- [anchored, trigger_only] do
+        projected = CompactionTrigger.project_responses_payload(payload, :sse)
+
+        assert projected["previous_response_id"] == payload["previous_response_id"]
+        assert projected["input"] == payload["input"]
+        assert CompactionTrigger.compaction_result_transport(payload) == :sse
+      end
+
+      for anchor <- [:absent, nil, 7, false, [], %{}, "", " \t\r\n"] do
+        payload =
+          if anchor == :absent,
+            do: Map.delete(trigger_only, "previous_response_id"),
+            else: Map.put(trigger_only, "previous_response_id", anchor)
+
+        refute Map.has_key?(
+                 CompactionTrigger.project_responses_payload(payload, :sse),
+                 "previous_response_id"
+               )
+      end
+
+      assert CompactionTrigger.compaction_result_transport(%{}) == :buffered
+    end
+
+    @tag :compaction_state_contract
+    test "classifies compaction input mode only from a valid top-level anchor" do
+      anchored_output = incremental_scenario!("anchored_tool_output_and_trigger")
+      anchored_trigger = incremental_scenario!("anchored_trigger_only")
+      full_history = incremental_scenario!("full_history_without_anchor")
+
+      assert CompactionTrigger.compaction_input_mode(anchored_output) == :incremental
+      assert CompactionTrigger.compaction_input_mode(anchored_trigger) == :incremental
+      assert CompactionTrigger.compaction_input_mode(full_history) == :full_history
+
+      for anchor <- [nil, 7, false, [], %{}, "", " \t\r\n"] do
+        assert full_history
+               |> Map.put("previous_response_id", anchor)
+               |> CompactionTrigger.compaction_input_mode() == :full_history
+      end
+    end
+
+    @tag :compaction_state_contract
+    test "classifies anchored custom tool output solely from the top-level anchor" do
+      payload = %{
+        "previous_response_id" => "resp_fixture_custom_output_0001",
+        "input" => [
+          %{
+            "type" => "custom_tool_call_output",
+            "call_id" => "call_fixture_custom_output",
+            "output" => "synthetic output"
+          },
+          %{"type" => "compaction_trigger"}
+        ]
+      }
+
+      assert CompactionTrigger.compaction_input_mode(payload) == :incremental
+
+      assert payload
+             |> Map.put("input", [%{"type" => "future_item_without_tool_semantics"}])
+             |> CompactionTrigger.compaction_input_mode() == :incremental
+    end
+
+    @tag :compaction_state_contract
+    test "keeps source-derived mode stable across repeated compact projection" do
+      for {scenario, expected_mode} <- [
+            {"anchored_tool_output_and_trigger", :incremental},
+            {"anchored_trigger_only", :incremental},
+            {"full_history_without_anchor", :full_history}
+          ] do
+        payload = incremental_scenario!(scenario)
+        mode = CompactionTrigger.compaction_input_mode(payload)
+
+        first = CompactionTrigger.project_responses_payload(payload, :sse)
+        second = CompactionTrigger.project_responses_payload(first, :sse)
+
+        assert mode == expected_mode
+        assert CompactionTrigger.compaction_input_mode(first) == expected_mode
+        assert CompactionTrigger.compaction_input_mode(second) == expected_mode
+        assert second == first
+      end
+    end
+
     test "locks the released Codex projection-relevant incremental frame contract" do
       fixture = load_incremental_fixture!()
 
       assert fixture["fixture_source"] == %{
-               "tag" => "rust-v0.150.0",
-               "annotated_tag_object" => "9bdd7a39c5034657dfbbb89381cd9364f61eee11",
-               "peeled_commit" => "3b3b4f8fb3f6403e72c2d0533ed0d2f309c59717",
+               "tag" => "rust-v0.153.3",
+               "annotated_tag_object" => "29d1e7f316229cd65c7e4a70476050c14962cf10",
+               "peeled_commit" => "b1a547b1f73ce86205d9222ac19cff334b3b7a2e",
                "source_paths" => [
                  "codex-rs/codex-api/src/common.rs",
                  "codex-rs/core/src/client.rs",
+                 "codex-rs/core/src/compact_remote_v2.rs",
                  "codex-rs/core/src/compact_remote_v2_attempt.rs",
-                 "codex-rs/protocol/src/models.rs"
+                 "codex-rs/core/src/responses_metadata.rs",
+                 "codex-rs/core/src/session/session.rs",
+                 "codex-rs/core/src/turn_metadata_tests.rs",
+                 "codex-rs/protocol/src/models.rs",
+                 "codex-rs/core/tests/suite/realtime_conversation.rs"
                ]
              }
 
       contract = fixture["contract"]
       assert contract["durability_boundary"] == "projection_relevant_incremental_frame_subset"
 
+      assert contract["zero_byte_function_call_output"] == %{
+               "type" => "function_call_output",
+               "output_byte_length" => 0,
+               "followed_by_final_compaction_trigger" => true
+             }
+
       assert contract["v2_trigger_metadata"]
              |> Map.fetch!("x-codex-turn-metadata")
              |> Jason.decode!() == %{
-               "context_window_id" => "00000000-0000-4000-8000-000000000150",
+               "window_number" => 0,
+               "context_window_id" => "00000000-0000-4000-8000-000000000153",
                "compaction" => %{"implementation" => "responses_compaction_v2"}
              }
 
@@ -218,16 +374,37 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
       fixture = load_fixture!()
 
       assert fixture["fixture_source"] == %{
-               "tag" => "rust-v0.150.0",
-               "annotated_tag_object" => "9bdd7a39c5034657dfbbb89381cd9364f61eee11",
-               "peeled_commit" => "3b3b4f8fb3f6403e72c2d0533ed0d2f309c59717",
+               "tag" => "rust-v0.153.3",
+               "annotated_tag_object" => "29d1e7f316229cd65c7e4a70476050c14962cf10",
+               "peeled_commit" => "b1a547b1f73ce86205d9222ac19cff334b3b7a2e",
                "source_paths" => [
-                 "codex-rs/core/src/compact_remote_v2_attempt.rs",
                  "codex-rs/core/src/client.rs",
+                 "codex-rs/core/src/compact_remote_v2.rs",
+                 "codex-rs/core/src/compact_remote_v2_attempt.rs",
                  "codex-rs/core/src/responses_metadata.rs",
-                 "codex-rs/core/src/turn_metadata_tests.rs"
+                 "codex-rs/core/src/session/session.rs",
+                 "codex-rs/core/src/turn_metadata_tests.rs",
+                 "codex-rs/protocol/src/models.rs",
+                 "codex-rs/core/tests/suite/realtime_conversation.rs"
                ]
              }
+
+      assert fixture["request"]
+             |> get_in(["client_metadata", "x-codex-turn-metadata"])
+             |> Jason.decode!()
+             |> Map.take(["window_number", "context_window_id", "request_kind", "compaction"]) ==
+               %{
+                 "window_number" => 0,
+                 "context_window_id" => "00000000-0000-4000-8000-000000000153",
+                 "request_kind" => "compaction",
+                 "compaction" => %{
+                   "trigger" => "auto",
+                   "reason" => "context_limit",
+                   "implementation" => "responses_compaction_v2",
+                   "phase" => "mid_turn",
+                   "strategy" => "memento"
+                 }
+               }
 
       assert result_transport(fixture["request"]) == :sse
     end
@@ -290,5 +467,19 @@ defmodule CodexPooler.Gateway.Payloads.CompactionTriggerTest do
     assert subset["client_metadata"] == v2_trigger_metadata
     assert CompactionTrigger.compaction_result_transport(subset) == :sse
     assert is_list(subset["input"])
+  end
+
+  defp zero_byte_compaction_payload do
+    %{
+      "input" => [
+        %{
+          "type" => "function_call_output",
+          "call_id" => "call_fixture_zero_byte",
+          "output" => ""
+        },
+        %{"type" => "compaction_trigger"}
+      ],
+      "stream" => true
+    }
   end
 end

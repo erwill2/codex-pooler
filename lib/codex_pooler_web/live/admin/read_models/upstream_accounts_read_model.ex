@@ -14,11 +14,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   alias CodexPooler.Pools
   alias CodexPooler.Upstreams
   alias CodexPooler.Upstreams.Assignments, as: UpstreamAssignments
-  alias CodexPooler.Upstreams.Auth.TokenRefresh
+  alias CodexPooler.Upstreams.Auth.{AccessTokenExpiry, TokenRefresh, TokenRefreshMetadata}
   alias CodexPooler.Upstreams.OAuth, as: UpstreamOAuth
-  alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.SavedResets
   alias CodexPooler.Upstreams.Schemas.{PoolUpstreamAssignment, UpstreamIdentity}
+  alias CodexPooler.Upstreams.Secrets
 
   alias CodexPoolerWeb.Admin.UpstreamAccountsReadModel.{
     Filter,
@@ -102,6 +103,8 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           required(:auth_fresh_label) => String.t(),
           required(:auth_verified_label) => String.t(),
           required(:access_token_label) => String.t(),
+          required(:secret_status) =>
+            :present | :missing | :expired | :refresh_due | :reauth_required,
           required(:reauth_required?) => boolean(),
           required(:reauth_reason_code) => String.t() | nil,
           required(:reauth_reason_message) => String.t() | nil,
@@ -188,8 +191,23 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
 
     token_burns = TokenBurnProjection.summaries(identities)
 
+    snapshot_at = DateTime.utc_now()
+
+    quota_snapshots =
+      identities
+      |> Enum.map(& &1.id)
+      |> RoutingQuotaSnapshot.load_by_identity_ids(snapshot_at)
+
     identities
-    |> Enum.map(&account_snapshot(&1, assignments, token_burns, datetime_preferences))
+    |> Enum.map(
+      &account_snapshot(
+        &1,
+        assignments,
+        token_burns,
+        datetime_preferences,
+        Map.fetch!(quota_snapshots, &1.id)
+      )
+    )
     |> Filter.apply(filters)
   end
 
@@ -277,9 +295,13 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   end
 
   defp active_assignment_snapshots(pools, pool_lookup) do
+    pool_order = pools |> Enum.with_index() |> Map.new(fn {pool, index} -> {pool.id, index} end)
+
     pools
-    |> Enum.flat_map(&UpstreamAssignments.list_pool_assignments/1)
+    |> Enum.map(& &1.id)
+    |> UpstreamAssignments.list_pool_assignments_for_pool_ids()
     |> Enum.reject(&(&1.status == "deleted"))
+    |> Enum.sort_by(&{Map.fetch!(pool_order, &1.pool_id), &1.created_at, &1.id})
     |> Enum.map(&assignment_snapshot(&1, pool_lookup))
     |> Enum.group_by(& &1.upstream_identity_id)
   end
@@ -353,13 +375,17 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     end
   end
 
-  defp account_snapshot(identity, assignments, token_burns, datetime_preferences) do
-    # one explicit snapshot instant for the effective window load so the
-    # readiness and card projections below reason about the same view
-    snapshot_at = DateTime.utc_now()
-    raw_quota_windows = QuotaWindows.list_evidence(identity)
-    quota_windows = QuotaWindows.effective_quota_windows(raw_quota_windows, snapshot_at)
-    quota_readiness = QuotaProjection.readiness(quota_windows, snapshot_at)
+  defp account_snapshot(
+         identity,
+         assignments,
+         token_burns,
+         datetime_preferences,
+         quota_snapshot
+       ) do
+    snapshot_at = quota_snapshot.as_of
+    raw_quota_windows = RoutingQuotaSnapshot.time_visible_raw_windows(quota_snapshot)
+    quota_windows = RoutingQuotaSnapshot.effective_windows(quota_snapshot)
+    quota_readiness = QuotaProjection.readiness(quota_snapshot, snapshot_at)
     token_burn = Map.fetch!(token_burns, identity.id)
 
     identity_assignments =
@@ -414,7 +440,9 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
           identity.auth_verified_at,
           datetime_preferences
         ),
-      access_token_label: access_token_label(identity, datetime_preferences),
+      access_token_label:
+        access_token_label(identity_observability.credential_expiry, datetime_preferences),
+      secret_status: Secrets.secret_status(identity),
       reauth_required?: reauth_required?(identity),
       reauth_reason_code: reauth_reason_code(identity),
       reauth_reason_message: reauth_reason_message(identity),
@@ -432,7 +460,12 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
       quota_readiness: quota_readiness,
       routing_readiness: routing_readiness,
       quota_limits:
-        QuotaProjection.quota_limit_rows(quota_windows, datetime_preferences, snapshot_at),
+        QuotaProjection.quota_limit_rows(
+          quota_windows,
+          datetime_preferences,
+          snapshot_at,
+          quota_snapshot.credit_balance
+        ),
       identity_observability: identity_observability
     }
 
@@ -654,23 +687,19 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
     end
   end
 
-  defp access_token_label(%{metadata: %{} = metadata}, datetime_preferences) do
-    case Formatting.parse_timestamp(metadata["access_token_expires_at"]) do
-      %DateTime{} = expires_at -> access_token_expiry_label(expires_at, datetime_preferences)
-      nil -> "access token expiry not reported"
-    end
-  end
+  defp access_token_label(
+         %{state: "known_future", expires_at: %DateTime{} = expires_at},
+         preferences
+       ),
+       do: Formatting.timestamp_status_label("access token expires", expires_at, preferences)
 
-  defp access_token_label(_identity, _datetime_preferences),
-    do: "access token expiry not reported"
+  defp access_token_label(
+         %{state: "known_past", expires_at: %DateTime{} = expires_at},
+         preferences
+       ),
+       do: Formatting.timestamp_status_label("access token expired", expires_at, preferences)
 
-  defp access_token_expiry_label(%DateTime{} = expires_at, datetime_preferences) do
-    if DateTime.compare(expires_at, DateTime.utc_now()) == :lt do
-      Formatting.timestamp_status_label("access token expired", expires_at, datetime_preferences)
-    else
-      Formatting.timestamp_status_label("access token expires", expires_at, datetime_preferences)
-    end
-  end
+  defp access_token_label(_credential_expiry, _preferences), do: "access token expiry unavailable"
 
   defp reauth_required?(%{status: "reauth_required"}), do: true
   defp reauth_required?(_identity), do: false
@@ -816,26 +845,30 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   end
 
   defp credential_expiry(%UpstreamIdentity{} = identity, now) do
-    expires_at =
-      identity |> Map.get(:metadata, %{}) |> nested_map_value("access_token_expires_at")
-
-    case Formatting.parse_datetime(expires_at) do
-      %DateTime{} = timestamp ->
-        state =
-          if DateTime.compare(timestamp, now) == :gt,
-            do: "known_future",
-            else: "known_past"
-
-        %{
-          state: state,
-          expires_at: timestamp,
-          age: Formatting.relative_time_label(timestamp, now)
-        }
-
-      nil ->
-        %{state: "unavailable", expires_at: nil, age: nil}
-    end
+    identity.metadata
+    |> TokenRefreshMetadata.project_access_token_expiry()
+    |> AccessTokenExpiry.evaluate(now)
+    |> credential_expiry_projection(now)
   end
+
+  defp credential_expiry_projection(%{state: :known, deadline: %DateTime{} = deadline}, now) do
+    %{
+      state: "known_future",
+      expires_at: deadline,
+      age: Formatting.relative_time_label(deadline, now)
+    }
+  end
+
+  defp credential_expiry_projection(%{state: :expired, deadline: %DateTime{} = deadline}, now) do
+    %{
+      state: "known_past",
+      expires_at: deadline,
+      age: Formatting.relative_time_label(deadline, now)
+    }
+  end
+
+  defp credential_expiry_projection(_evaluation, _now),
+    do: %{state: "unavailable", expires_at: nil, age: nil}
 
   defp relative_age(%DateTime{} = timestamp, now),
     do: Formatting.relative_time_label(timestamp, now)
@@ -863,8 +896,6 @@ defmodule CodexPoolerWeb.Admin.UpstreamAccountsReadModel do
   end
 
   defp nested_map(_map, _key), do: nil
-  defp nested_map_value(%{} = map, key), do: Map.get(map, key)
-  defp nested_map_value(_map, _key), do: nil
 
   defp pool_label(nil), do: "Unknown Pool"
   defp pool_label(pool), do: pool.name

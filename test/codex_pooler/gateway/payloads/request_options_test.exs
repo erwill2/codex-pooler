@@ -3,12 +3,14 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
 
   alias CodexPooler.Access.APIKeys.ReasoningEffortPolicy.Decision
   alias CodexPooler.Gateway.OperationalSettings
+  alias CodexPooler.Gateway.Payloads.CompactionTrigger
   alias CodexPooler.Gateway.Payloads.RequestOptions
   alias CodexPooler.Gateway.Payloads.RequestOptions.CompactionProjectionContext
   alias CodexPooler.Gateway.Payloads.RequestOptions.Continuity
   alias CodexPooler.Gateway.Payloads.RequestOptions.OpenAICompatibility
   alias CodexPooler.Gateway.Payloads.RequestOptions.ResetProbe
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
+  alias CodexPooler.Gateway.Transports.Websocket.NativeCompactionAdmission
   alias CodexPooler.Gateway.Transports.Websocket.UpstreamWebsocketSession.Request
   alias CodexPooler.Gateway.Websocket
   alias CodexPooler.RouteClass
@@ -31,6 +33,244 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
   end
 
   describe "boundary constructors" do
+    @tag :compaction_state_baseline
+    test "characterizes ordinary option transforms and existing result transport state" do
+      payload = %{"model" => "example-model", "input" => [%{"type" => "message"}]}
+
+      options =
+        %{}
+        |> RequestOptions.build("/backend-api/codex/responses", payload)
+        |> RequestOptions.put_model_serving_mode(
+          configured_mode: "auto",
+          effective_mode: "lite",
+          source: "catalog"
+        )
+
+      transformed = [
+        RequestOptions.build(options, "/backend-api/codex/responses", payload),
+        RequestOptions.for_payload(options, "/backend-api/codex/responses", payload),
+        RequestOptions.for_websocket(options, payload),
+        RequestOptions.retarget(options, "/backend-api/codex/responses/compact", payload)
+      ]
+
+      assert Enum.all?(transformed, fn transformed_options ->
+               RequestOptions.model_serving_mode_snapshot(transformed_options) ==
+                 RequestOptions.model_serving_mode_snapshot(options)
+             end)
+
+      assert options.transport.transport == "http_json"
+      assert options.payload_context.compaction_result_transport == :buffered
+    end
+
+    @tag :compaction_state_contract
+    test "derives input mode from source payload and defaults delivery to relay" do
+      anchored_payload = %{
+        "previous_response_id" => "resp_fixture_typed_state_0001",
+        "input" => [%{"type" => "compaction_trigger"}]
+      }
+
+      full_history_payload = %{"input" => [%{"type" => "compaction_trigger"}]}
+
+      anchored =
+        RequestOptions.build(%{}, "/backend-api/codex/responses", anchored_payload)
+
+      full_history =
+        RequestOptions.build(%{}, "/backend-api/codex/responses", full_history_payload)
+
+      assert anchored.payload_context.compaction_input_mode == :incremental
+      assert full_history.payload_context.compaction_input_mode == :full_history
+      assert anchored.transport.websocket_delivery_mode == :relay
+      assert full_history.transport.websocket_delivery_mode == :relay
+      refute RequestOptions.connection_bound_compaction?(anchored)
+      refute RequestOptions.connection_bound_compaction?(full_history)
+    end
+
+    @tag :compaction_state_contract
+    @tag :compaction_input_mode_immutable
+    test "typed payload updates cannot rewrite source-derived compaction input mode" do
+      anchored =
+        RequestOptions.build(
+          %{},
+          "/backend-api/codex/responses",
+          %{
+            "previous_response_id" => "resp_fixture_immutable_mode_0001",
+            "input" => [%{"type" => "compaction_trigger"}]
+          }
+        )
+
+      full_history =
+        RequestOptions.build(
+          %{},
+          "/backend-api/codex/responses",
+          %{"input" => [%{"type" => "compaction_trigger"}]}
+        )
+
+      for {options, attempted_modes, expected_mode} <- [
+            {anchored, [:incremental, :full_history], :incremental},
+            {full_history, [:full_history, :incremental], :full_history}
+          ],
+          attempted_mode <- attempted_modes do
+        updated =
+          RequestOptions.put_payload_context(options,
+            compaction_input_mode: attempted_mode
+          )
+
+        assert updated.payload_context.compaction_input_mode == expected_mode
+      end
+    end
+
+    @tag :compaction_state_contract
+    test "accepts collect mode only through typed server updates" do
+      anchor = "resp_fixture_private_anchor_0001"
+
+      payload = %{
+        "previous_response_id" => anchor,
+        "compaction_input_mode" => "incremental",
+        "websocket_delivery_mode" => "collect_compaction",
+        "input" => [%{"type" => "compaction_trigger"}]
+      }
+
+      spoofed =
+        RequestOptions.build(
+          %{
+            "compaction_input_mode" => "incremental",
+            "websocket_delivery_mode" => "collect_compaction",
+            compaction_input_mode: :incremental,
+            websocket_delivery_mode: :collect_compaction
+          },
+          "/backend-api/codex/responses",
+          payload
+        )
+
+      assert spoofed.payload_context.compaction_input_mode == :incremental
+      assert spoofed.transport.websocket_delivery_mode == :relay
+      refute RequestOptions.connection_bound_compaction?(spoofed)
+      assert spoofed.extra == %{}
+
+      connection_bound =
+        spoofed
+        |> RequestOptions.for_websocket(payload)
+        |> RequestOptions.put_payload_context(compaction_trigger_bridge?: true)
+        |> RequestOptions.put_transport(websocket_delivery_mode: :collect_compaction)
+
+      assert RequestOptions.connection_bound_compaction?(connection_bound)
+
+      invalid =
+        connection_bound
+        |> RequestOptions.put_payload_context(compaction_input_mode: :full_history)
+        |> RequestOptions.put_transport(websocket_delivery_mode: :invalid)
+
+      assert invalid.payload_context.compaction_input_mode == :incremental
+      assert invalid.transport.websocket_delivery_mode == :collect_compaction
+      assert RequestOptions.connection_bound_compaction?(invalid)
+
+      refute inspect(connection_bound) =~ anchor
+      refute inspect(RequestOptions.openai_compatibility_metadata(connection_bound)) =~ anchor
+
+      refute Map.has_key?(
+               RequestOptions.openai_compatibility_metadata(connection_bound),
+               "websocket_delivery_mode"
+             )
+
+      refute Map.has_key?(
+               RequestOptions.client_request_metadata(connection_bound),
+               "websocket_delivery_mode"
+             )
+    end
+
+    @tag :compaction_state_contract
+    test "requires every typed connection-bound compaction condition" do
+      payload = %{
+        "previous_response_id" => "resp_fixture_predicate_0001",
+        "input" => [%{"type" => "compaction_trigger"}]
+      }
+
+      base = RequestOptions.build(%{}, "/backend-api/codex/responses", payload)
+
+      full_history_base =
+        RequestOptions.build(
+          %{},
+          "/backend-api/codex/responses",
+          %{"input" => [%{"type" => "compaction_trigger"}]}
+        )
+
+      cases = [
+        {:ordinary, base},
+        {:bridge_only,
+         RequestOptions.put_payload_context(base, compaction_trigger_bridge?: true)},
+        {:websocket_only, RequestOptions.for_websocket(base, payload)},
+        {:collect_only,
+         RequestOptions.put_transport(base, websocket_delivery_mode: :collect_compaction)},
+        {:full_history_websocket_collect,
+         full_history_base
+         |> RequestOptions.for_websocket(%{"input" => [%{"type" => "compaction_trigger"}]})
+         |> RequestOptions.put_payload_context(compaction_trigger_bridge?: true)
+         |> RequestOptions.put_transport(websocket_delivery_mode: :collect_full_history)},
+        {:http_full_history_collect,
+         full_history_base
+         |> RequestOptions.put_payload_context(compaction_trigger_bridge?: true)
+         |> RequestOptions.put_transport(websocket_delivery_mode: :collect_full_history)},
+        {:websocket_bridge_relay,
+         full_history_base
+         |> RequestOptions.for_websocket(%{"input" => [%{"type" => "compaction_trigger"}]})
+         |> RequestOptions.put_payload_context(compaction_trigger_bridge?: true)},
+        {:incremental_websocket_collect,
+         base
+         |> RequestOptions.for_websocket(payload)
+         |> RequestOptions.put_payload_context(compaction_trigger_bridge?: true)
+         |> RequestOptions.put_transport(websocket_delivery_mode: :collect_compaction)}
+      ]
+
+      for {name, options} <- cases do
+        assert RequestOptions.connection_bound_compaction?(options) ==
+                 name in [:incremental_websocket_collect, :full_history_websocket_collect]
+      end
+    end
+
+    @tag :compaction_state_contract
+    test "preserves typed compaction state through rebuild websocket retarget and reprojection" do
+      source_payload = %{
+        "previous_response_id" => "resp_fixture_transform_0001",
+        "input" => [%{"type" => "compaction_trigger"}],
+        "client_metadata" => %{
+          "x-codex-turn-metadata" =>
+            Jason.encode!(%{
+              "compaction" => %{"implementation" => "responses_compaction_v2"}
+            })
+        }
+      }
+
+      projected = CompactionTrigger.project_responses_payload(source_payload, :sse)
+
+      options =
+        %{}
+        |> RequestOptions.build("/backend-api/codex/responses", source_payload)
+        |> RequestOptions.for_websocket(source_payload)
+        |> RequestOptions.put_payload_context(
+          compaction_trigger_bridge?: true,
+          compaction_result_transport: :sse
+        )
+        |> RequestOptions.put_transport(websocket_delivery_mode: :collect_compaction)
+
+      transformed = [
+        RequestOptions.build(options, "/backend-api/codex/responses/compact", projected),
+        RequestOptions.for_websocket(options, projected),
+        RequestOptions.retarget(options, "/backend-api/codex/responses/compact", projected),
+        options
+        |> RequestOptions.retarget("/backend-api/codex/responses/compact", projected)
+        |> RequestOptions.retarget("/backend-api/codex/responses/compact", projected)
+      ]
+
+      assert Enum.all?(transformed, fn transformed_options ->
+               transformed_options.payload_context.compaction_input_mode == :incremental and
+                 transformed_options.transport.websocket_delivery_mode == :collect_compaction and
+                 transformed_options.payload_context.compaction_result_transport == :sse and
+                 RequestOptions.connection_bound_compaction?(transformed_options)
+             end)
+
+      assert CompactionTrigger.project_responses_payload(projected, :sse) == projected
+    end
+
     test "keeps compaction projection provenance typed, transient, redacted, and non-serializable" do
       downstream = %{
         "previous_response_id" => "resp_projection_raw_anchor_a",
@@ -202,6 +442,166 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
       refute invalid_update.continuity.upstream_previous_response_id?
 
       assert %Request{connection_bound_continuation?: false} = %Request{}
+    end
+
+    test "uses the durable request claim without changing transient semantic identity" do
+      semantic_turn_key = :crypto.strong_rand_bytes(32)
+      turn_claim_key = "codex-turn:" <> Base.url_encode64(semantic_turn_key, padding: false)
+
+      request_claim_key =
+        "codex-request:" <>
+          (:crypto.hash(:sha256, "synthetic-request-claim")
+           |> Base.url_encode64(padding: false))
+
+      options =
+        RequestOptions.build(
+          %{
+            transport: "websocket",
+            semantic_turn_key: semantic_turn_key,
+            turn_claim_key: turn_claim_key,
+            request_claim_key: request_claim_key
+          },
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      assert options.continuity.semantic_turn_key == semantic_turn_key
+      assert options.continuity.turn_claim_key == turn_claim_key
+      assert options.continuity.request_claim_key == request_claim_key
+      assert RequestOptions.server_correlation_id(options) == request_claim_key
+      assert RequestOptions.websocket_request_correlation_id(options) == request_claim_key
+
+      persisted_request = %CodexPooler.Accounting.Request{correlation_id: request_claim_key}
+
+      assert RequestOptions.websocket_denial_correlation_id(options, persisted_request) ==
+               request_claim_key
+
+      assert RequestOptions.websocket_denial_correlation_id(options, nil) == request_claim_key
+
+      assert options.continuity.turn_claim_key == turn_claim_key
+
+      invalid = RequestOptions.put_continuity(options, request_claim_key: "codex-request:invalid")
+      assert invalid.continuity.request_claim_key == request_claim_key
+    end
+
+    test "websocket correlations fall back through turn claim and request id" do
+      turn_claim_key =
+        "codex-turn:" <>
+          (:crypto.hash(:sha256, "fallback-turn-claim")
+           |> Base.url_encode64(padding: false))
+
+      turn_options =
+        RequestOptions.build(
+          %{
+            transport: "websocket",
+            request_id: "fallback-request-id",
+            turn_claim_key: turn_claim_key
+          },
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      assert RequestOptions.server_correlation_id(turn_options) == turn_claim_key
+      assert RequestOptions.websocket_request_correlation_id(turn_options) == turn_claim_key
+
+      assert RequestOptions.websocket_denial_correlation_id(turn_options, nil) ==
+               "fallback-request-id"
+
+      request_options =
+        RequestOptions.build(
+          %{transport: "websocket", request_id: "fallback-request-id"},
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      assert {:ok, _generated_id} =
+               request_options
+               |> RequestOptions.server_correlation_id()
+               |> Ecto.UUID.cast()
+
+      assert RequestOptions.websocket_request_correlation_id(request_options) ==
+               "fallback-request-id"
+
+      assert RequestOptions.websocket_denial_correlation_id(request_options, nil) ==
+               "fallback-request-id"
+    end
+
+    test "compaction-shaped native frames keep the durable claim correlation without capability" do
+      turn_claim_key =
+        "codex-turn:" <>
+          (:crypto.hash(:sha256, "shape-only-correlation")
+           |> Base.url_encode64(padding: false))
+
+      options =
+        RequestOptions.build(
+          %{transport: "websocket", turn_claim_key: turn_claim_key},
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      payload = %{
+        "type" => "response.create",
+        "model" => "example-model",
+        "input" => [%{"type" => "compaction"}]
+      }
+
+      assert RequestOptions.server_correlation_id(options, payload) == turn_claim_key
+    end
+
+    test "an attached owner capability does not mint a correlation without runtime proof" do
+      turn_claim_key =
+        "codex-turn:" <>
+          (:crypto.hash(:sha256, "capability-correlation")
+           |> Base.url_encode64(padding: false))
+
+      options =
+        RequestOptions.build(
+          %{transport: "websocket", turn_claim_key: turn_claim_key},
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      capability = native_compaction_capability()
+
+      options =
+        RequestOptions.put_native_compaction_admission(
+          options,
+          capability,
+          {:direct, self()},
+          %{lifecycle_id: capability.binding.lifecycle_id, generation: 1}
+        )
+
+      assert {:ok, ^capability, {:direct, owner}, %{generation: 1}} =
+               RequestOptions.native_compaction_admission(options)
+
+      assert owner == self()
+      assert RequestOptions.server_correlation_id(options) == turn_claim_key
+      refute inspect(options) =~ Base.encode16(capability.token)
+    end
+
+    test "a manually constructed admission carrier cannot mint a privileged correlation" do
+      turn_claim_key =
+        "codex-turn:" <>
+          (:crypto.hash(:sha256, "forged-admission-correlation")
+           |> Base.url_encode64(padding: false))
+
+      options =
+        RequestOptions.build(
+          %{transport: "websocket", turn_claim_key: turn_claim_key},
+          "/backend-api/codex/responses",
+          %{"model" => "example-model"}
+        )
+
+      forged = %RequestOptions.NativeCompactionAdmission{
+        capability: :not_a_capability,
+        owner: :not_an_owner,
+        expected_connection_lifecycle: :not_a_lifecycle
+      }
+
+      options = %{options | native_compaction_admission: forged}
+
+      assert RequestOptions.native_compaction_admission(options) == {:error, :invalid_input}
+      assert RequestOptions.server_correlation_id(options) == turn_claim_key
     end
 
     test "defaults unresolved legacy inputs to Full without manufacturing a resolved snapshot" do
@@ -665,6 +1065,28 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
     end
   end
 
+  defp native_compaction_capability do
+    binding = %NativeCompactionAdmission.Binding{
+      semantic_turn_key: <<1::256>>,
+      window_digest: <<2::256>>,
+      context_digest: <<3::256>>,
+      window_number: 1,
+      previous_response_digest: nil,
+      serving_mode: :full,
+      topology: %NativeCompactionAdmission.Topology.Direct{},
+      lifecycle_id: Ecto.UUID.generate(),
+      generation: 1
+    }
+
+    {:ok, ordinary} = NativeCompactionAdmission.ordinary_success(binding)
+    {:ok, pending} = NativeCompactionAdmission.arm_compact(ordinary, 100)
+
+    {:ok, _reserved, capability} =
+      NativeCompactionAdmission.reserve(pending, :compact, binding, make_ref(), 0)
+
+    capability
+  end
+
   describe "reset probe runtime context" do
     test "new/0 creates one unbound pooler-owned UUID" do
       probe = ResetProbe.new()
@@ -939,6 +1361,7 @@ defmodule CodexPooler.Gateway.Payloads.RequestOptionsTest do
         "routing_state" => "reset_probe",
         "summary" => "guarded probe after saved reset pending confirmation",
         "reset_probe_candidate_count" => 1,
+        "windowless_provider_available_candidate_count" => 2,
         "eligible_candidate_count" => 1,
         "reset_probe" => %{
           "token" => token,

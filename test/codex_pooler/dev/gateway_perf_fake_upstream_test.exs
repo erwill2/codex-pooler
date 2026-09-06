@@ -316,13 +316,36 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
                "response.completed"
              ]
 
+    [compact_done, _completed] =
+      GatewayPerfFakeUpstream.stream_event_payloads(success, trigger)
+
+    assert compact_done["item"] == %{
+             "id" => "cmp_synthetic_native_local",
+             "type" => "compaction",
+             "encrypted_content" => "synthetic-encrypted-compaction"
+           }
+
     assert Enum.map(GatewayPerfFakeUpstream.stream_event_payloads(failure, trigger), & &1["type"]) ==
              [
                "response.failed"
              ]
+
+    assert Enum.map(
+             GatewayPerfFakeUpstream.stream_event_payloads(success, %{"input" => []}),
+             & &1["type"]
+           ) == [
+             "response.created",
+             "response.output_item.added",
+             "response.content_part.added",
+             "response.output_text.delta",
+             "response.output_text.done",
+             "response.content_part.done",
+             "response.output_item.done",
+             "response.completed"
+           ]
   end
 
-  test "native compaction observations are bounded and shape-only" do
+  test "HTTP compaction observations are bounded, closed, and shape-only" do
     server = start_server!("native-compaction-v2-success")
 
     response =
@@ -342,17 +365,175 @@ defmodule CodexPooler.Dev.GatewayPerfFakeUpstreamTest do
              Req.get!(server.url <> "/__smoke/request-observations").body
 
     assert observation == %{
-             "endpoint" => "/backend-api/codex/responses",
+             "requestClass" => "http",
+             "connectionId" => nil,
+             "connectionOrdinal" => nil,
+             "frameOrdinal" => nil,
+             "inputTypes" => ["compaction_trigger"],
              "inputCount" => 1,
+             "anchorPresent" => false,
              "terminalCompactionTrigger" => true,
              "store" => false,
-             "stream" => true
+             "stream" => true,
+             "compactPhase" => "compact",
+             "requestKind" => "unknown",
+             "windowId" => "metadata_missing",
+             "contextWindowId" => "metadata_missing",
+             "compactionMetadata" => "metadata_missing",
+             "toolResultContinuation" => false,
+             "logicalTurnFingerprint" => nil
            }
 
     encoded = Jason.encode!(observation)
     refute encoded =~ "encrypted_content"
     refute encoded =~ "authorization"
     refute encoded =~ "client_metadata"
+    refute encoded =~ "RAW_NESTED_SENTINEL"
+  end
+
+  test "HTTP observations hash nonblank logical turn ids into stable bounded fingerprints" do
+    server = start_server!("native-compaction-v2-success")
+
+    metadata_cases = [
+      {%{"turn_id" => "abc"}, "ba7816bf8f01cfea"},
+      {%{"x-codex-turn-metadata" => Jason.encode!(%{"turn_id" => "abc"})}, "ba7816bf8f01cfea"},
+      {%{
+         "turn_id" => "xyz",
+         "x-codex-turn-metadata" => Jason.encode!(%{"turn_id" => "abc"})
+       }, "3608bca1e44ea6c4"},
+      {%{"turn_id" => "  "}, nil},
+      {%{"turn_id" => 123}, nil},
+      {%{}, nil}
+    ]
+
+    for {metadata, expected} <- metadata_cases do
+      response =
+        Req.post!(server.url <> "/backend-api/codex/responses",
+          json: %{
+            "model" => "gateway-perf-full",
+            "input" => [%{"type" => "compaction_trigger"}],
+            "client_metadata" => metadata
+          },
+          retry: false
+        )
+
+      assert response.status == 200
+
+      assert %{"observations" => observations} =
+               Req.get!(server.url <> "/__smoke/request-observations").body
+
+      observation = List.last(observations)
+      assert observation["logicalTurnFingerprint"] == expected
+      refute Map.has_key?(observation, "turn_id")
+      refute Map.has_key?(observation, "client_metadata")
+    end
+  end
+
+  test "simultaneous websocket connections receive opaque ordered metadata-only observations" do
+    server = start_server!("quota-429")
+
+    {connection_a, websocket_a, ref_a} =
+      websocket_connect!(server.url, "/backend-api/codex/responses")
+
+    {connection_b, websocket_b, ref_b} =
+      websocket_connect!(server.url, "/backend-api/codex/responses")
+
+    {connection_a, websocket_a} =
+      websocket_send_text!(
+        connection_a,
+        websocket_a,
+        ref_a,
+        Jason.encode!(%{
+          "input" => [%{"type" => "message", "content" => "RAW_NESTED_SENTINEL"}],
+          "store" => false,
+          "stream" => true
+        })
+      )
+
+    {_connection_a, _websocket_a, _text_a} =
+      websocket_receive_text!(connection_a, websocket_a, ref_a)
+
+    {connection_b, websocket_b} =
+      websocket_send_text!(
+        connection_b,
+        websocket_b,
+        ref_b,
+        Jason.encode!(%{
+          "input" => [
+            %{"type" => "function_call_output", "output" => "RAW_NESTED_SENTINEL"},
+            %{"type" => "compaction_trigger"}
+          ],
+          "previous_response_id" => "resp_synthetic_anchor",
+          "store" => false,
+          "stream" => true
+        })
+      )
+
+    {_connection_b, _websocket_b, _text_b} =
+      websocket_receive_text!(connection_b, websocket_b, ref_b)
+
+    {connection_a, websocket_a} =
+      websocket_send_text!(
+        connection_a,
+        websocket_a,
+        ref_a,
+        Jason.encode!(%{
+          "input" => [%{"type" => "compaction"}],
+          "store" => false,
+          "stream" => true
+        })
+      )
+
+    {_connection_a, _websocket_a, _text_a} =
+      websocket_receive_text!(connection_a, websocket_a, ref_a)
+
+    assert %{"observations" => observations} =
+             Req.get!(server.url <> "/__smoke/request-observations").body
+
+    assert not Enum.any?(observations, &(&1["requestClass"] == "http"))
+
+    assert Enum.map(
+             observations,
+             &Map.take(&1, [
+               "connectionOrdinal",
+               "frameOrdinal",
+               "inputTypes",
+               "anchorPresent",
+               "compactPhase"
+             ])
+           ) == [
+             %{
+               "connectionOrdinal" => 1,
+               "frameOrdinal" => 1,
+               "inputTypes" => ["message"],
+               "anchorPresent" => false,
+               "compactPhase" => "lineage"
+             },
+             %{
+               "connectionOrdinal" => 2,
+               "frameOrdinal" => 1,
+               "inputTypes" => ["function_call_output", "compaction_trigger"],
+               "anchorPresent" => true,
+               "compactPhase" => "compact"
+             },
+             %{
+               "connectionOrdinal" => 1,
+               "frameOrdinal" => 2,
+               "inputTypes" => ["compaction"],
+               "anchorPresent" => false,
+               "compactPhase" => "final"
+             }
+           ]
+
+    connection_ids = observations |> Enum.map(& &1["connectionId"]) |> Enum.uniq()
+    assert Enum.all?(connection_ids, &is_binary/1)
+    assert Enum.all?(connection_ids, &Regex.match?(~r/\Aws_[a-f0-9]{12}\z/, &1))
+    assert length(connection_ids) == 2
+
+    encoded = Jason.encode!(observations)
+    refute encoded =~ "RAW_NESTED_SENTINEL"
+    refute encoded =~ "resp_synthetic_anchor"
+    refute encoded =~ "function_call_output\",\"output"
   end
 
   test "write_manifest! persists metadata-only manifest JSON" do

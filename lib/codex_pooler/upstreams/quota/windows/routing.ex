@@ -3,7 +3,12 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
 
   alias CodexPooler.Quotas.{Evidence, WindowClassifier}
   alias CodexPooler.Upstreams.Quota
-  alias CodexPooler.Upstreams.Quota.WindowSelector
+
+  alias CodexPooler.Upstreams.Quota.{
+    AccountAvailabilityStore,
+    RoutingQuotaSnapshot,
+    WindowSelector
+  }
 
   @fresh "fresh"
   @account_quota_key "account"
@@ -36,6 +41,106 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     windows
     |> selection_data_from_windows(opts)
     |> eligibility_from_selection(opts)
+  end
+
+  @spec eligibility_from_snapshot(RoutingQuotaSnapshot.t(), keyword()) :: map()
+  def eligibility_from_snapshot(%RoutingQuotaSnapshot{} = snapshot, opts \\ [])
+      when is_list(opts) do
+    opts = Keyword.put(opts, :at, snapshot.as_of)
+    raw_windows = RoutingQuotaSnapshot.time_visible_raw_windows(snapshot)
+    ordinary = eligibility_from_windows(raw_windows, opts)
+
+    cond do
+      AccountAvailabilityStore.blocked?(
+        snapshot.availability,
+        snapshot.credential_epoch,
+        snapshot.as_of
+      ) ->
+        availability_exclusion(:blocked, ordinary.selection)
+
+      ordinary.eligible? ->
+        ordinary
+
+      provider_permission_usable?(snapshot, ordinary.selection) ->
+        %{
+          ordinary
+          | eligible?: true,
+            routing_state: :provider_available,
+            exclusions: []
+        }
+
+      true ->
+        availability_fallback(snapshot, raw_windows, ordinary)
+    end
+  end
+
+  # Preserve the reported percentage. A current full usage observation may
+  # attest account capacity, but cannot override another window's authority.
+  defp provider_permission_usable?(snapshot, selection) do
+    fresh_available?(snapshot) and selection.blocked_windows != [] and
+      Enum.all?(selection.blocked_windows, &permission_overrides_percent?(&1, snapshot))
+  end
+
+  defp permission_overrides_percent?(
+         %Quota.AccountQuotaWindow{
+           quota_scope: "account",
+           source: "codex_usage_api",
+           observed_at: observed_at,
+           metadata: %{"rate_limit_allowed" => true, "rate_limit_reached" => false}
+         } = window,
+         %RoutingQuotaSnapshot{availability: %{observed_at: observed_at}} = snapshot
+       ) do
+    window_reason_codes(window, snapshot.as_of) == ["exhausted"] and
+      exhausted_by_used_percent?(window)
+  end
+
+  defp permission_overrides_percent?(_window, _snapshot), do: false
+
+  defp availability_fallback(snapshot, raw_windows, ordinary) do
+    windowless_evidence? =
+      windowless_snapshot_evidence?(snapshot, raw_windows, ordinary.selection)
+
+    cond do
+      current_available?(snapshot) and no_raw_account_windows?(raw_windows) and
+          applicable_unusable_windows(ordinary.selection, snapshot.as_of) != [] ->
+        applicable_unusable_exclusion(ordinary.selection, snapshot.as_of)
+
+      windowless_evidence? and fresh_available?(snapshot) ->
+        windowless_available_result(ordinary.selection)
+
+      windowless_evidence? and stale_current_available?(snapshot) ->
+        availability_exclusion(:not_fresh, ordinary.selection)
+
+      true ->
+        ordinary
+    end
+  end
+
+  defp windowless_snapshot_evidence?(snapshot, raw_windows, selection) do
+    windowless_eligible_evidence?(raw_windows, selection, snapshot.as_of) and
+      not account_window_from_availability?(snapshot)
+  end
+
+  defp account_window_from_availability?(%RoutingQuotaSnapshot{
+         raw_windows: windows,
+         availability: %{observed_at: observed_at}
+       }) do
+    Enum.any?(windows, fn window ->
+      window.quota_scope == "account" and window.source == "codex_usage_api" and
+        window.observed_at == observed_at
+    end)
+  end
+
+  defp account_window_from_availability?(_snapshot), do: false
+
+  defp windowless_available_result(selection) do
+    %{
+      eligible?: true,
+      routing_state: :windowless_provider_available,
+      warnings: [],
+      selection: selection,
+      exclusions: []
+    }
   end
 
   @spec eligibility_from_selection(map(), keyword()) :: map()
@@ -211,6 +316,93 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
        do: true
 
   defp routing_quota_eligible?(_state), do: false
+
+  defp windowless_eligible_evidence?(raw_windows, selection, timestamp) do
+    no_raw_account_windows?(raw_windows) and
+      applicable_unusable_windows(selection, timestamp) == []
+  end
+
+  defp no_raw_account_windows?(raw_windows),
+    do: not Enum.any?(raw_windows, &account_scoped_window?/1)
+
+  defp applicable_unusable_windows(selection, timestamp) do
+    Enum.reject(selection.routing_windows, &usable_window?(&1, timestamp))
+  end
+
+  defp account_scoped_window?(%Quota.AccountQuotaWindow{quota_scope: "account"}), do: true
+  defp account_scoped_window?(%Quota.AccountQuotaWindow{}), do: false
+
+  defp stale_current_available?(%RoutingQuotaSnapshot{
+         availability: %AccountAvailabilityStore.Snapshot{
+           state: :available,
+           credential_epoch: epoch,
+           observed_at: observed_at
+         },
+         credential_epoch: epoch,
+         as_of: as_of
+       }) do
+    DateTime.compare(observed_at, as_of) != :gt and
+      DateTime.compare(
+        as_of,
+        DateTime.add(observed_at, Evidence.freshness_ttl_seconds(), :second)
+      ) == :gt
+  end
+
+  defp stale_current_available?(%RoutingQuotaSnapshot{}), do: false
+
+  defp current_available?(%RoutingQuotaSnapshot{
+         availability: %AccountAvailabilityStore.Snapshot{
+           state: :available,
+           credential_epoch: epoch
+         },
+         credential_epoch: epoch
+       }),
+       do: true
+
+  defp current_available?(%RoutingQuotaSnapshot{}), do: false
+
+  defp fresh_available?(%RoutingQuotaSnapshot{} = snapshot) do
+    AccountAvailabilityStore.available?(
+      snapshot.availability,
+      snapshot.credential_epoch,
+      snapshot.as_of
+    )
+  end
+
+  defp applicable_unusable_exclusion(selection, timestamp) do
+    %{
+      eligible?: false,
+      routing_state: :blocked,
+      warnings: [],
+      selection: selection,
+      exclusions:
+        Enum.map(
+          applicable_unusable_windows(selection, timestamp),
+          &window_exclusion(&1, timestamp)
+        )
+    }
+  end
+
+  defp availability_exclusion(reason, selection) when reason in [:blocked, :not_fresh] do
+    reason_code = if reason == :blocked, do: "exhausted", else: "not_fresh"
+
+    %{
+      eligible?: false,
+      routing_state: :blocked,
+      warnings: [],
+      selection: selection,
+      exclusions: [
+        %{
+          code: "quota_window_unusable",
+          message: "recorded quota evidence is not usable for routing",
+          reason_codes: [reason_code],
+          quota_key: "account",
+          quota_scope: "account",
+          quota_family: "account"
+        }
+      ]
+    }
+  end
 
   defp credit_backed_probe_selection?(
          %{secondary: %Quota.AccountQuotaWindow{} = secondary, blocked_windows: blocked_windows},
@@ -388,7 +580,18 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     })
   end
 
-  defp window_in_model_scope?(%Quota.AccountQuotaWindow{quota_scope: "model"} = window, opts) do
+  defp window_in_model_scope?(%Quota.AccountQuotaWindow{} = window, opts) do
+    if Keyword.get(opts, :account_only, false) do
+      window.quota_scope == "account"
+    else
+      window_in_requested_scope?(window, opts)
+    end
+  end
+
+  defp window_in_requested_scope?(
+         %Quota.AccountQuotaWindow{quota_scope: "model"} = window,
+         opts
+       ) do
     case model_candidates(opts) do
       [] ->
         true
@@ -401,7 +604,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     end
   end
 
-  defp window_in_model_scope?(
+  defp window_in_requested_scope?(
          %Quota.AccountQuotaWindow{quota_scope: "upstream_model"} = window,
          opts
        ) do
@@ -411,7 +614,7 @@ defmodule CodexPooler.Upstreams.Quota.Windows.Routing do
     end
   end
 
-  defp window_in_model_scope?(%Quota.AccountQuotaWindow{}, _opts), do: true
+  defp window_in_requested_scope?(%Quota.AccountQuotaWindow{}, _opts), do: true
 
   defp model_candidates(opts) do
     opts

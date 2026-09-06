@@ -368,7 +368,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :websocket_turn,
       contract:
-        "backend websocket continuity persists sessions and turns with sticky routing affinity, uses response.create.client_metadata x-codex-turn-state as per-frame request-scoped turn state with the upgrade/header value only as fallback, and is excluded from prompt-cache routing locality; an unresolved previous-response alias retains the current authenticated runtime and emits no owner-outage error; successful native turns register hashed previous-response aliases independent of retained-body completeness; a native websocket continuation marked from its final upstream payload may use only its reused upstream connection, while a fresh or reconnected connection emits the exact previous_response_not_found client retry signal before upstream payload send so only a later explicit full request may use that replacement connection; a mid-stream upstream death after visible output authors exactly one native type:error frame with status 502, wire code upstream_request_failed, and the pinned message upstream request failed, carrying no terminal event, no sequence_number, and no socket close so the same socket serves later turns; every frame authored through the shared websocket error envelope carries error type invalid_request_error, defaulting independently to status 500 when its reason has no status and to wire code websocket_request_failed when its reason has no code and message; public /v1 terminal masking and shape remain unchanged"
+        "backend websocket continuity persists sessions and turns with sticky routing affinity, uses response.create.client_metadata x-codex-turn-state as per-frame request-scoped turn state with the upgrade/header value only as fallback, and is excluded from prompt-cache routing locality; strict native turn-identity precedence validates client_metadata.turn_id, canonical client metadata, turn_id, then request_id without falling through a present invalid source, retaining only an opaque session-scoped SHA-256 semantic key and full claim key; a same active non-cancelled replay is suppressed without new work, while a cancelled predecessor with a different valid native identity can enter one bounded cancellation handoff with a one-second soft boundary and five-second absolute boundary, then starts only after matching fenced readiness; cancelled equal, noncancelled different, missing, public, non-native, and response.processed reconnect candidates fail bounded busy, while generate:false prewarm stays local, row-free, and neutral; predecessor, replacement, and later turn each settle exactly once, replacement uses a new connection generation, and the later turn reuses it; mixed-release behavior is identity-aware only when both current proxy and owner support the control path, a current proxy fails before accounting against a previous owner, and older callers retain their legacy behavior; no hidden automatic replay occurs; native anchor, compact, and final frames share one semantic client turn but create three distinct accounting lifecycles on one physical websocket generation; a first full-history compact uses the ordinary durable turn claim, while mid-turn compact and final transitions require a one-shot owner capability plus sealed runtime proof and can never be authorized by payload shape or client metadata alone; rejected capability frames create no rows, upstream calls, saved-reset probe or redeem activity, retry, replay, or fallback; public /v1 never inherits the native owner capability or proof and retains its existing replay, bridge, byte, and terminal-shape semantics; an unresolved previous-response alias retains the current authenticated runtime and emits no owner-outage error; successful native turns register hashed previous-response aliases independent of retained-body completeness; a native websocket continuation marked from its final upstream payload may use only its reused upstream connection, while a fresh or reconnected connection emits the exact previous_response_not_found client retry signal before upstream payload send so only a later explicit full request may use that replacement connection; a mid-stream upstream death after visible output authors exactly one native type:error frame with status 502, wire code upstream_request_failed, and the pinned message upstream request failed, carrying no terminal event, no sequence_number, and no socket close so the same socket serves later turns; every frame authored through the shared websocket error envelope carries error type invalid_request_error, defaulting independently to status 500 when its reason has no status and to wire code websocket_request_failed when its reason has no code and message; public /v1 terminal masking and shape remain unchanged"
     },
     %{
       slug: :reasoning_minimal,
@@ -551,8 +551,14 @@ defmodule CodexPooler.CompatibilityMatrix do
       routes: [%{method: :post, path: "/backend-api/codex/responses"}],
       future_routes: [],
       fixture: :degraded_routing,
+      quota_evidence: %{
+        normal_authority: "fresh_reset_bearing_windows",
+        lower_priority_fallback: "provider_attested_windowless_availability",
+        operator_or_sku_gate: false,
+        synthetic_window_or_reset: false
+      },
       contract:
-        "degraded routing demotes failed bridge candidates and records sanitized routing metadata"
+        "degraded routing demotes failed bridge candidates and records sanitized routing metadata; fresh reset-bearing quota windows remain normal authority, while a fresh current-credential provider-attested availability observation with no account-window evidence is a distinct lower-priority routeable state; blocked, unknown, stale, credential-mismatched, malformed, or applicable model/additional-limit evidence fails closed with the existing 503 errors, without an operator or SKU gate and without fabricating a quota window or reset"
     },
     %{
       slug: :strict_schema_validation,
@@ -627,7 +633,7 @@ defmodule CodexPooler.CompatibilityMatrix do
       future_routes: [],
       fixture: :request_compression,
       contract:
-        "Request compression is Pool-gated by request_compression_enabled, request-side only, fail-open to the original upstream request when scanning, token counting, rewriting, or limits fail, and metadata-only through safe payload_compression request-log metadata; eligible routes are backend Responses, backend /v1 Responses/chat aliases, public /v1 Responses/chat translations, backend compact routes, and backend or narrow public websocket response.create dispatches; protected exact-output function tool outputs for Read, Glob, Grep, Write, Edit, WebSearch, WebFetch, web_search, web_fetch, and external retrieval are skipped before rewriting with aggregate-only skip counts; output-only function tool results fail closed as protected when their tool name is unavailable; search-result compression covers classic path-line matches, grouped heading matches, and portable NUL-delimited matches, diff compression covers hunk-based additions-only, deletions-only, replacement, minimal unified diffs, combined unified diffs, and long-preamble diffs, log-output compression preserves every failure block when a summary reports failure/error counts, and valid JSON object or array spans embedded in ordinary prose are minified losslessly while surrounding bytes, quoted JSON-looking text, malformed spans, and over-limit span sets remain unchanged; ordinary prose without eligible embedded JSON remains outside diff/search/log compression shapes; public /v1/responses/compact remains unsupported with no upstream compact dispatch or compression eligibility"
+        "Request compression is Pool-gated by request_compression_enabled, request-side only, fail-open to the original upstream request when scanning, token counting, rewriting, or limits fail, and metadata-only through safe payload_compression request-log metadata; eligible routes are backend Responses, backend /v1 Responses/chat aliases, public /v1 Responses/chat translations, backend compact routes, and backend or narrow public websocket response.create dispatches; protected exact-output function tool outputs for Read, Glob, Grep, Write, Edit, WebSearch, WebFetch, web_search, web_fetch, and external retrieval are skipped before rewriting with aggregate-only skip counts; output-only function tool results fail closed as protected when their tool name is unavailable; recognized same-frame command-backed file reads use bounded cat, nl, head, tail, sed-print-only, or nl-to-sed-print-only grammar and remain byte-exact before output range lookup or content detection; function and native local-shell producers and outputs resolve only through their declared same-frame identifiers, and duplicate, cross-kind, or conflicting identifiers preserve the original output; malformed or unrecognized commands retain existing behavior; search-result compression covers classic path-line matches, grouped heading matches, and portable NUL-delimited matches, diff compression covers hunk-based additions-only, deletions-only, replacement, minimal unified diffs, combined unified diffs, and long-preamble diffs, log-output compression preserves every failure block when a summary reports failure/error counts, and valid JSON object or array spans embedded in ordinary prose are minified losslessly while surrounding bytes, quoted JSON-looking text, malformed spans, and over-limit span sets remain unchanged; ordinary prose without eligible embedded JSON remains outside diff/search/log compression shapes; public /v1/responses/compact remains unsupported with no upstream compact dispatch or compression eligibility"
     },
     %{
       slug: :upstream_websocket_bridge,
@@ -1407,8 +1413,21 @@ defmodule CodexPooler.CompatibilityMatrix do
             canonical_identity: %{
               upstream_endpoint: "/backend-api/codex/responses",
               accounting_endpoint: "/backend-api/codex/responses/compact",
-              request_transport: "http_compact_json",
-              attempt_transport: "http_compact_json"
+              transport_contracts: %{
+                incremental_websocket: %{
+                  input_mode: "nonblank_top_level_previous_response_id",
+                  request_transport: "websocket",
+                  attempt_transport: "websocket",
+                  connection: "current_live_matching_generation_reused_only",
+                  delivery: "collect_compaction_before_validation_settlement_and_adapter",
+                  retry_or_fallback: false
+                },
+                full_history_http: %{
+                  input_mode: "no_top_level_previous_response_id",
+                  request_transport: "http_compact_json",
+                  attempt_transport: "http_compact_json"
+                }
+              }
             },
             result_transports: %{
               buffered: "responses_json",
@@ -1452,7 +1471,12 @@ defmodule CodexPooler.CompatibilityMatrix do
         },
         harness_applicability: %{
           codex: %{
-            version: "rust-v0.150.0",
+            version: "rust-v0.153.3",
+            peeled_commit: "b1a547b1f73ce86205d9222ac19cff334b3b7a2e",
+            sanitized_fixtures: [
+              "test/fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_request.json",
+              "test/fixtures/codex/rust-v0.153.3-b1a547b1f73ce86205d9222ac19cff334b3b7a2e/remote_compaction_v2_incremental_request.json"
+            ],
             applicability: "native_v2",
             classifier_authority: true,
             verification: "commit_blocking"
@@ -1489,7 +1513,23 @@ defmodule CodexPooler.CompatibilityMatrix do
             timing: "after_coercion_before_compact_execution",
             completion: "local_websocket_completion"
           },
-          transport: "http_compact_json",
+          transport_contracts: %{
+            incremental_websocket: %{
+              surface: "responses_websocket",
+              input_mode: "nonblank_top_level_previous_response_id",
+              request_transport: "websocket",
+              attempt_transport: "websocket",
+              connection: "current_live_matching_generation_reused_only",
+              delivery: "collect_compaction_before_validation_settlement_and_adapter",
+              retry_or_fallback: false
+            },
+            full_history_http: %{
+              surfaces: ["http_json", "http_sse", "responses_websocket"],
+              input_mode: "no_top_level_previous_response_id",
+              request_transport: "http_compact_json",
+              attempt_transport: "http_compact_json"
+            }
+          },
           closed_item: %{"type" => "compaction_trigger"},
           valid_trigger: "exactly_one_final_after_visible_input",
           malformed_trigger: %{status: 400, param: "input", upstream_dispatch: false},
@@ -1724,6 +1764,118 @@ defmodule CodexPooler.CompatibilityMatrix do
       response_create_client_metadata: %{"x-codex-turn-state" => "fixture-frame-turn-state"},
       turn_state_precedence: "response.create.client_metadata_over_upgrade_header",
       privacy: "raw_value_not_persisted",
+      native_turn_identity: %{
+        source_precedence: [
+          "client_metadata.turn_id",
+          "client_metadata.x-codex-turn-metadata.turn_id",
+          "turn_id",
+          "request_id"
+        ],
+        validation: %{
+          accepted: "1_to_256_byte_ascii_[A-Za-z0-9_.:-]+",
+          present_invalid: "source_specific_invalid_request_without_fallback",
+          missing: "no_native_turn_identity"
+        },
+        semantic_key: "opaque_session_scoped_sha256_32_bytes",
+        claim_key: "opaque_session_scoped_full_base64url_sha256_claim"
+      },
+      native_tool_continuation: %{
+        logical_turn: %{
+          identity: "semantic_turn_key_and_turn_claim_key",
+          client_turns: 1
+        },
+        request_claim: %{
+          kind: "deterministic_continuation_claim",
+          separate_from_logical_turn_identity: true
+        },
+        accepted_semantic_continuation: %{
+          requests: 2,
+          attempts: 2,
+          codex_turns: 2,
+          settlements: 2,
+          sequences: [1, 2]
+        },
+        exact_replay: %{
+          status: 409,
+          new_request_attempt_codex_turn_or_settlement: false,
+          upstream_dispatch: false
+        }
+      },
+      released_native_metadata: %{
+        request_kinds: [:turn, :prewarm, :compaction, :memory],
+        canonical_envelope: %{
+          accepted_encodings: [:map, :json_string],
+          ordinary_and_prewarm: %{
+            optional: [:window_id, :context_window_id, :window_number],
+            explicit_null: "rejected",
+            compaction: "omitted_only"
+          },
+          compaction: %{
+            authority: "strict_complete_enum_map",
+            malformed: "pre_dispatch_rejected"
+          },
+          memory: %{
+            semantic_turn_identity: false,
+            ordinary_websocket_accounting_continuity_owner_or_compaction_lifecycle: false
+          }
+        },
+        prewarm: %{
+          admitted_without_compaction_authority: true
+        },
+        rejection_diagnostics: %{
+          vocabulary: :fixed,
+          metadata_only: true,
+          raw_metadata_values: false
+        }
+      },
+      active_reconnect: %{
+        same_active_non_cancelled: %{
+          disposition: "same_turn_replay",
+          result: "suppressed_without_new_task_or_accounting_rows",
+          terminal: "predecessor_terminal_only"
+        },
+        bounded_busy: %{
+          cancelled_equal_identity: "owner_busy",
+          noncancelled_different_identity: "owner_busy",
+          missing_identity: "owner_busy",
+          public_response_create: "owner_busy",
+          non_native_active_descriptor: "owner_busy",
+          response_processed: "owner_busy"
+        }
+      },
+      prewarm: %{
+        generate_false: "local_created_completed",
+        accounting_rows: "none",
+        active_reconnect: "neutral",
+        pending_handoff: "neutral",
+        reconnect_events: "none",
+        owner_cancellation: "none"
+      },
+      edited_replacement_handoff: %{
+        eligibility: "cancelled_predecessor_with_different_native_identity",
+        admission: "matching_fenced_ready_only",
+        before_ready_accounting_rows: "none",
+        soft_cancellation_bound_ms: 1_000,
+        absolute_handoff_bound_ms: 5_000,
+        absolute_failure: "owner_forward_timeout",
+        duplicate_pending_identity: "suppressed_without_second_task_or_rows",
+        third_identity: "owner_busy"
+      },
+      exactly_once: %{
+        predecessor: "client_disconnected_once",
+        replacement: "success_once_after_ready",
+        later_turn: "success_once",
+        accounting: "one_request_attempt_turn_and_settlement_per_turn",
+        replacement_connection: "new_generation",
+        later_connection: "reuse_replacement_connection",
+        automatic_replay: false
+      },
+      mixed_release: %{
+        new_new: "identity_aware_handoff",
+        new_old: "identity_aware_handoff_fails_owner_unavailable_before_accounting",
+        old_new: "legacy_submission_behavior_without_new_handoff_protection",
+        old_old: "legacy_behavior_unchanged"
+      },
       native_continuation_generation_guard: %{
         scope: "native_backend_websocket_exact_previous_response_not_found",
         marked_continuation_connection_use: "reused_only",
@@ -1742,6 +1894,50 @@ defmodule CodexPooler.CompatibilityMatrix do
           reason_class: "previous_response_generation_mismatch",
           termination_source: "continuation_generation_guard",
           raw_payloads_or_response_values: false
+        }
+      },
+      native_compaction_admission: %{
+        semantic_sequence: ["anchor", "compact", "final"],
+        first_compact: %{
+          authority: "ordinary_durable_turn_claim",
+          capability_required: false,
+          replay: "duplicate_turn_without_new_side_effects"
+        },
+        mid_turn_transitions: %{
+          compact: "owner_capability_plus_sealed_runtime_proof",
+          final: "owner_capability_plus_sealed_runtime_proof",
+          payload_shape_or_client_metadata_alone: "never_authoritative"
+        },
+        binding: [
+          "phase",
+          "semantic_turn",
+          "prepared_frame_control",
+          "owner_epoch_and_lease",
+          "serving_mode",
+          "physical_websocket_lifecycle_and_generation"
+        ],
+        legitimate_accounting: %{
+          distinct_correlations: 3,
+          requests: 3,
+          attempts: 3,
+          codex_turns: 3,
+          reservations: 3,
+          settlements: 3,
+          semantic_client_turns: 1,
+          websocket_lifecycles: 1,
+          websocket_generations: 1,
+          http_fallbacks: 0
+        },
+        rejected_frames: %{
+          new_rows: 0,
+          upstream_calls: 0,
+          saved_reset_probe_or_redeem: false,
+          hidden_replay_retry_or_fallback: false
+        },
+        public_v1: %{
+          inherits_owner_capability_or_proof: false,
+          replay_and_bridge_semantics: "unchanged",
+          relayed_bytes_and_terminal_shape: "unchanged"
         }
       },
       json: %{"model" => "gpt-fixture-text", "input" => "synthetic websocket turn"}
@@ -1938,7 +2134,31 @@ defmodule CodexPooler.CompatibilityMatrix do
     },
     compressed_request: %{encoding: "gzip", bytes: "synthetic compressed bytes"},
     bulkhead_overload: %{lane: "proxy_http", decision: "synthetic shed"},
-    degraded_routing: %{json: %{"model" => "gpt-fixture-text", "input" => "synthetic fallback"}},
+    degraded_routing: %{
+      json: %{"model" => "gpt-fixture-text", "input" => "synthetic fallback"},
+      windowless_provider_availability: %{
+        routing_state: "windowless_provider_available",
+        required_metadata: ["version", "state", "observed_at", "credential_epoch"],
+        requires_current_credential_epoch: true,
+        requires_fresh_observation: true,
+        requires_no_account_window_evidence: true,
+        precedence: "below_reset_bearing_windows",
+        fabricated_window_or_reset: false
+      },
+      fail_closed: %{
+        status: 503,
+        blocked_error_code: "quota_exhausted",
+        unavailable_error_code: "quota_evidence_unavailable",
+        states: [
+          "provider_blocked",
+          "provider_unknown",
+          "stale_provider_availability",
+          "credential_epoch_mismatch",
+          "malformed_provider_availability",
+          "applicable_model_or_additional_blocker"
+        ]
+      }
+    },
     strict_schema_rejection: %{
       json: %{
         "model" => "gpt-fixture-text",
@@ -2109,6 +2329,34 @@ defmodule CodexPooler.CompatibilityMatrix do
         lowercase_variants: true,
         external_retrieval: true,
         unknown_function_output_behavior: "protected_original_output_preserved",
+        command_backed_reads: %{
+          arguments: ["cmd", "command"],
+          native_action: %{type: "exec", command: "argv"},
+          direct_commands: ["cat", "nl", "head", "tail", "sed_print_only"],
+          pipeline: "nl_to_sed_print_only",
+          producer_aliases: %{
+            function_call: ["call_id"],
+            local_shell_call: ["call_id", "id"]
+          },
+          output_aliases: %{
+            function_call_output: ["call_id"],
+            local_shell_call_output: ["call_id", "id"]
+          },
+          output_compatibility: %{
+            function_call_output: ["function_call", "local_shell_call"],
+            local_shell_call_output: ["local_shell_call"]
+          },
+          owner_identity: "positional_producer_path",
+          unresolved_function_output: "protected_legacy",
+          unresolved_local_shell_output: "existing_behavior",
+          duplicate_aliases: "protected_original_output_preserved",
+          cross_kind_collisions: "protected_original_output_preserved",
+          conflicting_output_aliases: "protected_original_output_preserved",
+          recognized_owner_stage: "before_output_range_lookup_and_content_detection",
+          malformed_or_unrecognized: "existing_behavior",
+          output_behavior: "byte_exact",
+          metadata: "aggregate_counts_only"
+        },
         output_behavior: "original_output_preserved",
         metadata: "aggregate_counts_only"
       },
@@ -3098,10 +3346,21 @@ defmodule CodexPooler.CompatibilityMatrix do
     misalignment_policy_violation: %{
       code: "misalignment_policy_violation",
       eligibility: %{
-        direct_http_statuses: [400, 403],
-        terminal_transports: ["sse", "websocket"],
-        route_scope: "eligible_direct_or_translated_responses_and_chat_routes_only",
-        exact_error_envelope: true
+        immediate_pre_stream_http_json: %{
+          routes: ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"],
+          statuses: [400, 403],
+          exact_error_code: "misalignment_policy_violation",
+          stream_true_rejected_before_sse_starts: true,
+          optional_fields: ["error_type", "detailed_explanation", "steer.message"]
+        },
+        private_native_app_server_response_failed_sse: %{
+          routes: ["/backend-api/codex/responses", "/backend-api/codex/v1/responses"],
+          statuses: [400, 403],
+          exact_error_code: "misalignment_policy_violation",
+          stream_true: true,
+          terminal_event: "response.failed",
+          optional_fields: ["error_type", "detailed_explanation", "steer.message"]
+        }
       },
       lifecycle: %{
         retryable: false,
@@ -3124,6 +3383,19 @@ defmodule CodexPooler.CompatibilityMatrix do
         bounded_facts_only: true,
         raw_provider_message: false,
         raw_provider_body: false
+      },
+      redaction: %{
+        native_websocket: false,
+        native_compact: false,
+        public_v1_responses_chat_sse_websocket: false,
+        generic_errors: false,
+        logs: false,
+        request_or_attempt_metadata: false,
+        audit: false,
+        telemetry: false,
+        receipts: false,
+        stored_errors: false,
+        durable_event_history: false
       },
       generic_provider_errors: %{
         message: "upstream request failed",

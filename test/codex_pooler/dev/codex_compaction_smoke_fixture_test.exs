@@ -7,6 +7,8 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Dev.CodexCompactionSmokeFixture
   alias CodexPooler.Dev.CodexCompactionSmokeFixture.Journal
+  alias CodexPooler.Gateway.Runtime.Finalization.SideEffects
+  alias CodexPooler.Jobs.AccountReconciliationWorker
   alias CodexPooler.Pools.Pool
   alias CodexPooler.Repo
   alias CodexPooler.Upstreams.Schemas.{EncryptedSecret, PoolUpstreamAssignment, UpstreamIdentity}
@@ -20,6 +22,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     %{run_id: run_id, root: root}
   end
 
+  @tag :unix_integration
   test "journal and one-time secret are private, disjoint, and reject links", context do
     paths = Journal.paths(context.root, context.run_id)
     journal = Journal.new(context.run_id, "pool-id", "identity-id", "assignment-id", "model-id")
@@ -39,6 +42,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     assert {:error, :unsafe_file} = Journal.read_journal(paths, context.run_id)
   end
 
+  @tag :unix_integration
   test "journal reads require the current uid and descriptor-safe ownership", context do
     paths = Journal.paths(context.root, context.run_id)
     journal = Journal.prepared(context.run_id)
@@ -51,6 +55,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
              Journal.read_journal(paths, context.run_id, expected_uid: current_uid() + 1)
   end
 
+  @tag :unix_integration
   test "journal exists before provisioning and a pre-commit interruption rolls back all rows",
        context do
     options = Keyword.put(fixture_options(context), :interrupt_after, :pool)
@@ -68,6 +73,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     refute File.exists?(paths.root)
   end
 
+  @tag :unix_integration
   test "acquire provisions exact run resources and release is idempotent", context do
     options = fixture_options(context)
 
@@ -90,6 +96,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
              Repo.get_by(Model, pool_id: secret["pool_id"])
 
     source_model = get_in(metadata, ["source_assignment_models", acquired.assignment_id])
+    assert source_model["use_responses_lite"] == true
     assert source_model["input_modalities"] == ["text", "image"]
     assert source_model["supports_image_detail_original"] == true
     assert source_model["context_window"] == 128_000
@@ -119,6 +126,71 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     assert {:ok, %{status: "absent"}} = CodexCompactionSmokeFixture.release(options)
   end
 
+  @tag :unix_integration
+  test "release cancels gateway reconciliation for its exact graph and preserves foreign jobs",
+       context do
+    options = fixture_options(context)
+    assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+    foreign_context = %{context | run_id: context.run_id <> "-foreign"}
+    foreign_options = fixture_options(foreign_context)
+    assert {:ok, foreign} = CodexCompactionSmokeFixture.acquire(foreign_options)
+
+    owned_job = enqueue_gateway_reconciliation(acquired)
+    foreign_job = enqueue_gateway_reconciliation(foreign)
+    assert owned_job.state == "available"
+
+    assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(options)
+    assert Repo.get!(Oban.Job, owned_job.id).state == "cancelled"
+    assert Repo.get!(Oban.Job, foreign_job.id).state == "available"
+    refute File.exists?(Journal.paths(context.root, context.run_id).root)
+    assert Repo.get!(Pool, foreign.pool_id).status == "active"
+    assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(foreign_options)
+  end
+
+  @tag :unix_integration
+  test "executing reconciliation retains the journal and fails release", context do
+    options = fixture_options(context)
+    assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+    job = enqueue_gateway_reconciliation(acquired)
+    job |> Ecto.Changeset.change(state: "executing") |> Repo.update!()
+
+    assert {:error, "fixture cleanup incomplete; metadata journal retained"} =
+             CodexCompactionSmokeFixture.release(options)
+
+    assert Repo.get!(Oban.Job, job.id).state == "executing"
+    assert File.exists?(Journal.paths(context.root, context.run_id).journal)
+  end
+
+  for pending_state <- ["scheduled", "retryable"] do
+    @pending_state pending_state
+    @tag :unix_integration
+    test "release cancels #{@pending_state} reconciliation", context do
+      options = fixture_options(context)
+      assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+      job = enqueue_gateway_reconciliation(acquired)
+      job |> Ecto.Changeset.change(state: @pending_state) |> Repo.update!()
+
+      assert {:ok, %{status: "released"}} = CodexCompactionSmokeFixture.release(options)
+      assert Repo.get!(Oban.Job, job.id).state == "cancelled"
+    end
+  end
+
+  @tag :unix_integration
+  test "release preserves reconciliation that does not match the complete owned graph", context do
+    options = fixture_options(context)
+    assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
+    job = enqueue_gateway_reconciliation(acquired)
+    args = Map.put(job.args, "upstream_identity_id", Ecto.UUID.generate())
+    job |> Ecto.Changeset.change(args: args) |> Repo.update!()
+
+    assert {:error, "fixture cleanup incomplete; metadata journal retained"} =
+             CodexCompactionSmokeFixture.release(options)
+
+    assert Repo.get!(Oban.Job, job.id).state == "available"
+    assert File.exists?(Journal.paths(context.root, context.run_id).journal)
+  end
+
+  @tag :unix_integration
   test "status output retains safe lifecycle identifiers without filesystem paths", context do
     options = fixture_options(context)
     assert {:ok, acquired} = CodexCompactionSmokeFixture.acquire(options)
@@ -136,6 +208,7 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     refute public_json(absent) =~ context.root
   end
 
+  @tag :unix_integration
   test "prepared journal recovers committed resources and cleanup retains no raw secret",
        context do
     options = Keyword.put(fixture_options(context), :interrupt_after, :provision)
@@ -205,6 +278,20 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
     assert {:ok, :release, _} =
              CodexCompactionSmokeFixture.parse_args(["release", "--run-id", context.run_id])
 
+    assert {:ok, :receipt, receipt_options} =
+             CodexCompactionSmokeFixture.parse_args([
+               "receipt",
+               "--run-id",
+               context.run_id,
+               "--upstream-frame-count",
+               "2",
+               "--duplicate-error-count",
+               "0"
+             ])
+
+    assert receipt_options[:upstream_frame_count] == 2
+    assert receipt_options[:duplicate_error_count] == 0
+
     assert {:error, _} = CodexCompactionSmokeFixture.parse_args(["status"])
 
     assert {:error, _} =
@@ -215,6 +302,63 @@ defmodule CodexPooler.Dev.CodexCompactionSmokeFixtureTest do
                "--upstream-base-url",
                "https://example.com"
              ])
+  end
+
+  @tag :unix_integration
+  test "native tool continuation receipt is metadata-only", context do
+    options = fixture_options(context)
+    assert {:ok, _acquired} = CodexCompactionSmokeFixture.acquire(options)
+
+    assert {:ok, receipt} =
+             CodexCompactionSmokeFixture.receipt(
+               Keyword.merge(options,
+                 upstream_frame_count: 2,
+                 duplicate_error_count: 0
+               )
+             )
+
+    assert Map.keys(receipt) |> Enum.sort() ==
+             [
+               :attempt_count,
+               :codex_turn_count,
+               :duplicate_error_count,
+               :logical_turn_fingerprints,
+               :request_count,
+               :request_fingerprints,
+               :settlement_count,
+               :status,
+               :turn_sequences,
+               :upstream_frame_count
+             ]
+
+    assert receipt.status == "closed"
+    assert receipt.request_count == 0
+    assert receipt.attempt_count == 0
+    assert receipt.codex_turn_count == 0
+    assert receipt.settlement_count == 0
+    assert receipt.turn_sequences == []
+    assert receipt.upstream_frame_count == 2
+    assert receipt.duplicate_error_count == 0
+    assert receipt.logical_turn_fingerprints == []
+    assert receipt.request_fingerprints == []
+
+    encoded = Jason.encode!(receipt)
+    refute encoded =~ context.run_id
+    refute encoded =~ context.root
+    refute encoded =~ "pool_id"
+    refute encoded =~ "identity_id"
+  end
+
+  defp enqueue_gateway_reconciliation(acquired) do
+    assignment = Repo.get!(PoolUpstreamAssignment, acquired.assignment_id)
+    assert :ok = SideEffects.maybe_enqueue_gateway_reconciliation(acquired.pool_id, assignment)
+
+    assert_enqueued(
+      worker: AccountReconciliationWorker,
+      args: %{pool_id: acquired.pool_id, pool_upstream_assignment_id: assignment.id}
+    )
+
+    Repo.one!(from job in Oban.Job, where: job.args["pool_id"] == ^acquired.pool_id)
   end
 
   defp fixture_options(context) do

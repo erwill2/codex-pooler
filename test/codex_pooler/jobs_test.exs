@@ -19,6 +19,7 @@ defmodule CodexPooler.JobsTest do
     DailyRollupRebuildEnqueueWorker,
     DailyRollupRebuildWorker,
     PricingImportWorker,
+    RequestReplayCleanupWorker,
     RuntimeStateCleanupWorker,
     TokenRefreshEnqueueWorker,
     TokenRefreshWorker
@@ -40,6 +41,7 @@ defmodule CodexPooler.JobsTest do
   end
 
   describe "worker execution policy" do
+    @tag :replay_cleanup
     test "uses the shared schedule catalog for Oban cron entries" do
       assert Application.get_env(:codex_pooler, Oban)[:shutdown_grace_period] ==
                :timer.seconds(55)
@@ -51,7 +53,8 @@ defmodule CodexPooler.JobsTest do
                {"*/5 * * * *", AlertEvaluationEnqueueWorker},
                {"*/15 * * * *", TokenRefreshEnqueueWorker},
                {"17 0 * * *", DailyRollupRebuildEnqueueWorker},
-               {"*/15 * * * *", RuntimeStateCleanupWorker}
+               {"*/15 * * * *", RuntimeStateCleanupWorker},
+               {"* * * * *", RequestReplayCleanupWorker}
              ]
 
       worker_groups = Schedule.worker_groups()
@@ -93,15 +96,17 @@ defmodule CodexPooler.JobsTest do
     end
 
     test "preserves attempts and records metadata when Oban 2.24 snoozes a job" do
-      assert {:ok, job} = PricingImportWorker.new(%{}) |> Oban.insert()
+      assert {:ok, inserted_job} = PricingImportWorker.new(%{}) |> Oban.insert()
+      conf = Oban.config()
 
-      {1, _rows} =
-        from(row in Oban.Job, where: row.id == ^job.id)
-        |> Repo.update_all(set: [state: "executing", attempt: 1])
+      assert {:ok, meta} = Oban.Engine.init(conf, queue: "jobs", limit: 1)
+      assert {:ok, {_meta, [job]}} = Oban.Engine.fetch_jobs(conf, meta, %{})
+      assert job.id == inserted_job.id
+      assert job.state == "executing"
+      assert job.attempt == 1
+      assert %DateTime{} = job.attempted_at
 
-      job = Repo.get!(Oban.Job, job.id)
-
-      assert :ok = Oban.Engine.snooze_job(Oban.config(), job, 60)
+      assert :ok = Oban.Engine.snooze_job(conf, job, 60)
 
       snoozed_job = Repo.get!(Oban.Job, job.id)
       assert snoozed_job.state == "scheduled"

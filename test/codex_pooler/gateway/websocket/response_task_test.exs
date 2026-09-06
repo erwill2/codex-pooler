@@ -171,6 +171,7 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTaskTest do
     registry: registry
   } do
     parent = self()
+    termination_ref = make_ref()
 
     {:ok, pid} =
       ResponseTask.start(
@@ -184,6 +185,13 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTaskTest do
 
           receive do
             :release_completion_handoff -> :ok
+          end
+        end,
+        before_cancelled_coordinator_termination: fn token, coordinator ->
+          send(parent, {:before_cancelled_coordinator_termination, self(), token, coordinator})
+
+          receive do
+            {:release_cancelled_coordinator_termination, ^termination_ref} -> :ok
           end
         end
       )
@@ -203,6 +211,12 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTaskTest do
 
     assert :ok = ResponseTask.acknowledge_delivery(watcher, token)
     assert_receive {:codex_response_done, ^pid, {:error, :owner_drained}}
+    assert_receive {:before_cancelled_coordinator_termination, ^watcher, ^token, ^pid}
+    assert Process.alive?(pid)
+    refute_received {:DOWN, ^monitor, :process, ^pid, _reason}
+
+    send(watcher, {:release_cancelled_coordinator_termination, termination_ref})
+
     assert_receive {:DOWN, ^watcher_monitor, :process, ^watcher, :normal}
     assert_receive {:DOWN, ^monitor, :process, ^pid, :killed}
     assert {:finished, :aborted} = ActivityRegistry.status(token, name: registry)
@@ -215,6 +229,7 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTaskTest do
     registry: registry
   } do
     parent = self()
+    completion_ref = make_ref()
 
     {:ok, pid} =
       ResponseTask.start(
@@ -224,11 +239,21 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTaskTest do
         fn task_pid, reason ->
           send(parent, {:natural_winner_cancel_started, task_pid, reason})
         end,
-        activity_registry: registry
+        activity_registry: registry,
+        before_completion_handoff: fn token, watcher ->
+          send(parent, {:natural_winner_completion_ready, self(), token, watcher})
+
+          receive do
+            {:release_natural_winner_completion, ^completion_ref} -> :ok
+          end
+        end
       )
 
     monitor = Process.monitor(pid)
-    assert_receive {:websocket_response_activity, ^pid, token}
+    assert_receive {:natural_winner_completion_ready, ^pid, token, watcher}
+    watcher_monitor = Process.monitor(watcher)
+    send(pid, {:release_natural_winner_completion, completion_ref})
+    assert_receive {:websocket_response_activity, ^pid, ^token}
     assert_receive {:codex_response_done, ^pid, :ok}
     assert {_epoch, [%{token: ^token, pid: ^pid}]} = ActivityRegistry.begin_drain(name: registry)
     assert :ok = ActivityRegistry.cancel(token, :owner_drained, name: registry)
@@ -239,24 +264,83 @@ defmodule CodexPooler.Gateway.Websocket.ResponseTaskTest do
     send(pid, {:websocket_response_delivery_ack, token, :completed})
 
     assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+    assert_receive {:DOWN, ^watcher_monitor, :process, ^watcher, :normal}
     assert {:finished, :completed} = ActivityRegistry.status(token, name: registry)
     refute_received {:codex_response_done, ^pid, {:error, :owner_drained}}
     assert ActivityRegistry.activities(name: registry) == []
   end
 
-  test "untracked local-owner work is not double-counted", %{registry: registry} do
+  test "untracked local-owner submitted work waits for delivery without double-counting", %{
+    registry: registry
+  } do
     parent = self()
 
     {:ok, pid} =
       ResponseTask.start(
         parent,
         :local_owner,
-        fn _task_pid -> :ok end,
+        fn _task_pid -> {:socket_response_result, :owner_completion_pending, :ok} end,
         fn _task_pid, _reason -> :ok end,
         activity_registry: registry
       )
 
-    assert_receive {:codex_response_done, ^pid, :ok}
+    monitor = Process.monitor(pid)
+    assert_receive {:websocket_response_activity, ^pid, token}
+
+    assert_receive {:codex_response_done, ^pid,
+                    {:socket_response_result, :owner_completion_pending, :ok}}
+
+    assert Process.alive?(pid)
+    assert {_epoch, []} = ActivityRegistry.begin_drain(name: registry)
+    assert :ok = ResponseTask.acknowledge_delivery(pid, token, :completed)
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+  end
+
+  test "untracked local-owner local completion exits without delivery acknowledgement", %{
+    registry: registry
+  } do
+    parent = self()
+
+    {:ok, pid} =
+      ResponseTask.start(
+        parent,
+        :local_owner,
+        fn _task_pid -> {:socket_response_result, :local_complete, :ok} end,
+        fn _task_pid, _reason -> :ok end,
+        activity_registry: registry
+      )
+
+    monitor = Process.monitor(pid)
+    assert_receive {:codex_response_done, ^pid, {:socket_response_result, :local_complete, :ok}}
+    refute_receive {:websocket_response_activity, ^pid, _token}, 0
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
+    assert {_epoch, []} = ActivityRegistry.begin_drain(name: registry)
+  end
+
+  test "untracked local-owner failure exits without waiting for terminal delivery", %{
+    registry: registry
+  } do
+    parent = self()
+
+    {:ok, pid} =
+      ResponseTask.start(
+        parent,
+        :local_owner,
+        fn _task_pid ->
+          {:socket_response_result, :owner_completion_pending, {:error, :client_disconnected}}
+        end,
+        fn _task_pid, _reason -> :ok end,
+        activity_registry: registry
+      )
+
+    monitor = Process.monitor(pid)
+
+    assert_receive {:codex_response_done, ^pid,
+                    {:socket_response_result, :owner_completion_pending,
+                     {:error, :client_disconnected}}}
+
+    refute_receive {:websocket_response_activity, ^pid, _token}, 0
+    assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}
     assert {_epoch, []} = ActivityRegistry.begin_drain(name: registry)
   end
 end

@@ -10,15 +10,25 @@ defmodule CodexPooler.Gateway.Runtime.AccountingReservationTest do
 
   alias CodexPooler.Access
   alias CodexPooler.Accounting
-  alias CodexPooler.Accounting.{Attempt, LedgerEntry, Request}
+
+  alias CodexPooler.Accounting.{
+    Attempt,
+    LedgerEntry,
+    Request,
+    RequestClientRetryLink,
+    RequestReplayEntitlement
+  }
+
   alias CodexPooler.Accounting.RequestLifecycle.Reservation
   alias CodexPooler.Accounts.Scope
   alias CodexPooler.FakeUpstream
   alias CodexPooler.Gateway.Payloads.RequestOptions
-  alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn}
+  alias CodexPooler.Gateway.Persistence.{CodexSession, CodexTurn, SessionContinuity}
   alias CodexPooler.Gateway.Runtime.Dispatch.AccountingReservation
   alias CodexPooler.Gateway.Runtime.Dispatch.PreDispatch
+  alias CodexPooler.Gateway.Runtime.Finalization.Interruption
   alias CodexPooler.Gateway.Runtime.Service
+  alias CodexPooler.Gateway.Transports.Streaming.WebsocketCodec
   alias CodexPooler.Gateway.Websocket
   alias CodexPooler.Repo
   alias Ecto.Adapters.SQL.Sandbox
@@ -55,6 +65,804 @@ defmodule CodexPooler.Gateway.Runtime.AccountingReservationTest do
            ) == 1
 
     assert FakeUpstream.count(upstream) == 1
+  end
+
+  test "prepare_replay_intent returns fresh without consuming the prepared frame or creating work" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    session_opts = request_options(auth, %{}, setup.model.exposed_model_id, "intent-session")
+    assert {:ok, %CodexSession{} = session} = Websocket.start_codex_session(auth, session_opts)
+
+    payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "turn_id" => "intent-fresh-turn",
+      "input" => []
+    }
+
+    opts =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "intent-fresh")
+      |> RequestOptions.put_continuity(codex_session: session)
+      |> RequestOptions.capture_api_key_runtime_epoch(auth)
+
+    assert {:ok, prepared} =
+             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+
+    counts = runtime_counts()
+
+    {result, events} =
+      capture_query_order(fn -> Service.prepare_replay_intent(auth, prepared) end)
+
+    assert {:ok,
+            %{
+              intent: :fresh,
+              authorization_binding: %{
+                api_key_id: api_key_id,
+                api_key_runtime_epoch: 0,
+                pool_id: pool_id,
+                codex_session_id: session_id,
+                model_identifier: model_identifier
+              },
+              lifecycle: nil
+            }} = result
+
+    assert api_key_id == auth.api_key.id
+    assert pool_id == auth.pool.id
+    assert session_id == session.id
+    assert model_identifier == setup.model.exposed_model_id
+    assert runtime_counts() == counts
+    assert FakeUpstream.count(upstream) == 0
+
+    assert :ok =
+             WebsocketCodec.validate_prepared_frame(prepared)
+
+    session_lock_index =
+      Enum.find_index(events, &(&1.source == "codex_sessions" and &1.for_update?))
+
+    api_key_lock_index =
+      Enum.find_index(events, &(&1.source == "api_keys" and &1.for_update?))
+
+    replay_query_index =
+      Enum.find_index(events, &(&1.source == "codex_turns" and not &1.for_update?))
+
+    assert session_lock_index < api_key_lock_index
+    assert api_key_lock_index < replay_query_index
+  end
+
+  test "prepare_replay_intent classifies active and suspended lifecycle and rejects changed claims" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    session_opts =
+      request_options(auth, %{}, setup.model.exposed_model_id, "intent-existing-session")
+
+    assert {:ok, %CodexSession{} = session} = Websocket.start_codex_session(auth, session_opts)
+
+    payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "turn_id" => "intent-existing-turn",
+      "input" => []
+    }
+
+    opts =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "intent-existing")
+      |> RequestOptions.put_continuity(codex_session: session)
+      |> RequestOptions.capture_api_key_runtime_epoch(auth)
+
+    assert {:ok, prepared} =
+             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+
+    request =
+      CodexPooler.PoolerFixtures.request_fixture(auth, %{
+        model_id: setup.model.id,
+        requested_model: setup.model.exposed_model_id,
+        transport: "websocket",
+        status: "in_progress",
+        usage_status: "usage_pending",
+        completed_at: nil,
+        response_status_code: nil
+      })
+
+    assert {:ok, turn} =
+             SessionContinuity.start_codex_turn(
+               session,
+               request,
+               prepared.request_options
+             )
+
+    attempt =
+      CodexPooler.PoolerFixtures.attempt_fixture(request, setup.assignment, %{
+        status: "in_progress",
+        completed_at: nil,
+        upstream_status_code: nil,
+        usage_status: "usage_pending"
+      })
+
+    assert {:ok, %{intent: :active_reattach, lifecycle: active}} =
+             Service.prepare_replay_intent(auth, prepared)
+
+    assert active.request_id == request.id
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    attempt
+    |> Ecto.Changeset.change(%{
+      status: "retryable_failed",
+      completed_at: now,
+      retryable: true,
+      network_error_code: "client_disconnected",
+      usage_status: "usage_unknown"
+    })
+    |> Repo.update!()
+
+    entitlement =
+      %RequestReplayEntitlement{}
+      |> RequestReplayEntitlement.changeset(%{
+        request_id: request.id,
+        codex_turn_id: turn.id,
+        eligible_attempt_id: attempt.id,
+        api_key_id: auth.api_key.id,
+        api_key_runtime_epoch: auth.api_key.runtime_revocation_epoch,
+        pool_id: auth.pool.id,
+        model_id: setup.model.id,
+        model_identifier: setup.model.exposed_model_id,
+        semantic_turn_digest: prepared.semantic_turn_key,
+        replay_claim_digest: prepared.replay_claim_digest,
+        replay_generation: 1,
+        owner_lease_digest: <<3::256>>,
+        owner_lease_key_version: "test-v1",
+        predecessor_epoch: 1,
+        status: "armed",
+        armed_at: now,
+        expires_at: DateTime.add(now, 30, :second)
+      })
+      |> Repo.insert!()
+
+    assert {:ok, %{intent: :suspended_replay, lifecycle: %{entitlement_id: entitlement_id}}} =
+             Service.prepare_replay_intent(auth, prepared)
+
+    assert entitlement_id == entitlement.id
+
+    changed_payload = Map.put(payload, "instructions", "changed replay claim")
+
+    assert {:ok, changed} =
+             Service.prepare_websocket_response(
+               Jason.encode!(changed_payload),
+               opts,
+               fn _frame -> :ok end
+             )
+
+    assert {:error, %{status: 409, code: "duplicate_turn"}} =
+             Service.prepare_replay_intent(auth, changed)
+
+    assert Repo.aggregate(Request, :count) == 1
+    assert Repo.aggregate(Attempt, :count) == 1
+    assert Repo.aggregate(RequestReplayEntitlement, :count) == 1
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "prepare_replay_intent carries an eligible terminal original into the fresh successor lane" do
+    upstream =
+      start_upstream(
+        FakeUpstream.websocket_text_frames([
+          Jason.encode!(%{
+            "type" => "response.done",
+            "response" => %{"id" => "resp_successor123456789", "status" => "completed"}
+          })
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    assert {:ok, session} =
+             Websocket.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "turn_id" => "terminal-client-retry-turn",
+      "input" => [],
+      "stream" => true
+    }
+
+    opts =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "terminal-client-retry")
+      |> RequestOptions.put_continuity(codex_session: session)
+      |> RequestOptions.put_transport(
+        websocket_writer: fn frame -> send(self(), {:frame, frame}) end
+      )
+      |> RequestOptions.capture_api_key_runtime_epoch(auth)
+
+    assert {:ok, prepared} =
+             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+
+    assert {:ok, %{request: request}} =
+             Accounting.claim_websocket_turn(auth, setup.model, %{
+               endpoint: @endpoint,
+               correlation_id: Ecto.UUID.generate(),
+               native_client_retry_witness: prepared.native_client_retry_witness
+             })
+
+    turn =
+      Repo.insert!(%CodexTurn{
+        codex_session_id: session.id,
+        request_id: request.id,
+        turn_sequence: 1,
+        transport_kind: "websocket",
+        semantic_turn_digest: prepared.semantic_turn_key,
+        status: "failed",
+        error_code: "upstream_stream_error",
+        first_visible_output_at: now,
+        completed_at: now,
+        started_at: now,
+        created_at: now,
+        updated_at: now
+      })
+
+    attempt =
+      CodexPooler.PoolerFixtures.attempt_fixture(request, setup.assignment, %{
+        status: "failed",
+        completed_at: now,
+        network_error_code: "upstream_stream_error",
+        usage_status: "usage_unknown",
+        transport: "websocket",
+        replay_generation: 0,
+        response_metadata: %{
+          "transport_failure" => %{
+            "phase" => "receive",
+            "termination_source" => "peer_close_frame",
+            "transport_signal" => "tcp_closed"
+          },
+          "native_client_retry_observation" => %{
+            "version" => 1,
+            "authority_complete" => true,
+            "output_item_done_count" => 0,
+            "output_item_done_count_saturated" => false,
+            "partial_reasoning_seen" => true,
+            "first_visible_at" => DateTime.to_iso8601(now),
+            "terminal_seen" => false,
+            "terminal_candidate_seen" => false
+          }
+        }
+      })
+
+    Repo.update!(
+      Ecto.Changeset.change(request,
+        status: "failed",
+        usage_status: "usage_unknown",
+        completed_at: now,
+        last_error_code: "upstream_stream_error"
+      )
+    )
+
+    Repo.update!(Ecto.Changeset.change(turn, final_attempt_id: attempt.id))
+    counts = runtime_counts()
+
+    assert {:ok,
+            intent = %{
+              intent: :fresh,
+              lifecycle: %{
+                replay_generation: 0,
+                client_retry_predecessor_request_id: predecessor_id
+              }
+            }} = Service.prepare_replay_intent(auth, prepared)
+
+    assert predecessor_id == request.id
+    assert runtime_counts() == counts
+    assert Repo.aggregate(RequestClientRetryLink, :count) == 0
+    assert FakeUpstream.count(upstream) == 0
+
+    session = Repo.reload!(session)
+
+    lifecycle =
+      Map.merge(intent.lifecycle, %{
+        owner_idle_validated?: true,
+        owner_lease_token: session.owner_lease_token,
+        owner_instance_id: session.owner_instance_id
+      })
+
+    assert {:ok, prepared} =
+             WebsocketCodec.attach_replay_intent(
+               prepared,
+               intent.authorization_binding,
+               lifecycle
+             )
+
+    assert {:ok, %{status: 200}} =
+             Service.execute_prepared_websocket_response(auth, prepared, true)
+
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert Repo.aggregate(RequestClientRetryLink, :count) == 1
+
+    successor =
+      Repo.one!(
+        from link in RequestClientRetryLink,
+          join: successor in Request,
+          on: successor.id == link.successor_request_id,
+          select: successor
+      )
+
+    assert successor.status == "succeeded"
+    assert Repo.aggregate(from(a in Attempt, where: a.request_id == ^successor.id), :count) == 1
+  end
+
+  test "prepare_replay_intent rejects stale epoch and swapped principal before mutation or dispatch" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert {:ok, session} =
+             Websocket.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "turn_id" => "intent-stale-turn",
+      "input" => []
+    }
+
+    stale_opts =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "intent-stale")
+      |> RequestOptions.put_continuity(codex_session: session)
+      |> RequestOptions.put_runtime_context(api_key_runtime_epoch: 1)
+
+    assert {:ok, stale_prepared} =
+             Service.prepare_websocket_response(Jason.encode!(payload), stale_opts, fn _frame ->
+               :ok
+             end)
+
+    counts = runtime_counts()
+
+    assert {:error, %{code: :api_key_runtime_epoch_stale}} =
+             Service.prepare_replay_intent(auth, stale_prepared)
+
+    %{api_key: other_key} = CodexPooler.PoolerFixtures.active_api_key_fixture(auth.pool)
+    swapped_auth = %{auth | api_key: other_key, api_key_id: other_key.id}
+
+    assert {:error, %{status: 409, code: "duplicate_turn"}} =
+             Service.prepare_replay_intent(swapped_auth, stale_prepared)
+
+    other_pool = CodexPooler.PoolerFixtures.pool_fixture()
+    swapped_pool_auth = %{auth | pool: other_pool, pool_id: other_pool.id}
+
+    assert {:error, %{status: 409, code: "duplicate_turn"}} =
+             Service.prepare_replay_intent(swapped_pool_auth, stale_prepared)
+
+    assert runtime_counts() == counts
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  for phase <- [:claim, :reservation] do
+    test "preflight and execution retry after real #{phase} cleanup preserves the original" do
+      assert_cleanup_retry(unquote(phase))
+    end
+  end
+
+  defp assert_cleanup_retry(phase) do
+    upstream =
+      start_upstream(
+        FakeUpstream.websocket_text_frames([
+          Jason.encode!(%{
+            "type" => "response.done",
+            "response" => %{
+              "id" => "resp_claimsuccessor123456789",
+              "status" => "completed"
+            }
+          })
+        ])
+      )
+
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    {:ok, session} =
+      Websocket.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "turn_id" => "claimed-client-retry-turn",
+      "input" => [],
+      "stream" => true
+    }
+
+    opts =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "claimed-client-retry")
+      |> RequestOptions.put_continuity(codex_session: session)
+      |> RequestOptions.put_transport(websocket_writer: fn _frame -> :ok end)
+      |> RequestOptions.capture_api_key_runtime_epoch(auth)
+
+    {:ok, prepared} =
+      Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _ -> :ok end)
+
+    {:ok, %{request: request}} =
+      Accounting.claim_websocket_turn(auth, setup.model, %{
+        endpoint: @endpoint,
+        correlation_id: prepared.request_options.continuity.request_claim_key,
+        native_client_retry_witness: prepared.native_client_retry_witness
+      })
+
+    request = cleanup_predecessor(auth, setup.model, session, request, prepared, phase)
+    assert request.status == "failed"
+    assert request.usage_status == "usage_unknown"
+    assert request.request_metadata["websocket_pre_attempt_drain"] == true
+    original_turn = Repo.get_by(CodexTurn, request_id: request.id)
+    original_ledger = Repo.all(from e in LedgerEntry, where: e.request_id == ^request.id)
+    assert length(original_ledger) == if(phase == :claim, do: 0, else: 2)
+
+    {:ok, changed} =
+      Service.prepare_websocket_response(
+        Jason.encode!(Map.put(payload, "temperature", 0.5)),
+        opts,
+        fn _ -> :ok end
+      )
+
+    assert {:error, %{code: "duplicate_turn"}} = Service.prepare_replay_intent(auth, changed)
+
+    {:ok, other_session} =
+      Websocket.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    {:ok, other} =
+      Service.prepare_websocket_response(
+        Jason.encode!(payload),
+        RequestOptions.put_continuity(opts, codex_session: other_session),
+        fn _ -> :ok end
+      )
+
+    assert {:ok, %{intent: :fresh, lifecycle: nil}} = Service.prepare_replay_intent(auth, other)
+
+    assert {:ok,
+            intent = %{
+              intent: :fresh,
+              lifecycle: %{
+                client_retry_predecessor_request_id: predecessor_id
+              }
+            }} = Service.prepare_replay_intent(auth, prepared)
+
+    assert predecessor_id == request.id
+    session = Repo.reload!(session)
+
+    lifecycle =
+      Map.merge(intent.lifecycle, %{
+        owner_idle_validated?: true,
+        owner_lease_token: session.owner_lease_token,
+        owner_instance_id: session.owner_instance_id
+      })
+
+    {:ok, admitted} =
+      WebsocketCodec.attach_replay_intent(prepared, intent.authorization_binding, lifecycle)
+
+    assert {:ok, %{status: 200}} =
+             Service.execute_prepared_websocket_response(auth, admitted, true)
+
+    assert FakeUpstream.websocket_connection_count(upstream) == 1
+    assert FakeUpstream.count(upstream) == 1
+    link = Repo.get_by!(RequestClientRetryLink, predecessor_request_id: request.id)
+    assert Repo.get!(Request, link.successor_request_id).status == "succeeded"
+
+    assert Repo.aggregate(
+             from(a in Attempt, where: a.request_id == ^link.successor_request_id),
+             :count
+           ) == 1
+
+    assert Repo.get!(Request, request.id) == request
+    assert Repo.get_by(CodexTurn, request_id: request.id) == original_turn
+    refute Repo.exists?(from a in Attempt, where: a.request_id == ^request.id)
+    assert Repo.all(from e in LedgerEntry, where: e.request_id == ^request.id) == original_ledger
+
+    {:ok, retry} =
+      Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _ -> :ok end)
+
+    assert {:error, %{code: "duplicate_turn"}} = Service.prepare_replay_intent(auth, retry)
+  end
+
+  defp cleanup_predecessor(auth, model, session, request, prepared, phase) do
+    request = reserve_predecessor(auth, model, session, request, prepared, phase)
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+    token = Ecto.UUID.generate()
+
+    original_owner =
+      Map.take(session, [:owner_instance_id, :owner_lease_token, :owner_lease_expires_at])
+
+    Repo.update!(
+      Ecto.Changeset.change(session,
+        owner_instance_id: "cleanup-owner",
+        owner_lease_token: token,
+        owner_lease_expires_at: DateTime.add(now, 60)
+      )
+    )
+
+    request =
+      Repo.update!(
+        Ecto.Changeset.change(request,
+          request_metadata: %{
+            "websocket_owner_forwarding" => %{
+              "owner_instance_id" => "cleanup-owner",
+              "downstream_epoch" => 1
+            }
+          }
+        )
+      )
+
+    receipt = %{
+      session_id: session.id,
+      request_id: request.id,
+      correlation_id: request.correlation_id,
+      api_key_id: auth.api_key.id,
+      owner_binding: %{
+        owner_instance_id: "cleanup-owner",
+        owner_lease_token: token,
+        downstream_epoch: 1
+      }
+    }
+
+    assert :ok = Interruption.interrupt_direct_request(receipt, "owner_drained")
+    Repo.update!(Ecto.Changeset.change(Repo.reload!(session), original_owner))
+    Repo.reload!(request)
+  end
+
+  defp reserve_predecessor(_auth, _model, _session, request, _prepared, :claim), do: request
+
+  defp reserve_predecessor(auth, model, session, request, prepared, :reservation) do
+    {:ok, %{request: reserved}} =
+      Accounting.reserve(auth, model, prepared.payload, %{
+        transport: "websocket",
+        endpoint: @endpoint,
+        correlation_id: request.correlation_id,
+        turn_claim: request
+      })
+
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
+    Repo.insert!(%CodexTurn{
+      codex_session_id: session.id,
+      request_id: reserved.id,
+      turn_sequence: 1,
+      semantic_turn_digest: prepared.semantic_turn_key,
+      transport_kind: "websocket",
+      status: "in_progress",
+      started_at: now,
+      created_at: now,
+      updated_at: now
+    })
+
+    reserved
+  end
+
+  test "prepare_replay_intent rejects epoch and session tampering before database work" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert {:ok, session} =
+             Websocket.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "turn_id" => "intent-tamper-turn",
+      "input" => []
+    }
+
+    opts =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "intent-tamper")
+      |> RequestOptions.put_continuity(codex_session: session)
+      |> RequestOptions.capture_api_key_runtime_epoch(auth)
+
+    assert {:ok, prepared} =
+             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+
+    tampered_epoch =
+      update_in(prepared.request_options.runtime.api_key_runtime_epoch, fn _epoch -> 1 end)
+
+    other_session = %{session | id: Ecto.UUID.generate()}
+
+    tampered_session =
+      put_in(prepared.request_options.continuity.codex_session, other_session)
+
+    counts = runtime_counts()
+
+    for tampered <- [tampered_epoch, tampered_session] do
+      {result, events} =
+        capture_query_order(fn -> Service.prepare_replay_intent(auth, tampered) end)
+
+      assert {:error, %{status: 400, code: "invalid_request"}} = result
+      assert events == []
+    end
+
+    assert runtime_counts() == counts
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  test "prepare_replay_intent rejects a currently locked API key moved outside the session Pool" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert {:ok, session} =
+             Websocket.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "turn_id" => "intent-key-pool-mismatch",
+      "input" => []
+    }
+
+    opts =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "intent-key-pool-mismatch")
+      |> RequestOptions.put_continuity(codex_session: session)
+      |> RequestOptions.capture_api_key_runtime_epoch(auth)
+
+    assert {:ok, prepared} =
+             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+
+    other_pool = CodexPooler.PoolerFixtures.pool_fixture()
+
+    auth.api_key
+    |> Ecto.Changeset.change(%{pool_id: other_pool.id})
+    |> Repo.update!()
+
+    counts = runtime_counts()
+
+    assert {:error, %{status: 409, code: "duplicate_turn"}} =
+             Service.prepare_replay_intent(auth, prepared)
+
+    assert runtime_counts() == counts
+    assert FakeUpstream.count(upstream) == 0
+
+    assert :ok =
+             WebsocketCodec.validate_prepared_frame(prepared)
+  end
+
+  test "concurrent replay intent preparation remains read-only and leaves capability reusable" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+
+    assert {:ok, session} =
+             Websocket.start_codex_session(auth, %{accepted_turn_state: Ecto.UUID.generate()})
+
+    payload = %{
+      "type" => "response.create",
+      "model" => setup.model.exposed_model_id,
+      "turn_id" => "intent-concurrent-turn",
+      "input" => []
+    }
+
+    opts =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "intent-concurrent")
+      |> RequestOptions.put_continuity(codex_session: session)
+      |> RequestOptions.capture_api_key_runtime_epoch(auth)
+
+    assert {:ok, prepared} =
+             Service.prepare_websocket_response(Jason.encode!(payload), opts, fn _frame -> :ok end)
+
+    parent = self()
+    release_ref = make_ref()
+    counts = runtime_counts()
+
+    tasks =
+      for _index <- 1..2 do
+        Task.async(fn ->
+          Sandbox.allow(Repo, parent, self())
+          send(parent, {:replay_intent_ready, self()})
+
+          receive do
+            {:prepare_replay_intent, ^release_ref} ->
+              Service.prepare_replay_intent(auth, prepared)
+          end
+        end)
+      end
+
+    pids =
+      for _index <- 1..2 do
+        assert_receive {:replay_intent_ready, pid}
+        Sandbox.allow(Repo, self(), pid)
+        pid
+      end
+
+    Enum.each(pids, &send(&1, {:prepare_replay_intent, release_ref}))
+    results = Enum.map(tasks, &Task.await(&1, 15_000))
+
+    assert Enum.all?(results, fn
+             {:ok, %{intent: :fresh, lifecycle: nil, authorization_binding: binding}} ->
+               binding == expected_binding(auth, session, setup.model)
+
+             _other ->
+               false
+           end)
+
+    assert runtime_counts() == counts
+    assert FakeUpstream.count(upstream) == 0
+
+    assert :ok =
+             WebsocketCodec.validate_prepared_frame(prepared)
+  end
+
+  test "manually forged admission carrier fails before claim reservation or upstream work" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_forged_admission"}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    payload = websocket_payload(setup.model.exposed_model_id, "forged admission")
+
+    options =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "forged-admission-turn")
+      |> then(fn options ->
+        %{
+          options
+          | native_compaction_admission: %RequestOptions.NativeCompactionAdmission{
+              capability: :forged,
+              owner: :forged,
+              expected_connection_lifecycle: :forged
+            }
+        }
+      end)
+
+    assert {:error, %{code: "invalid_runtime_admission"}} =
+             Service.execute(auth, @endpoint, payload, options)
+
+    assert_runtime_counts(%{requests: 0, attempts: 0, ledger: 0, turns: 0, sessions: 0})
+    assert FakeUpstream.count(upstream) == 0
+  end
+
+  @tag :replacement_turn_lock_order
+  test "replacement reservation locks its session before API key authorization" do
+    upstream = start_upstream(FakeUpstream.json_response(%{"id" => "resp_lock_order123456789"}))
+    setup = gateway_setup(upstream)
+    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+    payload = websocket_payload(setup.model.exposed_model_id, "replacement lock order")
+
+    opts =
+      auth
+      |> request_options(payload, setup.model.exposed_model_id, "replacement-lock-order")
+      |> RequestOptions.put_continuity(
+        accepted_turn_state:
+          "replacement-lock-order-#{System.unique_integer([:positive, :monotonic])}"
+      )
+
+    assert {:ok, %CodexSession{} = session} = Websocket.start_codex_session(auth, opts)
+    opts = RequestOptions.put_continuity(opts, codex_session: session)
+
+    {result, events} =
+      capture_query_order(fn -> Service.execute(auth, @endpoint, payload, opts) end)
+
+    assert {:ok, %{status: 200}} = result
+
+    session_lock_index =
+      Enum.find_index(events, fn event ->
+        event.source == "codex_sessions" and event.operation == "SELECT" and
+          event.for_update?
+      end)
+
+    api_key_lock_index =
+      events
+      |> Enum.with_index()
+      |> Enum.filter(fn {event, _index} ->
+        event.source == "api_keys" and event.operation == "SELECT" and event.for_update?
+      end)
+      |> List.last()
+      |> then(fn {_, index} -> index end)
+
+    assert is_integer(session_lock_index)
+    assert is_integer(api_key_lock_index)
+    assert session_lock_index < api_key_lock_index
+    assert Repo.aggregate(Request, :count) == 1
+    assert Repo.aggregate(CodexTurn, :count) == 1
   end
 
   test "pause before websocket claim creates no runtime or accounting work" do
@@ -189,101 +997,111 @@ defmodule CodexPooler.Gateway.Runtime.AccountingReservationTest do
     assert FakeUpstream.count(upstream) == 1
   end
 
-  test "session-routable execution rejects a claimed turn after a real transaction rollback" do
-    upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
-    setup = gateway_setup(upstream)
-    {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
+  for {failure_reason, status, retryable} <- [
+        {:rollback, 503, true},
+        {:invalid_transition, 500, false}
+      ] do
+    @tag failure_reason: failure_reason, failure_status: status, failure_retryable: retryable
+    test "session-routable execution rejects a claimed turn after a #{failure_reason} rollback",
+         %{failure_reason: failure_reason, failure_status: status, failure_retryable: retryable} do
+      upstream = start_upstream(FakeUpstream.json_response(%{"data" => []}))
+      setup = gateway_setup(upstream)
+      {:ok, auth} = Access.authenticate_authorization_header(setup.authorization)
 
-    payload = %{
-      "model" => setup.model.exposed_model_id,
-      "input" => [
-        %{
-          "type" => "message",
-          "role" => "user",
-          "content" => [%{"type" => "input_text", "text" => "pre-attempt rollback regression"}]
-        }
-      ],
-      "stream" => true
-    }
+      payload = %{
+        "model" => setup.model.exposed_model_id,
+        "input" => [
+          %{
+            "type" => "message",
+            "role" => "user",
+            "content" => [%{"type" => "input_text", "text" => "pre-attempt rollback regression"}]
+          }
+        ],
+        "stream" => true
+      }
 
-    request_options = request_options(auth, payload, setup.model.exposed_model_id)
+      request_options = request_options(auth, payload, setup.model.exposed_model_id)
 
-    assert {:ok, prepared} =
-             PreDispatch.prepare(auth, @endpoint, payload, request_options, setup.model)
+      assert {:ok, prepared} =
+               PreDispatch.prepare(auth, @endpoint, payload, request_options, setup.model)
 
-    claim_attrs =
-      AccountingReservation.attrs(
-        auth,
-        payload,
-        @endpoint,
-        prepared.request_options,
-        prepared.route_state
-      )
+      claim_attrs =
+        AccountingReservation.attrs(
+          auth,
+          payload,
+          @endpoint,
+          prepared.request_options,
+          prepared.route_state
+        )
 
-    assert {:ok, %{request: turn_claim}} =
-             Accounting.claim_websocket_turn(auth, setup.model, claim_attrs)
+      assert {:ok, %{request: turn_claim}} =
+               Accounting.claim_websocket_turn(auth, setup.model, claim_attrs)
 
-    reserve_and_start_turn = fn
-      received_auth,
-      received_model,
-      received_payload,
-      received_endpoint,
-      received_request_options,
-      received_route_state,
-      received_turn_claim ->
-        assert received_auth == auth
-        assert received_model.id == setup.model.id
-        assert received_payload == payload
-        assert received_endpoint == @endpoint
-        assert received_request_options.transport.transport == "websocket"
-        assert received_route_state == prepared.route_state
-        assert received_turn_claim.id == turn_claim.id
+      reserve_and_start_turn = fn
+        received_auth,
+        received_model,
+        received_payload,
+        received_endpoint,
+        received_request_options,
+        received_route_state,
+        received_turn_claim,
+        received_authorized_correlation_id ->
+          assert received_auth == auth
+          assert received_model.id == setup.model.id
+          assert received_payload == payload
+          assert received_endpoint == @endpoint
+          assert received_request_options.transport.transport == "websocket"
+          assert received_route_state == prepared.route_state
+          assert received_turn_claim.id == turn_claim.id
+          assert received_authorized_correlation_id == nil
 
-        Repo.transaction(fn -> Repo.rollback(:rollback) end)
+          Repo.transaction(fn -> Repo.rollback(failure_reason) end)
+      end
+
+      log =
+        capture_log(fn ->
+          assert {:error,
+                  %{
+                    status: status,
+                    code: "gateway_reservation_failed",
+                    message: "gateway request reservation failed",
+                    retryable: retryable
+                  }} ==
+                   Service.execute_session_routable_model(
+                     %{
+                       auth: auth,
+                       endpoint: @endpoint,
+                       payload: payload,
+                       request_options: prepared.request_options,
+                       model: setup.model,
+                       candidates: prepared.candidates,
+                       route_state: prepared.route_state,
+                       turn_claim: turn_claim
+                     },
+                     reserve_and_start_turn
+                   )
+        end)
+
+      assert log =~ "gateway pre-attempt reservation failed"
+      assert log =~ "phase=pre_attempt"
+      assert log =~ "operation=reserve_and_start_turn"
+      assert log =~ "failure_code=gateway_reservation_failed"
+      assert log =~ "status=#{status}"
+      assert log =~ "request_id=pre-attempt-rollback"
+      assert log =~ "failure_reason=#{failure_reason}"
+      assert log =~ "retryable=#{retryable}"
+      refute log =~ "finalization"
+      refute log =~ "attempt_id=unknown"
+
+      assert %Request{
+               status: "rejected",
+               response_status_code: ^status,
+               last_error_code: "gateway_reservation_failed"
+             } = Repo.reload!(turn_claim)
+
+      assert FakeUpstream.count(upstream) == 0
+      assert Repo.aggregate(Attempt, :count) == 0
     end
-
-    log =
-      capture_log(fn ->
-        assert {:error,
-                %{
-                  status: 503,
-                  code: "gateway_reservation_failed",
-                  message: "gateway request reservation failed",
-                  retryable: true
-                }} =
-                 Service.execute_session_routable_model(
-                   %{
-                     auth: auth,
-                     endpoint: @endpoint,
-                     payload: payload,
-                     request_options: prepared.request_options,
-                     model: setup.model,
-                     candidates: prepared.candidates,
-                     route_state: prepared.route_state,
-                     turn_claim: turn_claim
-                   },
-                   reserve_and_start_turn
-                 )
-      end)
-
-    assert log =~ "gateway pre-attempt reservation failed"
-    assert log =~ "phase=pre_attempt"
-    assert log =~ "operation=reserve_and_start_turn"
-    assert log =~ "failure_code=gateway_reservation_failed"
-    assert log =~ "status=503"
-    assert log =~ "request_id=pre-attempt-rollback"
-    assert log =~ "failure_reason=rollback"
-    assert log =~ "retryable=true"
-    refute log =~ "finalization"
-    refute log =~ "attempt_id=unknown"
-
-    assert %Request{
-             status: "rejected",
-             response_status_code: 503,
-             last_error_code: "gateway_reservation_failed"
-           } = Repo.reload!(turn_claim)
-
-    assert FakeUpstream.count(upstream) == 0
   end
 
   test "unknown pre-attempt failures stay non-retryable" do
@@ -326,11 +1144,16 @@ defmodule CodexPooler.Gateway.Runtime.AccountingReservationTest do
   defp request_options(auth, payload, model, request_id \\ "pre-attempt-rollback") do
     {:ok, policy} = Access.normalize_api_key_policy(auth.api_key)
 
+    turn_claim_key =
+      "codex-turn:" <>
+        (:crypto.hash(:sha256, request_id) |> Base.url_encode64(padding: false))
+
     %{
       request_id: request_id,
       upstream_endpoint: @endpoint,
       transport: "websocket",
-      codex_turn_id: request_id
+      turn_claim_key: turn_claim_key,
+      request_claim_key: turn_claim_key
     }
     |> RequestOptions.build(@endpoint, payload)
     |> RequestOptions.put_routing(
@@ -375,6 +1198,56 @@ defmodule CodexPooler.Gateway.Runtime.AccountingReservationTest do
     task
   end
 
+  defp capture_query_order(fun) when is_function(fun, 0) do
+    parent = self()
+    handler_id = {__MODULE__, :query_order, System.unique_integer([:positive, :monotonic])}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:codex_pooler, :repo, :query],
+        fn _event, _measurements, metadata, _config ->
+          if metadata[:repo] == Repo and self() == parent do
+            query = Map.get(metadata, :query, "")
+
+            send(parent, {
+              handler_id,
+              %{
+                source: metadata[:source],
+                operation: query_operation(query),
+                for_update?: String.contains?(String.upcase(query), "FOR UPDATE")
+              }
+            })
+          end
+        end,
+        nil
+      )
+
+    try do
+      result = fun.()
+      {result, drain_query_order(handler_id, [])}
+    after
+      :telemetry.detach(handler_id)
+    end
+  end
+
+  defp drain_query_order(handler_id, events) do
+    receive do
+      {^handler_id, event} -> drain_query_order(handler_id, events ++ [event])
+    after
+      0 -> events
+    end
+  end
+
+  defp query_operation(query) do
+    query
+    |> String.trim_leading()
+    |> String.split(~r/\s+/, parts: 2)
+    |> List.first()
+    |> to_string()
+    |> String.upcase()
+  end
+
   defp instance_owner_scope do
     %{user: owner} = bootstrap_owner_fixture(%{"email" => unique_user_email()})
     Scope.for_user(owner, ["instance_owner"])
@@ -388,5 +1261,26 @@ defmodule CodexPooler.Gateway.Runtime.AccountingReservationTest do
              turns: Repo.aggregate(CodexTurn, :count),
              sessions: Repo.aggregate(CodexSession, :count)
            } == expected
+  end
+
+  defp runtime_counts do
+    %{
+      requests: Repo.aggregate(Request, :count),
+      attempts: Repo.aggregate(Attempt, :count),
+      ledger: Repo.aggregate(LedgerEntry, :count),
+      turns: Repo.aggregate(CodexTurn, :count),
+      sessions: Repo.aggregate(CodexSession, :count),
+      entitlements: Repo.aggregate(RequestReplayEntitlement, :count)
+    }
+  end
+
+  defp expected_binding(auth, session, model) do
+    %{
+      api_key_id: auth.api_key.id,
+      api_key_runtime_epoch: auth.api_key.runtime_revocation_epoch,
+      pool_id: auth.pool.id,
+      codex_session_id: session.id,
+      model_identifier: model.exposed_model_id
+    }
   end
 end

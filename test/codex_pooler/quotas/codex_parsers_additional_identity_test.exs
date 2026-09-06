@@ -5,6 +5,32 @@ defmodule CodexPooler.Quotas.CodexParsersAdditionalIdentityTest do
 
   @observed_at ~U[2026-08-25 10:00:00Z]
 
+  test "windows-only compatibility accepts legacy selected windows while strict results reject them" do
+    legacy_payload = %{
+      "plan_type" => "sample_plan",
+      "rate_limit" => %{
+        "primary_window" => %{
+          "used_percent" => 25,
+          "limit_window_seconds" => 18_000,
+          "reset_after_seconds" => 900
+        }
+      }
+    }
+
+    assert {:ok, [legacy_window]} =
+             CodexParsers.parse_codex_usage_payload(legacy_payload, @observed_at)
+
+    assert legacy_window.window_minutes == 300
+    assert legacy_window.reset_at == DateTime.add(@observed_at, 900, :second)
+
+    assert {:ok, %{windows: [], account_availability: availability}} =
+             CodexParsers.parse_codex_usage_result(legacy_payload, @observed_at)
+
+    assert availability.state == :unknown
+    assert availability.basis == :conflict
+    assert availability.account_windows == :unknown
+  end
+
   test "same-label additional meters retain the shared legacy window identity" do
     assert {:ok, evidences} =
              CodexParsers.parse_codex_usage_payload(same_label_meter_payload(), @observed_at)
@@ -24,6 +50,35 @@ defmodule CodexPooler.Quotas.CodexParsersAdditionalIdentityTest do
              {"meter_alpha", "meter_alpha", Decimal.new("31.0")},
              {"meter_beta", "meter_beta", Decimal.new("71.0")}
            ]
+  end
+
+  test "synthetic Reserve-shaped weekly payload preserves its wire identity without a model substitution" do
+    payload = %{
+      "additional_rate_limits" => [
+        %{
+          "limit_name" => "gpt-reserve",
+          "metered_feature" => "base_model_inference",
+          "rate_limit" => %{
+            "primary_window" => %{
+              "used_percent" => 25,
+              "limit_window_seconds" => 604_800,
+              "reset_after_seconds" => 604_800,
+              "reset_at" => 1_778_000_000
+            }
+          }
+        }
+      ]
+    }
+
+    assert {:ok, [evidence]} = CodexParsers.parse_codex_usage_payload(payload, @observed_at)
+
+    assert evidence.quota_key == "gpt_reserve"
+    assert evidence.quota_scope == "model"
+    assert evidence.model == "gpt-reserve"
+    assert evidence.raw_limit_name == "gpt-reserve"
+    assert evidence.raw_metered_feature == "base_model_inference"
+    assert evidence.window_kind == "secondary"
+    assert evidence.window_minutes == 10_080
   end
 
   test "exact duplicate meter identity deterministically retains highest pressure" do
@@ -87,6 +142,7 @@ defmodule CodexPooler.Quotas.CodexParsersAdditionalIdentityTest do
         "primary_window" => %{
           "used_percent" => used_percent,
           "limit_window_seconds" => 604_800,
+          "reset_after_seconds" => 604_800,
           "reset_at" => 1_778_000_000
         }
       }

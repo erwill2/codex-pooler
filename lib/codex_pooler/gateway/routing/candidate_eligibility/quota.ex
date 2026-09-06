@@ -3,16 +3,25 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
 
   alias CodexPooler.Catalog.Model
   alias CodexPooler.Gateway.Contracts
+  alias CodexPooler.Gateway.Routing.CandidateEligibility
   alias CodexPooler.Gateway.Routing.CandidateEligibility.FilterInput
   alias CodexPooler.Gateway.Routing.SessionContinuity
   alias CodexPooler.Gateway.Runtime.Dispatch.RouteState
+  alias CodexPooler.Upstreams.Lifecycle.CredentialFencing
+  alias CodexPooler.Upstreams.Quota.RoutingQuotaSnapshot
   alias CodexPooler.Upstreams.Quota.Windows, as: QuotaWindows
   alias CodexPooler.Upstreams.SavedResets.RedemptionLifecycle
 
   # The routing states `add_classified_quota_candidate/4` keeps as candidates.
   # An eligibility map also carries `routing_state` when it is blocked, so
   # matching the key alone would call every exhausted account routable.
-  @routable_routing_states [:precise, :credit_backed_probe, :weekly_only_probe]
+  @routable_routing_states [
+    :precise,
+    :credit_backed_probe,
+    :weekly_only_probe,
+    :provider_available,
+    :windowless_provider_available
+  ]
 
   @spec filter_quota_eligible_candidates(FilterInput.t()) ::
           CodexPooler.Gateway.Routing.CandidateEligibility.quota_filter_result()
@@ -137,18 +146,20 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
   @spec quota_routable?(
           Model.t(),
           CodexPooler.Gateway.Routing.CandidateEligibility.candidate(),
-          [CodexPooler.Upstreams.Quota.AccountQuotaWindow.t()],
+          RoutingQuotaSnapshot.t(),
           DateTime.t()
         ) :: boolean()
-  def quota_routable?(%Model{} = model, {_assignment, identity}, windows, %DateTime{} = at)
-      when is_list(windows) do
+  def quota_routable?(
+        %Model{} = model,
+        {_assignment, identity},
+        %RoutingQuotaSnapshot{as_of: at} = snapshot,
+        %DateTime{} = at
+      ) do
     if claimed_pending_reset_probe?(identity) do
       false
     else
-      windows
-      |> QuotaWindows.routing_quota_eligibility_from_windows(
-        Keyword.put(quota_scope_opts(model), :at, at)
-      )
+      snapshot
+      |> QuotaWindows.routing_quota_eligibility_from_snapshot(quota_scope_opts(model))
       |> case do
         %{routing_state: routing_state} when routing_state in @routable_routing_states -> true
         %{exclusions: reasons} when is_list(reasons) -> reset_probe_routeable?(identity, reasons)
@@ -156,15 +167,79 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
     end
   end
 
+  @spec windowless_candidate?(
+          Model.t(),
+          CodexPooler.Gateway.Routing.CandidateEligibility.candidate(),
+          RouteState.t()
+        ) :: boolean()
+  def windowless_candidate?(
+        %Model{} = model,
+        {_assignment, identity},
+        %RouteState{} = route_state
+      ) do
+    Map.has_key?(route_state.quota_snapshots, identity.id) and
+      not claimed_pending_reset_probe?(identity) and
+      match?(
+        %{routing_state: state}
+        when state in [:windowless_provider_available, :provider_available],
+        routing_quota_eligibility(identity, model, route_state)
+      )
+  end
+
+  @spec provider_permission_current?(
+          Model.t(),
+          CandidateEligibility.candidate(),
+          RouteState.t() | nil
+        ) ::
+          boolean()
+  def provider_permission_current?(_model, _candidate, nil), do: true
+
+  def provider_permission_current?(model, {assignment, identity} = candidate, route_state) do
+    if windowless_candidate?(model, candidate, route_state) do
+      with {:ok, candidates} <- CandidateEligibility.routable_candidates(model),
+           {current_assignment, current_identity} <-
+             Enum.find(candidates, fn {current, _identity} -> current.id == assignment.id end),
+           true <-
+             CredentialFencing.credential_epoch(current_identity) ==
+               CredentialFencing.credential_epoch(identity) do
+        as_of = DateTime.utc_now()
+
+        snapshot = RoutingQuotaSnapshot.load_by_identity_ids([identity.id], as_of)[identity.id]
+
+        current_permission_snapshot?(
+          snapshot,
+          model,
+          {current_assignment, current_identity},
+          CredentialFencing.credential_epoch(identity)
+        )
+      else
+        _unavailable -> false
+      end
+    else
+      true
+    end
+  end
+
+  defp current_permission_snapshot?(
+         %RoutingQuotaSnapshot{credential_epoch: epoch} = snapshot,
+         model,
+         candidate,
+         epoch
+       ) do
+    quota_routable?(model, candidate, snapshot, snapshot.as_of)
+  end
+
+  defp current_permission_snapshot?(_snapshot, _model, _candidate, _epoch), do: false
+
   defp classify_quota_candidates(%Model{} = model, candidates) do
     classify_quota_candidates(model, candidates, nil)
   end
 
   defp classify_quota_candidates(%Model{} = model, candidates, route_state) do
     {precise_candidates, credit_backed_probe_candidates, weekly_probe_candidates,
-     reset_probe_candidates, exclusions, refreshable_candidates} =
-      Enum.reduce(candidates, {[], [], [], [], [], []}, fn {assignment, identity} = candidate,
-                                                           acc ->
+     reset_probe_candidates, windowless_candidates, exclusions, refreshable_candidates} =
+      Enum.reduce(candidates, {[], [], [], [], [], [], []}, fn {assignment, identity} = candidate,
+                                                               acc ->
         identity
         |> routing_quota_eligibility(model, route_state)
         |> add_classified_quota_candidate(candidate, assignment, acc)
@@ -175,9 +250,19 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
     weekly_probe_candidates = Enum.reverse(weekly_probe_candidates)
     reset_probe_candidates = Enum.reverse(reset_probe_candidates)
 
+    {provider_candidates, windowless_candidates} =
+      windowless_candidates
+      |> Enum.reverse()
+      |> Enum.split_with(fn {state, _candidate} -> state == :provider_available end)
+
+    provider_candidates = Enum.map(provider_candidates, &elem(&1, 1))
+    windowless_candidates = Enum.map(windowless_candidates, &elem(&1, 1))
+
     candidates =
       precise_candidates ++
-        credit_backed_probe_candidates ++ weekly_probe_candidates ++ reset_probe_candidates
+        credit_backed_probe_candidates ++
+        weekly_probe_candidates ++
+        reset_probe_candidates ++ provider_candidates ++ windowless_candidates
 
     case candidates do
       [] ->
@@ -190,36 +275,35 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
            precise_candidates,
            credit_backed_probe_candidates,
            weekly_probe_candidates,
-           reset_probe_candidates
-         )}
+           reset_probe_candidates,
+           windowless_candidates
+         )
+         |> put_provider_decision(provider_candidates)}
     end
   end
 
   defp routing_quota_eligibility(
          identity,
          %Model{} = model,
-         %RouteState{quota_snapshot_at: %DateTime{} = snapshot_at} = route_state
+         %RouteState{} = route_state
        ) do
     if claimed_pending_reset_probe?(identity) do
       claimed_pending_reset_probe_exclusion()
     else
-      route_state
-      |> RouteState.quota_windows_for_identity(identity)
-      |> QuotaWindows.routing_quota_eligibility_from_windows(
-        Keyword.put(quota_scope_opts(model), :at, snapshot_at)
-      )
-    end
-  end
+      snapshot = RouteState.quota_snapshot_for_identity(route_state, identity)
 
-  defp routing_quota_eligibility(_identity, %Model{}, %RouteState{}) do
-    raise ArgumentError, "route state quota snapshot timestamp is missing"
+      QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, quota_scope_opts(model))
+    end
   end
 
   defp routing_quota_eligibility(identity, %Model{} = model, nil) do
     if claimed_pending_reset_probe?(identity) do
       claimed_pending_reset_probe_exclusion()
     else
-      QuotaWindows.routing_quota_eligibility(identity, quota_scope_opts(model))
+      snapshot =
+        RoutingQuotaSnapshot.load_by_identity_ids([identity.id], DateTime.utc_now())[identity.id]
+
+      QuotaWindows.routing_quota_eligibility_from_snapshot(snapshot, quota_scope_opts(model))
     end
   end
 
@@ -245,46 +329,62 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
          %{routing_state: :precise},
          candidate,
          _assignment,
-         {precise, credit_backed, weekly_probes, reset_probes, excluded, refreshable}
+         {precise, credit_backed, weekly_probes, reset_probes, windowless, excluded, refreshable}
        ) do
-    {[candidate | precise], credit_backed, weekly_probes, reset_probes, excluded, refreshable}
+    {[candidate | precise], credit_backed, weekly_probes, reset_probes, windowless, excluded,
+     refreshable}
   end
 
   defp add_classified_quota_candidate(
          %{routing_state: :credit_backed_probe},
          candidate,
          _assignment,
-         {precise, credit_backed, weekly_probes, reset_probes, excluded, refreshable}
+         {precise, credit_backed, weekly_probes, reset_probes, windowless, excluded, refreshable}
        ) do
-    {precise, [candidate | credit_backed], weekly_probes, reset_probes, excluded, refreshable}
+    {precise, [candidate | credit_backed], weekly_probes, reset_probes, windowless, excluded,
+     refreshable}
   end
 
   defp add_classified_quota_candidate(
          %{routing_state: :weekly_only_probe},
          candidate,
          _assignment,
-         {precise, credit_backed, weekly_probes, reset_probes, excluded, refreshable}
+         {precise, credit_backed, weekly_probes, reset_probes, windowless, excluded, refreshable}
        ) do
-    {precise, credit_backed, [candidate | weekly_probes], reset_probes, excluded, refreshable}
+    {precise, credit_backed, [candidate | weekly_probes], reset_probes, windowless, excluded,
+     refreshable}
+  end
+
+  defp add_classified_quota_candidate(
+         %{routing_state: state},
+         candidate,
+         _assignment,
+         {precise, credit_backed, weekly_probes, reset_probes, windowless, excluded, refreshable}
+       )
+       when state in [:windowless_provider_available, :provider_available] do
+    {precise, credit_backed, weekly_probes, reset_probes, [{state, candidate} | windowless],
+     excluded, refreshable}
   end
 
   defp add_classified_quota_candidate(
          %{exclusions: reasons},
          {_, identity} = candidate,
          assignment,
-         {precise, credit_backed, weekly_probes, reset_probes, excluded, refreshable}
+         {precise, credit_backed, weekly_probes, reset_probes, windowless, excluded, refreshable}
        ) do
     if reset_probe_routeable?(identity, reasons) do
       # The quota window still reads exhausted, but this identity holds a
       # post-reset lifecycle that a successful probe or fresh quota already
       # confirmed as temporarily routeable. Route it as a guarded reset probe
       # instead of excluding it — this is what sustainably breaks the deadlock.
-      {precise, credit_backed, weekly_probes, [candidate | reset_probes], excluded, refreshable}
+      {precise, credit_backed, weekly_probes, [candidate | reset_probes], windowless, excluded,
+       refreshable}
     else
       exclusion = quota_candidate_exclusion(assignment, identity, reasons)
       refreshable = maybe_add_refreshable_quota_candidate(refreshable, candidate, reasons)
 
-      {precise, credit_backed, weekly_probes, reset_probes, [exclusion | excluded], refreshable}
+      {precise, credit_backed, weekly_probes, reset_probes, windowless, [exclusion | excluded],
+       refreshable}
     end
   end
 
@@ -398,7 +498,8 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
          precise_candidates,
          credit_backed_probe_candidates,
          weekly_probe_candidates,
-         reset_probe_candidates
+         reset_probe_candidates,
+         windowless_candidates
        ) do
     %{
       "allowed" => true,
@@ -407,36 +508,51 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
           precise_candidates,
           credit_backed_probe_candidates,
           weekly_probe_candidates,
-          reset_probe_candidates
+          reset_probe_candidates,
+          windowless_candidates
         ),
       "routing_state" =>
         quota_decision_state(
           precise_candidates,
           credit_backed_probe_candidates,
           weekly_probe_candidates,
-          reset_probe_candidates
+          reset_probe_candidates,
+          windowless_candidates
         ),
       "precise_candidate_count" => length(precise_candidates),
       "credit_backed_probe_candidate_count" => length(credit_backed_probe_candidates),
       "weekly_probe_candidate_count" => length(weekly_probe_candidates),
       "reset_probe_candidate_count" => length(reset_probe_candidates),
+      "windowless_provider_available_candidate_count" => length(windowless_candidates),
       "eligible_candidate_count" => length(candidates)
     }
   end
 
-  defp quota_decision_state([_ | _], _credit_backed, _weekly_probes, _reset_probes), do: "precise"
+  defp quota_decision_state([_ | _], _credit_backed, _weekly_probes, _reset_probes, _windowless),
+    do: "precise"
 
-  defp quota_decision_state([], [_ | _], _weekly_probes, _reset_probes),
+  defp quota_decision_state([], [_ | _], _weekly_probes, _reset_probes, _windowless),
     do: "credit_backed_probe"
 
-  defp quota_decision_state([], [], [_ | _], _reset_probes), do: "weekly_only_probe"
-  defp quota_decision_state([], [], [], [_ | _]), do: "reset_probe"
+  defp quota_decision_state([], [], [_ | _], _reset_probes, _windowless),
+    do: "weekly_only_probe"
 
-  defp quota_decision_summary([], [], [], [_ | _]),
+  defp quota_decision_state([], [], [], [_ | _], _windowless), do: "reset_probe"
+  defp quota_decision_state([], [], [], [], _windowless), do: "windowless_provider_available"
+
+  defp quota_decision_summary([], [], [], [_ | _], _windowless),
     do: "allowed by post-reset guarded probe lifecycle"
 
-  defp quota_decision_summary(precise, credit_backed, weekly_probes, _reset_probes),
-    do: quota_decision_summary(precise, credit_backed, weekly_probes)
+  defp quota_decision_summary([], [], [], [], _windowless),
+    do: "allowed by provider availability without reset-bearing quota windows"
+
+  defp quota_decision_summary(precise, credit_backed, weekly_probes, _reset_probes, windowless) do
+    base = quota_decision_summary(precise, credit_backed, weekly_probes)
+
+    if windowless == [],
+      do: base,
+      else: base <> " and provider availability without reset-bearing quota windows"
+  end
 
   defp quota_decision_summary([], [], [_ | _]), do: "allowed by weekly quota evidence"
 
@@ -456,6 +572,22 @@ defmodule CodexPooler.Gateway.Routing.CandidateEligibility.Quota do
 
   defp quota_decision_summary([_ | _], [_ | _], [_ | _]),
     do: "allowed by fresh, credit-backed secondary, and weekly quota evidence"
+
+  defp put_provider_decision(decision, []), do: decision
+
+  defp put_provider_decision(decision, provider_candidates) do
+    decision =
+      Map.put(decision, "provider_available_candidate_count", length(provider_candidates))
+
+    if decision["routing_state"] == "windowless_provider_available" do
+      Map.merge(decision, %{
+        "routing_state" => "provider_available",
+        "summary" => "allowed by current provider account permission"
+      })
+    else
+      decision
+    end
+  end
 
   defp sanitize_quota_exclusion(%{} = exclusion) do
     exclusion
