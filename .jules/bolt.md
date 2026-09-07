@@ -1,0 +1,3 @@
+## 2026-03-30 - Gateway Candidate List Transformation Short-Circuiting
+**Learning:** In high-throughput request dispatch pipelines like `BridgeRing`, candidate lists often already meet sticky session / affinity requirements or share equal default routing priority. Unconditionally applying `Enum.split_with/2`, list concatenation `++`, `rotate_candidates` with 0 shift, or `Enum.with_index/1` + `Enum.sort_by/2` creates unnecessary tuple and list memory allocations on every gateway request.
+**Action:** Check head elements and list properties (`length <= 1`, `shift == 0`, `Enum.all?` equal priority) before executing splitting, concatenation, or sorting pipelines to return lists untouched on happy paths.
