@@ -1,0 +1,3 @@
+## 2026-09-08 - Candidate Pipeline Short-Circuiting in BridgeRing
+**Learning:** In hot request-routing paths (such as `BridgeRing.plan_route`), candidate lists frequently have <= 1 item or uniform priorities. Performing `Enum.with_index`, `Enum.sort_by`, `Enum.split`, or `Enum.split_with` blindly allocates intermediate tuples and lists. Pattern matching `[]` and `[_]` ($O(1)$) and checking if target assignment is already head avoids list allocations completely.
+**Action:** Always check list length via $O(1)$ pattern matching (`[]` / `[_]`) or head checks before running list pipeline transformations on hot paths.

@@ -293,15 +293,23 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
   defp apply_affinity(candidates, %{row: nil} = _affinity), do: candidates
 
+  # Short-circuit if matched assignment is already at list head to avoid Enum.split_with allocations.
   defp apply_affinity(candidates, %{row: %BridgeAffinity{} = affinity}) do
-    {matched, rest} =
-      Enum.split_with(candidates, fn {assignment, _identity} ->
-        assignment.id == affinity.pool_upstream_assignment_id
-      end)
+    case candidates do
+      [{assignment, _identity} | _] when assignment.id == affinity.pool_upstream_assignment_id ->
+        candidates
 
-    matched ++ rest
+      _ ->
+        {matched, rest} =
+          Enum.split_with(candidates, fn {assignment, _identity} ->
+            assignment.id == affinity.pool_upstream_assignment_id
+          end)
+
+        matched ++ rest
+    end
   end
 
+  # Short-circuit if preferred session assignment is already at list head.
   defp apply_codex_session_preference(
          candidates,
          %RequestOptions{
@@ -309,10 +317,18 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
          }
        )
        when is_binary(assignment_id) do
-    {matched, rest} =
-      Enum.split_with(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end)
+    case candidates do
+      [{assignment, _identity} | _] when assignment.id == assignment_id ->
+        candidates
 
-    matched ++ rest
+      _ ->
+        {matched, rest} =
+          Enum.split_with(candidates, fn {assignment, _identity} ->
+            assignment.id == assignment_id
+          end)
+
+        matched ++ rest
+    end
   end
 
   defp apply_codex_session_preference(candidates, %RequestOptions{}), do: candidates
@@ -328,14 +344,26 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   # Priority is an operator preference layered over the configured strategy.
   # Keeping the strategy position as the second key makes equal-priority rows
   # behave exactly as they did before priorities were configured.
+  # Short-circuit when candidate count <= 1 or all priorities match to avoid Enum.with_index/sort_by allocations.
+  defp apply_routing_priority([] = candidates), do: candidates
+  defp apply_routing_priority([_] = candidates), do: candidates
+
   defp apply_routing_priority(candidates) do
-    candidates
-    |> Enum.with_index()
-    |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
-      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
-       strategy_index}
-    end)
-    |> Enum.map(&elem(&1, 0))
+    default_prio = PoolUpstreamAssignment.default_routing_priority()
+    first_prio = elem(hd(candidates), 0).routing_priority || default_prio
+
+    if Enum.all?(candidates, fn {assignment, _identity} ->
+         (assignment.routing_priority || default_prio) == first_prio
+       end) do
+      candidates
+    else
+      candidates
+      |> Enum.with_index()
+      |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
+        {assignment.routing_priority || default_prio, strategy_index}
+      end)
+      |> Enum.map(&elem(&1, 0))
+    end
   end
 
   defp prompt_cache_locality_context(
@@ -619,11 +647,19 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   defp latest_success_sort_key(%DateTime{} = timestamp),
     do: DateTime.to_unix(timestamp, :microsecond)
 
-  defp rotate_candidates(candidates, _seed) when length(candidates) <= 1, do: candidates
+  defp rotate_candidates([] = candidates, _seed), do: candidates
+  defp rotate_candidates([_] = candidates, _seed), do: candidates
 
+  # Short-circuit if rotation shift is 0 to avoid Enum.split/2 and concatenation.
   defp rotate_candidates(candidates, seed) do
-    {head, tail} = Enum.split(candidates, :erlang.phash2(seed, length(candidates)))
-    tail ++ head
+    shift = :erlang.phash2(seed, length(candidates))
+
+    if shift == 0 do
+      candidates
+    else
+      {head, tail} = Enum.split(candidates, shift)
+      tail ++ head
+    end
   end
 
   defp quota_capacity_score(identity, %Model{} = model) do
