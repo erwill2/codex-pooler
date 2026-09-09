@@ -16,9 +16,11 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter.Pretokenizer do
   def split(text, :o200k_base) when is_binary(text),
     do: scan(@o200k_pattern, text)
 
+  # Optimize extracting single-element list matches from Regex.scan using Enum.map(&hd/1)
+  # to avoid deep recursive list flattening and redundant list memory allocations.
   defp scan(pattern, text) do
     pattern
     |> Regex.scan(text)
-    |> List.flatten()
+    |> Enum.map(&hd/1)
   end
 end
