@@ -453,7 +453,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
   defp maybe_filter_request_log_model(query, nil), do: query
 
   defp maybe_filter_request_log_model(query, model) do
-    pattern = "%#{model}%"
+    pattern = "%#{escape_like(model)}%"
 
     from([request, ...] in query,
       where: ilike(request.requested_model, ^pattern)
@@ -474,7 +474,7 @@ defmodule CodexPooler.Accounting.RequestLogs do
         )
 
       :error ->
-        pattern = "%#{trimmed}%"
+        pattern = "%#{escape_like(trimmed)}%"
 
         from([request, ...] in query,
           where:
@@ -485,6 +485,15 @@ defmodule CodexPooler.Accounting.RequestLogs do
         )
     end
   end
+
+  defp escape_like(value) when is_binary(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
+  end
+
+  defp escape_like(value), do: value
 
   defp maybe_filter_request_log_date_from(query, nil), do: query
 

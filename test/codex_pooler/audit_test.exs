@@ -144,6 +144,25 @@ defmodule CodexPooler.AuditTest do
     assert listed_correlation.id == second_event.id
   end
 
+  test "escapes ILIKE wildcard characters in audit filters" do
+    pool = pool_fixture(%{slug: "wildcard-pool", name: "Wildcard Pool"})
+
+    assert {:ok, _event} =
+             Audit.record_system_event(%{
+               pool_id: pool.id,
+               action: "pool.update",
+               target_type: "pool",
+               correlation_id: "corr-100-percent",
+               details: %{}
+             })
+
+    assert %{items: []} = Audit.list_events(pool, filters: [request: "%"])
+    assert %{items: []} = Audit.list_events(pool, filters: [target: "_"])
+
+    assert %{items: [matched]} = Audit.list_events(pool, filters: [request: "100-percent"])
+    assert matched.correlation_id == "corr-100-percent"
+  end
+
   test "does not record runtime request or file events in audit_events" do
     pool = pool_fixture(%{slug: "request-audit", name: "Request Audit"})
 
