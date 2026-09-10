@@ -328,14 +328,31 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   # Priority is an operator preference layered over the configured strategy.
   # Keeping the strategy position as the second key makes equal-priority rows
   # behave exactly as they did before priorities were configured.
+  # Fast-path: short-circuit if 0/1 candidates, or all candidates have identical priority.
+  defp apply_routing_priority([]), do: []
+  defp apply_routing_priority([_] = candidates), do: candidates
+
   defp apply_routing_priority(candidates) do
-    candidates
-    |> Enum.with_index()
-    |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
-      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
-       strategy_index}
-    end)
-    |> Enum.map(&elem(&1, 0))
+    default_prio = PoolUpstreamAssignment.default_routing_priority()
+    first_prio = elem(hd(candidates), 0).routing_priority || default_prio
+
+    if uniform_routing_priority?(candidates, first_prio, default_prio) do
+      candidates
+    else
+      candidates
+      |> Enum.with_index()
+      |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
+        {assignment.routing_priority || default_prio, strategy_index}
+      end)
+      |> Enum.map(&elem(&1, 0))
+    end
+  end
+
+  defp uniform_routing_priority?([], _target, _default), do: true
+
+  defp uniform_routing_priority?([{assignment, _identity} | rest], target, default) do
+    prio = assignment.routing_priority || default
+    prio == target and uniform_routing_priority?(rest, target, default)
   end
 
   defp prompt_cache_locality_context(
