@@ -293,15 +293,25 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
   defp apply_affinity(candidates, %{row: nil} = _affinity), do: candidates
 
+  # Performance optimization: if target affinity candidate is already at list head,
+  # return candidates immediately without splitting/concatenating lists.
   defp apply_affinity(candidates, %{row: %BridgeAffinity{} = affinity}) do
-    {matched, rest} =
-      Enum.split_with(candidates, fn {assignment, _identity} ->
-        assignment.id == affinity.pool_upstream_assignment_id
-      end)
+    case candidates do
+      [{assignment, _} | _] when assignment.id == affinity.pool_upstream_assignment_id ->
+        candidates
 
-    matched ++ rest
+      _ ->
+        {matched, rest} =
+          Enum.split_with(candidates, fn {assignment, _identity} ->
+            assignment.id == affinity.pool_upstream_assignment_id
+          end)
+
+        matched ++ rest
+    end
   end
 
+  # Performance optimization: if preferred session assignment is already at list head,
+  # return candidates immediately without splitting/concatenating lists.
   defp apply_codex_session_preference(
          candidates,
          %RequestOptions{
@@ -309,10 +319,18 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
          }
        )
        when is_binary(assignment_id) do
-    {matched, rest} =
-      Enum.split_with(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end)
+    case candidates do
+      [{assignment, _} | _] when assignment.id == assignment_id ->
+        candidates
 
-    matched ++ rest
+      _ ->
+        {matched, rest} =
+          Enum.split_with(candidates, fn {assignment, _identity} ->
+            assignment.id == assignment_id
+          end)
+
+        matched ++ rest
+    end
   end
 
   defp apply_codex_session_preference(candidates, %RequestOptions{}), do: candidates
@@ -328,14 +346,33 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   # Priority is an operator preference layered over the configured strategy.
   # Keeping the strategy position as the second key makes equal-priority rows
   # behave exactly as they did before priorities were configured.
+  # Performance optimization: short-circuit when <= 1 candidates or all candidates
+  # share equal routing_priority to avoid sorting and tuple allocations.
+  defp apply_routing_priority(candidates) when length(candidates) <= 1, do: candidates
+
   defp apply_routing_priority(candidates) do
-    candidates
-    |> Enum.with_index()
-    |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
-      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
-       strategy_index}
+    if same_routing_priority?(candidates) do
+      candidates
+    else
+      candidates
+      |> Enum.with_index()
+      |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
+        {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
+         strategy_index}
+      end)
+      |> Enum.map(&elem(&1, 0))
+    end
+  end
+
+  defp same_routing_priority?([]), do: true
+
+  defp same_routing_priority?([{first_assignment, _} | rest]) do
+    default_p = PoolUpstreamAssignment.default_routing_priority()
+    first_p = first_assignment.routing_priority || default_p
+
+    Enum.all?(rest, fn {assignment, _} ->
+      (assignment.routing_priority || default_p) == first_p
     end)
-    |> Enum.map(&elem(&1, 0))
   end
 
   defp prompt_cache_locality_context(
@@ -621,9 +658,17 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
   defp rotate_candidates(candidates, _seed) when length(candidates) <= 1, do: candidates
 
+  # Performance optimization: short-circuit when rotation shift is 0 to avoid Enum.split
+  # and list concatenation allocations.
   defp rotate_candidates(candidates, seed) do
-    {head, tail} = Enum.split(candidates, :erlang.phash2(seed, length(candidates)))
-    tail ++ head
+    shift = :erlang.phash2(seed, length(candidates))
+
+    if shift == 0 do
+      candidates
+    else
+      {head, tail} = Enum.split(candidates, shift)
+      tail ++ head
+    end
   end
 
   defp quota_capacity_score(identity, %Model{} = model) do

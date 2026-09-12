@@ -1,0 +1,3 @@
+## 2026-07-20 - Short-circuiting candidate list transformations in gateway routing
+**Learning:** In gateway dispatch hot paths (such as `BridgeRing.plan_route`), candidate list ordering functions (`apply_routing_priority`, `rotate_candidates`, `apply_affinity`, `apply_codex_session_preference`) were running `Enum.with_index`, `Enum.sort_by`, `Enum.split_with`, and list concatenations on every request even when all candidates shared equal routing priority, candidates length was <= 1, rotation shift was 0, or the target affinity candidate was already at the list head.
+**Action:** Always check for zero-work conditions (equal priorities, candidate count <= 1, shift == 0, head-match) before calling sorting or list splitting functions in request hot paths.
