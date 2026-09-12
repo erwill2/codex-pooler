@@ -1,0 +1,3 @@
+## 2026-07-20 - Link Form Validation Errors to Inputs via ARIA
+**Learning:** In Phoenix LiveView form inputs (such as `CoreComponents.input/1`), error messages are rendered dynamically when inputs are invalid. Linking validation errors to form elements using `aria-describedby` pointing to a wrapper container `id={"#{@id}-error"}` and setting `aria-invalid={@errors != []}` ensures screen readers immediately announce field validation errors upon focus without duplicating DOM IDs.
+**Action:** When creating or updating form input components, always group validation errors under `id={"#{@id}-error"}` and associate them with inputs via `aria-describedby` and `aria-invalid`.
