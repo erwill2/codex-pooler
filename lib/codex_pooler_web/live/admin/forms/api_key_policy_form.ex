@@ -451,15 +451,21 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
     ]
   end
 
+  @limit_field_atoms (for prefix <- ~w(default model),
+                          field <- @limit_fields,
+                          into: %{} do
+    {"#{prefix}_#{field}", String.to_atom("#{prefix}_#{field}")}
+  end)
+
   defp limit_review_rows(form) do
     values =
       @limit_fields
       |> Enum.flat_map(fn field ->
         [
           {"Default #{limit_field_label(field)}",
-           normalized_limit_value(form[String.to_atom("default_#{field}")].value)},
+           normalized_limit_value(form[Map.fetch!(@limit_field_atoms, "default_#{field}")].value)},
           {"Model #{limit_field_label(field)}",
-           normalized_limit_value(form[String.to_atom("model_#{field}")].value)}
+           normalized_limit_value(form[Map.fetch!(@limit_field_atoms, "model_#{field}")].value)}
         ]
       end)
       |> Enum.reject(fn {_label, value} -> is_nil(value) end)
