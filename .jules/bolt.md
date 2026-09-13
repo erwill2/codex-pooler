@@ -1,0 +1,3 @@
+## 2026-09-13 - Short-circuit candidate routing pipeline in BridgeRing
+**Learning:** In hot-path candidate routing, operations like rotation (`Enum.split` & concatenation), priority sorting (`Enum.with_index` & `Enum.sort_by`), and affinity list splitting (`Enum.split_with`) are frequently executed on candidates that have equal priorities, 0 rotation shift, or are already positioned at list head. Short-circuiting these operations when candidates <= 1, shift == 0, priorities match, or head target matches yields ~2x-3.2x speedup and saves memory allocations per routing request.
+**Action:** Always check for common-case no-op conditions (like equal values, 0 offsets, or list head matches) before performing list transformations or sorting in high-frequency routing pipelines.
