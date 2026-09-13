@@ -60,6 +60,38 @@ defmodule CodexPooler.InstanceSettingsTest do
     assert Repo.aggregate(Settings, :count) == 1
   end
 
+  test "map_get/2 safely converts string keys to existing atoms without raising ArgumentError for unknown keys" do
+    settings = InstanceSettings.ensure_singleton!()
+
+    bulkhead = %{max_concurrency: 10, queue_limit: 5, queue_timeout_ms: 1000}
+
+    atom_keyed_bulkheads =
+      Map.new(CodexPooler.RouteClass.all(), fn class -> {class, bulkhead} end)
+
+    assert {:ok, updated} =
+             InstanceSettings.update_system_settings(settings, %{
+               "gateway" => %{"bulkheads" => atom_keyed_bulkheads}
+             })
+
+    assert updated.gateway.bulkheads["proxy_http"][:max_concurrency] == 10 or
+             updated.gateway.bulkheads["proxy_http"]["max_concurrency"] == 10
+
+    # Ensure non-existent atom string keys do not raise ArgumentError when evaluated
+    unknown_key = "unregistered_key_#{System.unique_integer([:positive])}"
+    refute (try do String.to_existing_atom(unknown_key) rescue ArgumentError -> false end)
+
+    # Calling Settings changeset with invalid bulkhead config containing non-existent key string handles it safely
+    invalid_bulkheads =
+      Map.put(atom_keyed_bulkheads, "proxy_http", %{unknown_key => 10})
+
+    assert {:error, changeset} =
+             InstanceSettings.update_system_settings(settings, %{
+               "gateway" => %{"bulkheads" => invalid_bulkheads}
+             })
+
+    assert errors_on(changeset).gateway.bulkheads != []
+  end
+
   test "baseline characterization preserves downstream websocket idle timeout and persistence round-trip" do
     settings = InstanceSettings.ensure_singleton!()
 
