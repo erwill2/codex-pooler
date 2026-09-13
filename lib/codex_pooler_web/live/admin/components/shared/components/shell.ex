@@ -150,6 +150,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
                   class="btn btn-ghost btn-sm btn-square relative list-none text-base-content/60 [&::-webkit-details-marker]:hidden"
                   role="button"
                   aria-label="Live updates: syncing"
+                  title="Live updates: syncing"
                   data-ws-button
                   phx-update="ignore"
                 >
@@ -338,6 +339,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
         class="btn btn-ghost btn-sm btn-square relative list-none text-base-content/60 [&::-webkit-details-marker]:hidden"
         role="button"
         aria-label="Codex Pooler project links"
+        title="Codex Pooler project links"
         data-role="admin-github-trigger"
       >
         <.github_icon class="size-5 fill-current" />
@@ -452,6 +454,7 @@ defmodule CodexPoolerWeb.Admin.Components.Shell do
         class="btn btn-ghost btn-sm btn-square relative list-none text-base-content/60 [&::-webkit-details-marker]:hidden"
         role="button"
         aria-label={notification_button_label(@center)}
+        title={notification_button_label(@center)}
         data-role="admin-notifications-trigger"
       >
         <.icon name="hero-bell" class="size-5" />
