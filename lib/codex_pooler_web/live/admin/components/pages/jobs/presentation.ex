@@ -352,7 +352,7 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
         words =
           ~r/[A-Za-z0-9]+/
           |> Regex.scan(label)
-          |> List.flatten()
+          |> Enum.map(&hd/1)
 
         case words do
           [one] ->
@@ -370,7 +370,9 @@ defmodule CodexPoolerWeb.Admin.JobsPresentation do
 
   defp compact_marker_glyph(token) do
     token = String.upcase(String.trim(token))
-    digits = Regex.scan(~r/\d+/, token) |> List.flatten()
+    # Extracting single-element lists returned by Regex.scan/2 via Enum.map(&hd/1)
+    # avoids recursive list flattening and redundant list memory allocations.
+    digits = Regex.scan(~r/\d+/, token) |> Enum.map(&hd/1)
 
     cond do
       token == "" ->
