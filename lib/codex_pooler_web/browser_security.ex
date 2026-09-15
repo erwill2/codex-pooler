@@ -4,6 +4,18 @@ defmodule CodexPoolerWeb.BrowserSecurity do
   @codex_desktop_browser_script_sources ["'unsafe-eval'", "blob:"]
   @local_browser_hosts ["localhost", "127.0.0.1", "::1"]
 
+  # Default secure browser headers normally provided by Phoenix.Controller.put_secure_browser_headers/1
+  # when no custom map is passed. Because passing a custom dynamic map (for CSP) overrides rather than
+  # merges the defaults, we explicitly include standard secure browser headers here.
+  @default_headers %{
+    "x-frame-options" => "SAMEORIGIN",
+    "x-xss-protection" => "1; mode=block",
+    "x-content-type-options" => "nosniff",
+    "x-download-options" => "noopen",
+    "x-permitted-cross-domain-policies" => "none",
+    "cross-origin-window-policy" => "deny"
+  }
+
   @base_directives [
     default_src: ["'self'"],
     base_uri: ["'self'"],
@@ -21,7 +33,7 @@ defmodule CodexPoolerWeb.BrowserSecurity do
 
   @spec secure_headers(Plug.Conn.t() | nil) :: %{String.t() => String.t()}
   def secure_headers(conn) do
-    %{"content-security-policy" => content_security_policy(conn)}
+    Map.put(@default_headers, "content-security-policy", content_security_policy(conn))
   end
 
   @spec codex_desktop_browser?(Plug.Conn.t()) :: boolean()
