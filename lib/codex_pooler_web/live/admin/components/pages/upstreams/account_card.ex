@@ -520,6 +520,7 @@ defmodule CodexPoolerWeb.Admin.UpstreamPageComponents.AccountCard do
         class="btn btn-ghost btn-sm btn-square"
         tabindex="0"
         aria-label={"Actions for #{@account.label}"}
+        title={"Actions for #{@account.label}"}
       >
         <.icon name="hero-ellipsis-vertical" class="size-5" />
       </button>
