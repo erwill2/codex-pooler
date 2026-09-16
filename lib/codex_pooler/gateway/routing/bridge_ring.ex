@@ -293,13 +293,23 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
 
   defp apply_affinity(candidates, %{row: nil} = _affinity), do: candidates
 
-  defp apply_affinity(candidates, %{row: %BridgeAffinity{} = affinity}) do
-    {matched, rest} =
-      Enum.split_with(candidates, fn {assignment, _identity} ->
-        assignment.id == affinity.pool_upstream_assignment_id
-      end)
+  defp apply_affinity(
+         candidates,
+         %{row: %BridgeAffinity{pool_upstream_assignment_id: target_id}}
+       ) do
+    # Optimization: Short-circuit if target candidate is already at list head
+    case candidates do
+      [{%{id: ^target_id}, _identity} | _] ->
+        candidates
 
-    matched ++ rest
+      _ ->
+        {matched, rest} =
+          Enum.split_with(candidates, fn {assignment, _identity} ->
+            assignment.id == target_id
+          end)
+
+        matched ++ rest
+    end
   end
 
   defp apply_codex_session_preference(
@@ -309,10 +319,17 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
          }
        )
        when is_binary(assignment_id) do
-    {matched, rest} =
-      Enum.split_with(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end)
+    # Optimization: Short-circuit if target candidate is already at list head
+    case candidates do
+      [{%{id: ^assignment_id}, _identity} | _] ->
+        candidates
 
-    matched ++ rest
+      _ ->
+        {matched, rest} =
+          Enum.split_with(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end)
+
+        matched ++ rest
+    end
   end
 
   defp apply_codex_session_preference(candidates, %RequestOptions{}), do: candidates
@@ -328,14 +345,30 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   # Priority is an operator preference layered over the configured strategy.
   # Keeping the strategy position as the second key makes equal-priority rows
   # behave exactly as they did before priorities were configured.
+  # Optimization: Short-circuit when candidate list is empty or has a single candidate,
+  # or when all candidates share equal priority, avoiding Enum.with_index, Enum.sort_by,
+  # and list rebuilds on hot dispatch paths.
+  defp apply_routing_priority([]), do: []
+  defp apply_routing_priority([_] = candidates), do: candidates
+
   defp apply_routing_priority(candidates) do
-    candidates
-    |> Enum.with_index()
-    |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
-      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
-       strategy_index}
-    end)
-    |> Enum.map(&elem(&1, 0))
+    if equal_routing_priorities?(candidates) do
+      candidates
+    else
+      candidates
+      |> Enum.with_index()
+      |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
+        {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
+         strategy_index}
+      end)
+      |> Enum.map(&elem(&1, 0))
+    end
+  end
+
+  defp equal_routing_priorities?([{assignment, _identity} | rest]) do
+    default_prio = PoolUpstreamAssignment.default_routing_priority()
+    prio = assignment.routing_priority || default_prio
+    Enum.all?(rest, fn {a, _i} -> (a.routing_priority || default_prio) == prio end)
   end
 
   defp prompt_cache_locality_context(
