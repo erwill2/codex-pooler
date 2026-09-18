@@ -144,6 +144,38 @@ defmodule CodexPooler.AuditTest do
     assert listed_correlation.id == second_event.id
   end
 
+  test "escapes SQL LIKE wildcard characters in search filters" do
+    %{user: wildcard_user} = bootstrap_owner_fixture(%{"email" => "user_100%@example.com"})
+
+    assert {:ok, wildcard_event} =
+             Audit.record_user_event(wildcard_user, %{
+               action: "operator.update",
+               target_type: "user_setting",
+               correlation_id: "corr_100%_test",
+               details: %{}
+             })
+
+    %{user: normal_user} = bootstrap_owner_fixture(%{"email" => "userX100Y@example.com"})
+
+    assert {:ok, _normal_event} =
+             Audit.record_user_event(normal_user, %{
+               action: "operator.update",
+               target_type: "userXsetting",
+               correlation_id: "corrX100Ytest",
+               details: %{}
+             })
+
+    assert %{items: actor_matches} = Audit.list_events(nil, filters: [actor: "100%"])
+    assert Enum.all?(actor_matches, &(&1.actor_user_email == "user_100%@example.com"))
+    refute Enum.any?(actor_matches, &(&1.actor_user_email == "userX100Y@example.com"))
+
+    assert %{items: [target_match]} = Audit.list_events(nil, filters: [target: "user_setting"])
+    assert target_match.id == wildcard_event.id
+
+    assert %{items: [request_match]} = Audit.list_events(nil, filters: [request: "100%_test"])
+    assert request_match.id == wildcard_event.id
+  end
+
   test "does not record runtime request or file events in audit_events" do
     pool = pool_fixture(%{slug: "request-audit", name: "Request Audit"})
 

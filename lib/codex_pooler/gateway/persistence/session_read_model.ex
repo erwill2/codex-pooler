@@ -321,11 +321,18 @@ defmodule CodexPooler.Gateway.Persistence.SessionReadModel do
   defp maybe_filter_session_model(query, nil), do: query
 
   defp maybe_filter_session_model(query, model) do
-    pattern = "%#{model}%"
+    pattern = "%#{escape_like(model)}%"
 
     from([_session, _key, _turn, request, _attempt] in query,
       where: ilike(request.requested_model, ^pattern)
     )
+  end
+
+  defp escape_like(value) when is_binary(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
   end
 
   defp maybe_filter_session_status(query, nil), do: query

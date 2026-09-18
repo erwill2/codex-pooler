@@ -282,7 +282,7 @@ defmodule CodexPooler.Audit do
   defp maybe_filter_actor(query, nil), do: query
 
   defp maybe_filter_actor(query, actor) do
-    pattern = "%#{actor}%"
+    pattern = "%#{escape_like(actor)}%"
 
     from([event, user, _pool] in query,
       where:
@@ -301,7 +301,7 @@ defmodule CodexPooler.Audit do
   defp maybe_filter_target(query, nil), do: query
 
   defp maybe_filter_target(query, target) do
-    pattern = "%#{target}%"
+    pattern = "%#{escape_like(target)}%"
 
     from([event, ...] in query,
       where:
@@ -313,13 +313,20 @@ defmodule CodexPooler.Audit do
   defp maybe_filter_request(query, nil), do: query
 
   defp maybe_filter_request(query, request) do
-    pattern = "%#{request}%"
+    pattern = "%#{escape_like(request)}%"
 
     from([event, ...] in query,
       where:
         fragment("?::text ILIKE ?", event.request_id, ^pattern) or
           ilike(event.correlation_id, ^pattern)
     )
+  end
+
+  defp escape_like(value) when is_binary(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
   end
 
   defp maybe_filter_date_from(query, nil), do: query
