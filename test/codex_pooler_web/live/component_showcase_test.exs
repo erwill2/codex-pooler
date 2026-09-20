@@ -58,6 +58,17 @@ defmodule CodexPoolerWeb.Dev.ComponentShowcaseTest do
 
       assert has_element?(view, "#showcase-theme-toggle.h-10.w-40")
 
+      for {theme_option, label} <- [
+            {"system", "System theme"},
+            {"light", "Light theme"},
+            {"dark", "Dark theme"}
+          ] do
+        assert has_element?(
+                 view,
+                 "#showcase-theme-toggle button[data-phx-theme='#{theme_option}'][aria-label='#{label}'][title='#{label}'][type='button']"
+               )
+      end
+
       assert unique_ids?(html)
     end
   end
