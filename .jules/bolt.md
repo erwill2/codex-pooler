@@ -1,0 +1,3 @@
+## 2026-07-20 - List flattening and splitting in BPE tokenization
+**Learning:** `Regex.scan/2` without capture groups returns a list of single-element lists (`[["a"], ["b"]]`). Using `List.flatten/1` causes Erlang to perform deep recursive list flattening. `Enum.map(&hd/1)` extracts the head directly with far lower allocation overhead. Similarly, merging list items in loops via recursive pattern matching avoids intermediate tuple and list allocations from `Enum.split/2` and `++`.
+**Action:** Use `Enum.map(&hd/1)` for single-element `Regex.scan` results and direct recursive pattern matching for list element merging at indices.
