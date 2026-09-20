@@ -27,6 +27,22 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
     :ok
   end
 
+  test "settings changeset safely handles non-existent string keys without creating atoms" do
+    unexisting_key = "unexisting_setting_key_#{System.unique_integer([:positive])}"
+
+    changeset =
+      Settings.changeset(
+        Settings.default(),
+        %{"gateway" => %{unexisting_key => "invalid_value"}}
+      )
+
+    assert changeset.valid? or not changeset.valid?
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(unexisting_key)
+    end
+  end
+
   test "only owner scopes can update singleton settings through the context", %{
     scope: owner_scope
   } do
