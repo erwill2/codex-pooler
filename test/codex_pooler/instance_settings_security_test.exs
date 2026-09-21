@@ -108,6 +108,26 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
     assert InstanceSettings.get!().lock_version == settings.lock_version
   end
 
+  test "changeset validation with unexisting atom keys in bulkheads map handles keys safely without atom creation" do
+    unexisting_key = "unexisting_atom_key_#{System.unique_integer([:positive])}"
+
+    changeset =
+      Settings.changeset(Settings.default(), %{
+        "gateway" => %{
+          "bulkheads" => %{
+            unexisting_key => %{
+              "max_concurrency" => 1,
+              "queue_limit" => 1,
+              "queue_timeout_ms" => 1000
+            }
+          }
+        }
+      })
+
+    refute changeset.valid?
+    assert catch_error(String.to_existing_atom(unexisting_key)) == :badarg
+  end
+
   test "mcp service updates are audited as non-secret setting changes only", %{scope: scope} do
     settings = InstanceSettings.ensure_singleton!()
 
