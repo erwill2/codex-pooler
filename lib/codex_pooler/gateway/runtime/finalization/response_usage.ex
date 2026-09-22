@@ -83,14 +83,26 @@ defmodule CodexPooler.Gateway.Runtime.Finalization.ResponseUsage do
     end)
   end
 
+  # Search backwards in chunks from offset to find the preceding newline character without scanning the entire prefix
   defp retained_record_start(body, offset) do
-    body
-    |> binary_part(0, offset)
-    |> :binary.matches("\n")
-    |> List.last()
-    |> case do
+    case find_last_newline_before(body, offset) do
       {newline_offset, _length} -> newline_offset + 1
       nil -> 0
+    end
+  end
+
+  defp find_last_newline_before(_body, 0), do: nil
+
+  defp find_last_newline_before(body, offset) do
+    chunk_size = min(offset, 1024)
+    start = offset - chunk_size
+    chunk = binary_part(body, start, chunk_size)
+
+    case :binary.matches(chunk, "\n") do
+      [] -> find_last_newline_before(body, start)
+      matches ->
+        {pos, len} = List.last(matches)
+        {start + pos, len}
     end
   end
 

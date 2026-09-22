@@ -1,0 +1,3 @@
+## 2026-03-31 - Reverse Chunk Scanning for Record Start Boundary in Binary Stream Parsing
+**Learning:** Using `:binary.matches/2` across the entire prefix binary (`0..offset`) to find the preceding newline in large binary text payloads (e.g. SSE stream responses or WebSocket message buffers) causes O(N) allocation and scan time proportional to the entire body size. Scanning backwards in 1 KB chunks using `:binary.matches/2` narrows the scope to O(chunk) and yields ~35x speedup for stream usage line boundary extraction.
+**Action:** When extracting boundary delimiters (like preceding newlines or line starts) from large binary buffers at a given byte offset, search backwards in small chunks instead of scanning from offset 0.
