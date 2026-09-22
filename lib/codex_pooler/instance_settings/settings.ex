@@ -647,7 +647,23 @@ defmodule CodexPooler.InstanceSettings.Settings do
   defp positive_integer?(value), do: is_integer(value) and value > 0
   defp non_negative_integer?(value), do: is_integer(value) and value >= 0
 
-  defp map_get(map, key), do: Map.get(map, key, Map.get(map, String.to_atom(key)))
+  defp map_get(map, key) do
+    case map do
+      %{^key => val} ->
+        val
+
+      _other ->
+        if is_binary(key) do
+          try do
+            Map.get(map, String.to_existing_atom(key))
+          rescue
+            ArgumentError -> nil
+          end
+        else
+          Map.get(map, to_string(key))
+        end
+    end
+  end
 
   defp default_gateway(nil), do: default_gateway(%{})
 
