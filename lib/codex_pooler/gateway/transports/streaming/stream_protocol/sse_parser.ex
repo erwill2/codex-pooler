@@ -16,39 +16,53 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser do
     bounded? = Keyword.fetch!(opts, :bounded?)
 
     if String.contains?(data, "\n\n") do
-      parts = String.split(data, "\n\n")
-      ends_with_separator? = String.ends_with?(data, "\n\n")
-
       {complete, buffer} =
-        if ends_with_separator? do
-          {parts, ""}
-        else
-          {Enum.drop(parts, -1), List.last(parts) || ""}
-        end
+        data
+        |> String.split("\n\n")
+        |> separate_buffer()
 
-      {Enum.reject(complete, &(&1 == "")), maybe_bound_incomplete_sse_block(buffer, bounded?)}
+      {complete, maybe_bound_incomplete_sse_block(buffer, bounded?)}
     else
       {[], maybe_bound_incomplete_sse_block(data, bounded?)}
     end
   end
 
+  # Single-pass tail-recursive decomposition: separates the trailing incomplete buffer
+  # from completed non-empty SSE blocks, replacing ends_with?, Enum.drop, List.last,
+  # and Enum.reject.
+  defp separate_buffer(parts), do: do_separate_buffer(parts, [])
+
+  defp do_separate_buffer([last], acc), do: {Enum.reverse(acc), last}
+  defp do_separate_buffer(["" | tail], acc), do: do_separate_buffer(tail, acc)
+  defp do_separate_buffer([head | tail], acc), do: do_separate_buffer(tail, [head | acc])
+
   @spec sse_field(binary(), binary()) :: binary() | nil
   def sse_field(block, name) do
     prefix = name <> ":"
+    prefix_len = byte_size(prefix)
 
     block
     |> String.split("\n")
-    |> Enum.map(&String.trim/1)
-    |> Enum.flat_map(fn line ->
-      if String.starts_with?(line, prefix) do
-        [line |> String.replace_prefix(prefix, "") |> String.trim_leading()]
-      else
-        []
-      end
-    end)
-    |> case do
-      [] -> nil
-      values -> Enum.join(values, "\n")
+    |> extract_field_lines(prefix, prefix_len, [])
+  end
+
+  # Single-pass line extraction: avoids intermediate Enum.map and Enum.flat_map
+  # allocations and uses O(1) binary_part slicing instead of String.replace_prefix.
+  defp extract_field_lines([], _prefix, _prefix_len, []), do: nil
+
+  defp extract_field_lines([], _prefix, _prefix_len, acc),
+    do: acc |> Enum.reverse() |> Enum.join("\n")
+
+  defp extract_field_lines([line | rest], prefix, prefix_len, acc) do
+    line = String.trim(line)
+
+    if String.starts_with?(line, prefix) do
+      value =
+        line |> binary_part(prefix_len, byte_size(line) - prefix_len) |> String.trim_leading()
+
+      extract_field_lines(rest, prefix, prefix_len, [value | acc])
+    else
+      extract_field_lines(rest, prefix, prefix_len, acc)
     end
   end
 

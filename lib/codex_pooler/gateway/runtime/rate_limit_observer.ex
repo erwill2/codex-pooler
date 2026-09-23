@@ -206,21 +206,22 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
     data = String.replace(data, "\r\n", "\n")
 
     if String.contains?(data, "\n\n") do
-      parts = String.split(data, "\n\n")
-      ends_with_separator? = String.ends_with?(data, "\n\n")
-
       {complete, buffer} =
-        if ends_with_separator? do
-          {parts, ""}
-        else
-          {Enum.drop(parts, -1), List.last(parts) || ""}
-        end
+        data
+        |> String.split("\n\n")
+        |> separate_buffer()
 
-      {Enum.reject(complete, &(&1 == "")), bounded_incomplete_sse_block(buffer)}
+      {complete, bounded_incomplete_sse_block(buffer)}
     else
       {[], bounded_incomplete_sse_block(data)}
     end
   end
+
+  defp separate_buffer(parts), do: do_separate_buffer(parts, [])
+
+  defp do_separate_buffer([last], acc), do: {Enum.reverse(acc), last}
+  defp do_separate_buffer(["" | tail], acc), do: do_separate_buffer(tail, acc)
+  defp do_separate_buffer([head | tail], acc), do: do_separate_buffer(tail, [head | acc])
 
   defp bounded_incomplete_sse_block(buffer) when byte_size(buffer) > @max_event_buffer_bytes,
     do: ""
