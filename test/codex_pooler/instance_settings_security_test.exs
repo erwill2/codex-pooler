@@ -281,4 +281,23 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
 
     assert has_element?(remounted_smtp_view, "#instance-settings-smtp-password[value='']")
   end
+
+  test "untrusted map keys in changeset inputs do not dynamically create atoms" do
+    untrusted_key = "untrusted_atom_exhaustion_test_key_#{System.unique_integer([:positive])}"
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(untrusted_key)
+    end
+
+    _changeset =
+      Settings.changeset(Settings.default(), %{
+        "gateway" => %{
+          untrusted_key => "invalid_value"
+        }
+      })
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(untrusted_key)
+    end
+  end
 end
