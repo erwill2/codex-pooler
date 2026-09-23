@@ -30,6 +30,7 @@ defmodule CodexPoolerWeb.Admin.OperatorsLiveTest do
     open_create_dialog(view)
 
     assert has_element?(view, "#operator-create-dialog[open]")
+    assert has_element?(view, "#operator-create-dialog .modal-backdrop button[aria-label='Close dialog']")
     assert has_element?(view, "#operator-create-form")
     assert has_element?(view, "#operator_email")
     assert has_element?(view, "#operator_display_name")
@@ -500,6 +501,7 @@ defmodule CodexPoolerWeb.Admin.OperatorsLiveTest do
     view |> element("#edit-operator-#{operator.id}") |> render_click()
 
     assert has_element?(view, "#operator-edit-dialog[open]")
+    assert has_element?(view, "#operator-edit-dialog .modal-backdrop button[aria-label='Close dialog']")
     assert has_element?(view, "#operator-edit-form")
     assert has_element?(view, "#operator_edit_email")
     assert has_element?(view, "#operator_edit_display_name")
@@ -575,6 +577,7 @@ defmodule CodexPoolerWeb.Admin.OperatorsLiveTest do
     view |> element("#reset-operator-password-#{operator.id}") |> render_click()
 
     assert has_element?(view, "#operator-password-dialog[open]")
+    assert has_element?(view, "#operator-password-dialog .modal-backdrop button[aria-label='Close dialog']")
     assert has_element?(view, "#operator-reset-password-form")
     assert has_element?(view, "#operator-reset-password-cancel + #operator-reset-password-submit")
     assert has_element?(view, "#operator-password-dialog", "reset.operator@example.com")

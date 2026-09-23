@@ -99,7 +99,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_create_operator">close</button>
+        <button type="button" aria-label="Close dialog" phx-click="cancel_create_operator">close</button>
       </form>
     </dialog>
     """
@@ -172,7 +172,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_edit">close</button>
+        <button type="button" aria-label="Close dialog" phx-click="cancel_edit">close</button>
       </form>
     </dialog>
     """
@@ -262,7 +262,7 @@ defmodule CodexPoolerWeb.Admin.OperatorComponents.Dialogs do
         </AdminComponents.dialog_footer>
       </div>
       <form method="dialog" class="modal-backdrop">
-        <button type="button" phx-click="cancel_reset">close</button>
+        <button type="button" aria-label="Close dialog" phx-click="cancel_reset">close</button>
       </form>
     </dialog>
     """
