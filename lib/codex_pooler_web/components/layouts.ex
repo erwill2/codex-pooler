@@ -191,13 +191,15 @@ defmodule CodexPoolerWeb.Layouts do
 
   def theme_toggle(assigns) do
     ~H"""
-    <div id={@id} class={@class}>
+    <div id={@id} class={@class} role="group" aria-label="Theme">
       <div class="absolute w-1/3 h-full rounded-full border-1 border-base-200 bg-base-100 brightness-200 left-0 [[data-theme=light]_&]:left-1/3 [[data-theme=dark]_&]:left-2/3 transition-[left]" />
 
       <button
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="system"
+        aria-label="Match system theme"
+        title="Match system theme"
       >
         <.icon name="hero-computer-desktop-micro" class="size-4 opacity-75 hover:opacity-100" />
       </button>
@@ -206,6 +208,8 @@ defmodule CodexPoolerWeb.Layouts do
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="light"
+        aria-label="Light theme"
+        title="Light theme"
       >
         <.icon name="hero-sun-micro" class="size-4 opacity-75 hover:opacity-100" />
       </button>
@@ -214,6 +218,8 @@ defmodule CodexPoolerWeb.Layouts do
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="dark"
+        aria-label="Dark theme"
+        title="Dark theme"
       >
         <.icon name="hero-moon-micro" class="size-4 opacity-75 hover:opacity-100" />
       </button>
