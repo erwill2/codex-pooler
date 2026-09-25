@@ -198,6 +198,8 @@ defmodule CodexPoolerWeb.Layouts do
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="system"
+        aria-label={gettext("System theme")}
+        title={gettext("System theme")}
       >
         <.icon name="hero-computer-desktop-micro" class="size-4 opacity-75 hover:opacity-100" />
       </button>
@@ -206,6 +208,8 @@ defmodule CodexPoolerWeb.Layouts do
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="light"
+        aria-label={gettext("Light theme")}
+        title={gettext("Light theme")}
       >
         <.icon name="hero-sun-micro" class="size-4 opacity-75 hover:opacity-100" />
       </button>
@@ -214,6 +218,8 @@ defmodule CodexPoolerWeb.Layouts do
         class="flex h-full w-1/3 cursor-pointer items-center justify-center p-2"
         phx-click={JS.dispatch("phx:set-theme")}
         data-phx-theme="dark"
+        aria-label={gettext("Dark theme")}
+        title={gettext("Dark theme")}
       >
         <.icon name="hero-moon-micro" class="size-4 opacity-75 hover:opacity-100" />
       </button>

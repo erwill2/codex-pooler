@@ -41,6 +41,22 @@ defmodule CodexPoolerWeb.Admin.SettingsLiveTest do
     assert has_element?(view, "#settings-tab-security", "Security")
     assert has_element?(view, "#settings-appearance-panel")
     assert has_element?(view, "#settings-theme-toggle")
+
+    assert has_element?(
+             view,
+             "#settings-theme-toggle button[data-phx-theme='system'][aria-label='System theme'][title='System theme']"
+           )
+
+    assert has_element?(
+             view,
+             "#settings-theme-toggle button[data-phx-theme='light'][aria-label='Light theme'][title='Light theme']"
+           )
+
+    assert has_element?(
+             view,
+             "#settings-theme-toggle button[data-phx-theme='dark'][aria-label='Dark theme'][title='Dark theme']"
+           )
+
     refute has_element?(view, "#system-settings-panel")
     refute has_element?(view, "#instance-settings-form")
     refute has_element?(view, "#instance-settings-gateway")
