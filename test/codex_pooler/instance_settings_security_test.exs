@@ -281,4 +281,25 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
 
     assert has_element?(remounted_smtp_view, "#instance-settings-smtp-password[value='']")
   end
+
+  test "Settings changeset safely handles unknown string keys without creating atoms" do
+    unknown_key = "unbound_atom_key_#{System.unique_integer([:positive])}"
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(unknown_key)
+    end
+
+    changeset =
+      Settings.changeset(Settings.default(), %{
+        "gateway" => %{
+          unknown_key => "value"
+        }
+      })
+
+    assert changeset.valid?
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(unknown_key)
+    end
+  end
 end
