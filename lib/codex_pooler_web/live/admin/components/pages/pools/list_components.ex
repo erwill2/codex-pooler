@@ -641,6 +641,7 @@ defmodule CodexPoolerWeb.Admin.PoolListComponents do
         class="btn btn-ghost btn-sm btn-square"
         tabindex="0"
         aria-label={"Actions for #{@pool_row.pool.name}"}
+        title={"Actions for #{@pool_row.pool.name}"}
       >
         <.icon name="hero-ellipsis-vertical" class="size-5" />
       </button>

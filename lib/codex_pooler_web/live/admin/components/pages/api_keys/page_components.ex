@@ -447,6 +447,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
         class="btn btn-ghost btn-sm btn-square"
         tabindex="0"
         aria-label={"Actions for #{@api_key.display_name}"}
+        title={"Actions for #{@api_key.display_name}"}
       >
         <.icon name="hero-ellipsis-vertical" class="size-5" />
       </button>
