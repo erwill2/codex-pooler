@@ -281,4 +281,31 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
 
     assert has_element?(remounted_smtp_view, "#instance-settings-smtp-password[value='']")
   end
+
+  test "changeset does not create new atoms for unvetted map keys in settings input" do
+    unvetted_key = "unvetted_atom_test_key_#{System.unique_integer([:positive])}"
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(unvetted_key)
+    end
+
+    unvetted_attrs = %{
+      "gateway" => %{
+        "bulkheads" => %{
+          "read" => %{
+            "max_concurrency" => 10,
+            "queue_limit" => 100,
+            "queue_timeout_ms" => 5000,
+            unvetted_key => "malicious_value"
+          }
+        }
+      }
+    }
+
+    _changeset = Settings.changeset(Settings.default(), unvetted_attrs)
+
+    assert_raise ArgumentError, fn ->
+      String.to_existing_atom(unvetted_key)
+    end
+  end
 end
