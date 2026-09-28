@@ -77,6 +77,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Toolbar do
           class="btn btn-sm btn-ghost btn-square observatory-icon-button"
           data-observatory-refresh-action="resume"
           aria-label="Resume auto-refresh"
+          title="Resume auto-refresh"
         >
           <.icon name="hero-play" class="size-4" />
         </button>
@@ -87,6 +88,7 @@ defmodule CodexPoolerWeb.Observatory.Components.Toolbar do
           class="btn btn-sm btn-ghost btn-square observatory-icon-button"
           data-observatory-refresh-action="pause"
           aria-label="Pause auto-refresh"
+          title="Pause auto-refresh"
         >
           <.icon name="hero-pause" class="size-4" />
         </button>

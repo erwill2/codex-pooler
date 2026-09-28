@@ -26,7 +26,11 @@ defmodule CodexPoolerWeb.Observatory.ComponentsTest do
     refute html =~ "safe-prefix"
     assert html =~ "8s ago"
     assert html =~ "Paused"
-    assert LazyHTML.query(fragment, "#observatory-resume[aria-label='Resume auto-refresh']") != []
+
+    assert LazyHTML.query(
+             fragment,
+             "#observatory-resume[aria-label='Resume auto-refresh'][title='Resume auto-refresh']"
+           ) != []
 
     for {key, label} <- [{"1h", "1h"}, {"5h", "5h"}, {"24h", "24h"}, {"7d", "7d"}] do
       selector = "#observatory-window-#{key}[aria-pressed='#{key == "24h"}']"
