@@ -19,6 +19,7 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter.Pretokenizer do
   defp scan(pattern, text) do
     pattern
     |> Regex.scan(text)
-    |> List.flatten()
+    # Enum.map(&hd/1) is faster than List.flatten/1 for single-element match list extraction
+    |> Enum.map(&hd/1)
   end
 end

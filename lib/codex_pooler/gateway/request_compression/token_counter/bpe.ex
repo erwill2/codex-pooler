@@ -36,9 +36,9 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter.BPE do
 
   defp merge_count(pieces, ranks), do: pieces |> merge_pieces(ranks) |> length()
 
-  defp byte_pieces(chunk) do
-    for <<byte <- chunk>>, do: <<byte>>
-  end
+  # Recursive binary pattern matching is significantly faster than bitstring list comprehensions
+  defp byte_pieces(<<>>), do: []
+  defp byte_pieces(<<byte, rest::binary>>), do: [<<byte>> | byte_pieces(rest)]
 
   defp merge_pieces([], _ranks), do: []
   defp merge_pieces([_piece] = pieces, _ranks), do: pieces
@@ -79,8 +79,7 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter.BPE do
 
   defp pair_rank(first, second, ranks), do: Map.get(ranks, first <> second)
 
-  defp merge_at(pieces, index) do
-    {before_pair, [first, second | after_pair]} = Enum.split(pieces, index)
-    before_pair ++ [first <> second | after_pair]
-  end
+  # Merging adjacent list elements at index via recursive pattern matching avoids Enum.split tuple allocation and list concatenation (++)
+  defp merge_at([first, second | rest], 0), do: [first <> second | rest]
+  defp merge_at([head | tail], index), do: [head | merge_at(tail, index - 1)]
 end
