@@ -170,8 +170,11 @@ defmodule CodexPooler.Alerts.Evaluation.SavedResetFirstSeenEvaluator do
         selected
       end
     end)
-    |> Map.fetch!(:"#{key}_iso")
+    |> Map.fetch!(iso_key(key))
   end
+
+  defp iso_key(:expires_at), do: :expires_at_iso
+  defp iso_key(:first_seen_at), do: :first_seen_at_iso
 
   defp stringify_metadata(metadata),
     do: Map.new(metadata, fn {key, value} -> {to_string(key), value} end)
