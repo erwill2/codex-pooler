@@ -294,12 +294,19 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   defp apply_affinity(candidates, %{row: nil} = _affinity), do: candidates
 
   defp apply_affinity(candidates, %{row: %BridgeAffinity{} = affinity}) do
-    {matched, rest} =
-      Enum.split_with(candidates, fn {assignment, _identity} ->
-        assignment.id == affinity.pool_upstream_assignment_id
-      end)
+    case candidates do
+      [{%PoolUpstreamAssignment{id: id}, _} | _]
+      when id == affinity.pool_upstream_assignment_id ->
+        candidates
 
-    matched ++ rest
+      _ ->
+        {matched, rest} =
+          Enum.split_with(candidates, fn {assignment, _identity} ->
+            assignment.id == affinity.pool_upstream_assignment_id
+          end)
+
+        matched ++ rest
+    end
   end
 
   defp apply_codex_session_preference(
@@ -309,10 +316,18 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
          }
        )
        when is_binary(assignment_id) do
-    {matched, rest} =
-      Enum.split_with(candidates, fn {assignment, _identity} -> assignment.id == assignment_id end)
+    case candidates do
+      [{%PoolUpstreamAssignment{id: id}, _} | _] when id == assignment_id ->
+        candidates
 
-    matched ++ rest
+      _ ->
+        {matched, rest} =
+          Enum.split_with(candidates, fn {assignment, _identity} ->
+            assignment.id == assignment_id
+          end)
+
+        matched ++ rest
+    end
   end
 
   defp apply_codex_session_preference(candidates, %RequestOptions{}), do: candidates
@@ -328,14 +343,26 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   # Priority is an operator preference layered over the configured strategy.
   # Keeping the strategy position as the second key makes equal-priority rows
   # behave exactly as they did before priorities were configured.
+  # Short-circuiting when candidates length is <= 1 or when all candidates share equal priority
+  # avoids Enum.with_index, Enum.sort_by, and Enum.map allocations.
+  defp apply_routing_priority(candidates) when length(candidates) <= 1, do: candidates
+
   defp apply_routing_priority(candidates) do
-    candidates
-    |> Enum.with_index()
-    |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
-      {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
-       strategy_index}
-    end)
-    |> Enum.map(&elem(&1, 0))
+    first_priority = elem(hd(candidates), 0).routing_priority
+
+    if Enum.all?(candidates, fn {assignment, _identity} ->
+         assignment.routing_priority == first_priority
+       end) do
+      candidates
+    else
+      candidates
+      |> Enum.with_index()
+      |> Enum.sort_by(fn {{assignment, _identity}, strategy_index} ->
+        {assignment.routing_priority || PoolUpstreamAssignment.default_routing_priority(),
+         strategy_index}
+      end)
+      |> Enum.map(&elem(&1, 0))
+    end
   end
 
   defp prompt_cache_locality_context(
@@ -622,8 +649,14 @@ defmodule CodexPooler.Gateway.Routing.BridgeRing do
   defp rotate_candidates(candidates, _seed) when length(candidates) <= 1, do: candidates
 
   defp rotate_candidates(candidates, seed) do
-    {head, tail} = Enum.split(candidates, :erlang.phash2(seed, length(candidates)))
-    tail ++ head
+    case :erlang.phash2(seed, length(candidates)) do
+      0 ->
+        candidates
+
+      shift ->
+        {head, tail} = Enum.split(candidates, shift)
+        tail ++ head
+    end
   end
 
   defp quota_capacity_score(identity, %Model{} = model) do

@@ -1,0 +1,3 @@
+## 2026-03-30 - Candidate Pipeline Transformations in Gateway Bridge Ring
+**Learning:** In Elixir gateway routing pipelines, short-circuiting list transformations when candidate list length is <= 1, rotation shift is 0, candidates share equal priority, or the matching affinity/session candidate is already at the head of the list eliminates `Enum.with_index`, `Enum.sort_by`, `Enum.split_with`, `Enum.split`, and list concatenation (`++`) allocations.
+**Action:** When working on hot-path list ordering and selection pipelines, check for trivial cases (head match, single item, zero shift, or equal field values across elements) to short-circuit list traversal and sorting.
