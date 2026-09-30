@@ -79,8 +79,8 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter.BPE do
 
   defp pair_rank(first, second, ranks), do: Map.get(ranks, first <> second)
 
-  defp merge_at(pieces, index) do
-    {before_pair, [first, second | after_pair]} = Enum.split(pieces, index)
-    before_pair ++ [first <> second | after_pair]
-  end
+  # Merges adjacent byte-pair tokens at a given index via direct recursive pattern matching,
+  # avoiding Enum.split tuple allocation and list concatenation (++).
+  defp merge_at([first, second | rest], 0), do: [first <> second | rest]
+  defp merge_at([head | rest], index), do: [head | merge_at(rest, index - 1)]
 end
