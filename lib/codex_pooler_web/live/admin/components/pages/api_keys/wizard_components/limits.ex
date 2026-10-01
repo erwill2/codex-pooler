@@ -45,12 +45,26 @@ defmodule CodexPoolerWeb.Admin.ApiKeyWizardComponents.Limits do
     """
   end
 
+  @limit_field_atoms (for prefix <- ["default", "model"],
+                          field <- [
+                            "max_requests_per_minute",
+                            "max_tokens_per_day",
+                            "max_tokens_per_week",
+                            "max_input_tokens_per_request",
+                            "max_output_tokens_per_request"
+                          ],
+                          into: %{} do
+                        {"#{prefix}_#{field}", String.to_atom("#{prefix}_#{field}")}
+                      end)
+
   attr :form, :any, required: true
   attr :field, :string, required: true
   attr :prefix, :string, required: true
 
   def limit_input(assigns) do
-    assigns = assign(assigns, :field_atom, String.to_atom("#{assigns.prefix}_#{assigns.field}"))
+    key = "#{assigns.prefix}_#{assigns.field}"
+    field_atom = Map.get(@limit_field_atoms, key) || String.to_existing_atom(key)
+    assigns = assign(assigns, :field_atom, field_atom)
 
     ~H"""
     <.input

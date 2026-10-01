@@ -163,6 +163,13 @@ defmodule CodexPooler.Alerts.Evaluation.SavedResetFirstSeenEvaluator do
   defp max_datetime_iso(expirations, key), do: aggregate_datetime_iso(expirations, key, :gt)
 
   defp aggregate_datetime_iso([first | rest], key, comparison) do
+    iso_key =
+      case key do
+        :first_seen_at -> :first_seen_at_iso
+        :expires_at -> :expires_at_iso
+        _other -> String.to_existing_atom("#{key}_iso")
+      end
+
     Enum.reduce(rest, first, fn expiration, selected ->
       if DateTime.compare(Map.fetch!(expiration, key), Map.fetch!(selected, key)) == comparison do
         expiration
@@ -170,7 +177,7 @@ defmodule CodexPooler.Alerts.Evaluation.SavedResetFirstSeenEvaluator do
         selected
       end
     end)
-    |> Map.fetch!(:"#{key}_iso")
+    |> Map.fetch!(iso_key)
   end
 
   defp stringify_metadata(metadata),

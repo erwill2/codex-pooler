@@ -281,4 +281,30 @@ defmodule CodexPooler.InstanceSettingsSecurityTest do
 
     assert has_element?(remounted_smtp_view, "#instance-settings-smtp-password[value='']")
   end
+
+  test "settings changeset safely handles untrusted non-existing string keys in bulkheads" do
+    untrusted_key = "untrusted_non_existent_key_#{System.unique_integer([:positive])}"
+
+    bulkheads =
+      CodexPooler.RouteClass.all()
+      |> Map.new(fn route_class ->
+        {route_class,
+         %{
+           "max_concurrency" => 10,
+           "queue_limit" => 10,
+           "queue_timeout_ms" => 1000,
+           untrusted_key => "value"
+         }}
+      end)
+
+    valid_attrs = %{
+      "gateway" => %{
+        "bulkheads" => bulkheads
+      }
+    }
+
+    changeset = Settings.changeset(Settings.default(), valid_attrs)
+    assert changeset.valid?
+    refute String.to_existing_atom(untrusted_key) rescue ArgumentError -> false
+  end
 end

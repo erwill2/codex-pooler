@@ -25,6 +25,12 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
     max_output_tokens_per_request
   )
 
+  @limit_field_atoms (for prefix <- ["default", "model"],
+                          field <- @limit_fields,
+                          into: %{} do
+                        {"#{prefix}_#{field}", String.to_atom("#{prefix}_#{field}")}
+                      end)
+
   @spec limit_fields() :: [String.t()]
   def limit_fields, do: @limit_fields
 
@@ -455,11 +461,14 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPolicyForm do
     values =
       @limit_fields
       |> Enum.flat_map(fn field ->
+        default_atom = Map.fetch!(@limit_field_atoms, "default_#{field}")
+        model_atom = Map.fetch!(@limit_field_atoms, "model_#{field}")
+
         [
           {"Default #{limit_field_label(field)}",
-           normalized_limit_value(form[String.to_atom("default_#{field}")].value)},
+           normalized_limit_value(form[default_atom].value)},
           {"Model #{limit_field_label(field)}",
-           normalized_limit_value(form[String.to_atom("model_#{field}")].value)}
+           normalized_limit_value(form[model_atom].value)}
         ]
       end)
       |> Enum.reject(fn {_label, value} -> is_nil(value) end)
