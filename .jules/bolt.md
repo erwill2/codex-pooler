@@ -1,0 +1,3 @@
+## 2026-10-02 - Bridge Ring Candidate Routing Pipeline Short-Circuiting
+**Learning:** In Elixir gateway routing pipelines where candidates are repeatedly transformed by affinity, session preferences, routing priority, and demotions, checking fast-path conditions (candidate list length <= 1, shift offset 0, head element matching target ID, or uniform routing priorities) avoids redundant list splitting (`Enum.split_with`), list concatenation (`++`), and tuple allocations (`Enum.with_index` / `Enum.sort_by`).
+**Action:** Always place head-match pattern matches or uniform property checks before invoking multi-pass list functions in candidate evaluation loops.
