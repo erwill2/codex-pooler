@@ -284,6 +284,7 @@ defmodule CodexPoolerWeb.Admin.Components do
           id={"#{@id}-close"}
           type="button"
           class="btn btn-ghost btn-sm btn-square shrink-0"
+          title={@close_label}
           aria-label={@close_label}
           phx-click={@close_event}
         >
@@ -505,11 +506,11 @@ defmodule CodexPoolerWeb.Admin.Components do
         type="button"
         class="btn btn-ghost btn-xs btn-circle text-warning transition-colors hover:bg-warning/10 hover:text-warning"
         tabindex="0"
+        title={@label}
         aria-label={@label}
         aria-describedby={"#{@id}-content"}
       >
         <.icon name="hero-exclamation-triangle" class="size-4" />
-        <span class="sr-only">{@label}</span>
       </button>
       <span
         id={"#{@id}-content"}
