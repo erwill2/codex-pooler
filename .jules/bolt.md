@@ -1,0 +1,3 @@
+## 2026-05-18 - Replacing `List.flatten/1` on `Regex.scan/2` with `Enum.map(&hd/1)`
+**Learning:** `Regex.scan/2` without capture groups produces a flat list of 1-element lists (`[["match1"], ["match2"], ...]`). Using `List.flatten/1` triggers expensive recursive tree traversal and unnecessary intermediate memory allocations. Replacing `List.flatten/1` with `Enum.map(&hd/1)` extracts matches in a single pass with zero recursive overhead.
+**Action:** Always prefer `Enum.map(&hd/1)` over `List.flatten/1` when processing matches from `Regex.scan/2` patterns without capture groups in performance-critical code paths.

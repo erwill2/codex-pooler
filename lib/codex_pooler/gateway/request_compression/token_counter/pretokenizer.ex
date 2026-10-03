@@ -19,6 +19,9 @@ defmodule CodexPooler.Gateway.RequestCompression.TokenCounter.Pretokenizer do
   defp scan(pattern, text) do
     pattern
     |> Regex.scan(text)
-    |> List.flatten()
+    # Regex.scan without captures returns a list of 1-element lists (`[[match], ...]`).
+    # Extracting head via Enum.map(&hd/1) avoids deep recursive List.flatten/1 overhead
+    # and intermediate nested list memory allocations.
+    |> Enum.map(&hd/1)
   end
 end
