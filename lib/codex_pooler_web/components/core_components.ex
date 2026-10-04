@@ -156,12 +156,16 @@ defmodule CodexPoolerWeb.CoreComponents do
             name={@name}
             value="true"
             checked={@checked}
+            aria-invalid={@errors != [] && "true"}
+            aria-describedby={@errors != [] && "#{@id}-error"}
             class={@class || "checkbox checkbox-sm"}
             {@rest}
           />{@label}
         </span>
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -174,6 +178,8 @@ defmodule CodexPoolerWeb.CoreComponents do
         <select
           id={@id}
           name={@name}
+          aria-invalid={@errors != [] && "true"}
+          aria-describedby={@errors != [] && "#{@id}-error"}
           class={[@class || "w-full select", @errors != [] && (@error_class || "select-error")]}
           multiple={@multiple}
           {@rest}
@@ -182,7 +188,9 @@ defmodule CodexPoolerWeb.CoreComponents do
           {Form.options_for_select(@options, @value)}
         </select>
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -195,6 +203,8 @@ defmodule CodexPoolerWeb.CoreComponents do
         <textarea
           id={@id}
           name={@name}
+          aria-invalid={@errors != [] && "true"}
+          aria-describedby={@errors != [] && "#{@id}-error"}
           class={[
             @class || "w-full textarea",
             @errors != [] && (@error_class || "textarea-error")
@@ -202,7 +212,9 @@ defmodule CodexPoolerWeb.CoreComponents do
           {@rest}
         >{Form.normalize_value("textarea", @value)}</textarea>
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
@@ -217,6 +229,8 @@ defmodule CodexPoolerWeb.CoreComponents do
           name={@name}
           id={@id}
           value={Form.normalize_value(@type, @value)}
+          aria-invalid={@errors != [] && "true"}
+          aria-describedby={@errors != [] && "#{@id}-error"}
           class={[
             @class || "w-full input",
             @errors != [] && (@error_class || "input-error")
@@ -224,7 +238,9 @@ defmodule CodexPoolerWeb.CoreComponents do
           {@rest}
         />
       </label>
-      <.error :for={msg <- @errors}>{msg}</.error>
+      <div :if={@errors != []} id={"#{@id}-error"}>
+        <.error :for={msg <- @errors}>{msg}</.error>
+      </div>
     </div>
     """
   end
