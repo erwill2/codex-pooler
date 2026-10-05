@@ -1,0 +1,3 @@
+## 2026-07-20 - Single-pass SSE partitioning and O(1) list prepending for JSON tree traversal
+**Learning:** In hot request-processing and streaming paths, multi-pass list traversals (`Enum.drop`, `List.last`, `Enum.reject`) and $O(N)$ list concatenations (`path ++ [elem]`) create unnecessary heap allocations and garbage collection pressure. Single-pass tail-recursive accumulators and $O(1)$ list prepending eliminate intermediate list copies.
+**Action:** Always prefer single-pass tail-recursive pattern matching for binary/string block partitioning and $O(1)$ list prepending (`[elem | path]`) when building breadcrumb paths during tree parsing.

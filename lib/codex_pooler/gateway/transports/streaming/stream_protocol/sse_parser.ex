@@ -16,21 +16,22 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser do
     bounded? = Keyword.fetch!(opts, :bounded?)
 
     if String.contains?(data, "\n\n") do
-      parts = String.split(data, "\n\n")
-      ends_with_separator? = String.ends_with?(data, "\n\n")
-
-      {complete, buffer} =
-        if ends_with_separator? do
-          {parts, ""}
-        else
-          {Enum.drop(parts, -1), List.last(parts) || ""}
-        end
-
-      {Enum.reject(complete, &(&1 == "")), maybe_bound_incomplete_sse_block(buffer, bounded?)}
+      # Single-pass tail-recursive partitioning avoids Enum.drop, List.last, and Enum.reject passes.
+      {complete, buffer} = partition_sse_parts(String.split(data, "\n\n"), [])
+      {complete, maybe_bound_incomplete_sse_block(buffer, bounded?)}
     else
       {[], maybe_bound_incomplete_sse_block(data, bounded?)}
     end
   end
+
+  defp partition_sse_parts([last], acc), do: {Enum.reverse(acc), last}
+
+  defp partition_sse_parts([head | tail], acc) do
+    acc = if head == "", do: acc, else: [head | acc]
+    partition_sse_parts(tail, acc)
+  end
+
+  defp partition_sse_parts([], _acc), do: {[], ""}
 
   @spec sse_field(binary(), binary()) :: binary() | nil
   def sse_field(block, name) do
