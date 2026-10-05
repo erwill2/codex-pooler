@@ -174,12 +174,14 @@ defmodule CodexPoolerWeb.ObservatoryDashboardLiveTest do
     render_click(view, "pause-refresh")
     assert has_element?(view, "#observatory-state-stale")
     assert has_element?(view, "#observatory-resume[aria-label='Resume auto-refresh']")
+    assert has_element?(view, "#observatory-resume[title='Resume auto-refresh']")
 
     render_click(view, "resume-refresh")
     render_async(view)
     assert has_element?(view, "#observatory-widgets")
     refute has_element?(view, "#observatory-state-stale")
     assert has_element?(view, "#observatory-pause[aria-label='Pause auto-refresh']")
+    assert has_element?(view, "#observatory-pause[title='Pause auto-refresh']")
 
     assert has_element?(
              view,
