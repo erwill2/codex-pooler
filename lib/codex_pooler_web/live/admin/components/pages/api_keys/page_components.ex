@@ -347,6 +347,7 @@ defmodule CodexPoolerWeb.Admin.ApiKeyPageComponents do
                         data-copy-text={api_key.key_prefix}
                         class="inline-grid size-5 shrink-0 place-items-center rounded text-base-content/40 transition-colors hover:bg-base-200 hover:text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-primary"
                         aria-label="Copy key prefix"
+                        title="Copy key prefix"
                       >
                         <.icon name="hero-clipboard-document" class="copy-icon size-3.5" />
                       </button>
