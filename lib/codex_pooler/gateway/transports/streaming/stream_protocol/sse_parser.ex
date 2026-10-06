@@ -12,24 +12,31 @@ defmodule CodexPooler.Gateway.Transports.Streaming.StreamProtocol.SSEParser do
 
   @spec complete_sse_blocks(binary(), keyword()) :: {[binary()], binary()}
   def complete_sse_blocks(data, opts) do
-    data = String.replace(data, "\r\n", "\n")
+    # Avoid unconditional String.replace allocation when \r is absent
+    data = if String.contains?(data, "\r"), do: String.replace(data, "\r\n", "\n"), else: data
     bounded? = Keyword.fetch!(opts, :bounded?)
 
-    if String.contains?(data, "\n\n") do
-      parts = String.split(data, "\n\n")
-      ends_with_separator? = String.ends_with?(data, "\n\n")
+    case String.split(data, "\n\n") do
+      [single] ->
+        {[], maybe_bound_incomplete_sse_block(single, bounded?)}
 
-      {complete, buffer} =
-        if ends_with_separator? do
-          {parts, ""}
-        else
-          {Enum.drop(parts, -1), List.last(parts) || ""}
-        end
-
-      {Enum.reject(complete, &(&1 == "")), maybe_bound_incomplete_sse_block(buffer, bounded?)}
-    else
-      {[], maybe_bound_incomplete_sse_block(data, bounded?)}
+      parts ->
+        {blocks, buffer} = extract_sse_blocks(parts, [])
+        {blocks, maybe_bound_incomplete_sse_block(buffer, bounded?)}
     end
+  end
+
+  # Single-pass tail-recursive accumulator avoids multi-pass List/Enum traversals
+  defp extract_sse_blocks([last], acc) do
+    {Enum.reverse(acc), last}
+  end
+
+  defp extract_sse_blocks(["" | rest], acc) do
+    extract_sse_blocks(rest, acc)
+  end
+
+  defp extract_sse_blocks([block | rest], acc) do
+    extract_sse_blocks(rest, [block | acc])
   end
 
   @spec sse_field(binary(), binary()) :: binary() | nil

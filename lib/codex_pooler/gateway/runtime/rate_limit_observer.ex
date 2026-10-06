@@ -203,23 +203,30 @@ defmodule CodexPooler.Gateway.Runtime.RateLimitObserver do
   end
 
   defp complete_sse_blocks(data) do
-    data = String.replace(data, "\r\n", "\n")
+    # Avoid unconditional String.replace allocation when \r is absent
+    data = if String.contains?(data, "\r"), do: String.replace(data, "\r\n", "\n"), else: data
 
-    if String.contains?(data, "\n\n") do
-      parts = String.split(data, "\n\n")
-      ends_with_separator? = String.ends_with?(data, "\n\n")
+    case String.split(data, "\n\n") do
+      [single] ->
+        {[], bounded_incomplete_sse_block(single)}
 
-      {complete, buffer} =
-        if ends_with_separator? do
-          {parts, ""}
-        else
-          {Enum.drop(parts, -1), List.last(parts) || ""}
-        end
-
-      {Enum.reject(complete, &(&1 == "")), bounded_incomplete_sse_block(buffer)}
-    else
-      {[], bounded_incomplete_sse_block(data)}
+      parts ->
+        {blocks, buffer} = extract_sse_blocks(parts, [])
+        {blocks, bounded_incomplete_sse_block(buffer)}
     end
+  end
+
+  # Single-pass tail-recursive accumulator avoids multi-pass List/Enum traversals
+  defp extract_sse_blocks([last], acc) do
+    {Enum.reverse(acc), last}
+  end
+
+  defp extract_sse_blocks(["" | rest], acc) do
+    extract_sse_blocks(rest, acc)
+  end
+
+  defp extract_sse_blocks([block | rest], acc) do
+    extract_sse_blocks(rest, [block | acc])
   end
 
   defp bounded_incomplete_sse_block(buffer) when byte_size(buffer) > @max_event_buffer_bytes,
