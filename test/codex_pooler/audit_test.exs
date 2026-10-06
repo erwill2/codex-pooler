@@ -144,6 +144,35 @@ defmodule CodexPooler.AuditTest do
     assert listed_correlation.id == second_event.id
   end
 
+  test "escapes SQL LIKE wildcards in filter search terms" do
+    pool = pool_fixture()
+
+    assert {:ok, _match_event} =
+             Audit.record_system_event(%{
+               pool_id: pool.id,
+               action: "access.denied",
+               target_type: "api_key_100%",
+               correlation_id: "corr_100%_test",
+               details: %{}
+             })
+
+    assert {:ok, _non_match_event} =
+             Audit.record_system_event(%{
+               pool_id: pool.id,
+               action: "access.denied",
+               target_type: "api_key_1000",
+               correlation_id: "corr_1000_test",
+               details: %{}
+             })
+
+    # Filtering by "100%" should only match "api_key_100%" and "corr_100%_test", not "1000"
+    assert %{items: [target_item]} = Audit.list_events(pool, filters: [target: "100%"])
+    assert target_item.target_type == "api_key_100%"
+
+    assert %{items: [request_item]} = Audit.list_events(pool, filters: [request: "100%"])
+    assert request_item.correlation_id == "corr_100%_test"
+  end
+
   test "does not record runtime request or file events in audit_events" do
     pool = pool_fixture(%{slug: "request-audit", name: "Request Audit"})
 
