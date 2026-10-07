@@ -990,7 +990,7 @@ defmodule CodexPooler.CompatibilityMatrixTest do
       for page <- ~w(responses-lite-vs-full runtime-routes) do
         path = Path.join("docs-site/src/content/docs/reference", page <> ".mdx")
         assert File.read!(path) =~ mode_contract
-        examples = Regex.scan(~r/```json\n(.*?)\n```/s, File.read!(path), capture: :all_but_first)
+        examples = Regex.scan(~r/```json\r?\n(.*?)\r?\n```/s, File.read!(path), capture: :all_but_first)
 
         assert Enum.any?(examples, fn [json] ->
                  CodexPooler.JSON.decode(json) == {:ok, fixture.full_supported_values_example}
